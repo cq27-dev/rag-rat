@@ -13,14 +13,12 @@
 //! re-blesses it, §11.4), so while we are behind the author that parks rather than hardening into a
 //! rejection.
 
+use super::super::branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
+use super::super::id::{AccountEntryHash, OwnerId};
 use super::super::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
     EntryStatus, OwnerChainAuthority,
 };
-
-type AccountEntryHash = [u8; 32];
-
-use super::super::branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::account) enum SecretsParkReason {
@@ -108,7 +106,7 @@ where
     pub(in crate::account) entry_hash: AccountEntryHash,
     pub(in crate::account) seq: u64,
     /// The header's `authority_ref` — the cited owner incarnation id (null ⇒ reject).
-    pub(in crate::account) authority_ref: Option<AccountEntryHash>,
+    pub(in crate::account) authority_ref: Option<OwnerId>,
     /// The cited owner incarnation resolved via `owner_secrets_authority` (the two secrets
     /// boundaries).
     pub(in crate::account) owner_authority: AuthorityQuery<OwnerChainAuthority>,
@@ -289,8 +287,8 @@ where
 mod tests {
     use super::*;
 
-    const ENTRY_HASH: AccountEntryHash = [9; 32];
-    const OWNER_ID: AccountEntryHash = [7; 32];
+    const ENTRY_HASH: AccountEntryHash = AccountEntryHash::from_bytes([9; 32]);
+    const OWNER_ID: AccountEntryHash = AccountEntryHash::from_bytes([7; 32]);
 
     fn account() -> AccountId {
         AccountId::from_bytes([5; 32])
@@ -318,9 +316,9 @@ mod tests {
             account_id: account(),
             entry_hash: ENTRY_HASH,
             seq: 0,
-            authority_ref: Some(OWNER_ID),
+            authority_ref: Some(OWNER_ID.into()),
             owner_authority,
-            ownership: Some(AuthorityQuery::Effective([1; 32])),
+            ownership: Some(AuthorityQuery::Effective(AccountEntryHash::from_bytes([1; 32]))),
             asserted_auth_len: 3,
             dense_predecessor_reachable: true,
             branch_selected: true,
@@ -418,12 +416,12 @@ mod tests {
             account_id: account(),
             entry_hash: ENTRY_HASH,
             seq: 5,
-            authority_ref: Some(OWNER_ID),
+            authority_ref: Some(OWNER_ID.into()),
             owner_authority: owner_chain(
-                AuthorityBoundary::Cut { seq: 2, hash: [1; 32] },
+                AuthorityBoundary::Cut { seq: 2, hash: AccountEntryHash::from_bytes([1; 32]) },
                 AuthorityBoundary::Open,
             ),
-            ownership: Some(AuthorityQuery::Effective([1; 32])),
+            ownership: Some(AuthorityQuery::Effective(AccountEntryHash::from_bytes([1; 32]))),
             asserted_auth_len: 3,
             dense_predecessor_reachable: true,
             branch_selected: true,
@@ -448,7 +446,10 @@ mod tests {
     #[test]
     fn an_off_branch_wrap_is_condemned_and_a_within_cut_on_branch_accepts() {
         let off = base(
-            owner_chain(AuthorityBoundary::Cut { seq: 5, hash: [1; 32] }, AuthorityBoundary::Open),
+            owner_chain(
+                AuthorityBoundary::Cut { seq: 5, hash: AccountEntryHash::from_bytes([1; 32]) },
+                AuthorityBoundary::Open,
+            ),
             AncestryRelation::OffBranch,
         );
         assert_eq!(
@@ -456,7 +457,10 @@ mod tests {
             Ok(SecretsAcceptance::Condemned(SecretsCondemnReason::OffBranch))
         );
         let on = base(
-            owner_chain(AuthorityBoundary::Cut { seq: 5, hash: [1; 32] }, AuthorityBoundary::Open),
+            owner_chain(
+                AuthorityBoundary::Cut { seq: 5, hash: AccountEntryHash::from_bytes([1; 32]) },
+                AuthorityBoundary::Open,
+            ),
             AncestryRelation::OnBranch,
         );
         assert_eq!(evaluate_secrets_acceptance(&on), Ok(SecretsAcceptance::Accepted));
@@ -482,7 +486,7 @@ mod tests {
             contested: true,
             ..base(
                 owner_chain(
-                    AuthorityBoundary::Cut { seq: 5, hash: [1; 32] },
+                    AuthorityBoundary::Cut { seq: 5, hash: AccountEntryHash::from_bytes([1; 32]) },
                     AuthorityBoundary::Open,
                 ),
                 AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget),

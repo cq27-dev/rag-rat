@@ -21,7 +21,7 @@ use super::branch::{AncestryRelation, UnknownAncestry};
 use super::candidate::{self, CutCoordinate, HeaderView, JoinResult};
 use super::cut::{Cut, beyond};
 use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
-use super::id::account_id_from_genesis_payload;
+use super::id::{self, AccountEntryHash, GrantId, OwnerId, RosterRef};
 use super::ops::{self, AccountOp, ChainKind, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::registers::RegisterKey;
 use crate::cbor;
@@ -200,18 +200,18 @@ pub(super) enum AccountClassification {
 /// The derived authority history of one account: per-entry outcomes, the account classification,
 /// and (only when `contested`) the deterministic recovery successor.
 pub(super) struct AccountAuthHistory {
-    outcomes: HashMap<[u8; 32], Outcome>,
+    outcomes: HashMap<AccountEntryHash, Outcome>,
     classification: AccountClassification,
     /// In a `contested` account, the deterministic `AccountReRoot` successor a subscriber follows
     /// — the smallest `successor_account_id` by byte order among the admitted re-roots (§12).
     /// `None` when the account is `Live` or no pre-contest owner has re-rooted yet.
     contested_successor: Option<AccountId>,
     effective_count: u64,
-    roster_refs: HashMap<[u8; 32], RosterFact>,
-    owner_incarnations: HashMap<[u8; 32], OwnerIncarnationFact>,
+    roster_refs: HashMap<RosterRef, RosterFact>,
+    owner_incarnations: HashMap<OwnerId, OwnerIncarnationFact>,
     stream_ownership: HashMap<StreamId, StreamOwnershipFact>,
-    grants: HashMap<[u8; 32], GrantFact>,
-    grant_cuts: HashMap<[u8; 32], Vec<DeviceCut>>,
+    grants: HashMap<GrantId, GrantFact>,
+    grant_cuts: HashMap<GrantId, Vec<DeviceCut>>,
     /// Removed devices (I4: never re-enroll). Exported because the C6 canonical projection binds
     /// it: a snapshot that omitted tombstones would let a bootstrap re-admit a removed device.
     tombstoned: HashSet<DeviceFingerprint>,
@@ -220,7 +220,7 @@ pub(super) struct AccountAuthHistory {
     /// same-payload genesis (a non-null `parent_ref`, say) can be held alongside the real root and
     /// sort ahead of it by hash, and no snapshot read revalidates `parent_ref`. `None` when no
     /// valid genesis is held yet.
-    genesis_hash: Option<[u8; 32]>,
+    genesis_hash: Option<AccountEntryHash>,
 }
 
 /// One authority fact resolved against the CURRENT fold. There is exactly one snapshot to resolve
@@ -279,7 +279,7 @@ pub struct RosterAuthority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityBoundary {
     Open,
-    Cut { seq: u64, hash: [u8; 32] },
+    Cut { seq: u64, hash: AccountEntryHash },
     Closed,
 }
 
@@ -349,7 +349,7 @@ pub(super) struct OwnerIncarnationFact {
 
 #[derive(Clone, Copy)]
 pub(super) struct StreamOwnershipFact {
-    pub(super) own_id: [u8; 32],
+    pub(super) own_id: AccountEntryHash,
     pub(super) effective_at: u64,
 }
 
@@ -362,13 +362,13 @@ pub(super) struct GrantFact {
 
 impl AccountAuthHistory {
     /// The outcome of the entry with this hash (absent ⇒ the entry was not in the folded set).
-    pub(super) fn outcome(&self, entry_hash: &[u8; 32]) -> Option<Outcome> {
+    pub(super) fn outcome(&self, entry_hash: &AccountEntryHash) -> Option<Outcome> {
         self.outcomes.get(entry_hash).copied()
     }
 
     /// The canonical root hash — see the field docs. Callers signing `parent_ref` MUST use this
     /// rather than scanning held entries for the genesis tag themselves.
-    pub(super) fn genesis_hash(&self) -> Option<[u8; 32]> {
+    pub(super) fn genesis_hash(&self) -> Option<AccountEntryHash> {
         self.genesis_hash
     }
 
@@ -385,13 +385,13 @@ impl AccountAuthHistory {
         self.effective_count
     }
 
-    pub(super) fn roster_facts(&self) -> impl Iterator<Item = (&[u8; 32], &RosterFact)> {
+    pub(super) fn roster_facts(&self) -> impl Iterator<Item = (&RosterRef, &RosterFact)> {
         self.roster_refs.iter()
     }
 
     pub(super) fn owner_incarnation_facts(
         &self,
-    ) -> impl Iterator<Item = (&[u8; 32], &OwnerIncarnationFact)> {
+    ) -> impl Iterator<Item = (&OwnerId, &OwnerIncarnationFact)> {
         self.owner_incarnations.iter()
     }
 
@@ -401,13 +401,13 @@ impl AccountAuthHistory {
         self.stream_ownership.iter()
     }
 
-    pub(super) fn grant_facts(&self) -> impl Iterator<Item = (&[u8; 32], &GrantFact)> {
+    pub(super) fn grant_facts(&self) -> impl Iterator<Item = (&GrantId, &GrantFact)> {
         self.grants.iter()
     }
 
     /// Every EFFECTIVE entry with the `auth_epoch` it took, in arbitrary order. The C6 canonical
     /// projection sorts this; callers must not depend on iteration order (it is a `HashMap`).
-    pub(super) fn effective_entries(&self) -> impl Iterator<Item = ([u8; 32], u64)> + '_ {
+    pub(super) fn effective_entries(&self) -> impl Iterator<Item = (AccountEntryHash, u64)> + '_ {
         self.outcomes.iter().filter_map(|(hash, outcome)| match outcome {
             Outcome::Effective { auth_epoch } => Some((*hash, *auth_epoch)),
             _ => None,
@@ -419,7 +419,7 @@ impl AccountAuthHistory {
         self.tombstoned.iter()
     }
 
-    pub(super) fn grant_cuts(&self) -> impl Iterator<Item = (&[u8; 32], &[DeviceCut])> {
+    pub(super) fn grant_cuts(&self) -> impl Iterator<Item = (&GrantId, &[DeviceCut])> {
         self.grant_cuts.iter().map(|(grant_id, cuts)| (grant_id, cuts.as_slice()))
     }
 
@@ -436,7 +436,7 @@ impl AccountAuthHistory {
 
     pub(super) fn roster_ref_effective(
         &self,
-        roster_ref: [u8; 32],
+        roster_ref: RosterRef,
         device_fingerprint: DeviceFingerprint,
     ) -> AuthorityQuery<RosterAuthority> {
         query_fact(
@@ -445,19 +445,19 @@ impl AccountAuthHistory {
                 .filter(|fact| fact.closed_at.is_none())
                 .map(|fact| (fact.authority, fact.authority.device_fingerprint)),
             device_fingerprint,
-            self.outcomes.contains_key(&roster_ref),
+            self.outcomes.contains_key(&roster_ref.into()),
         )
     }
 
     pub(super) fn roster_content_authority(
         &self,
-        roster_ref: [u8; 32],
+        roster_ref: RosterRef,
         device_fingerprint: DeviceFingerprint,
         stream_id: StreamId,
     ) -> AuthorityQuery<RosterContentAuthority> {
         let fact = match resolve_fact(
             self.roster_refs.get(&roster_ref),
-            self.outcomes.contains_key(&roster_ref),
+            self.outcomes.contains_key(&roster_ref.into()),
         ) {
             Ok(fact) => fact,
             Err(verdict) => return verdict,
@@ -482,7 +482,7 @@ impl AccountAuthHistory {
 
     pub(super) fn owner_incarnation_effective(
         &self,
-        owner_id: [u8; 32],
+        owner_id: OwnerId,
         device_fingerprint: DeviceFingerprint,
     ) -> AuthorityQuery<OwnerAuthority> {
         query_fact(
@@ -491,13 +491,13 @@ impl AccountAuthHistory {
                 .filter(|fact| fact.closed_at.is_none())
                 .map(|fact| (fact.authority, fact.authority.device_fingerprint)),
             device_fingerprint,
-            self.outcomes.contains_key(&owner_id),
+            self.outcomes.contains_key(&owner_id.into()),
         )
     }
 
     pub(super) fn owner_control_authority(
         &self,
-        owner_id: [u8; 32],
+        owner_id: OwnerId,
         device_fingerprint: DeviceFingerprint,
     ) -> AuthorityQuery<OwnerChainAuthority> {
         self.owner_chain_authority(owner_id, device_fingerprint, AuthorityChain::Control)
@@ -505,7 +505,7 @@ impl AccountAuthHistory {
 
     pub(super) fn owner_secrets_authority(
         &self,
-        owner_id: [u8; 32],
+        owner_id: OwnerId,
         device_fingerprint: DeviceFingerprint,
     ) -> AuthorityQuery<OwnerChainAuthority> {
         self.owner_chain_authority(owner_id, device_fingerprint, AuthorityChain::Secrets)
@@ -513,13 +513,13 @@ impl AccountAuthHistory {
 
     fn owner_chain_authority(
         &self,
-        owner_id: [u8; 32],
+        owner_id: OwnerId,
         device_fingerprint: DeviceFingerprint,
         chain: AuthorityChain,
     ) -> AuthorityQuery<OwnerChainAuthority> {
         let owner = match resolve_fact(
             self.owner_incarnations.get(&owner_id),
-            self.outcomes.contains_key(&owner_id),
+            self.outcomes.contains_key(&owner_id.into()),
         ) {
             Ok(fact) => fact,
             Err(verdict) => return verdict,
@@ -543,15 +543,17 @@ impl AccountAuthHistory {
 
     pub(super) fn grant_effective(
         &self,
-        grant_id: [u8; 32],
+        grant_id: GrantId,
         stream_id: StreamId,
         grantee_account_id: AccountId,
     ) -> AuthorityQuery<GrantAuthority> {
-        let fact =
-            match resolve_fact(self.grants.get(&grant_id), self.outcomes.contains_key(&grant_id)) {
-                Ok(fact) => fact,
-                Err(verdict) => return verdict,
-            };
+        let fact = match resolve_fact(
+            self.grants.get(&grant_id),
+            self.outcomes.contains_key(&grant_id.into()),
+        ) {
+            Ok(fact) => fact,
+            Err(verdict) => return verdict,
+        };
         if let Err(verdict) = require_subject(
             (fact.authority.stream_id, fact.authority.grantee_account_id),
             (stream_id, grantee_account_id),
@@ -561,14 +563,17 @@ impl AccountAuthHistory {
         AuthorityQuery::Effective(fact.authority)
     }
 
-    pub(super) fn stream_owner_effective(&self, stream_id: StreamId) -> AuthorityQuery<[u8; 32]> {
+    pub(super) fn stream_owner_effective(
+        &self,
+        stream_id: StreamId,
+    ) -> AuthorityQuery<AccountEntryHash> {
         let Some(fact) = self.stream_ownership.get(&stream_id) else {
             return AuthorityQuery::Unknown;
         };
         AuthorityQuery::Effective(fact.own_id)
     }
 
-    fn is_effective(&self, entry_hash: &[u8; 32]) -> bool {
+    fn is_effective(&self, entry_hash: &AccountEntryHash) -> bool {
         self.outcome(entry_hash).is_some_and(|o| o.is_effective())
     }
 }
@@ -614,7 +619,7 @@ struct Candidate {
 }
 
 impl Candidate {
-    fn hash(&self) -> [u8; 32] {
+    fn hash(&self) -> AccountEntryHash {
         self.entry.entry_hash
     }
 
@@ -650,20 +655,21 @@ impl Candidate {
 /// account-local by construction (the map only holds THIS account's mints).
 struct Incarnations<'a> {
     /// owner_id -> the mint candidate.
-    mints: HashMap<[u8; 32], &'a Candidate>,
-    genesis_owner_id: [u8; 32],
+    mints: HashMap<OwnerId, &'a Candidate>,
+    genesis_owner_id: OwnerId,
     /// Memoized structural depth per owner_id.
-    depth: HashMap<[u8; 32], Option<usize>>,
+    depth: HashMap<OwnerId, Option<usize>>,
 }
 
 impl<'a> Incarnations<'a> {
-    fn build(candidates: &'a [Candidate], genesis_owner_id: [u8; 32]) -> Self {
-        let mints = candidates.iter().filter(|c| c.is_mint()).map(|c| (c.hash(), c)).collect();
+    fn build(candidates: &'a [Candidate], genesis_owner_id: OwnerId) -> Self {
+        let mints =
+            candidates.iter().filter(|c| c.is_mint()).map(|c| (c.hash().into(), c)).collect();
         Incarnations { mints, genesis_owner_id, depth: HashMap::new() }
     }
 
     /// Resolve an `owner_id` to its mint candidate (account-local).
-    fn candidate(&self, owner_id: &[u8; 32]) -> Option<&'a Candidate> {
+    fn candidate(&self, owner_id: &OwnerId) -> Option<&'a Candidate> {
         self.mints.get(owner_id).copied()
     }
 
@@ -671,7 +677,7 @@ impl<'a> Incarnations<'a> {
     /// the minting op's author cited. `None` if the citation chain is unresolvable in this
     /// account (cross-account — P3 — or not yet synced). Memoized with an in-progress guard
     /// (the DAG cannot cycle — L1 — but a corrupt set must not loop).
-    fn incarnation_depth(&mut self, owner_id: [u8; 32]) -> Option<usize> {
+    fn incarnation_depth(&mut self, owner_id: OwnerId) -> Option<usize> {
         if let Some(cached) = self.depth.get(&owner_id) {
             return *cached;
         }
@@ -682,7 +688,7 @@ impl<'a> Incarnations<'a> {
         // unresolvable), collecting the path, then assign depths back up. The in-progress `None`
         // marker also breaks an (impossible) cycle: a revisit reads `None` and resolves
         // unresolvable.
-        let mut chain: Vec<[u8; 32]> = Vec::new();
+        let mut chain: Vec<OwnerId> = Vec::new();
         let mut node = owner_id;
         let base: Option<usize> = loop {
             if let Some(cached) = self.depth.get(&node) {
@@ -716,9 +722,9 @@ impl<'a> Incarnations<'a> {
 
     /// The incarnation `e` acts under: genesis acts under its OWN incarnation; else the cited
     /// `authority_ref`.
-    fn author_incarnation_id(&self, e: &Candidate) -> Option<[u8; 32]> {
+    fn author_incarnation_id(&self, e: &Candidate) -> Option<OwnerId> {
         match e.op {
-            AccountOp::AccountGenesis { .. } => Some(e.hash()),
+            AccountOp::AccountGenesis { .. } => Some(e.hash().into()),
             _ => e.header().authority_ref,
         }
     }
@@ -736,11 +742,11 @@ impl<'a> Incarnations<'a> {
 #[derive(Default)]
 struct FoldState {
     /// Incarnations proven live so far (owner_ids). Seeded with the genesis incarnation.
-    live: HashSet<[u8; 32]>,
+    live: HashSet<OwnerId>,
     /// Each enrolled device → the entry_hash of the DeviceAdd / genesis that enrolled it. Keyed by
     /// SOURCE (not just presence) so condemning a superseded / duplicate add for a device does not
     /// erase the enrollment a DIFFERENT, still-valid add contributed.
-    roster: HashMap<DeviceFingerprint, [u8; 32]>,
+    roster: HashMap<DeviceFingerprint, RosterRef>,
     /// Immutable role granted by the effective enrollment entry. `OwnerPromote` is deliberately
     /// limited to authoring-capable enrollments: otherwise a later promotion could retroactively
     /// re-bless content a read-only device authored before it had write authority.
@@ -748,7 +754,7 @@ struct FoldState {
     /// Each device holding an OPEN owner incarnation → that incarnation's `owner_id`. Keyed by
     /// incarnation (not just device) so a stale `OwnerDemote` naming a since-superseded `owner_id`
     /// cannot close a device's freshly-reopened incarnation.
-    owners: HashMap<DeviceFingerprint, [u8; 32]>,
+    owners: HashMap<DeviceFingerprint, OwnerId>,
     /// Removed devices — never re-enroll (I4).
     tombstoned: HashSet<DeviceFingerprint>,
     /// Whether an `AccountGenesis` has been made effective.
@@ -756,7 +762,7 @@ struct FoldState {
     /// 0-based effective index assigned as `auth_epoch`.
     next_auth_epoch: u64,
     /// Effective immutable stream ownership roots, keyed by owner-bound stream id.
-    stream_ownership: HashMap<StreamId, [u8; 32]>,
+    stream_ownership: HashMap<StreamId, AccountEntryHash>,
     /// The owned streams whose effective `StreamOwn` spec declares `PublicRead` — the only
     /// streams a `StreamGrant` may fold on (see the grant gate). A subset of
     /// `stream_ownership`; the access mode is committed into the stream id, so membership is
@@ -764,7 +770,7 @@ struct FoldState {
     public_streams: HashSet<StreamId>,
     /// Effective grant incarnations. A revoke closes exactly one id; a later grant gets a fresh
     /// hash and remains independent.
-    grants: HashMap<[u8; 32], LiveGrant>,
+    grants: HashMap<GrantId, LiveGrant>,
 }
 
 #[derive(Clone, Copy)]
@@ -780,11 +786,11 @@ struct LiveGrant {
 /// folded): a signed header is present whether or not its op decodes, so a cut may name an unknown
 /// entry as its watermark, and unknown entries beyond a cut are condemnable.
 struct CandidateView<'a> {
-    headers: &'a HashMap<[u8; 32], &'a AccountEntryHeader>,
+    headers: &'a HashMap<AccountEntryHash, &'a AccountEntryHeader>,
 }
 
 impl HeaderView for CandidateView<'_> {
-    fn header(&self, entry_hash: &[u8; 32]) -> Option<&AccountEntryHeader> {
+    fn header(&self, entry_hash: &AccountEntryHash) -> Option<&AccountEntryHeader> {
         self.headers.get(entry_hash).copied()
     }
 }
@@ -808,7 +814,7 @@ fn cut_op_registers(c: &Candidate) -> Vec<(RegisterKey, Cut, CutCoordinate)> {
             device,
         })
     };
-    let owner_register = |log: u8, device: DeviceFingerprint, owner_id: [u8; 32], cut: &Cut| {
+    let owner_register = |log: u8, device: DeviceFingerprint, owner_id: OwnerId, cut: &Cut| {
         (
             RegisterKey::OwnerIncarnation { account, log, device, owner_id },
             cut.clone(),
@@ -865,7 +871,7 @@ fn cut_extend_register(c: &Candidate) -> Option<(RegisterKey, Cut, CutCoordinate
             account,
             log,
             device: *device_fingerprint,
-            owner_id: *owner_id,
+            owner_id: (*owner_id).into(),
         },
         None => RegisterKey::Device { account, log, device: *device_fingerprint },
     };
@@ -1077,17 +1083,17 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
 
 fn fold_account_pass(
     entries: &[VerifiedAccountEntry],
-    readiness_exclusions: &HashMap<[u8; 32], Outcome>,
-) -> (AccountAuthHistory, HashMap<[u8; 32], Outcome>) {
-    let mut outcomes: HashMap<[u8; 32], Outcome> = HashMap::new();
+    readiness_exclusions: &HashMap<AccountEntryHash, Outcome>,
+) -> (AccountAuthHistory, HashMap<AccountEntryHash, Outcome>) {
+    let mut outcomes: HashMap<AccountEntryHash, Outcome> = HashMap::new();
 
     // Decode once, then classify. `candidates` are the ops the fold actually folds; `all_headers`
     // is the ancestry / cut-binding view — it holds every STRUCTURALLY-VALID entry (a valid chain
     // link, incl. a forward-compat unknown or a sealed op), but NOT a malformed one, so invalid
     // bytes can't shape the accepted branch.
     let mut candidates: Vec<Candidate> = Vec::with_capacity(entries.len());
-    let mut all_headers: HashMap<[u8; 32], &AccountEntryHeader> = HashMap::new();
-    let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut all_headers: HashMap<AccountEntryHash, &AccountEntryHeader> = HashMap::new();
+    let mut seen: HashSet<AccountEntryHash> = HashSet::new();
     for entry in entries {
         // Dedup the entry SET by hash — the fold classifies each entry once; a duplicated entry
         // must not apply its state transition (or overwrite its outcome) twice
@@ -1163,7 +1169,7 @@ fn fold_account_pass(
     let genesis_owner_id = genesis.hash();
     let genesis_founder = genesis.subject_device();
 
-    let mut incarnations = Incarnations::build(&candidates, genesis_owner_id);
+    let mut incarnations = Incarnations::build(&candidates, genesis_owner_id.into());
 
     // Group resolvable candidates by author-depth; unresolvable citations park.
     let mut strata: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -1198,8 +1204,8 @@ fn fold_account_pass(
         candidates: &candidates,
         incarnations: &incarnations,
         view: CandidateView { headers: &all_headers },
-        genesis_owner_id,
-        state: FoldState::seeded(genesis_owner_id),
+        genesis_owner_id: genesis_owner_id.into(),
+        state: FoldState::seeded(genesis_owner_id.into()),
         registers: HashMap::new(),
         verdicts: FoldVerdicts::default(),
         register_contributors: HashSet::new(),
@@ -1292,7 +1298,7 @@ fn fold_account_pass(
 
     // ponytail: one scan of the candidates per cut; index them by register key if cuts get
     // numerous.
-    let credits: HashMap<[u8; 32], u64> = candidates
+    let credits: HashMap<AccountEntryHash, u64> = candidates
         .iter()
         .filter(|c| register_contributors.contains(&c.hash()))
         .map(|c| (c.hash(), revocation_credit(&candidates, &strata, &incarnations, &outcomes, c)))
@@ -1375,12 +1381,12 @@ struct DepthPass<'a> {
     candidates: &'a [Candidate],
     incarnations: &'a Incarnations<'a>,
     view: CandidateView<'a>,
-    genesis_owner_id: [u8; 32],
+    genesis_owner_id: OwnerId,
     state: FoldState,
     /// The revocation registers accumulated so far (extend-only, joined by `⊔`).
     registers: HashMap<RegisterKey, Cut>,
     verdicts: FoldVerdicts,
-    register_contributors: HashSet<[u8; 32]>,
+    register_contributors: HashSet<AccountEntryHash>,
     classification: AccountClassification,
 }
 
@@ -1388,11 +1394,11 @@ struct DepthPass<'a> {
 struct FoldVerdicts {
     /// Every entry a register condemns. Grows monotonically — a lower-depth decision is final, no
     /// oscillation.
-    condemned: HashMap<[u8; 32], CondemnedReason>,
+    condemned: HashMap<AccountEntryHash, CondemnedReason>,
     /// Every entry a register parks. Rebuilt fresh each depth.
-    parked: HashMap<[u8; 32], ParkReason>,
+    parked: HashMap<AccountEntryHash, ParkReason>,
     /// The cut ops decided in the register pass (a binding failure / I2).
-    cut_verdicts: HashMap<[u8; 32], Outcome>,
+    cut_verdicts: HashMap<AccountEntryHash, Outcome>,
 }
 
 impl<'a> DepthPass<'a> {
@@ -1402,7 +1408,7 @@ impl<'a> DepthPass<'a> {
         &mut self,
         depth: usize,
         idxs: &[usize],
-        outcomes: &mut HashMap<[u8; 32], Outcome>,
+        outcomes: &mut HashMap<AccountEntryHash, Outcome>,
     ) -> ControlFlow<()> {
         let mut admitted = self.admit_cut_registers(idxs);
         self.reject_sole_owner_cuts(&mut admitted);
@@ -1563,7 +1569,7 @@ impl<'a> DepthPass<'a> {
         admitted: &mut Vec<AdmittedCut<'a>>,
     ) -> ControlFlow<()> {
         let mut working = self.registers.clone();
-        let mut parked_cuts: HashSet<[u8; 32]> = HashSet::new();
+        let mut parked_cuts: HashSet<AccountEntryHash> = HashSet::new();
         for a in admitted.iter() {
             let mut any_parked = false;
             for (key, cut) in &a.registers {
@@ -1716,7 +1722,8 @@ impl<'a> DepthPass<'a> {
             // which condemns everything on that chain incl. seq 0) would leave a `Live`
             // account with no effective root. The founder's LATER entries stay
             // condemnable; only the seq-0 root is exempt.
-            if c.hash() == self.genesis_owner_id || self.verdicts.condemned.contains_key(&c.hash())
+            if c.hash() == self.genesis_owner_id.into()
+                || self.verdicts.condemned.contains_key(&c.hash())
             {
                 continue;
             }
@@ -1731,15 +1738,15 @@ impl<'a> DepthPass<'a> {
                     // the device's separate DeviceAdd enrollment may still be valid.)
                     if c.is_mint() {
                         let state = &mut self.state;
-                        state.live.remove(&c.hash());
-                        if state.owners.get(&c.subject_device()) == Some(&c.hash()) {
+                        state.live.remove(&c.hash().into());
+                        if state.owners.get(&c.subject_device()) == Some(&c.hash().into()) {
                             state.owners.remove(&c.subject_device());
                         }
                         // Roll back the roster only if THIS DeviceAdd is the source of the current
                         // enrollment — a condemned duplicate/superseded add must not erase the
                         // enrollment a different, still-valid add contributed.
                         if matches!(c.op, AccountOp::DeviceAdd { .. })
-                            && state.roster.get(&c.subject_device()) == Some(&c.hash())
+                            && state.roster.get(&c.subject_device()) == Some(&c.hash().into())
                         {
                             state.roster.remove(&c.subject_device());
                             state.enrollment_roles.remove(&c.subject_device());
@@ -1757,7 +1764,11 @@ impl<'a> DepthPass<'a> {
     /// (b) EFFECT PASS over the stratum in (chain, seq, hash) order — a TOTAL order, so an
     /// equivocation (same device + seq, different content) sorts identically under every
     /// arrival permutation (I9).
-    fn run_effect_pass(&mut self, idxs: &[usize], outcomes: &mut HashMap<[u8; 32], Outcome>) {
+    fn run_effect_pass(
+        &mut self,
+        idxs: &[usize],
+        outcomes: &mut HashMap<AccountEntryHash, Outcome>,
+    ) {
         effect_pass(
             self.candidates,
             idxs,
@@ -1774,7 +1785,7 @@ fn effect_pass(
     incarnations: &Incarnations<'_>,
     verdicts: &FoldVerdicts,
     state: &mut FoldState,
-    outcomes: &mut HashMap<[u8; 32], Outcome>,
+    outcomes: &mut HashMap<AccountEntryHash, Outcome>,
 ) {
     let mut ordered = idxs.to_vec();
     ordered.sort_by_key(|&i| {
@@ -1814,7 +1825,7 @@ fn replay_effect_state(
     incarnations: &Incarnations<'_>,
     before_depth: Option<usize>,
     verdicts: &FoldVerdicts,
-    outcomes: &mut HashMap<[u8; 32], Outcome>,
+    outcomes: &mut HashMap<AccountEntryHash, Outcome>,
 ) -> FoldState {
     let mut state = FoldState::seeded(incarnations.genesis_owner_id);
     for (&depth, idxs) in strata {
@@ -1826,8 +1837,8 @@ fn replay_effect_state(
     state
 }
 
-fn normalize_auth_epochs(outcomes: &mut HashMap<[u8; 32], Outcome>) -> u64 {
-    let mut effective: Vec<([u8; 32], u64)> = outcomes
+fn normalize_auth_epochs(outcomes: &mut HashMap<AccountEntryHash, Outcome>) -> u64 {
+    let mut effective: Vec<(AccountEntryHash, u64)> = outcomes
         .iter()
         .filter_map(|(hash, outcome)| match outcome {
             Outcome::Effective { auth_epoch } => Some((*hash, *auth_epoch)),
@@ -1858,11 +1869,11 @@ fn revocation_credit(
     candidates: &[Candidate],
     strata: &BTreeMap<usize, Vec<usize>>,
     incarnations: &Incarnations<'_>,
-    outcomes: &HashMap<[u8; 32], Outcome>,
+    outcomes: &HashMap<AccountEntryHash, Outcome>,
     cut: &Candidate,
 ) -> u64 {
     let keys: Vec<RegisterKey> = cut_op_registers(cut).into_iter().map(|(key, ..)| key).collect();
-    let mut closed_mints: HashSet<[u8; 32]> = HashSet::new();
+    let mut closed_mints: HashSet<AccountEntryHash> = HashSet::new();
     let mut credit = 0;
     // Every candidate, not just the strata: an entry held out by a readiness exclusion is still
     // condemned by the final register overlay, and its author's count included it.
@@ -1885,7 +1896,9 @@ fn revocation_credit(
         // Nor the cut itself when it condemned its own authorizing mint and went stale.
         if c.hash() != cut.hash()
             && outcomes.get(&c.hash()) == Some(&Outcome::Rejected(RejectReason::StaleAuthority))
-            && incarnations.author_incarnation_id(c).is_some_and(|inc| closed_mints.contains(&inc))
+            && incarnations
+                .author_incarnation_id(c)
+                .is_some_and(|inc| closed_mints.contains(&inc.into()))
         {
             credit += 1;
             if c.is_mint() {
@@ -1902,15 +1915,15 @@ fn revocation_credit(
 struct VouchTable {
     /// Each effective cut that installs a register: its hash, revocation credit and cited length.
     /// A cut extend installs no register and vouches for nothing.
-    cuts: Vec<([u8; 32], u64, u64)>,
+    cuts: Vec<(AccountEntryHash, u64, u64)>,
     /// Every effective op by author device: chain seq and cited length.
     chains: HashMap<DeviceFingerprint, Vec<(u64, u64)>>,
 }
 
 fn vouch_table(
     candidates: &[Candidate],
-    credits: &HashMap<[u8; 32], u64>,
-    outcomes: &HashMap<[u8; 32], Outcome>,
+    credits: &HashMap<AccountEntryHash, u64>,
+    outcomes: &HashMap<AccountEntryHash, Outcome>,
 ) -> VouchTable {
     let effective: Vec<&Candidate> = candidates
         .iter()
@@ -2014,9 +2027,9 @@ fn concurrent_vouch(table: &VouchTable, op: &Candidate, base: u64) -> u64 {
 /// the other op's verdict.
 fn close_final_authority_dependencies(
     candidates: &[Candidate],
-    credits: &HashMap<[u8; 32], u64>,
-    outcomes: &mut HashMap<[u8; 32], Outcome>,
-) -> HashMap<[u8; 32], Outcome> {
+    credits: &HashMap<AccountEntryHash, u64>,
+    outcomes: &mut HashMap<AccountEntryHash, Outcome>,
+) -> HashMap<AccountEntryHash, Outcome> {
     let mut discovered = HashMap::new();
     loop {
         let measured: Vec<&Candidate> = candidates
@@ -2029,7 +2042,7 @@ fn close_final_authority_dependencies(
         // Every op effective at the start of the round is measured against the settled fold
         // without it, the ones that just fell included: a citation ahead of that count is the
         // stronger, permanent verdict.
-        let ahead: Vec<[u8; 32]> = measured
+        let ahead: Vec<AccountEntryHash> = measured
             .into_iter()
             .filter(|candidate| {
                 let credit = credits.get(&candidate.hash()).copied().unwrap_or(0);
@@ -2057,7 +2070,7 @@ fn close_final_authority_dependencies(
 /// effect is excluded, so these verdicts are recomputed rather than permanently held out.
 fn settle_authority_dependencies(
     candidates: &[Candidate],
-    outcomes: &mut HashMap<[u8; 32], Outcome>,
+    outcomes: &mut HashMap<AccountEntryHash, Outcome>,
 ) {
     loop {
         let effective_roster: HashSet<DeviceFingerprint> = candidates
@@ -2082,12 +2095,12 @@ fn settle_authority_dependencies(
                 _ => None,
             })
             .collect();
-        let effective_grants: HashMap<[u8; 32], (StreamId, AccountId)> = candidates
+        let effective_grants: HashMap<GrantId, (StreamId, AccountId)> = candidates
             .iter()
             .filter(|candidate| outcomes.get(&candidate.hash()).is_some_and(Outcome::is_effective))
             .filter_map(|candidate| match candidate.op {
                 AccountOp::StreamGrant { stream_id, grantee_account_id, .. } =>
-                    Some((candidate.hash(), (stream_id, grantee_account_id))),
+                    Some((candidate.hash().into(), (stream_id, grantee_account_id))),
                 _ => None,
             })
             .collect();
@@ -2098,9 +2111,9 @@ fn settle_authority_dependencies(
                 continue;
             }
             let replacement = if let Some(authority_ref) = candidate.header().authority_ref
-                && !outcomes.get(&authority_ref).is_some_and(Outcome::is_effective)
+                && !outcomes.get(&authority_ref.into()).is_some_and(Outcome::is_effective)
             {
-                Some(match outcomes.get(&authority_ref) {
+                Some(match outcomes.get(&authority_ref.into()) {
                     Some(Outcome::Parked(reason)) => Outcome::Parked(*reason),
                     _ => Outcome::Rejected(RejectReason::StaleAuthority),
                 })
@@ -2132,16 +2145,16 @@ fn settle_authority_dependencies(
 
 #[derive(Default)]
 struct AuthorityFacts {
-    roster_refs: HashMap<[u8; 32], RosterFact>,
-    owner_incarnations: HashMap<[u8; 32], OwnerIncarnationFact>,
+    roster_refs: HashMap<RosterRef, RosterFact>,
+    owner_incarnations: HashMap<OwnerId, OwnerIncarnationFact>,
     stream_ownership: HashMap<StreamId, StreamOwnershipFact>,
-    grants: HashMap<[u8; 32], GrantFact>,
-    grant_cuts: HashMap<[u8; 32], Vec<DeviceCut>>,
+    grants: HashMap<GrantId, GrantFact>,
+    grant_cuts: HashMap<GrantId, Vec<DeviceCut>>,
 }
 
 fn derive_authority_facts(
     candidates: &[Candidate],
-    outcomes: &HashMap<[u8; 32], Outcome>,
+    outcomes: &HashMap<AccountEntryHash, Outcome>,
     registers: &HashMap<RegisterKey, Cut>,
 ) -> AuthorityFacts {
     let mut effective: Vec<(&Candidate, u64)> = candidates
@@ -2154,14 +2167,14 @@ fn derive_authority_facts(
     effective.sort_by_key(|(candidate, epoch)| (*epoch, candidate.hash()));
 
     let mut facts = AuthorityFacts::default();
-    let mut roster = HashMap::<DeviceFingerprint, [u8; 32]>::new();
-    let mut owners = HashMap::<DeviceFingerprint, [u8; 32]>::new();
+    let mut roster = HashMap::<DeviceFingerprint, RosterRef>::new();
+    let mut owners = HashMap::<DeviceFingerprint, OwnerId>::new();
     for (candidate, epoch) in effective {
         match &candidate.op {
             AccountOp::AccountGenesis { .. } => {
                 let device = candidate.subject_device();
                 let hash = candidate.hash();
-                facts.roster_refs.insert(hash, RosterFact {
+                facts.roster_refs.insert(hash.into(), RosterFact {
                     authority: RosterAuthority {
                         device_fingerprint: device,
                         current_role: DeviceRole::Owner,
@@ -2172,19 +2185,19 @@ fn derive_authority_facts(
                     secrets_boundary: AuthorityBoundary::Open,
                     content_boundaries: HashMap::new(),
                 });
-                facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
+                facts.owner_incarnations.insert(hash.into(), OwnerIncarnationFact {
                     authority: OwnerAuthority { device_fingerprint: device },
                     effective_at: epoch,
                     closed_at: None,
                     control_boundary: AuthorityBoundary::Open,
                     secrets_boundary: AuthorityBoundary::Open,
                 });
-                roster.insert(device, hash);
-                owners.insert(device, hash);
+                roster.insert(device, hash.into());
+                owners.insert(device, hash.into());
             },
             AccountOp::DeviceAdd { device_fingerprint, role, .. } => {
                 let hash = candidate.hash();
-                facts.roster_refs.insert(hash, RosterFact {
+                facts.roster_refs.insert(hash.into(), RosterFact {
                     authority: RosterAuthority {
                         device_fingerprint: *device_fingerprint,
                         current_role: *role,
@@ -2195,16 +2208,16 @@ fn derive_authority_facts(
                     secrets_boundary: AuthorityBoundary::Open,
                     content_boundaries: HashMap::new(),
                 });
-                roster.insert(*device_fingerprint, hash);
+                roster.insert(*device_fingerprint, hash.into());
                 if *role == DeviceRole::Owner {
-                    facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
+                    facts.owner_incarnations.insert(hash.into(), OwnerIncarnationFact {
                         authority: OwnerAuthority { device_fingerprint: *device_fingerprint },
                         effective_at: epoch,
                         closed_at: None,
                         control_boundary: AuthorityBoundary::Open,
                         secrets_boundary: AuthorityBoundary::Open,
                     });
-                    owners.insert(*device_fingerprint, hash);
+                    owners.insert(*device_fingerprint, hash.into());
                 }
             },
             AccountOp::OwnerPromote { device_fingerprint } => {
@@ -2218,14 +2231,14 @@ fn derive_authority_facts(
                     .expect("active roster fact")
                     .authority
                     .current_role = DeviceRole::Owner;
-                facts.owner_incarnations.insert(hash, OwnerIncarnationFact {
+                facts.owner_incarnations.insert(hash.into(), OwnerIncarnationFact {
                     authority: OwnerAuthority { device_fingerprint: *device_fingerprint },
                     effective_at: epoch,
                     closed_at: None,
                     control_boundary: AuthorityBoundary::Open,
                     secrets_boundary: AuthorityBoundary::Open,
                 });
-                owners.insert(*device_fingerprint, hash);
+                owners.insert(*device_fingerprint, hash.into());
             },
             AccountOp::DeviceRemove { device_fingerprint, content_cuts, .. } => {
                 if let Some(roster_ref) = roster.remove(device_fingerprint) {
@@ -2306,7 +2319,7 @@ fn derive_authority_facts(
                 });
             },
             AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
-                facts.grants.insert(candidate.hash(), GrantFact {
+                facts.grants.insert(candidate.hash().into(), GrantFact {
                     authority: GrantAuthority {
                         stream_id: *stream_id,
                         grantee_account_id: *grantee_account_id,
@@ -2388,7 +2401,7 @@ fn find_genesis(candidates: &[Candidate]) -> Option<&Candidate> {
                     && h.parent_ref.is_none()
                     && h.authority_ref.is_none()
                     && h.auth_len == 0
-                    && account_id_from_genesis_payload(&c.entry.payload) == h.account_id
+                    && id::account_id_from_genesis_payload(&c.entry.payload) == h.account_id
                     && h.device_fingerprint.to_bytes() == cbor::sha256(ed25519_pubkey)
             },
             _ => false,
@@ -2417,7 +2430,7 @@ enum AuthorityStatus {
 
 fn closes_open_incarnation(
     op: &AccountOp,
-    owners: &HashMap<DeviceFingerprint, [u8; 32]>,
+    owners: &HashMap<DeviceFingerprint, OwnerId>,
 ) -> Option<DeviceFingerprint> {
     match op {
         AccountOp::DeviceRemove { device_fingerprint, .. } =>
@@ -2436,7 +2449,7 @@ fn authority_status(
     c: &Candidate,
     incarnations: &Incarnations<'_>,
     state: &FoldState,
-    parked: &HashMap<[u8; 32], ParkReason>,
+    parked: &HashMap<AccountEntryHash, ParkReason>,
 ) -> AuthorityStatus {
     let Some(author_inc) = incarnations.author_incarnation_id(c) else {
         return AuthorityStatus::Unresolvable;
@@ -2450,7 +2463,7 @@ fn authority_status(
     if state.live.contains(&author_inc) {
         return AuthorityStatus::Live;
     }
-    match parked.get(&author_inc) {
+    match parked.get(&author_inc.into()) {
         Some(reason) => AuthorityStatus::ParkedAuthorizer(*reason),
         None => AuthorityStatus::Stale,
     }
@@ -2462,7 +2475,7 @@ fn classify_effect(
     c: &Candidate,
     incarnations: &Incarnations<'_>,
     state: &FoldState,
-    parked: &HashMap<[u8; 32], ParkReason>,
+    parked: &HashMap<AccountEntryHash, ParkReason>,
 ) -> EffectVerdict {
     // The author must act under a LIVE incarnation minted for THIS device (clauses 1 + 3). This is
     // what defeats laundering (a cut authored under a since-condemned owner is not live) AND owner
@@ -2482,7 +2495,7 @@ fn classify_effect(
                 return EffectVerdict::Rejected(RejectReason::DuplicateGenesis);
             }
             // The self-hash was checked in `find_genesis`; a second genesis reaching here is a dup.
-            if account_id_from_genesis_payload(&c.entry.payload) != c.header().account_id {
+            if id::account_id_from_genesis_payload(&c.entry.payload) != c.header().account_id {
                 return EffectVerdict::Rejected(RejectReason::GenesisSelfHash);
             }
             EffectVerdict::Effective
@@ -2599,22 +2612,22 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
     match &c.op {
         AccountOp::AccountGenesis { .. } => {
             state.genesis_seen = true;
-            state.roster.insert(c.subject_device(), c.hash());
+            state.roster.insert(c.subject_device(), c.hash().into());
             state.enrollment_roles.insert(c.subject_device(), DeviceRole::Owner);
-            state.owners.insert(c.subject_device(), c.hash());
-            state.live.insert(c.hash());
+            state.owners.insert(c.subject_device(), c.hash().into());
+            state.live.insert(c.hash().into());
         },
         AccountOp::DeviceAdd { device_fingerprint, role, .. } => {
-            state.roster.insert(*device_fingerprint, c.hash());
+            state.roster.insert(*device_fingerprint, c.hash().into());
             state.enrollment_roles.insert(*device_fingerprint, *role);
             if *role == DeviceRole::Owner {
-                state.owners.insert(*device_fingerprint, c.hash());
-                state.live.insert(c.hash());
+                state.owners.insert(*device_fingerprint, c.hash().into());
+                state.live.insert(c.hash().into());
             }
         },
         AccountOp::OwnerPromote { device_fingerprint } => {
-            state.owners.insert(*device_fingerprint, c.hash());
-            state.live.insert(c.hash());
+            state.owners.insert(*device_fingerprint, c.hash().into());
+            state.live.insert(c.hash().into());
         },
         AccountOp::StreamOwn { stream_id, stream_spec_bytes } => {
             state.stream_ownership.insert(*stream_id, c.hash());
@@ -2627,7 +2640,7 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
             }
         },
         AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
-            state.grants.insert(c.hash(), LiveGrant {
+            state.grants.insert(c.hash().into(), LiveGrant {
                 stream_id: *stream_id,
                 grantee_account_id: *grantee_account_id,
                 role: *grant_role,
@@ -2666,7 +2679,7 @@ impl FoldState {
         Outcome::Effective { auth_epoch }
     }
 
-    fn seeded(genesis_owner_id: [u8; 32]) -> Self {
+    fn seeded(genesis_owner_id: OwnerId) -> Self {
         Self { live: HashSet::from([genesis_owner_id]), ..Default::default() }
     }
 }
@@ -2736,7 +2749,7 @@ mod tests {
     #[derive(Clone)]
     struct Fixture {
         account_id: AccountId,
-        genesis_hash: [u8; 32],
+        genesis_hash: AccountEntryHash,
         chains: HashMap<[u8; 32], (u64, Option<[u8; 32]>)>,
         entries: Vec<VerifiedAccountEntry>,
     }
@@ -2751,7 +2764,7 @@ mod tests {
                 label: None,
             };
             let payload = account_ops::encode(&op).unwrap();
-            let account_id = account_id_from_genesis_payload(&payload);
+            let account_id = id::account_id_from_genesis_payload(&payload);
             let header = AccountEntryHeader {
                 account_id,
                 log_id: 0,
@@ -2772,7 +2785,7 @@ mod tests {
             let genesis_hash = verified.entry_hash;
             let mut fixture =
                 Fixture { account_id, genesis_hash, chains: HashMap::new(), entries: Vec::new() };
-            fixture.chains.insert(founder.fp.to_bytes(), (1, Some(genesis_hash)));
+            fixture.chains.insert(founder.fp.to_bytes(), (1, Some(genesis_hash.into())));
             fixture.entries.push(verified);
             fixture
         }
@@ -2781,7 +2794,7 @@ mod tests {
         fn author(
             &mut self,
             author: &Dev,
-            authority_ref: Option<[u8; 32]>,
+            authority_ref: Option<OwnerId>,
             op: &AccountOp,
         ) -> [u8; 32] {
             self.author_at_auth_len(author, authority_ref, op, 1)
@@ -2790,7 +2803,7 @@ mod tests {
         fn author_at_auth_len(
             &mut self,
             author: &Dev,
-            authority_ref: Option<[u8; 32]>,
+            authority_ref: Option<OwnerId>,
             op: &AccountOp,
             auth_len: u64,
         ) -> [u8; 32] {
@@ -2801,7 +2814,7 @@ mod tests {
                 log_id: 0,
                 device_fingerprint: author.fp,
                 seq,
-                prev_hash: prev,
+                prev_hash: prev.map(Into::into),
                 parent_ref: Some(self.genesis_hash),
                 entry_type: account_ops::entry_type_of(op),
                 op_version: 1,
@@ -2814,9 +2827,9 @@ mod tests {
             let verified =
                 verify_account_signed(&signed.signed_bytes, &author.secret.public()).unwrap();
             let hash = verified.entry_hash;
-            self.chains.insert(author.fp.to_bytes(), (seq + 1, Some(hash)));
+            self.chains.insert(author.fp.to_bytes(), (seq + 1, Some(hash.into())));
             self.entries.push(verified);
-            hash
+            hash.into()
         }
 
         /// Author `op` at an EXPLICIT `(seq, prev_hash)` without advancing the device's main chain
@@ -2825,10 +2838,10 @@ mod tests {
         fn author_forked(
             &mut self,
             author: &Dev,
-            authority_ref: Option<[u8; 32]>,
+            authority_ref: Option<OwnerId>,
             op: &AccountOp,
             seq: u64,
-            prev_hash: Option<[u8; 32]>,
+            prev_hash: Option<AccountEntryHash>,
         ) -> [u8; 32] {
             let payload = account_ops::encode(op).unwrap();
             let header = AccountEntryHeader {
@@ -2850,7 +2863,7 @@ mod tests {
                 verify_account_signed(&signed.signed_bytes, &author.secret.public()).unwrap();
             let hash = verified.entry_hash;
             self.entries.push(verified);
-            hash
+            hash.into()
         }
 
         /// Author a raw log-1 (secrets) entry at an explicit `(seq, prev_hash)` on `author`'s
@@ -2865,7 +2878,7 @@ mod tests {
             author: &Dev,
             filler: &Dev,
             seq: u64,
-            prev_hash: Option<[u8; 32]>,
+            prev_hash: Option<AccountEntryHash>,
         ) -> [u8; 32] {
             let op = device_add(filler, DeviceRole::Member);
             let payload = account_ops::encode(&op).unwrap();
@@ -2888,7 +2901,7 @@ mod tests {
                 verify_account_signed(&signed.signed_bytes, &author.secret.public()).unwrap();
             let hash = verified.entry_hash;
             self.entries.push(verified);
-            hash
+            hash.into()
         }
 
         fn fold(&self) -> AccountAuthHistory {
@@ -2905,12 +2918,16 @@ mod tests {
 
         /// Fold every entry EXCEPT `exclude` — models a watermark (or any entry) not yet synced.
         fn fold_without(&self, exclude: [u8; 32]) -> AccountAuthHistory {
-            let held: Vec<VerifiedAccountEntry> =
-                self.entries.iter().filter(|e| e.entry_hash != exclude).cloned().collect();
+            let held: Vec<VerifiedAccountEntry> = self
+                .entries
+                .iter()
+                .filter(|e| e.entry_hash != AccountEntryHash::from_bytes(exclude))
+                .cloned()
+                .collect();
             fold_account(&held)
         }
 
-        fn effective_set(history: &AccountAuthHistory) -> HashSet<[u8; 32]> {
+        fn effective_set(history: &AccountAuthHistory) -> HashSet<AccountEntryHash> {
             history.outcomes.iter().filter(|(_, o)| o.is_effective()).map(|(h, _)| *h).collect()
         }
     }
@@ -2926,12 +2943,12 @@ mod tests {
         let removed = Dev::new(4);
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        f.author(&founder, Some(g), &device_add(&owner_b, DeviceRole::Owner));
-        f.author(&founder, Some(g), &device_add(&member, DeviceRole::Member));
-        f.author(&founder, Some(g), &device_add(&removed, DeviceRole::Member));
+        f.author(&founder, Some(g.into()), &device_add(&owner_b, DeviceRole::Owner));
+        f.author(&founder, Some(g.into()), &device_add(&member, DeviceRole::Member));
+        f.author(&founder, Some(g.into()), &device_add(&removed, DeviceRole::Member));
         let (stream_id, own) = stream_own(f.account_id);
-        f.author(&founder, Some(g), &own);
-        f.author(&founder, Some(g), &AccountOp::StreamGrant {
+        f.author(&founder, Some(g.into()), &own);
+        f.author(&founder, Some(g.into()), &AccountOp::StreamGrant {
             stream_id,
             grantee_account_id: AccountId::from_bytes([0x9a; 32]),
             grant_role: GrantRole::Writer,
@@ -2940,7 +2957,7 @@ mod tests {
         // coordinate on its chain that does not exist, and the remove would park
         // `unknown_cut_target` instead of taking effect — leaving the fixture with no tombstone at
         // all, which is exactly what `a_different_covered_prefix_projects_differently` caught.
-        f.author(&founder, Some(g), &AccountOp::DeviceRemove {
+        f.author(&founder, Some(g.into()), &AccountOp::DeviceRemove {
             device_fingerprint: removed.fp,
             control_cut: Cut::Empty,
             secrets_cut: Cut::Empty,
@@ -2979,9 +2996,10 @@ mod tests {
         let mut heads: HashMap<DeviceFingerprint, (u64, [u8; 32])> = HashMap::new();
         for entry in &f.entries {
             let h = &entry.header;
-            let slot = heads.entry(h.device_fingerprint).or_insert((h.seq, entry.entry_hash));
+            let slot =
+                heads.entry(h.device_fingerprint).or_insert((h.seq, entry.entry_hash.into()));
             if h.seq >= slot.0 {
-                *slot = (h.seq, entry.entry_hash);
+                *slot = (h.seq, entry.entry_hash.into());
             }
         }
         snapshot::ops::SnapshotTarget {
@@ -2994,7 +3012,7 @@ mod tests {
                 .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
                     device_fingerprint,
                     seq,
-                    entry_hash,
+                    entry_hash: AccountEntryHash::from_bytes(entry_hash),
                 })
                 .collect(),
         }
@@ -3088,7 +3106,7 @@ mod tests {
         let g = f.genesis_hash;
         f.author_forked(
             &founder,
-            Some(g),
+            Some(g.into()),
             &device_add(&sibling_target, DeviceRole::Member),
             seq,
             prev,
@@ -3169,7 +3187,7 @@ mod tests {
         // A roster/effective-set change.
         let mut roster = projection_fixture();
         let g = roster.genesis_hash;
-        roster.author(&Dev::new(1), Some(g), &device_add(&Dev::new(7), DeviceRole::Member));
+        roster.author(&Dev::new(1), Some(g.into()), &device_add(&Dev::new(7), DeviceRole::Member));
         assert_ne!(
             snapshot::projection::folded_state_hash(&roster.fold()),
             base,
@@ -3180,7 +3198,7 @@ mod tests {
         let mut tombstone = projection_fixture();
         let g = tombstone.genesis_hash;
         let victim = Dev::new(3);
-        tombstone.author(&Dev::new(1), Some(g), &AccountOp::DeviceRemove {
+        tombstone.author(&Dev::new(1), Some(g.into()), &AccountOp::DeviceRemove {
             device_fingerprint: victim.fp,
             control_cut: Cut::Empty,
             secrets_cut: Cut::Empty,
@@ -3197,7 +3215,7 @@ mod tests {
         let mut grant = projection_fixture();
         let g = grant.genesis_hash;
         let (stream_id, _) = stream_own(grant.account_id);
-        grant.author(&Dev::new(1), Some(g), &AccountOp::StreamGrant {
+        grant.author(&Dev::new(1), Some(g.into()), &AccountOp::StreamGrant {
             stream_id,
             grantee_account_id: AccountId::from_bytes([0xbe; 32]),
             grant_role: GrantRole::Reader,
@@ -3217,7 +3235,7 @@ mod tests {
         let full = snapshot::projection::folded_state_hash(&f.fold());
         let withheld = f.entries.last().expect("fixture has entries").entry_hash;
         assert_ne!(
-            snapshot::projection::folded_state_hash(&f.fold_without(withheld)),
+            snapshot::projection::folded_state_hash(&f.fold_without(withheld.into())),
             full,
             "folding a shorter prefix must project differently",
         );
@@ -3243,7 +3261,7 @@ mod tests {
         }
     }
 
-    fn owner_demote(dev: &Dev, owner_id: [u8; 32], control_cut: Cut) -> AccountOp {
+    fn owner_demote(dev: &Dev, owner_id: OwnerId, control_cut: Cut) -> AccountOp {
         AccountOp::OwnerDemote {
             device_fingerprint: dev.fp,
             owner_id,
@@ -3268,7 +3286,7 @@ mod tests {
     /// An `OwnerDemote` that cuts BOTH the incarnation's control chain and its secrets chain.
     fn owner_demote_with_secrets(
         dev: &Dev,
-        owner_id: [u8; 32],
+        owner_id: OwnerId,
         control_cut: Cut,
         secrets_cut: Cut,
     ) -> AccountOp {
@@ -3326,7 +3344,7 @@ mod tests {
         }
     }
 
-    fn stream_revoke(stream: StreamId, grantee: AccountId, grant_id: [u8; 32]) -> AccountOp {
+    fn stream_revoke(stream: StreamId, grantee: AccountId, grant_id: GrantId) -> AccountOp {
         AccountOp::StreamRevoke {
             stream_id: stream,
             grantee_account_id: grantee,
@@ -3341,9 +3359,9 @@ mod tests {
     fn cut_extend_ctrl(
         account: AccountId,
         subject: &Dev,
-        incarnation_id: Option<[u8; 32]>,
+        incarnation_id: Option<AccountEntryHash>,
         new_seq: u64,
-        new_entry_hash: [u8; 32],
+        new_entry_hash: AccountEntryHash,
     ) -> AccountOp {
         AccountOp::CutExtend {
             chain_kind: ops::ChainKind::Ctrl,
@@ -3361,9 +3379,9 @@ mod tests {
     fn cut_extend_secrets(
         account: AccountId,
         subject: &Dev,
-        incarnation_id: Option<[u8; 32]>,
+        incarnation_id: Option<AccountEntryHash>,
         new_seq: u64,
-        new_entry_hash: [u8; 32],
+        new_entry_hash: AccountEntryHash,
     ) -> AccountOp {
         AccountOp::CutExtend {
             chain_kind: ops::ChainKind::Secrets,
@@ -3393,25 +3411,25 @@ mod tests {
         let mut f = Fixture::genesis(&founder);
         let ahead = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_add(&ahead_device, DeviceRole::Member),
             10,
         );
         let behind = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_add(&behind_device, DeviceRole::Member),
             0,
         );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&ahead.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
         assert_eq!(
-            h.roster_ref_effective(ahead, ahead_device.fp),
+            h.roster_ref_effective(RosterRef::from_bytes(ahead), ahead_device.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
             "an ahead candidate must not leave a projected roster mutation",
         );
-        assert!(h.is_effective(&behind), "a stale count is informational, never authority");
+        assert!(h.is_effective(&behind.into()), "a stale count is informational, never authority");
     }
 
     #[test]
@@ -3420,32 +3438,40 @@ mod tests {
         let mut f = Fixture::genesis(&founder);
         let ahead = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_add(&device, DeviceRole::Member),
             2,
         );
 
         let h = f.fold();
         assert_eq!(h.effective_count(), 1, "only genesis preceded the candidate");
-        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&ahead.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
     }
 
     #[test]
     fn an_auth_len_ahead_cut_has_no_register_side_effect() {
         let (founder, b, member) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
-        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_b =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
         let ahead_remove = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_remove(&b, Cut::Empty),
             u64::MAX,
         );
-        let add_member = f.author(&b, Some(add_b), &device_add(&member, DeviceRole::Member));
+        let add_member = f.author(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_add(&member, DeviceRole::Member),
+        );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&ahead_remove), Some(Outcome::Parked(ParkReason::AuthLenAhead)),);
-        assert!(h.is_effective(&add_member), "a parked cut must not condemn B's chain");
+        assert_eq!(
+            h.outcome(&ahead_remove.into()),
+            Some(Outcome::Parked(ParkReason::AuthLenAhead)),
+        );
+        assert!(h.is_effective(&add_member.into()), "a parked cut must not condemn B's chain");
         assert_eq!(h.classification(), AccountClassification::Live);
     }
 
@@ -3455,24 +3481,30 @@ mod tests {
         let mut f = Fixture::genesis(&founder);
         let ahead_remove = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_remove(&device, Cut::Empty),
             u64::MAX,
         );
-        let add_device =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&device, DeviceRole::Owner));
-        let add_member =
-            f.author(&device, Some(add_device), &device_add(&member, DeviceRole::Member));
+        let add_device = f.author(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_add(&device, DeviceRole::Owner),
+        );
+        let add_member = f.author(
+            &device,
+            Some(OwnerId::from_bytes(add_device)),
+            &device_add(&member, DeviceRole::Member),
+        );
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&ahead_remove),
+            h.outcome(&ahead_remove.into()),
             Some(Outcome::Parked(ParkReason::AuthLenAhead)),
             "freshness dominates the phase-E ineffective verdict for a register contributor",
         );
-        assert!(h.is_effective(&add_device));
+        assert!(h.is_effective(&add_device.into()));
         assert!(
-            h.is_effective(&add_member),
+            h.is_effective(&add_member.into()),
             "the rejected ahead cut must leave no empty register on the enrolled device",
         );
     }
@@ -3483,16 +3515,20 @@ mod tests {
         let mut f = Fixture::genesis(&founder);
         let ahead_add = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_add(&b, DeviceRole::Owner),
             u64::MAX,
         );
-        let remove_founder = f.author(&b, Some(ahead_add), &device_remove(&founder, Cut::Empty));
+        let remove_founder = f.author(
+            &b,
+            Some(OwnerId::from_bytes(ahead_add)),
+            &device_remove(&founder, Cut::Empty),
+        );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&ahead_add), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&ahead_add.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
         assert_eq!(
-            h.outcome(&remove_founder),
+            h.outcome(&remove_founder.into()),
             Some(Outcome::Rejected(RejectReason::StaleAuthority)),
             "an excluded mint cannot launder authority into its descendant",
         );
@@ -3506,30 +3542,33 @@ mod tests {
         let mut f = Fixture::genesis(&founder);
         let ahead = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_add(&device, DeviceRole::Member),
             u64::MAX,
         );
-        let valid =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&device, DeviceRole::Member));
-        let promote = f.author(&founder, Some(f.genesis_hash), &owner_promote(&device));
+        let valid = f.author(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_add(&device, DeviceRole::Member),
+        );
+        let promote = f.author(&founder, Some(f.genesis_hash.into()), &owner_promote(&device));
 
         let h = f.fold();
-        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert!(h.is_effective(&valid), "the parked add must not cause DuplicateAdd");
+        assert_eq!(h.outcome(&ahead.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&valid.into()), "the parked add must not cause DuplicateAdd");
         assert!(
-            h.is_effective(&promote),
+            h.is_effective(&promote.into()),
             "the promotion must recover with the valid enrollment on the next readiness pass",
         );
         assert_eq!(
-            h.roster_ref_effective(valid, device.fp),
+            h.roster_ref_effective(RosterRef::from_bytes(valid), device.fp),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: device.fp,
                 current_role: DeviceRole::Owner,
             }),
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, device.fp),
+            h.owner_incarnation_effective(OwnerId::from_bytes(promote), device.fp),
             AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: device.fp }),
         );
     }
@@ -3540,15 +3579,18 @@ mod tests {
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&founder);
         let (stream, own) = stream_own(f.account_id);
-        let ahead_own = f.author_at_auth_len(&founder, Some(f.genesis_hash), &own, u64::MAX);
-        let valid_own = f.author(&founder, Some(f.genesis_hash), &own);
-        let grant = f.author(&founder, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let ahead_own = f.author_at_auth_len(&founder, Some(f.genesis_hash.into()), &own, u64::MAX);
+        let valid_own = f.author(&founder, Some(f.genesis_hash.into()), &own);
+        let grant = f.author(&founder, Some(f.genesis_hash.into()), &stream_grant(stream, grantee));
 
         let h = f.fold();
-        assert_eq!(h.outcome(&ahead_own), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert!(h.is_effective(&valid_own), "the valid StreamOwn must replace its ahead twin");
+        assert_eq!(h.outcome(&ahead_own.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
         assert!(
-            h.is_effective(&grant),
+            h.is_effective(&valid_own.into()),
+            "the valid StreamOwn must replace its ahead twin"
+        );
+        assert!(
+            h.is_effective(&grant.into()),
             "a state-dependent grant must be recomputed, not permanently readiness-excluded",
         );
     }
@@ -3557,18 +3599,28 @@ mod tests {
     fn mutually_condemning_ahead_cuts_do_not_manufacture_contested() {
         let (founder, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
-        let add_a = f.author(&founder, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let remove_b =
-            f.author_at_auth_len(&a, Some(add_a), &device_remove(&b, Cut::Empty), u64::MAX);
-        let remove_a =
-            f.author_at_auth_len(&b, Some(add_b), &device_remove(&a, Cut::Empty), u64::MAX);
+        let add_a =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let remove_b = f.author_at_auth_len(
+            &a,
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove(&b, Cut::Empty),
+            u64::MAX,
+        );
+        let remove_a = f.author_at_auth_len(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove(&a, Cut::Empty),
+            u64::MAX,
+        );
 
         let h = f.fold();
         assert_eq!(h.classification(), AccountClassification::Live);
-        assert_eq!(h.outcome(&remove_a), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert_eq!(h.outcome(&remove_b), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert!(h.is_effective(&add_a) && h.is_effective(&add_b));
+        assert_eq!(h.outcome(&remove_a.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&remove_b.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&add_a.into()) && h.is_effective(&add_b.into()));
     }
 
     /// The founder adds owner O, and O authors `k` member adds. Every op cites the count its author
@@ -3577,11 +3629,17 @@ mod tests {
     fn owner_with_history(k: u8) -> (Fixture, Dev, Dev, [u8; 32], Vec<[u8; 32]>) {
         let (founder, o) = (Dev::new(1), Dev::new(2));
         let mut f = Fixture::genesis(&founder);
-        let add_o = f.author(&founder, Some(f.genesis_hash), &device_add(&o, DeviceRole::Owner));
+        let add_o =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&o, DeviceRole::Owner));
         let adds = (0..k)
             .map(|i| {
                 let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-                f.author_at_auth_len(&o, Some(add_o), &member, 2 + u64::from(i))
+                f.author_at_auth_len(
+                    &o,
+                    Some(OwnerId::from_bytes(add_o)),
+                    &member,
+                    2 + u64::from(i),
+                )
             })
             .collect();
         (f, founder, o, add_o, adds)
@@ -3594,17 +3652,24 @@ mod tests {
     #[test]
     fn a_cut_condemning_ops_its_author_folded_takes_effect() {
         let (mut f, founder, o, _, adds) = owner_with_history(3);
-        let cut =
-            f.author_at_auth_len(&founder, Some(f.genesis_hash), &device_remove(&o, Cut::Empty), 5);
+        let cut = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_remove(&o, Cut::Empty),
+            5,
+        );
 
         for rot in 0..f.entries.len() {
             let h = f.fold_rotated(rot);
             assert!(
-                h.is_effective(&cut),
+                h.is_effective(&cut.into()),
                 "rotation {rot}: the cut parked behind the ops it revokes"
             );
             for add in &adds {
-                assert_eq!(h.outcome(add), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+                assert_eq!(
+                    h.outcome(&(*(add)).into()),
+                    Some(Outcome::Condemned(CondemnedReason::BeyondCut))
+                );
             }
             assert_eq!(h.effective_count(), 3, "genesis, the add of O, and the cut");
         }
@@ -3613,12 +3678,19 @@ mod tests {
     #[test]
     fn a_cut_one_past_its_honest_count_still_parks() {
         let (mut f, founder, o, _, adds) = owner_with_history(2);
-        let cut =
-            f.author_at_auth_len(&founder, Some(f.genesis_hash), &device_remove(&o, Cut::Empty), 5);
+        let cut = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_remove(&o, Cut::Empty),
+            5,
+        );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert!(adds.iter().all(|add| h.is_effective(add)), "a parked cut condemns nothing");
+        assert_eq!(h.outcome(&cut.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(
+            adds.iter().all(|add| h.is_effective(&(*(add)).into())),
+            "a parked cut condemns nothing"
+        );
     }
 
     #[test]
@@ -3626,16 +3698,31 @@ mod tests {
         let (founder, o, e, member) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        let add_o = f.author(&founder, Some(g), &device_add(&o, DeviceRole::Owner));
-        let add_e = f.author_at_auth_len(&o, Some(add_o), &device_add(&e, DeviceRole::Owner), 2);
-        let add_member =
-            f.author_at_auth_len(&e, Some(add_e), &device_add(&member, DeviceRole::Member), 3);
-        let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 4);
+        let add_o = f.author(&founder, Some(g.into()), &device_add(&o, DeviceRole::Owner));
+        let add_e = f.author_at_auth_len(
+            &o,
+            Some(OwnerId::from_bytes(add_o)),
+            &device_add(&e, DeviceRole::Owner),
+            2,
+        );
+        let add_member = f.author_at_auth_len(
+            &e,
+            Some(OwnerId::from_bytes(add_e)),
+            &device_add(&member, DeviceRole::Member),
+            3,
+        );
+        let cut = f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o, Cut::Empty), 4);
 
         let h = f.fold();
-        assert!(h.is_effective(&cut), "E's add, left without authority, is credited to the cut");
-        assert_eq!(h.outcome(&add_e), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
-        assert_eq!(h.outcome(&add_member), Some(Outcome::Rejected(RejectReason::StaleAuthority)));
+        assert!(
+            h.is_effective(&cut.into()),
+            "E's add, left without authority, is credited to the cut"
+        );
+        assert_eq!(h.outcome(&add_e.into()), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+        assert_eq!(
+            h.outcome(&add_member.into()),
+            Some(Outcome::Rejected(RejectReason::StaleAuthority))
+        );
     }
 
     /// V1 compatibility: a direct victim-chain head does not bound the transitive credit.
@@ -3648,34 +3735,37 @@ mod tests {
             let mut f = Fixture::genesis(&founder);
             let genesis = f.genesis_hash;
             let add_owner =
-                f.author(&founder, Some(genesis), &device_add(&owner, DeviceRole::Owner));
+                f.author(&founder, Some(genesis.into()), &device_add(&owner, DeviceRole::Owner));
             let add_descendant = f.author_at_auth_len(
                 &owner,
-                Some(add_owner),
+                Some(add_owner.into()),
                 &device_add(&descendant, DeviceRole::Owner),
                 2,
             );
             let victim_head = f.chains[&owner.fp.to_bytes()];
             let revocation = if demote {
-                owner_demote(&owner, add_owner, Cut::Empty)
+                owner_demote(&owner, add_owner.into(), Cut::Empty)
             } else {
                 device_remove(&owner, Cut::Empty)
             };
-            let cut = f.author_at_auth_len(&founder, Some(genesis), &revocation, 4);
-            assert_eq!(f.fold().outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+            let cut = f.author_at_auth_len(&founder, Some(genesis.into()), &revocation, 4);
+            assert_eq!(
+                f.fold().outcome(&cut.into()),
+                Some(Outcome::Parked(ParkReason::AuthLenAhead))
+            );
 
             let later = f.author_at_auth_len(
                 &descendant,
-                Some(add_descendant),
+                Some(add_descendant.into()),
                 &device_add(&member, DeviceRole::Member),
                 3,
             );
             assert_eq!(f.chains[&owner.fp.to_bytes()], victim_head);
             for rotation in 0..f.entries.len() {
                 let history = f.fold_rotated(rotation);
-                assert!(history.is_effective(&cut));
+                assert!(history.is_effective(&cut.into()));
                 assert_eq!(
-                    history.outcome(&later),
+                    history.outcome(&later.into()),
                     Some(Outcome::Rejected(RejectReason::StaleAuthority))
                 );
             }
@@ -3691,53 +3781,60 @@ mod tests {
                 (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
             let mut f = Fixture::genesis(&founder);
             let g = f.genesis_hash;
-            let add_owner = f.author(&founder, Some(g), &device_add(&owner, DeviceRole::Owner));
+            let add_owner =
+                f.author(&founder, Some(g.into()), &device_add(&owner, DeviceRole::Owner));
             let add_concurrent_owner = f.author_at_auth_len(
                 &founder,
-                Some(g),
+                Some(g.into()),
                 &device_add(&concurrent_owner, DeviceRole::Owner),
                 2,
             );
             let add_descendant = f.author_at_auth_len(
                 &owner,
-                Some(add_owner),
+                Some(add_owner.into()),
                 &device_add(&descendant, DeviceRole::Owner),
                 3,
             );
             assert_eq!(f.fold().effective_count(), 4);
             let victim_head = f.chains[&owner.fp.to_bytes()];
             let revocation = if demote {
-                owner_demote(&owner, add_owner, Cut::Empty)
+                owner_demote(&owner, add_owner.into(), Cut::Empty)
             } else {
                 device_remove(&owner, Cut::Empty)
             };
-            let cut = f.author_at_auth_len(&founder, Some(g), &revocation, 5);
-            assert_eq!(f.fold().outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+            let cut = f.author_at_auth_len(&founder, Some(g.into()), &revocation, 5);
+            assert_eq!(
+                f.fold().outcome(&cut.into()),
+                Some(Outcome::Parked(ParkReason::AuthLenAhead))
+            );
             let later = f.author_at_auth_len(
                 &descendant,
-                Some(add_descendant),
+                Some(add_descendant.into()),
                 &device_add(&Dev::new(6), DeviceRole::Member),
                 4,
             );
             assert_eq!(f.chains[&owner.fp.to_bytes()], victim_head);
             let after = f.fold();
-            assert!(after.is_effective(&cut));
+            assert!(after.is_effective(&cut.into()));
             assert_eq!(
-                after.outcome(&later),
+                after.outcome(&later.into()),
                 Some(Outcome::Rejected(RejectReason::StaleAuthority))
             );
             let concurrent = f.author_at_auth_len(
                 &concurrent_owner,
-                Some(add_concurrent_owner),
+                Some(add_concurrent_owner.into()),
                 &device_add(&Dev::new(5), DeviceRole::Member),
                 5,
             );
             for rotation in 0..f.entries.len() {
                 let history = f.fold_rotated(rotation);
-                assert!(history.is_effective(&cut), "demote={demote}, rotation={rotation}");
-                assert!(history.is_effective(&concurrent), "demote={demote}, rotation={rotation}");
+                assert!(history.is_effective(&cut.into()), "demote={demote}, rotation={rotation}");
+                assert!(
+                    history.is_effective(&concurrent.into()),
+                    "demote={demote}, rotation={rotation}"
+                );
                 assert_eq!(
-                    history.outcome(&later),
+                    history.outcome(&later.into()),
                     Some(Outcome::Rejected(RejectReason::StaleAuthority))
                 );
             }
@@ -3755,13 +3852,18 @@ mod tests {
             let (mut f, founder, o, add_o, _) = owner_with_history(2);
             let g = f.genesis_hash;
             let (q, b) = (Dev::new(20), Dev::new(22));
-            f.author_at_auth_len(&founder, Some(g), &device_add(&q, DeviceRole::Member), 4);
-            let add_b =
-                f.author_at_auth_len(&founder, Some(g), &device_add(&b, DeviceRole::Owner), 5);
-            let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 6);
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&q, DeviceRole::Member), 4);
+            let add_b = f.author_at_auth_len(
+                &founder,
+                Some(g.into()),
+                &device_add(&b, DeviceRole::Owner),
+                5,
+            );
+            let cut =
+                f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o, Cut::Empty), 6);
             for i in 0..10 {
                 let junk = device_add(&Dev::new(30 + i), DeviceRole::Member);
-                f.author_at_auth_len(&o, Some(add_o), &junk, 6);
+                f.author_at_auth_len(&o, Some(OwnerId::from_bytes(add_o)), &junk, 6);
             }
             let other = |n: u8| {
                 if remove_q {
@@ -3773,15 +3875,19 @@ mod tests {
             // B folded the pre-cut view (6, B's own add included) and never saw the cut. The op one
             // past it lives in its own fixture, so a second removal of Q is not merely redundant.
             let mut g2 = f.clone();
-            let ahead = g2.author_at_auth_len(&b, Some(add_b), &other(1), 7);
-            let concurrent = f.author_at_auth_len(&b, Some(add_b), &other(0), 6);
+            let ahead = g2.author_at_auth_len(&b, Some(OwnerId::from_bytes(add_b)), &other(1), 7);
+            let concurrent =
+                f.author_at_auth_len(&b, Some(OwnerId::from_bytes(add_b)), &other(0), 6);
 
             let h = f.fold();
-            assert!(h.is_effective(&cut), "remove_q={remove_q}");
-            assert!(h.is_effective(&concurrent), "remove_q={remove_q}: concurrent with the cut");
+            assert!(h.is_effective(&cut.into()), "remove_q={remove_q}");
+            assert!(
+                h.is_effective(&concurrent.into()),
+                "remove_q={remove_q}: concurrent with the cut"
+            );
             let h2 = g2.fold();
             assert_eq!(
-                h2.outcome(&ahead),
+                h2.outcome(&ahead.into()),
                 Some(Outcome::Parked(ParkReason::AuthLenAhead)),
                 "remove_q={remove_q}: O's condemned entries carried an op past the cut's citation",
             );
@@ -3797,16 +3903,17 @@ mod tests {
         let (founder, b, o) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
-        let add_o = f.author_at_auth_len(&founder, Some(g), &device_add(&o, DeviceRole::Owner), 2);
+        let add_b = f.author(&founder, Some(g.into()), &device_add(&b, DeviceRole::Owner));
+        let add_o =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o, DeviceRole::Owner), 2);
         for i in 0..2 {
             let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-            f.author_at_auth_len(&o, Some(add_o), &member, 3 + u64::from(i));
+            f.author_at_auth_len(&o, Some(OwnerId::from_bytes(add_o)), &member, 3 + u64::from(i));
         }
-        let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 5);
+        let cut = f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o, Cut::Empty), 5);
         let concurrent = f.author_at_auth_len(
             &b,
-            Some(add_b),
+            Some(OwnerId::from_bytes(add_b)),
             &device_add(&Dev::new(20), DeviceRole::Member),
             5,
         );
@@ -3814,22 +3921,25 @@ mod tests {
         // citations alone cap at 5; B's own landed ops raise what B could honestly cite.
         let second = f.author_at_auth_len(
             &b,
-            Some(add_b),
+            Some(OwnerId::from_bytes(add_b)),
             &device_add(&Dev::new(21), DeviceRole::Member),
             6,
         );
         let third = f.author_at_auth_len(
             &b,
-            Some(add_b),
+            Some(OwnerId::from_bytes(add_b)),
             &device_add(&Dev::new(22), DeviceRole::Member),
             7,
         );
 
         for rot in 0..f.entries.len() {
             let h = f.fold_rotated(rot);
-            assert!(h.is_effective(&cut), "rotation {rot}");
+            assert!(h.is_effective(&cut.into()), "rotation {rot}");
             for (name, op) in [("first", &concurrent), ("second", &second), ("third", &third)] {
-                assert!(h.is_effective(op), "rotation {rot}: B's {name} op parked behind the cut");
+                assert!(
+                    h.is_effective(&(*(op)).into()),
+                    "rotation {rot}: B's {name} op parked behind the cut"
+                );
             }
             assert_eq!(h.effective_count(), 7, "rotation {rot}");
         }
@@ -3841,24 +3951,29 @@ mod tests {
         let (founder, b, o) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
-        let add_o = f.author_at_auth_len(&founder, Some(g), &device_add(&o, DeviceRole::Owner), 2);
+        let add_b = f.author(&founder, Some(g.into()), &device_add(&b, DeviceRole::Owner));
+        let add_o =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o, DeviceRole::Owner), 2);
         for i in 0..2 {
             let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-            f.author_at_auth_len(&o, Some(add_o), &member, 3 + u64::from(i));
+            f.author_at_auth_len(&o, Some(OwnerId::from_bytes(add_o)), &member, 3 + u64::from(i));
         }
-        let demote =
-            f.author_at_auth_len(&founder, Some(g), &owner_demote(&o, add_o, Cut::Empty), 5);
+        let demote = f.author_at_auth_len(
+            &founder,
+            Some(g.into()),
+            &owner_demote(&o, OwnerId::from_bytes(add_o), Cut::Empty),
+            5,
+        );
         let concurrent = f.author_at_auth_len(
             &b,
-            Some(add_b),
+            Some(OwnerId::from_bytes(add_b)),
             &device_add(&Dev::new(20), DeviceRole::Member),
             5,
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&demote));
-        assert!(h.is_effective(&concurrent));
+        assert!(h.is_effective(&demote.into()));
+        assert!(h.is_effective(&concurrent.into()));
     }
 
     /// Two owners removing each other, both citing the view a concurrent revocation of O has since
@@ -3869,27 +3984,39 @@ mod tests {
         let (founder, b, d, o) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
-        let add_d = f.author_at_auth_len(&founder, Some(g), &device_add(&d, DeviceRole::Owner), 2);
-        let add_o = f.author_at_auth_len(&founder, Some(g), &device_add(&o, DeviceRole::Owner), 3);
+        let add_b = f.author(&founder, Some(g.into()), &device_add(&b, DeviceRole::Owner));
+        let add_d =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&d, DeviceRole::Owner), 2);
+        let add_o =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o, DeviceRole::Owner), 3);
         for i in 0..2 {
             let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-            f.author_at_auth_len(&o, Some(add_o), &member, 4 + u64::from(i));
+            f.author_at_auth_len(&o, Some(OwnerId::from_bytes(add_o)), &member, 4 + u64::from(i));
         }
-        let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 6);
-        let remove_d = f.author_at_auth_len(&b, Some(add_b), &device_remove(&d, Cut::Empty), 6);
-        let remove_b = f.author_at_auth_len(&d, Some(add_d), &device_remove(&b, Cut::Empty), 6);
+        let cut = f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o, Cut::Empty), 6);
+        let remove_d = f.author_at_auth_len(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove(&d, Cut::Empty),
+            6,
+        );
+        let remove_b = f.author_at_auth_len(
+            &d,
+            Some(OwnerId::from_bytes(add_d)),
+            &device_remove(&b, Cut::Empty),
+            6,
+        );
 
         for rot in 0..f.entries.len() {
             let h = f.fold_rotated(rot);
-            assert!(h.is_effective(&cut), "rotation {rot}");
+            assert!(h.is_effective(&cut.into()), "rotation {rot}");
             assert!(
                 matches!(h.classification(), AccountClassification::Contested { .. }),
                 "rotation {rot}: the standoff was held out as ahead instead of contesting",
             );
             for op in [&remove_d, &remove_b] {
                 assert_eq!(
-                    h.outcome(op),
+                    h.outcome(&(*(op)).into()),
                     Some(Outcome::Parked(ParkReason::ContestedSubject)),
                     "rotation {rot}"
                 );
@@ -3907,46 +4034,56 @@ mod tests {
         let (founder, b, o1, o2) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        let add_b =
-            f.author_at_auth_len(&founder, Some(g), &device_add(&b, DeviceRole::Owner), u64::MAX);
-        f.author_at_auth_len(&founder, Some(g), &device_add(&o1, DeviceRole::Owner), 1);
+        let add_b = f.author_at_auth_len(
+            &founder,
+            Some(g.into()),
+            &device_add(&b, DeviceRole::Owner),
+            u64::MAX,
+        );
+        f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o1, DeviceRole::Owner), 1);
         let add_o2 =
-            f.author_at_auth_len(&founder, Some(g), &device_add(&o2, DeviceRole::Owner), 2);
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o2, DeviceRole::Owner), 2);
         for i in 0..2 {
             let member = device_add(&Dev::new(30 + i), DeviceRole::Member);
-            f.author_at_auth_len(&o2, Some(add_o2), &member, 3 + u64::from(i));
+            f.author_at_auth_len(&o2, Some(OwnerId::from_bytes(add_o2)), &member, 3 + u64::from(i));
         }
         for i in 0..8 {
             let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-            f.author_at_auth_len(&founder, Some(g), &member, 6);
+            f.author_at_auth_len(&founder, Some(g.into()), &member, 6);
         }
-        let low = f.author_at_auth_len(&founder, Some(g), &device_remove(&o2, Cut::Empty), 6);
-        let high = f.author_at_auth_len(&b, Some(add_b), &device_remove(&o1, Cut::Empty), 13);
+        let low =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o2, Cut::Empty), 6);
+        let high = f.author_at_auth_len(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove(&o1, Cut::Empty),
+            13,
+        );
         let mut g2 = f.clone();
         let x = f.author_at_auth_len(
             &founder,
-            Some(g),
+            Some(g.into()),
             &device_add(&Dev::new(50), DeviceRole::Member),
             14,
         );
         let beyond = g2.author_at_auth_len(
             &founder,
-            Some(g),
+            Some(g.into()),
             &device_add(&Dev::new(51), DeviceRole::Member),
             15,
         );
 
         for rot in 0..f.entries.len() {
             let h = f.fold_rotated(rot);
-            assert!(!h.is_effective(&high), "rotation {rot}: its enrolment is parked");
-            assert!(h.is_effective(&low), "rotation {rot}");
-            assert!(h.is_effective(&x), "rotation {rot}: parked by a cut that fell");
+            assert!(!h.is_effective(&high.into()), "rotation {rot}: its enrolment is parked");
+            assert!(h.is_effective(&low.into()), "rotation {rot}");
+            assert!(h.is_effective(&x.into()), "rotation {rot}: parked by a cut that fell");
             assert_eq!(h.effective_count(), 13, "rotation {rot}");
         }
         for rot in 0..g2.entries.len() {
             let h = g2.fold_rotated(rot);
             assert_eq!(
-                h.outcome(&beyond),
+                h.outcome(&beyond.into()),
                 Some(Outcome::Parked(ParkReason::AuthLenAhead)),
                 "rotation {rot}"
             );
@@ -3962,43 +4099,53 @@ mod tests {
             (Dev::new(1), Dev::new(2), Dev::new(5), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
-        let add_c = f.author_at_auth_len(&founder, Some(g), &device_add(&c, DeviceRole::Owner), 2);
+        let add_b = f.author(&founder, Some(g.into()), &device_add(&b, DeviceRole::Owner));
+        let add_c =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&c, DeviceRole::Owner), 2);
         let add_o1 =
-            f.author_at_auth_len(&founder, Some(g), &device_add(&o1, DeviceRole::Owner), 3);
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o1, DeviceRole::Owner), 3);
         let add_o2 =
-            f.author_at_auth_len(&founder, Some(g), &device_add(&o2, DeviceRole::Owner), 4);
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o2, DeviceRole::Owner), 4);
         for i in 0..2 {
             let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-            f.author_at_auth_len(&o1, Some(add_o1), &member, 5 + u64::from(i));
+            f.author_at_auth_len(&o1, Some(OwnerId::from_bytes(add_o1)), &member, 5 + u64::from(i));
         }
         for i in 0..2 {
             let member = device_add(&Dev::new(12 + i), DeviceRole::Member);
-            f.author_at_auth_len(&o2, Some(add_o2), &member, 7 + u64::from(i));
+            f.author_at_auth_len(&o2, Some(OwnerId::from_bytes(add_o2)), &member, 7 + u64::from(i));
         }
         // The pre-cut view is 9; the fold with both cuts is 7. Each cut cites 6 + 2 + 2: the
         // fold without it plus its own credit plus the other's. C, with nothing landed since the
         // view, is vouched for up to that citation and no further.
-        let cut1 = f.author_at_auth_len(&founder, Some(g), &device_remove(&o1, Cut::Empty), 10);
-        let cut2 = f.author_at_auth_len(&b, Some(add_b), &device_remove(&o2, Cut::Empty), 10);
+        let cut1 =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o1, Cut::Empty), 10);
+        let cut2 = f.author_at_auth_len(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove(&o2, Cut::Empty),
+            10,
+        );
         let mut g2 = f.clone();
         let past = f.author_at_auth_len(
             &c,
-            Some(add_c),
+            Some(OwnerId::from_bytes(add_c)),
             &device_add(&Dev::new(20), DeviceRole::Member),
             10,
         );
         let beyond = g2.author_at_auth_len(
             &c,
-            Some(add_c),
+            Some(OwnerId::from_bytes(add_c)),
             &device_add(&Dev::new(21), DeviceRole::Member),
             11,
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&cut1) && h.is_effective(&cut2));
-        assert!(h.is_effective(&past), "vouched up to the condemned count");
-        assert_eq!(g2.fold().outcome(&beyond), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&cut1.into()) && h.is_effective(&cut2.into()));
+        assert!(h.is_effective(&past.into()), "vouched up to the condemned count");
+        assert_eq!(
+            g2.fold().outcome(&beyond.into()),
+            Some(Outcome::Parked(ParkReason::AuthLenAhead))
+        );
     }
 
     /// Two owners revoke two DIFFERENT devices over one history of 8 ops, each citing 8. Each cut's
@@ -4011,29 +4158,53 @@ mod tests {
             let (founder, b, o1, o2) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
             let mut f = Fixture::genesis(&founder);
             let g = f.genesis_hash;
-            let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
-            let add_o1 =
-                f.author_at_auth_len(&founder, Some(g), &device_add(&o1, DeviceRole::Owner), 2);
-            let add_o2 =
-                f.author_at_auth_len(&founder, Some(g), &device_add(&o2, DeviceRole::Owner), 3);
+            let add_b = f.author(&founder, Some(g.into()), &device_add(&b, DeviceRole::Owner));
+            let add_o1 = f.author_at_auth_len(
+                &founder,
+                Some(g.into()),
+                &device_add(&o1, DeviceRole::Owner),
+                2,
+            );
+            let add_o2 = f.author_at_auth_len(
+                &founder,
+                Some(g.into()),
+                &device_add(&o2, DeviceRole::Owner),
+                3,
+            );
             let mut victims = Vec::new();
             for i in 0..2 {
                 let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-                victims.push(f.author_at_auth_len(&o1, Some(add_o1), &member, 4 + u64::from(i)));
+                victims.push(f.author_at_auth_len(
+                    &o1,
+                    Some(OwnerId::from_bytes(add_o1)),
+                    &member,
+                    4 + u64::from(i),
+                ));
             }
             for i in 0..2 {
                 let member = device_add(&Dev::new(12 + i), DeviceRole::Member);
-                victims.push(f.author_at_auth_len(&o2, Some(add_o2), &member, 6 + u64::from(i)));
+                victims.push(f.author_at_auth_len(
+                    &o2,
+                    Some(OwnerId::from_bytes(add_o2)),
+                    &member,
+                    6 + u64::from(i),
+                ));
             }
-            let cut1 = f.author_at_auth_len(&founder, Some(g), &device_remove(&o1, Cut::Empty), 8);
-            let cut2 = f.author_at_auth_len(&b, Some(add_b), &device_remove(&o2, Cut::Empty), 8);
+            let cut1 =
+                f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o1, Cut::Empty), 8);
+            let cut2 = f.author_at_auth_len(
+                &b,
+                Some(OwnerId::from_bytes(add_b)),
+                &device_remove(&o2, Cut::Empty),
+                8,
+            );
             for i in 0..junk {
                 let entry = device_add(&Dev::new(30 + i), DeviceRole::Member);
-                f.author_at_auth_len(&o1, Some(add_o1), &entry, 8);
+                f.author_at_auth_len(&o1, Some(OwnerId::from_bytes(add_o1)), &entry, 8);
             }
             let concurrent = f.author_at_auth_len(
                 &b,
-                Some(add_b),
+                Some(OwnerId::from_bytes(add_b)),
                 &device_add(&Dev::new(20), DeviceRole::Member),
                 8,
             );
@@ -4041,13 +4212,13 @@ mod tests {
             let mut g2 = f.clone();
             let next = g2.author_at_auth_len(
                 &b,
-                Some(add_b),
+                Some(OwnerId::from_bytes(add_b)),
                 &device_add(&Dev::new(21), DeviceRole::Member),
                 10,
             );
             let ahead = g2.author_at_auth_len(
                 &b,
-                Some(add_b),
+                Some(OwnerId::from_bytes(add_b)),
                 &device_add(&Dev::new(22), DeviceRole::Member),
                 12,
             );
@@ -4055,22 +4226,25 @@ mod tests {
             for rot in 0..f.entries.len() {
                 let h = f.fold_rotated(rot);
                 assert!(
-                    h.is_effective(&cut1) && h.is_effective(&cut2),
+                    h.is_effective(&cut1.into()) && h.is_effective(&cut2.into()),
                     "junk={junk} rotation {rot}"
                 );
-                assert!(h.is_effective(&concurrent), "junk={junk} rotation {rot}");
+                assert!(h.is_effective(&concurrent.into()), "junk={junk} rotation {rot}");
                 for victim in &victims {
                     assert_eq!(
-                        h.outcome(victim),
+                        h.outcome(&(*(victim)).into()),
                         Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
                         "junk={junk} rotation {rot}"
                     );
                 }
             }
             let h2 = g2.fold();
-            assert!(h2.is_effective(&next), "junk={junk}: B's own landed ops raise its ceiling");
+            assert!(
+                h2.is_effective(&next.into()),
+                "junk={junk}: B's own landed ops raise its ceiling"
+            );
             assert_eq!(
-                h2.outcome(&ahead),
+                h2.outcome(&ahead.into()),
                 Some(Outcome::Parked(ParkReason::AuthLenAhead)),
                 "junk={junk}: admitted past the largest citation any effective cut made",
             );
@@ -4083,20 +4257,21 @@ mod tests {
         let (mut f, founder, o, _, _) = owner_with_history(2);
         let g = f.genesis_hash;
         let b = Dev::new(22);
-        let add_b = f.author_at_auth_len(&founder, Some(g), &device_add(&b, DeviceRole::Owner), 4);
+        let add_b =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&b, DeviceRole::Owner), 4);
         // Past the honest count of 5 (genesis, the adds of O and B, O's two adds) AND past the two
         // condemned ops the cut's own credit covers: 7 parks it.
-        let cut = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 7);
+        let cut = f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o, Cut::Empty), 7);
         let concurrent = f.author_at_auth_len(
             &b,
-            Some(add_b),
+            Some(OwnerId::from_bytes(add_b)),
             &device_add(&Dev::new(20), DeviceRole::Member),
             7,
         );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert_eq!(h.outcome(&concurrent), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&cut.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&concurrent.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
     }
 
     /// An unenrolled device signing entries that cite O's incarnation folds `WrongDevice`; they are
@@ -4107,15 +4282,19 @@ mod tests {
         let stranger = Dev::new(40);
         for i in 0..10 {
             let junk = device_add(&Dev::new(50 + i), DeviceRole::Member);
-            f.author_at_auth_len(&stranger, Some(add_o), &junk, 3);
+            f.author_at_auth_len(&stranger, Some(OwnerId::from_bytes(add_o)), &junk, 3);
         }
         // One past the honest count of 3: genesis, the add of O, and O's one add.
-        let cut =
-            f.author_at_auth_len(&founder, Some(f.genesis_hash), &device_remove(&o, Cut::Empty), 4);
+        let cut = f.author_at_auth_len(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_remove(&o, Cut::Empty),
+            4,
+        );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert!(h.is_effective(&adds[0]));
+        assert_eq!(h.outcome(&cut.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&adds[0].into()));
     }
 
     /// Two owners revoking O over the same history both cite the pre-cut count. The cuts share O's
@@ -4126,20 +4305,27 @@ mod tests {
         let (founder, b, o) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
         let g = f.genesis_hash;
-        let add_b = f.author(&founder, Some(g), &device_add(&b, DeviceRole::Owner));
-        let add_o = f.author_at_auth_len(&founder, Some(g), &device_add(&o, DeviceRole::Owner), 2);
+        let add_b = f.author(&founder, Some(g.into()), &device_add(&b, DeviceRole::Owner));
+        let add_o =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_add(&o, DeviceRole::Owner), 2);
         for i in 0..2 {
             let member = device_add(&Dev::new(10 + i), DeviceRole::Member);
-            f.author_at_auth_len(&o, Some(add_o), &member, 3 + u64::from(i));
+            f.author_at_auth_len(&o, Some(OwnerId::from_bytes(add_o)), &member, 3 + u64::from(i));
         }
-        let by_founder = f.author_at_auth_len(&founder, Some(g), &device_remove(&o, Cut::Empty), 5);
-        let by_b = f.author_at_auth_len(&b, Some(add_b), &device_remove(&o, Cut::Empty), 5);
+        let by_founder =
+            f.author_at_auth_len(&founder, Some(g.into()), &device_remove(&o, Cut::Empty), 5);
+        let by_b = f.author_at_auth_len(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove(&o, Cut::Empty),
+            5,
+        );
 
         for rot in 0..f.entries.len() {
             let h = f.fold_rotated(rot);
-            assert!(h.is_effective(&by_founder), "rotation {rot}");
+            assert!(h.is_effective(&by_founder.into()), "rotation {rot}");
             assert_eq!(
-                h.outcome(&by_b),
+                h.outcome(&by_b.into()),
                 Some(Outcome::Rejected(RejectReason::Ineffective)),
                 "rotation {rot}: the redundant cut must not park as ahead",
             );
@@ -4151,15 +4337,18 @@ mod tests {
         let (mut f, founder, o, add_o, adds) = owner_with_history(2);
         let demote = f.author_at_auth_len(
             &founder,
-            Some(f.genesis_hash),
-            &owner_demote(&o, add_o, Cut::Empty),
+            Some(f.genesis_hash.into()),
+            &owner_demote(&o, OwnerId::from_bytes(add_o), Cut::Empty),
             4,
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&demote));
+        assert!(h.is_effective(&demote.into()));
         for add in &adds {
-            assert_eq!(h.outcome(add), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+            assert_eq!(
+                h.outcome(&(*(add)).into()),
+                Some(Outcome::Condemned(CondemnedReason::BeyondCut))
+            );
         }
     }
 
@@ -4169,12 +4358,18 @@ mod tests {
     fn a_self_removal_cannot_credit_its_own_entry() {
         let (founder, o) = (Dev::new(1), Dev::new(2));
         let mut f = Fixture::genesis(&founder);
-        let add_o = f.author(&founder, Some(f.genesis_hash), &device_add(&o, DeviceRole::Owner));
+        let add_o =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&o, DeviceRole::Owner));
         // One past the honest count of 2: genesis and the add of O.
-        let cut = f.author_at_auth_len(&o, Some(add_o), &device_remove(&o, Cut::Empty), 3);
+        let cut = f.author_at_auth_len(
+            &o,
+            Some(OwnerId::from_bytes(add_o)),
+            &device_remove(&o, Cut::Empty),
+            3,
+        );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert_eq!(h.outcome(&cut.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
     }
 
     /// B's removal of the founder condemns the founder's add of B, B's own mint, so the cut itself
@@ -4184,13 +4379,19 @@ mod tests {
     fn a_cut_that_strands_its_own_authority_cannot_credit_itself() {
         let (founder, b) = (Dev::new(1), Dev::new(2));
         let mut f = Fixture::genesis(&founder);
-        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_b =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
         // One past the honest count of 2: genesis and the add of B.
-        let cut = f.author_at_auth_len(&b, Some(add_b), &device_remove(&founder, Cut::Empty), 3);
+        let cut = f.author_at_auth_len(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove(&founder, Cut::Empty),
+            3,
+        );
 
         let h = f.fold();
-        assert_eq!(h.outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert!(h.is_effective(&add_b), "an excluded cut condemns nothing");
+        assert_eq!(h.outcome(&cut.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&add_b.into()), "an excluded cut condemns nothing");
     }
 
     #[test]
@@ -4200,20 +4401,23 @@ mod tests {
         // shallower depth.
         let (founder, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
-        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let add_c = f.author(&b, Some(add_b), &device_add(&c, DeviceRole::Member));
+        let add_b =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let add_c =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&c, DeviceRole::Member));
         let h = f.fold();
         assert!(h.is_effective(&f.genesis_hash));
-        assert!(h.is_effective(&add_b), "founder's DeviceAdd(B, owner) is effective");
-        assert!(h.is_effective(&add_c), "B's DeviceAdd(C) at depth 1 is effective");
+        assert!(h.is_effective(&add_b.into()), "founder's DeviceAdd(B, owner) is effective");
+        assert!(h.is_effective(&add_c.into()), "B's DeviceAdd(C) at depth 1 is effective");
     }
 
     #[test]
     fn arrival_order_does_not_change_the_result_p9() {
         let (founder, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
-        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        f.author(&b, Some(add_b), &device_add(&c, DeviceRole::Member));
+        let add_b =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&c, DeviceRole::Member));
         let baseline = Fixture::effective_set(&f.fold());
         for rot in 0..f.entries.len() {
             assert_eq!(
@@ -4232,22 +4436,28 @@ mod tests {
         let (founder, d, e) = (Dev::new(1), Dev::new(9), Dev::new(10));
         let mut f = Fixture::genesis(&founder);
         let foreign_incarnation = [0x77u8; 32];
-        let op = f.author(&d, Some(foreign_incarnation), &device_add(&e, DeviceRole::Member));
+        let op = f.author(
+            &d,
+            Some(OwnerId::from_bytes(foreign_incarnation)),
+            &device_add(&e, DeviceRole::Member),
+        );
         let h = f.fold();
-        assert!(!h.is_effective(&op), "cross-account citation is not admitted (P3)");
-        assert_eq!(h.outcome(&op), Some(Outcome::Parked(ParkReason::UnknownOwnerRef)));
+        assert!(!h.is_effective(&op.into()), "cross-account citation is not admitted (P3)");
+        assert_eq!(h.outcome(&op.into()), Some(Outcome::Parked(ParkReason::UnknownOwnerRef)));
     }
 
     #[test]
     fn duplicate_device_add_is_rejected_p11() {
         let (founder, b) = (Dev::new(1), Dev::new(2));
         let mut f = Fixture::genesis(&founder);
-        let add_b1 = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let add_b2 = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_b1 =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let add_b2 =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
         let h = f.fold();
-        assert!(h.is_effective(&add_b1), "the first DeviceAdd(B) is effective");
+        assert!(h.is_effective(&add_b1.into()), "the first DeviceAdd(B) is effective");
         assert_eq!(
-            h.outcome(&add_b2),
+            h.outcome(&add_b2.into()),
             Some(Outcome::Rejected(RejectReason::DuplicateAdd)),
             "the duplicate DeviceAdd(B) is ineffective",
         );
@@ -4265,29 +4475,43 @@ mod tests {
         let (a, b) = (Dev::new(1), Dev::new(2));
         let (d, e, fdev, g) = (Dev::new(4), Dev::new(5), Dev::new(6), Dev::new(7));
         let mut f = Fixture::genesis(&a);
-        let add_b = f.author(&a, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
-        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
-        let b2 = f.author(&b, Some(add_b), &device_add(&fdev, DeviceRole::Member));
+        let add_b = f.author(&a, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let b0 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&d, DeviceRole::Member));
+        let b1 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&e, DeviceRole::Member));
+        let b2 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&fdev, DeviceRole::Member));
         // A forged sibling of b1: seq 1 (within the cut) but forking off b0 — off the branch b1 is
         // on.
-        let forged =
-            f.author_forked(&b, Some(add_b), &device_add(&g, DeviceRole::Member), 1, Some(b0));
+        let forged = f.author_forked(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_add(&g, DeviceRole::Member),
+            1,
+            Some(AccountEntryHash::from_bytes(b0)),
+        );
         // A removes B, valid prefix pinned to b1 on B's control chain.
-        let remove_b =
-            f.author(&a, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 1, hash: b1 }));
+        let remove_b = f.author(
+            &a,
+            Some(f.genesis_hash.into()),
+            &device_remove(&b, Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(b1) }),
+        );
 
         let h = f.fold();
-        assert!(h.is_effective(&remove_b), "the removal itself is effective");
-        assert!(h.is_effective(&b0), "b0 is within the cut and on-branch — effective");
-        assert!(h.is_effective(&b1), "b1 (the watermark slot) is within the cut — effective");
+        assert!(h.is_effective(&remove_b.into()), "the removal itself is effective");
+        assert!(h.is_effective(&b0.into()), "b0 is within the cut and on-branch — effective");
+        assert!(
+            h.is_effective(&b1.into()),
+            "b1 (the watermark slot) is within the cut — effective"
+        );
         assert_eq!(
-            h.outcome(&b2),
+            h.outcome(&b2.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "b2 is beyond the cut — a back-dated forgery",
         );
         assert_eq!(
-            h.outcome(&forged),
+            h.outcome(&forged.into()),
             Some(Outcome::Condemned(CondemnedReason::OffBranch)),
             "the forged sibling of b1 is off the accepted branch",
         );
@@ -4310,26 +4534,32 @@ mod tests {
         //   * The account is NOT contested — there is no mutual, same-depth revocation.
         let (a, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&a);
-        let add_b = f.author(&a, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let demote_b = f.author(&a, Some(f.genesis_hash), &owner_demote(&b, add_b, Cut::Empty));
-        let add_c = f.author(&b, Some(add_b), &device_add(&c, DeviceRole::Owner));
-        let remove_a = f.author(&c, Some(add_c), &device_remove(&a, Cut::Empty));
+        let add_b = f.author(&a, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let demote_b = f.author(
+            &a,
+            Some(f.genesis_hash.into()),
+            &owner_demote(&b, OwnerId::from_bytes(add_b), Cut::Empty),
+        );
+        let add_c =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&c, DeviceRole::Owner));
+        let remove_a =
+            f.author(&c, Some(OwnerId::from_bytes(add_c)), &device_remove(&a, Cut::Empty));
 
         let h = f.fold();
         assert!(h.is_effective(&f.genesis_hash));
-        assert!(h.is_effective(&add_b), "B was a legitimately-added owner");
-        assert!(h.is_effective(&demote_b), "A's demotion of B is effective");
+        assert!(h.is_effective(&add_b.into()), "B was a legitimately-added owner");
+        assert!(h.is_effective(&demote_b.into()), "A's demotion of B is effective");
         assert_eq!(
-            h.outcome(&add_c),
+            h.outcome(&add_c.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "B's laundered owner-mint is condemned by the demotion cut",
         );
         assert_eq!(
-            h.outcome(&remove_a),
+            h.outcome(&remove_a.into()),
             Some(Outcome::Rejected(RejectReason::StaleAuthority)),
             "C's removal of A cites an incarnation that never lived",
         );
-        assert!(!h.is_effective(&remove_a), "A is not removed — laundering defeated");
+        assert!(!h.is_effective(&remove_a.into()), "A is not removed — laundering defeated");
         assert_eq!(
             h.classification(),
             AccountClassification::Live,
@@ -4346,13 +4576,15 @@ mod tests {
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let (small, big) = (AccountId::from_bytes([0x11; 32]), AccountId::from_bytes([0x22; 32]));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let remove_b = f.author(&a, Some(add_a), &device_remove(&b, Cut::Empty));
-        let remove_a = f.author(&b, Some(add_b), &device_remove(&a, Cut::Empty));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let remove_b =
+            f.author(&a, Some(OwnerId::from_bytes(add_a)), &device_remove(&b, Cut::Empty));
+        let remove_a =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_remove(&a, Cut::Empty));
         // Two competing recovery re-roots by a pre-contest owner (A, live in state_before(1)).
-        let reroot_big = f.author(&a, Some(add_a), &account_reroot(big));
-        let reroot_small = f.author(&a, Some(add_a), &account_reroot(small));
+        let reroot_big = f.author(&a, Some(OwnerId::from_bytes(add_a)), &account_reroot(big));
+        let reroot_small = f.author(&a, Some(OwnerId::from_bytes(add_a)), &account_reroot(small));
 
         let h = f.fold();
         assert_eq!(
@@ -4361,18 +4593,27 @@ mod tests {
             "two owners cutting each other is contested at the last cycle-free depth",
         );
         assert!(h.is_effective(&f.genesis_hash), "state_before(1) keeps the depth-0 roster");
-        assert!(h.is_effective(&add_a), "A was a legitimate owner before the standoff");
-        assert!(h.is_effective(&add_b), "B was a legitimate owner before the standoff");
-        assert!(!h.is_effective(&remove_a), "authority mutation is halted — no removal folds");
-        assert!(!h.is_effective(&remove_b), "authority mutation is halted — no removal folds");
+        assert!(h.is_effective(&add_a.into()), "A was a legitimate owner before the standoff");
+        assert!(h.is_effective(&add_b.into()), "B was a legitimate owner before the standoff");
+        assert!(
+            !h.is_effective(&remove_a.into()),
+            "authority mutation is halted — no removal folds"
+        );
+        assert!(
+            !h.is_effective(&remove_b.into()),
+            "authority mutation is halted — no removal folds"
+        );
         assert_eq!(
-            h.outcome(&remove_a),
+            h.outcome(&remove_a.into()),
             Some(Outcome::Parked(ParkReason::ContestedSubject)),
             "the residue cut op parks, fail-closed",
         );
         // The sole admitted ops are the pre-contest owner's re-roots; the successor is
         // deterministic.
-        assert!(h.is_effective(&reroot_small) && h.is_effective(&reroot_big), "re-roots admitted");
+        assert!(
+            h.is_effective(&reroot_small.into()) && h.is_effective(&reroot_big.into()),
+            "re-roots admitted"
+        );
         assert_eq!(
             h.contested_successor(),
             Some(small),
@@ -4396,16 +4637,23 @@ mod tests {
         let (ahead_small, valid_big) =
             (AccountId::from_bytes([0x11; 32]), AccountId::from_bytes([0x22; 32]));
         let mut f = Fixture::genesis(&founder);
-        let add_a = f.author(&founder, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        f.author(&a, Some(add_a), &device_remove(&b, Cut::Empty));
-        f.author(&b, Some(add_b), &device_remove(&a, Cut::Empty));
-        let ahead = f.author_at_auth_len(&a, Some(add_a), &account_reroot(ahead_small), u64::MAX);
-        let valid = f.author(&a, Some(add_a), &account_reroot(valid_big));
+        let add_a =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        f.author(&a, Some(OwnerId::from_bytes(add_a)), &device_remove(&b, Cut::Empty));
+        f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_remove(&a, Cut::Empty));
+        let ahead = f.author_at_auth_len(
+            &a,
+            Some(OwnerId::from_bytes(add_a)),
+            &account_reroot(ahead_small),
+            u64::MAX,
+        );
+        let valid = f.author(&a, Some(OwnerId::from_bytes(add_a)), &account_reroot(valid_big));
 
         let h = f.fold();
-        assert_eq!(h.outcome(&ahead), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
-        assert!(h.is_effective(&valid));
+        assert_eq!(h.outcome(&ahead.into()), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+        assert!(h.is_effective(&valid.into()));
         assert_eq!(h.contested_successor(), Some(valid_big));
     }
 
@@ -4419,15 +4667,35 @@ mod tests {
         let (fdr, a, b, d) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let (t8, t9) = (Dev::new(8), Dev::new(9));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&d, DeviceRole::Owner));
         // D's equivocation: two seq-0 entries on D's chain with distinct content.
-        let d0a = f.author_forked(&d, Some(add_d), &device_add(&t8, DeviceRole::Member), 0, None);
-        let d0b = f.author_forked(&d, Some(add_d), &device_add(&t9, DeviceRole::Member), 0, None);
+        let d0a = f.author_forked(
+            &d,
+            Some(OwnerId::from_bytes(add_d)),
+            &device_add(&t8, DeviceRole::Member),
+            0,
+            None,
+        );
+        let d0b = f.author_forked(
+            &d,
+            Some(OwnerId::from_bytes(add_d)),
+            &device_add(&t9, DeviceRole::Member),
+            0,
+            None,
+        );
         assert_ne!(d0a, d0b, "the two seq-0 entries must be distinct watermarks");
-        f.author(&a, Some(add_a), &device_remove(&d, Cut::At { seq: 0, hash: d0a }));
-        f.author(&b, Some(add_b), &device_remove(&d, Cut::At { seq: 0, hash: d0b }));
+        f.author(
+            &a,
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove(&d, Cut::At { seq: 0, hash: AccountEntryHash::from_bytes(d0a) }),
+        );
+        f.author(
+            &b,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove(&d, Cut::At { seq: 0, hash: AccountEntryHash::from_bytes(d0b) }),
+        );
 
         let h = f.fold();
         assert_eq!(
@@ -4435,7 +4703,11 @@ mod tests {
             AccountClassification::Contested { state_before_depth: 1 },
             "one register key with equal-seq different-hash cuts is contested",
         );
-        assert!(h.is_effective(&add_a) && h.is_effective(&add_b) && h.is_effective(&add_d));
+        assert!(
+            h.is_effective(&add_a.into())
+                && h.is_effective(&add_b.into())
+                && h.is_effective(&add_d.into())
+        );
         // The verdict is arrival-order-free: the incomparable join is symmetric (I9).
         for rot in 0..f.entries.len() {
             assert_eq!(
@@ -4455,21 +4727,28 @@ mod tests {
         let (fdr, b) = (Dev::new(1), Dev::new(2));
         let (d, e, g) = (Dev::new(5), Dev::new(6), Dev::new(7));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
-        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
-        let b2 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
-        f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 1, hash: b1 }));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let b0 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&d, DeviceRole::Member));
+        let b1 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&e, DeviceRole::Member));
+        let b2 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&g, DeviceRole::Member));
+        f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &device_remove(&b, Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(b1) }),
+        );
 
         // Withheld: fold WITHOUT b1. Beyond-cut still fires; the under-cut prefix parks.
         let withheld = f.fold_without(b1);
         assert_eq!(
-            withheld.outcome(&b0),
+            withheld.outcome(&b0.into()),
             Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
             "under-cut b0 parks while the watermark is withheld",
         );
         assert_eq!(
-            withheld.outcome(&b2),
+            withheld.outcome(&b2.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "beyond-cut b2 is condemned from seq alone (I11) even with the watermark withheld",
         );
@@ -4477,10 +4756,10 @@ mod tests {
         // Healed: the watermark synced — the prefix is on the accepted branch and re-blesses; the
         // beyond-cut verdict is unchanged (no prior verdict flipped).
         let healed = f.fold();
-        assert!(healed.is_effective(&b0), "b0 heals to effective once b1 is held");
-        assert!(healed.is_effective(&b1), "b1 (the watermark slot) is within the cut");
+        assert!(healed.is_effective(&b0.into()), "b0 heals to effective once b1 is held");
+        assert!(healed.is_effective(&b1.into()), "b1 (the watermark slot) is within the cut");
         assert_eq!(
-            healed.outcome(&b2),
+            healed.outcome(&b2.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "b2 stays condemned — healing never flips the beyond-cut verdict",
         );
@@ -4495,27 +4774,43 @@ mod tests {
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let (d, g, hdev, k) = (Dev::new(4), Dev::new(5), Dev::new(6), Dev::new(7));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let a0 = f.author(&a, Some(add_a), &device_add(&d, DeviceRole::Member));
-        let b0 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
-        let b1 = f.author(&b, Some(add_b), &device_add(&hdev, DeviceRole::Member));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let a0 =
+            f.author(&a, Some(OwnerId::from_bytes(add_a)), &device_add(&d, DeviceRole::Member));
+        let b0 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&g, DeviceRole::Member));
+        let b1 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&hdev, DeviceRole::Member));
         // Demote B's incarnation, valid prefix pinned to b0 ⇒ b1 (seq 1) is condemned.
         f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &owner_demote(&b, add_b, Cut::At { seq: 0, hash: b0 }),
+            Some(f.genesis_hash.into()),
+            &owner_demote(&b, OwnerId::from_bytes(add_b), Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(b0),
+            }),
         );
-        f.author(&a, Some(add_a), &device_remove(&d, Cut::Empty));
+        f.author(&a, Some(OwnerId::from_bytes(add_a)), &device_remove(&d, Cut::Empty));
         // An op citing an unresolvable incarnation parks.
-        let foreign = f.author(&a, Some([0x77u8; 32]), &device_add(&k, DeviceRole::Member));
+        let foreign = f.author(
+            &a,
+            Some(OwnerId::from_bytes([0x77u8; 32])),
+            &device_add(&k, DeviceRole::Member),
+        );
 
         let baseline = f.fold();
         // Totality: exactly one outcome per candidate, and the mixed classes are all represented.
         assert_eq!(baseline.outcomes.len(), f.entries.len(), "every candidate is classified");
-        assert!(baseline.is_effective(&a0) && baseline.is_effective(&add_a));
-        assert_eq!(baseline.outcome(&b1), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
-        assert_eq!(baseline.outcome(&foreign), Some(Outcome::Parked(ParkReason::UnknownOwnerRef)));
+        assert!(baseline.is_effective(&a0.into()) && baseline.is_effective(&add_a.into()));
+        assert_eq!(
+            baseline.outcome(&b1.into()),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut))
+        );
+        assert_eq!(
+            baseline.outcome(&foreign.into()),
+            Some(Outcome::Parked(ParkReason::UnknownOwnerRef))
+        );
 
         // No oscillation: the FULL map (including auth_epoch numbering) is permutation-invariant.
         for rot in 0..f.entries.len() {
@@ -4538,26 +4833,41 @@ mod tests {
         let (fdr, b) = (Dev::new(1), Dev::new(2));
         let (d, e, g) = (Dev::new(5), Dev::new(6), Dev::new(7));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
-        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
-        let b2 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
-        let remove_b =
-            f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 0, hash: b0 }));
-        let extend =
-            f.author(&fdr, Some(f.genesis_hash), &cut_extend_ctrl(f.account_id, &b, None, 2, b2));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let b0 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&d, DeviceRole::Member));
+        let b1 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&e, DeviceRole::Member));
+        let b2 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&g, DeviceRole::Member));
+        let remove_b = f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &device_remove(&b, Cut::At { seq: 0, hash: AccountEntryHash::from_bytes(b0) }),
+        );
+        let extend = f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &cut_extend_ctrl(f.account_id, &b, None, 2, AccountEntryHash::from_bytes(b2)),
+        );
 
         // Without the extend, the beyond-cut cone is condemned.
         let before = f.fold_without(extend);
-        assert_eq!(before.outcome(&b1), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
-        assert_eq!(before.outcome(&b2), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
+        assert_eq!(
+            before.outcome(&b1.into()),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut))
+        );
+        assert_eq!(
+            before.outcome(&b2.into()),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut))
+        );
 
         // With the extend, the cone re-blesses; the removal + extend themselves are effective.
         let after = f.fold();
-        assert!(after.is_effective(&b0), "b0 stays within every watermark");
-        assert!(after.is_effective(&b1), "b1 re-blessed by the extend");
-        assert!(after.is_effective(&b2), "b2 re-blessed by the extend");
-        assert!(after.is_effective(&remove_b) && after.is_effective(&extend));
+        assert!(after.is_effective(&b0.into()), "b0 stays within every watermark");
+        assert!(after.is_effective(&b1.into()), "b1 re-blessed by the extend");
+        assert!(after.is_effective(&b2.into()), "b2 re-blessed by the extend");
+        assert!(after.is_effective(&remove_b.into()) && after.is_effective(&extend.into()));
     }
 
     #[test]
@@ -4568,29 +4878,35 @@ mod tests {
         let (fdr, b, dremoved) = (Dev::new(1), Dev::new(2), Dev::new(4));
         let (t5, t6) = (Dev::new(5), Dev::new(6));
         let mut f = Fixture::genesis(&fdr);
-        let g1 = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let g1 = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
         // Demote B's incarnation g1 with an empty cut — everything B does under g1 is condemned.
-        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&b, g1, Cut::Empty));
-        let under_g1 = f.author(&b, Some(g1), &device_add(&t5, DeviceRole::Member));
+        f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &owner_demote(&b, OwnerId::from_bytes(g1), Cut::Empty),
+        );
+        let under_g1 =
+            f.author(&b, Some(OwnerId::from_bytes(g1)), &device_add(&t5, DeviceRole::Member));
         // Re-promote B → a fresh incarnation g2 (no register); B's work under g2 accepts.
-        let g2 = f.author(&fdr, Some(f.genesis_hash), &owner_promote(&b));
-        let under_g2 = f.author(&b, Some(g2), &device_add(&t6, DeviceRole::Member));
+        let g2 = f.author(&fdr, Some(f.genesis_hash.into()), &owner_promote(&b));
+        let under_g2 =
+            f.author(&b, Some(OwnerId::from_bytes(g2)), &device_add(&t6, DeviceRole::Member));
         // A removed device's fingerprint is tombstoned; re-adding it is barred (I4).
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&dremoved, DeviceRole::Member));
-        f.author(&fdr, Some(f.genesis_hash), &device_remove(&dremoved, Cut::Empty));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&dremoved, DeviceRole::Member));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_remove(&dremoved, Cut::Empty));
         let readd =
-            f.author(&fdr, Some(f.genesis_hash), &device_add(&dremoved, DeviceRole::Member));
+            f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&dremoved, DeviceRole::Member));
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&under_g1),
+            h.outcome(&under_g1.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "work under the demoted incarnation is condemned",
         );
-        assert!(h.is_effective(&g2), "the re-promotion mints a fresh incarnation");
-        assert!(h.is_effective(&under_g2), "B resumes under the fresh incarnation");
+        assert!(h.is_effective(&g2.into()), "the re-promotion mints a fresh incarnation");
+        assert!(h.is_effective(&under_g2.into()), "B resumes under the fresh incarnation");
         assert_eq!(
-            h.outcome(&readd),
+            h.outcome(&readd.into()),
             Some(Outcome::Rejected(RejectReason::TombstoneReAdd)),
             "a tombstoned fingerprint can never re-enroll (I4)",
         );
@@ -4603,14 +4919,15 @@ mod tests {
         // cannot borrow another device's incarnation, even within the same account.
         let (fdr, a, m, x) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&m, DeviceRole::Member));
-        let impersonation = f.author(&m, Some(add_a), &device_add(&x, DeviceRole::Member));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&m, DeviceRole::Member));
+        let impersonation =
+            f.author(&m, Some(OwnerId::from_bytes(add_a)), &device_add(&x, DeviceRole::Member));
 
         let h = f.fold();
-        assert!(h.is_effective(&add_a));
+        assert!(h.is_effective(&add_a.into()));
         assert_eq!(
-            h.outcome(&impersonation),
+            h.outcome(&impersonation.into()),
             Some(Outcome::Rejected(RejectReason::WrongDevice)),
             "citing another device's incarnation is not admitted",
         );
@@ -4623,14 +4940,18 @@ mod tests {
         // target binding (owner_id resolves to a mint for the demoted device) rejects it.
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let bad = f.author(&fdr, Some(f.genesis_hash), &owner_demote(&a, add_b, Cut::Empty));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let bad = f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &owner_demote(&a, OwnerId::from_bytes(add_b), Cut::Empty),
+        );
 
         let h = f.fold();
-        assert!(h.is_effective(&add_a) && h.is_effective(&add_b));
+        assert!(h.is_effective(&add_a.into()) && h.is_effective(&add_b.into()));
         assert_eq!(
-            h.outcome(&bad),
+            h.outcome(&bad.into()),
             Some(Outcome::Rejected(RejectReason::WrongDevice)),
             "an OwnerDemote whose owner_id names a different device is rejected",
         );
@@ -4645,21 +4966,26 @@ mod tests {
         let (fdr, b) = (Dev::new(1), Dev::new(2));
         let (d, e) = (Dev::new(5), Dev::new(6));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
-        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
-        let extend =
-            f.author(&fdr, Some(f.genesis_hash), &cut_extend_ctrl(f.account_id, &b, None, 0, b0));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let b0 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&d, DeviceRole::Member));
+        let b1 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&e, DeviceRole::Member));
+        let extend = f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &cut_extend_ctrl(f.account_id, &b, None, 0, AccountEntryHash::from_bytes(b0)),
+        );
 
         let h = f.fold();
-        assert!(h.is_effective(&b0), "b0 effective");
+        assert!(h.is_effective(&b0.into()), "b0 effective");
         assert!(
-            h.is_effective(&b1),
+            h.is_effective(&b1.into()),
             "b1 (seq 1, beyond a phantom [0] watermark) is effective — the extend created no \
              register",
         );
         assert_eq!(
-            h.outcome(&extend),
+            h.outcome(&extend.into()),
             Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
             "a bare extend parks until a creating cut exists",
         );
@@ -4674,13 +5000,13 @@ mod tests {
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&fdr);
         let (stream, own_op) = stream_own_private(f.account_id);
-        let own = f.author(&fdr, Some(f.genesis_hash), &own_op);
-        let grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let own = f.author(&fdr, Some(f.genesis_hash.into()), &own_op);
+        let grant = f.author(&fdr, Some(f.genesis_hash.into()), &stream_grant(stream, grantee));
 
         let h = f.fold();
-        assert!(h.is_effective(&own), "private ownership itself is effective");
+        assert!(h.is_effective(&own.into()), "private ownership itself is effective");
         assert_eq!(
-            h.outcome(&grant),
+            h.outcome(&grant.into()),
             Some(Outcome::Rejected(RejectReason::Ineffective)),
             "a grant on a private stream never folds effective",
         );
@@ -4692,20 +5018,24 @@ mod tests {
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&fdr);
         let (stream, own_op) = stream_own(f.account_id);
-        let own = f.author(&fdr, Some(f.genesis_hash), &own_op);
-        let grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
-        let revoke = f.author(&fdr, Some(f.genesis_hash), &stream_revoke(stream, grantee, grant));
+        let own = f.author(&fdr, Some(f.genesis_hash.into()), &own_op);
+        let grant = f.author(&fdr, Some(f.genesis_hash.into()), &stream_grant(stream, grantee));
+        let revoke = f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &stream_revoke(stream, grantee, GrantId::from_bytes(grant)),
+        );
 
         let h = f.fold();
-        assert!(h.is_effective(&own));
-        assert!(h.is_effective(&grant));
-        assert!(h.is_effective(&revoke));
+        assert!(h.is_effective(&own.into()));
+        assert!(h.is_effective(&grant.into()));
+        assert!(h.is_effective(&revoke.into()));
         assert_eq!(h.effective_count(), 4);
         // The exact citation resolves against the fold we hold, and NOTHING else: revocation bounds
         // content through cuts, so no assertion the author makes about its own control length can
         // reopen, close, or deny this grant. That counter is a separate, purely informational axis.
         assert_eq!(
-            h.grant_effective(grant, stream, grantee),
+            h.grant_effective(GrantId::from_bytes(grant), stream, grantee),
             AuthorityQuery::Effective(GrantAuthority {
                 stream_id: stream,
                 grantee_account_id: grantee,
@@ -4719,7 +5049,7 @@ mod tests {
             AuthorityFreshness::Ahead,
             "an author citing more effective ops than we folded is a refetch signal, not a verdict",
         );
-        assert_eq!(h.stream_owner_effective(stream), AuthorityQuery::Effective(own));
+        assert_eq!(h.stream_owner_effective(stream), AuthorityQuery::Effective(own.into()));
     }
 
     #[test]
@@ -4728,23 +5058,26 @@ mod tests {
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&fdr);
         let (stream, own_op) = stream_own(f.account_id);
-        let early_grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
-        let own = f.author(&fdr, Some(f.genesis_hash), &own_op);
-        let duplicate_own = f.author(&fdr, Some(f.genesis_hash), &own_op);
-        let self_grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, f.account_id));
-        let grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
-        let duplicate_grant = f.author(&fdr, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let early_grant =
+            f.author(&fdr, Some(f.genesis_hash.into()), &stream_grant(stream, grantee));
+        let own = f.author(&fdr, Some(f.genesis_hash.into()), &own_op);
+        let duplicate_own = f.author(&fdr, Some(f.genesis_hash.into()), &own_op);
+        let self_grant =
+            f.author(&fdr, Some(f.genesis_hash.into()), &stream_grant(stream, f.account_id));
+        let grant = f.author(&fdr, Some(f.genesis_hash.into()), &stream_grant(stream, grantee));
+        let duplicate_grant =
+            f.author(&fdr, Some(f.genesis_hash.into()), &stream_grant(stream, grantee));
         let wrong_revoke = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &stream_revoke(stream, AccountId::from_bytes([0x55; 32]), grant),
+            Some(f.genesis_hash.into()),
+            &stream_revoke(stream, AccountId::from_bytes([0x55; 32]), GrantId::from_bytes(grant)),
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&own));
-        assert!(h.is_effective(&grant));
+        assert!(h.is_effective(&own.into()));
+        assert!(h.is_effective(&grant.into()));
         assert_eq!(
-            h.grant_effective(early_grant, stream, grantee),
+            h.grant_effective(GrantId::from_bytes(early_grant), stream, grantee),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
             "a held but ineffective grant is invalid, not parked as if it were missing",
         );
@@ -4756,7 +5089,7 @@ mod tests {
             (wrong_revoke, "revoke with mismatched grantee"),
         ] {
             assert_eq!(
-                h.outcome(&hash),
+                h.outcome(&hash.into()),
                 Some(Outcome::Rejected(RejectReason::Ineffective)),
                 "{label}",
             );
@@ -4769,22 +5102,32 @@ mod tests {
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&founder);
         let add_owner =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&owner, DeviceRole::Owner));
         let (stream, own_op) = stream_own(f.account_id);
-        let own = f.author(&founder, Some(f.genesis_hash), &own_op);
+        let own = f.author(&founder, Some(f.genesis_hash.into()), &own_op);
         let remove_founder = f.author(
             &owner,
-            Some(add_owner),
-            &device_remove(&founder, Cut::At { seq: 1, hash: add_owner }),
+            Some(OwnerId::from_bytes(add_owner)),
+            &device_remove(&founder, Cut::At {
+                seq: 1,
+                hash: AccountEntryHash::from_bytes(add_owner),
+            }),
         );
-        let grant = f.author(&owner, Some(add_owner), &stream_grant(stream, grantee));
+        let grant =
+            f.author(&owner, Some(OwnerId::from_bytes(add_owner)), &stream_grant(stream, grantee));
 
         let expected = f.fold();
-        assert_eq!(expected.outcome(&own), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
-        assert!(expected.is_effective(&remove_founder));
-        assert_eq!(expected.outcome(&grant), Some(Outcome::Rejected(RejectReason::Ineffective)));
         assert_eq!(
-            expected.grant_effective(grant, stream, grantee),
+            expected.outcome(&own.into()),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut))
+        );
+        assert!(expected.is_effective(&remove_founder.into()));
+        assert_eq!(
+            expected.outcome(&grant.into()),
+            Some(Outcome::Rejected(RejectReason::Ineffective))
+        );
+        assert_eq!(
+            expected.grant_effective(GrantId::from_bytes(grant), stream, grantee),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
         assert_eq!(expected.stream_owner_effective(stream), AuthorityQuery::Unknown);
@@ -4798,25 +5141,32 @@ mod tests {
         let (founder, owner, member) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
         let add_owner =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
-        let add_member =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&member, DeviceRole::Member));
-        let promote = f.author(&owner, Some(add_owner), &owner_promote(&member));
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&owner, DeviceRole::Owner));
+        let add_member = f.author(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_add(&member, DeviceRole::Member),
+        );
+        let promote =
+            f.author(&owner, Some(OwnerId::from_bytes(add_owner)), &owner_promote(&member));
         let cut = f.author(
             &owner,
-            Some(add_owner),
-            &device_remove(&founder, Cut::At { seq: 1, hash: add_owner }),
+            Some(OwnerId::from_bytes(add_owner)),
+            &device_remove(&founder, Cut::At {
+                seq: 1,
+                hash: AccountEntryHash::from_bytes(add_owner),
+            }),
         );
 
         let expected = f.fold();
-        assert!(expected.is_effective(&cut));
+        assert!(expected.is_effective(&cut.into()));
         assert_eq!(
-            expected.outcome(&add_member),
+            expected.outcome(&add_member.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
         );
-        assert!(!expected.is_effective(&promote));
+        assert!(!expected.is_effective(&promote.into()));
         assert_eq!(
-            expected.owner_incarnation_effective(promote, member.fp,),
+            expected.owner_incarnation_effective(OwnerId::from_bytes(promote), member.fp,),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
             "a promotion cannot survive solely through a condemned enrollment mutation",
         );
@@ -4830,25 +5180,32 @@ mod tests {
         let (founder, owner, member) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
         let add_owner =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
-        let add_member =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&member, DeviceRole::Member));
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&owner, DeviceRole::Owner));
+        let add_member = f.author(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_add(&member, DeviceRole::Member),
+        );
         let remove_member =
-            f.author(&founder, Some(f.genesis_hash), &device_remove(&member, Cut::Empty));
+            f.author(&founder, Some(f.genesis_hash.into()), &device_remove(&member, Cut::Empty));
         f.author(
             &owner,
-            Some(add_owner),
-            &device_remove(&founder, Cut::At { seq: 2, hash: add_member }),
+            Some(OwnerId::from_bytes(add_owner)),
+            &device_remove(&founder, Cut::At {
+                seq: 2,
+                hash: AccountEntryHash::from_bytes(add_member),
+            }),
         );
-        let promote = f.author(&owner, Some(add_owner), &owner_promote(&member));
+        let promote =
+            f.author(&owner, Some(OwnerId::from_bytes(add_owner)), &owner_promote(&member));
 
         let expected = f.fold();
         assert_eq!(
-            expected.outcome(&remove_member),
+            expected.outcome(&remove_member.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
         );
         assert!(
-            expected.is_effective(&promote),
+            expected.is_effective(&promote.into()),
             "phase-E replay restores the enrolled member after its tombstone op is condemned",
         );
         for rotation in 1..f.entries.len() {
@@ -4862,24 +5219,34 @@ mod tests {
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&founder);
         let add_owner =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&owner, DeviceRole::Owner));
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&owner, DeviceRole::Owner));
         let (stream, own_op) = stream_own(f.account_id);
-        let own = f.author(&founder, Some(f.genesis_hash), &own_op);
-        let grant = f.author(&founder, Some(f.genesis_hash), &stream_grant(stream, grantee));
+        let own = f.author(&founder, Some(f.genesis_hash.into()), &own_op);
+        let grant = f.author(&founder, Some(f.genesis_hash.into()), &stream_grant(stream, grantee));
         let remove_founder = f.author(
             &owner,
-            Some(add_owner),
-            &device_remove(&founder, Cut::At { seq: 2, hash: own }),
+            Some(OwnerId::from_bytes(add_owner)),
+            &device_remove(&founder, Cut::At { seq: 2, hash: AccountEntryHash::from_bytes(own) }),
         );
-        let revoke = f.author(&owner, Some(add_owner), &stream_revoke(stream, grantee, grant));
+        let revoke = f.author(
+            &owner,
+            Some(OwnerId::from_bytes(add_owner)),
+            &stream_revoke(stream, grantee, GrantId::from_bytes(grant)),
+        );
 
         let expected = f.fold();
-        assert!(expected.is_effective(&own));
-        assert_eq!(expected.outcome(&grant), Some(Outcome::Condemned(CondemnedReason::BeyondCut)));
-        assert!(expected.is_effective(&remove_founder));
-        assert_eq!(expected.outcome(&revoke), Some(Outcome::Rejected(RejectReason::Ineffective)));
+        assert!(expected.is_effective(&own.into()));
         assert_eq!(
-            expected.grant_effective(grant, stream, grantee),
+            expected.outcome(&grant.into()),
+            Some(Outcome::Condemned(CondemnedReason::BeyondCut))
+        );
+        assert!(expected.is_effective(&remove_founder.into()));
+        assert_eq!(
+            expected.outcome(&revoke.into()),
+            Some(Outcome::Rejected(RejectReason::Ineffective))
+        );
+        assert_eq!(
+            expected.grant_effective(GrantId::from_bytes(grant), stream, grantee),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
         assert!(expected.grant_cuts.is_empty());
@@ -4895,28 +5262,28 @@ mod tests {
             let (founder, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
             let mut f = Fixture::genesis(&founder);
             let add_a =
-                f.author(&founder, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+                f.author(&founder, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
             let add_b =
-                f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+                f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
             let (e_author, e_ref, x_author, x_ref) =
                 if e_is_a { (&a, add_a, &b, add_b) } else { (&b, add_b, &a, add_a) };
             saw_orderings.insert(e_author.fp < x_author.fp);
             let x = f.author_at_auth_len(
                 x_author,
-                Some(x_ref),
+                Some(OwnerId::from_bytes(x_ref)),
                 &device_add(&Dev::new(4), DeviceRole::Member),
                 3,
             );
             let e = f.author_at_auth_len(
                 e_author,
-                Some(e_ref),
+                Some(OwnerId::from_bytes(e_ref)),
                 &device_add(&Dev::new(5), DeviceRole::Member),
                 4,
             );
 
             let expected = f.fold();
-            assert!(expected.is_effective(&x));
-            assert!(expected.is_effective(&e));
+            assert!(expected.is_effective(&x.into()));
+            assert!(expected.is_effective(&e.into()));
             assert_eq!(expected.effective_count(), 5);
             for rotation in 1..f.entries.len() {
                 assert_eq!(f.fold_rotated(rotation).outcomes, expected.outcomes);
@@ -4931,20 +5298,23 @@ mod tests {
         let mut f = Fixture::genesis(&fdr);
         let (stream, valid) = stream_own(f.account_id);
         let AccountOp::StreamOwn { stream_spec_bytes, .. } = valid else { unreachable!() };
-        let wrong_hash = f.author(&fdr, Some(f.genesis_hash), &AccountOp::StreamOwn {
+        let wrong_hash = f.author(&fdr, Some(f.genesis_hash.into()), &AccountOp::StreamOwn {
             stream_id: StreamId::from_bytes([0x77; 32]),
             stream_spec_bytes: stream_spec_bytes.clone(),
         });
         let (_, wrong_owner_op) = stream_own(AccountId::from_bytes([0x66; 32]));
-        let wrong_owner = f.author(&fdr, Some(f.genesis_hash), &wrong_owner_op);
-        let malformed = f.author(&fdr, Some(f.genesis_hash), &AccountOp::StreamOwn {
+        let wrong_owner = f.author(&fdr, Some(f.genesis_hash.into()), &wrong_owner_op);
+        let malformed = f.author(&fdr, Some(f.genesis_hash.into()), &AccountOp::StreamOwn {
             stream_id: stream,
             stream_spec_bytes: vec![0x80],
         });
 
         let h = f.fold();
         for hash in [wrong_hash, wrong_owner, malformed] {
-            assert_eq!(h.outcome(&hash), Some(Outcome::Rejected(RejectReason::InvalidStreamSpec)),);
+            assert_eq!(
+                h.outcome(&hash.into()),
+                Some(Outcome::Rejected(RejectReason::InvalidStreamSpec)),
+            );
         }
     }
 
@@ -4953,49 +5323,54 @@ mod tests {
         let fdr = Dev::new(1);
         let member = Dev::new(2);
         let mut f = Fixture::genesis(&fdr);
-        let add = f.author(&fdr, Some(f.genesis_hash), &device_add(&member, DeviceRole::Member));
-        let promote = f.author(&fdr, Some(f.genesis_hash), &owner_promote(&member));
+        let add =
+            f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&member, DeviceRole::Member));
+        let promote = f.author(&fdr, Some(f.genesis_hash.into()), &owner_promote(&member));
         let h = f.fold();
 
         assert_eq!(
-            h.roster_ref_effective(add, member.fp),
+            h.roster_ref_effective(RosterRef::from_bytes(add), member.fp),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Owner,
             }),
         );
         assert_eq!(
-            h.roster_ref_effective(add, fdr.fp),
+            h.roster_ref_effective(RosterRef::from_bytes(add), fdr.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject),
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, member.fp),
+            h.owner_incarnation_effective(OwnerId::from_bytes(promote), member.fp),
             AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: member.fp }),
             "a behind auth_len does not deny an exact owner citation",
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, member.fp),
+            h.owner_incarnation_effective(OwnerId::from_bytes(promote), member.fp),
             AuthorityQuery::Effective(OwnerAuthority { device_fingerprint: member.fp }),
         );
 
-        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&member, promote, Cut::Empty));
+        f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &owner_demote(&member, OwnerId::from_bytes(promote), Cut::Empty),
+        );
         let h = f.fold();
         assert_eq!(
-            h.roster_ref_effective(add, member.fp),
+            h.roster_ref_effective(RosterRef::from_bytes(add), member.fp),
             AuthorityQuery::Effective(RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Member,
             }),
         );
         assert_eq!(
-            h.owner_incarnation_effective(promote, member.fp),
+            h.owner_incarnation_effective(OwnerId::from_bytes(promote), member.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
 
-        f.author(&fdr, Some(f.genesis_hash), &device_remove(&member, Cut::Empty));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_remove(&member, Cut::Empty));
         let h = f.fold();
         assert_eq!(
-            h.roster_ref_effective(add, member.fp),
+            h.roster_ref_effective(RosterRef::from_bytes(add), member.fp),
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective),
         );
     }
@@ -5006,18 +5381,21 @@ mod tests {
         let read_only = Dev::new(2);
         let stream = StreamId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&founder);
-        let add =
-            f.author(&founder, Some(f.genesis_hash), &device_add(&read_only, DeviceRole::ReadOnly));
-        let promote = f.author(&founder, Some(f.genesis_hash), &owner_promote(&read_only));
+        let add = f.author(
+            &founder,
+            Some(f.genesis_hash.into()),
+            &device_add(&read_only, DeviceRole::ReadOnly),
+        );
+        let promote = f.author(&founder, Some(f.genesis_hash.into()), &owner_promote(&read_only));
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&promote),
+            h.outcome(&promote.into()),
             Some(Outcome::Rejected(RejectReason::BadPromote)),
             "promotion cannot turn a read-only enrollment into retroactive write authority",
         );
         assert_eq!(
-            h.roster_content_authority(add, read_only.fp, stream),
+            h.roster_content_authority(RosterRef::from_bytes(add), read_only.fp, stream),
             AuthorityQuery::Effective(RosterContentAuthority {
                 device_fingerprint: read_only.fp,
                 role: DeviceRole::ReadOnly,
@@ -5039,19 +5417,30 @@ mod tests {
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let (d, e, g) = (Dev::new(5), Dev::new(6), Dev::new(7));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let b0 = f.author(&b, Some(add_b), &device_add(&d, DeviceRole::Member));
-        let b1 = f.author(&b, Some(add_b), &device_add(&e, DeviceRole::Member));
-        let b2 = f.author(&b, Some(add_b), &device_add(&g, DeviceRole::Member));
-        f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::At { seq: 0, hash: b0 }));
-        let extend = f.author(&a, Some(add_a), &cut_extend_ctrl(f.account_id, &b, None, 2, b2));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let b0 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&d, DeviceRole::Member));
+        let b1 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&e, DeviceRole::Member));
+        let b2 =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&g, DeviceRole::Member));
+        f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &device_remove(&b, Cut::At { seq: 0, hash: AccountEntryHash::from_bytes(b0) }),
+        );
+        let extend = f.author(
+            &a,
+            Some(OwnerId::from_bytes(add_a)),
+            &cut_extend_ctrl(f.account_id, &b, None, 2, AccountEntryHash::from_bytes(b2)),
+        );
 
         let h = f.fold();
-        assert!(h.is_effective(&b0), "the within-cut prefix is effective");
-        assert!(h.is_effective(&extend), "the extend itself is a valid owner op");
+        assert!(h.is_effective(&b0.into()), "the within-cut prefix is effective");
+        assert!(h.is_effective(&extend.into()), "the extend itself is a valid owner op");
         assert_eq!(
-            h.outcome(&b1),
+            h.outcome(&b1.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "a deeper-depth extend does not revise a shallower depth's final condemnation",
         );
@@ -5066,13 +5455,13 @@ mod tests {
         let mut f = Fixture::genesis(&fdr);
         let reroot = f.author(
             &fdr,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &account_reroot(AccountId::from_bytes([0x55; 32])),
         );
 
         let h = f.fold();
         assert_eq!(h.classification(), AccountClassification::Live);
-        assert_eq!(h.outcome(&reroot), Some(Outcome::Rejected(RejectReason::Ineffective)));
+        assert_eq!(h.outcome(&reroot.into()), Some(Outcome::Rejected(RejectReason::Ineffective)));
         assert_eq!(h.contested_successor(), None);
     }
 
@@ -5085,13 +5474,13 @@ mod tests {
         let mut f = Fixture::genesis(&fdr);
         let remove_self = f.author(
             &fdr,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             &device_remove(&fdr, Cut::At { seq: 0, hash: f.genesis_hash }),
         );
 
         let h = f.fold();
         assert!(h.is_effective(&f.genesis_hash), "genesis stands — the founder remains an owner");
-        assert!(!h.is_effective(&remove_self), "a device cannot remove its own chain");
+        assert!(!h.is_effective(&remove_self.into()), "a device cannot remove its own chain");
     }
 
     #[test]
@@ -5100,18 +5489,27 @@ mod tests {
         // g1 must not close B's fresh g2 — the demote is scoped to its exact incarnation.
         let (fdr, b, t) = (Dev::new(1), Dev::new(2), Dev::new(5));
         let mut f = Fixture::genesis(&fdr);
-        let g1 = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&b, g1, Cut::Empty));
-        let g2 = f.author(&fdr, Some(f.genesis_hash), &owner_promote(&b));
+        let g1 = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &owner_demote(&b, OwnerId::from_bytes(g1), Cut::Empty),
+        );
+        let g2 = f.author(&fdr, Some(f.genesis_hash.into()), &owner_promote(&b));
         // A late, stale demote of the OLD incarnation g1.
-        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&b, g1, Cut::Empty));
+        f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &owner_demote(&b, OwnerId::from_bytes(g1), Cut::Empty),
+        );
         // B authors under the fresh incarnation g2.
-        let under_g2 = f.author(&b, Some(g2), &device_add(&t, DeviceRole::Member));
+        let under_g2 =
+            f.author(&b, Some(OwnerId::from_bytes(g2)), &device_add(&t, DeviceRole::Member));
 
         let h = f.fold();
-        assert!(h.is_effective(&g2), "the re-promotion mints a fresh incarnation");
+        assert!(h.is_effective(&g2.into()), "the re-promotion mints a fresh incarnation");
         assert!(
-            h.is_effective(&under_g2),
+            h.is_effective(&under_g2.into()),
             "B's fresh-incarnation work survives the stale demote of the old incarnation",
         );
     }
@@ -5123,17 +5521,23 @@ mod tests {
         // check, not just liveness) rejects it — a non-owner cannot select the successor.
         let (fdr, a, b, m) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&m, DeviceRole::Member));
-        f.author(&a, Some(add_a), &device_remove(&b, Cut::Empty));
-        f.author(&b, Some(add_b), &device_remove(&a, Cut::Empty));
-        let bad_reroot =
-            f.author(&m, Some(add_a), &account_reroot(AccountId::from_bytes([0x11; 32])));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&m, DeviceRole::Member));
+        f.author(&a, Some(OwnerId::from_bytes(add_a)), &device_remove(&b, Cut::Empty));
+        f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_remove(&a, Cut::Empty));
+        let bad_reroot = f.author(
+            &m,
+            Some(OwnerId::from_bytes(add_a)),
+            &account_reroot(AccountId::from_bytes([0x11; 32])),
+        );
 
         let h = f.fold();
         assert!(matches!(h.classification(), AccountClassification::Contested { .. }));
-        assert!(!h.is_effective(&bad_reroot), "a non-owner cannot select the recovery successor");
+        assert!(
+            !h.is_effective(&bad_reroot.into()),
+            "a non-owner cannot select the recovery successor"
+        );
         assert_eq!(h.contested_successor(), None, "no owner re-rooted ⇒ no successor");
     }
 
@@ -5147,19 +5551,26 @@ mod tests {
         let (succ_a, succ_f) =
             (AccountId::from_bytes([0x11; 32]), AccountId::from_bytes([0x22; 32]));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let add_c = f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &owner_demote(&a, add_a, Cut::Empty));
-        f.author(&b, Some(add_b), &device_remove(&c, Cut::Empty));
-        f.author(&c, Some(add_c), &device_remove(&b, Cut::Empty));
-        let reroot_f = f.author(&fdr, Some(f.genesis_hash), &account_reroot(succ_f));
-        let reroot_a = f.author(&a, Some(add_a), &account_reroot(succ_a));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let add_c = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&c, DeviceRole::Owner));
+        f.author(
+            &fdr,
+            Some(f.genesis_hash.into()),
+            &owner_demote(&a, OwnerId::from_bytes(add_a), Cut::Empty),
+        );
+        f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_remove(&c, Cut::Empty));
+        f.author(&c, Some(OwnerId::from_bytes(add_c)), &device_remove(&b, Cut::Empty));
+        let reroot_f = f.author(&fdr, Some(f.genesis_hash.into()), &account_reroot(succ_f));
+        let reroot_a = f.author(&a, Some(OwnerId::from_bytes(add_a)), &account_reroot(succ_a));
 
         let h = f.fold();
         assert!(matches!(h.classification(), AccountClassification::Contested { .. }));
-        assert!(h.is_effective(&reroot_f), "a current owner's re-root is admitted");
-        assert!(!h.is_effective(&reroot_a), "a demoted former owner's re-root is not admitted");
+        assert!(h.is_effective(&reroot_f.into()), "a current owner's re-root is admitted");
+        assert!(
+            !h.is_effective(&reroot_a.into()),
+            "a demoted former owner's re-root is not admitted"
+        );
         assert_eq!(
             h.contested_successor(),
             Some(succ_f),
@@ -5184,7 +5595,7 @@ mod tests {
             label: None,
         };
         let payload = account_ops::encode(&op).unwrap();
-        let account_id = account_id_from_genesis_payload(&payload);
+        let account_id = id::account_id_from_genesis_payload(&payload);
         let genesis_header = |signer: &Dev| AccountEntryHeader {
             account_id,
             log_id: 0,
@@ -5221,7 +5632,7 @@ mod tests {
             auth_len: 1,
             crypto_suite: 0,
             key_id: None,
-            authority_ref: Some(forged.entry_hash),
+            authority_ref: Some(forged.entry_hash.into()),
         };
         let attacker_add = signed(&attacker, &add_header, &add_payload);
 
@@ -5253,7 +5664,7 @@ mod tests {
         // self-removal is itself self-defeating; the point is the root survives.)
         let fdr = Dev::new(1);
         let mut f = Fixture::genesis(&fdr);
-        f.author(&fdr, Some(f.genesis_hash), &device_remove(&fdr, Cut::Empty));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_remove(&fdr, Cut::Empty));
 
         let h = f.fold();
         assert!(h.is_effective(&f.genesis_hash), "the genesis root is exempt from condemnation");
@@ -5280,7 +5691,7 @@ mod tests {
             auth_len: 1,
             crypto_suite: 0,
             key_id: None,
-            authority_ref: Some(f.genesis_hash),
+            authority_ref: Some(f.genesis_hash.into()),
         };
         let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
         let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
@@ -5315,7 +5726,7 @@ mod tests {
             auth_len: 1,
             crypto_suite: 0,
             key_id: None,
-            authority_ref: Some(f.genesis_hash),
+            authority_ref: Some(f.genesis_hash.into()),
         };
         let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
         let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
@@ -5332,17 +5743,22 @@ mod tests {
         // the fingerprint and permanently bars a later legitimate DeviceAdd (I4).
         let (fdr, ghost) = (Dev::new(1), Dev::new(7));
         let mut f = Fixture::genesis(&fdr);
-        let remove = f.author(&fdr, Some(f.genesis_hash), &device_remove(&ghost, Cut::Empty));
-        let add = f.author(&fdr, Some(f.genesis_hash), &device_add(&ghost, DeviceRole::Member));
+        let remove =
+            f.author(&fdr, Some(f.genesis_hash.into()), &device_remove(&ghost, Cut::Empty));
+        let add =
+            f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&ghost, DeviceRole::Member));
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&remove),
+            h.outcome(&remove.into()),
             Some(Outcome::Rejected(RejectReason::Ineffective)),
             "removing a never-enrolled device is ineffective",
         );
-        assert!(h.is_effective(&add), "the device is not pre-tombstoned, so it can still be added");
-        let fact = h.roster_refs.get(&add).expect("later enrollment has a roster fact");
+        assert!(
+            h.is_effective(&add.into()),
+            "the device is not pre-tombstoned, so it can still be added"
+        );
+        let fact = h.roster_refs.get(&add.into()).expect("later enrollment has a roster fact");
         assert_eq!(fact.control_boundary, AuthorityBoundary::Closed);
     }
 
@@ -5361,7 +5777,11 @@ mod tests {
         let mut devs = vec![founder];
         for k in 1..=N {
             let dev = Dev::seeded(k);
-            g = f.author(&devs[(k - 1) as usize], Some(g), &device_add(&dev, DeviceRole::Owner));
+            g = AccountEntryHash::from_bytes(f.author(
+                &devs[(k - 1) as usize],
+                Some(g.into()),
+                &device_add(&dev, DeviceRole::Owner),
+            ));
             devs.push(dev);
         }
         let mut entries = f.entries.clone();
@@ -5389,14 +5809,14 @@ mod tests {
         // must classify once and apply its state transition once (order-independence).
         let (fdr, b) = (Dev::new(1), Dev::new(2));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
         let mut doubled = f.entries.clone();
         doubled.extend(f.entries.clone());
 
         let h = fold_account(&doubled);
         assert!(h.is_effective(&f.genesis_hash));
         assert!(
-            h.is_effective(&add_b),
+            h.is_effective(&add_b.into()),
             "the duplicated add is effective once, not overwritten as a DuplicateAdd",
         );
     }
@@ -5417,14 +5837,14 @@ mod tests {
             label: None,
         };
         let payload = account_ops::encode(&op).unwrap();
-        let account_id = account_id_from_genesis_payload(&payload);
+        let account_id = id::account_id_from_genesis_payload(&payload);
         let header = AccountEntryHeader {
             account_id,
             log_id: 0,
             device_fingerprint: founder.fp,
             seq: 0,
             prev_hash: None,
-            parent_ref: Some([0x01; 32]), // a root has no parent
+            parent_ref: Some(AccountEntryHash::from_bytes([0x01; 32])), // a root has no parent
             entry_type: account_ops::entry_type::ACCOUNT_GENESIS,
             op_version: 1,
             auth_len: 0,
@@ -5467,7 +5887,7 @@ mod tests {
             auth_len: 1,
             crypto_suite: 0,
             key_id: None,
-            authority_ref: Some(f.genesis_hash),
+            authority_ref: Some(f.genesis_hash.into()),
         };
         let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
         let orphan = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
@@ -5501,7 +5921,7 @@ mod tests {
             auth_len: 1,
             crypto_suite: 1,          // sealed
             key_id: Some([0x33; 32]), // required when crypto_suite != 0
-            authority_ref: Some(f.genesis_hash),
+            authority_ref: Some(f.genesis_hash.into()),
         };
         let bad = vec![0xff, 0xff]; // not valid CBOR / not a DeviceAdd
         let signed = sign_account_entry(&fdr.secret, &header, &bad).unwrap();
@@ -5536,7 +5956,7 @@ mod tests {
             auth_len: 1,
             crypto_suite: 0,
             key_id: None,
-            authority_ref: Some(f.genesis_hash),
+            authority_ref: Some(f.genesis_hash.into()),
         };
         let bad_payload = vec![0xa0]; // a CBOR empty map — not the DeviceAdd array shape
         let signed = sign_account_entry(&fdr.secret, &header, &bad_payload).unwrap();
@@ -5572,7 +5992,7 @@ mod tests {
             auth_len: 1,
             crypto_suite: 1,
             key_id: Some([0x33; 32]), // required when crypto_suite != 0
-            authority_ref: Some(f.genesis_hash),
+            authority_ref: Some(f.genesis_hash.into()),
         };
         let signed = sign_account_entry(&fdr.secret, &header, &payload).unwrap();
         let entry = verify_account_signed(&signed.signed_bytes, &fdr.secret.public()).unwrap();
@@ -5602,13 +6022,13 @@ mod tests {
             subject_account_id: f.account_id,
             device_fingerprint: fdr.fp,
             new_seq: 3,
-            new_entry_hash: [0x44; 32],
+            new_entry_hash: AccountEntryHash::from_bytes([0x44; 32]),
         };
-        let extend = f.author(&fdr, Some(f.genesis_hash), &op);
+        let extend = f.author(&fdr, Some(f.genesis_hash.into()), &op);
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&extend),
+            h.outcome(&extend.into()),
             Some(Outcome::Parked(ParkReason::DeferredStreamAuthorization)),
             "a content CutExtend is deferred, not effective",
         );
@@ -5624,13 +6044,19 @@ mod tests {
         let mut f = Fixture::genesis(&fdr);
         let extend = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &cut_extend_secrets(f.account_id, &fdr, None, 3, [0x44; 32]),
+            Some(f.genesis_hash.into()),
+            &cut_extend_secrets(
+                f.account_id,
+                &fdr,
+                None,
+                3,
+                AccountEntryHash::from_bytes([0x44; 32]),
+            ),
         );
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&extend),
+            h.outcome(&extend.into()),
             Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
             "a secrets CutExtend with no creating register parks, extend-only",
         );
@@ -5645,23 +6071,26 @@ mod tests {
         // are bounded independently under one op.
         let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
         // A second owner so removing B is not the last-owner reject.
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&c, DeviceRole::Owner));
         // A held watermark on B's secrets chain (log 1) so §11.3 binding is Ok, not TargetNotHeld.
         let s0 = f.author_secrets_entry(&b, &b, 0, None);
         let remove_b = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &device_remove_with_secrets(&b, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+            Some(f.genesis_hash.into()),
+            &device_remove_with_secrets(&b, Cut::Empty, Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(s0),
+            }),
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&remove_b), "the remove is admitted — both cuts bind");
-        let fact = h.roster_refs.get(&add_b).expect("B has a roster fact");
+        assert!(h.is_effective(&remove_b.into()), "the remove is admitted — both cuts bind");
+        let fact = h.roster_refs.get(&add_b.into()).expect("B has a roster fact");
         assert_eq!(
             fact.secrets_boundary,
-            AuthorityBoundary::Cut { seq: 0, hash: s0 },
+            AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
             "secrets_boundary is the joined log-1 register",
         );
         assert_eq!(
@@ -5669,10 +6098,10 @@ mod tests {
             AuthorityBoundary::Closed,
             "the control chain is bounded independently by its own (empty) cut",
         );
-        match h.owner_secrets_authority(add_b, b.fp) {
+        match h.owner_secrets_authority(OwnerId::from_bytes(add_b), b.fp) {
             AuthorityQuery::Effective(auth) => assert_eq!(
                 auth.device_boundary,
-                AuthorityBoundary::Cut { seq: 0, hash: s0 },
+                AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
                 "owner_secrets_authority device_boundary reflects the secrets register",
             ),
             other => panic!("expected an effective owner-secrets authority, got {other:?}"),
@@ -5686,21 +6115,24 @@ mod tests {
         // validated, joined watermark. (Mirrors the control owner-incarnation boundary.)
         let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&c, DeviceRole::Owner));
         let s0 = f.author_secrets_entry(&b, &b, 0, None);
         let demote_b = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &owner_demote_with_secrets(&b, add_b, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+            Some(f.genesis_hash.into()),
+            &owner_demote_with_secrets(&b, OwnerId::from_bytes(add_b), Cut::Empty, Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(s0),
+            }),
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&demote_b), "the demote is admitted — both cuts bind");
-        match h.owner_secrets_authority(add_b, b.fp) {
+        assert!(h.is_effective(&demote_b.into()), "the demote is admitted — both cuts bind");
+        match h.owner_secrets_authority(OwnerId::from_bytes(add_b), b.fp) {
             AuthorityQuery::Effective(auth) => assert_eq!(
                 auth.incarnation_boundary,
-                AuthorityBoundary::Cut { seq: 0, hash: s0 },
+                AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
                 "owner_secrets_authority incarnation_boundary reflects the secrets register",
             ),
             other => panic!("expected an effective owner-secrets authority, got {other:?}"),
@@ -5715,38 +6147,44 @@ mod tests {
         // the extend is effective — the gap B1 closes (a secrets extend used to park forever).
         let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&c, DeviceRole::Owner));
         // B's secrets chain s0 <- s1 <- s2 (log 1), so the extend's watermark descends the
         // remove's.
         let s0 = f.author_secrets_entry(&b, &b, 0, None);
-        let s1 = f.author_secrets_entry(&b, &b, 1, Some(s0));
-        let s2 = f.author_secrets_entry(&b, &b, 2, Some(s1));
+        let s1 = f.author_secrets_entry(&b, &b, 1, Some(AccountEntryHash::from_bytes(s0)));
+        let s2 = f.author_secrets_entry(&b, &b, 2, Some(AccountEntryHash::from_bytes(s1)));
         let remove_b = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &device_remove_with_secrets(&b, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+            Some(f.genesis_hash.into()),
+            &device_remove_with_secrets(&b, Cut::Empty, Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(s0),
+            }),
         );
         let extend = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &cut_extend_secrets(f.account_id, &b, None, 2, s2),
+            Some(f.genesis_hash.into()),
+            &cut_extend_secrets(f.account_id, &b, None, 2, AccountEntryHash::from_bytes(s2)),
         );
 
         // Without the extend, the boundary is the original seq-0 watermark.
         let before = f.fold_without(extend);
         assert_eq!(
-            before.roster_refs.get(&add_b).unwrap().secrets_boundary,
-            AuthorityBoundary::Cut { seq: 0, hash: s0 },
+            before.roster_refs.get(&add_b.into()).unwrap().secrets_boundary,
+            AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
         );
 
         // With the extend, the register joins to seq 2 and the extend is effective.
         let after = f.fold();
-        assert!(after.is_effective(&extend), "the secrets extend re-blesses and is effective");
-        assert!(after.is_effective(&remove_b));
+        assert!(
+            after.is_effective(&extend.into()),
+            "the secrets extend re-blesses and is effective"
+        );
+        assert!(after.is_effective(&remove_b.into()));
         assert_eq!(
-            after.roster_refs.get(&add_b).unwrap().secrets_boundary,
-            AuthorityBoundary::Cut { seq: 2, hash: s2 },
+            after.roster_refs.get(&add_b.into()).unwrap().secrets_boundary,
+            AuthorityBoundary::Cut { seq: 2, hash: AccountEntryHash::from_bytes(s2) },
             "secrets_boundary reflects the extend-raised (joined) watermark, not the raw cut",
         );
     }
@@ -5760,22 +6198,28 @@ mod tests {
         // to the secrets cut.
         let (fdr, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let add_c = f.author(&fdr, Some(f.genesis_hash), &device_add(&c, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let add_c = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&c, DeviceRole::Owner));
         let remove_b = f.author(
             &fdr,
-            Some(f.genesis_hash),
+            Some(f.genesis_hash.into()),
             // add_c is a held CONTROL-log entry — the wrong coordinate for a log-1 watermark on B.
-            &device_remove_with_secrets(&b, Cut::Empty, Cut::At { seq: 1, hash: add_c }),
+            &device_remove_with_secrets(&b, Cut::Empty, Cut::At {
+                seq: 1,
+                hash: AccountEntryHash::from_bytes(add_c),
+            }),
         );
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&remove_b),
+            h.outcome(&remove_b.into()),
             Some(Outcome::Rejected(RejectReason::CutTargetMismatch)),
             "a misbound secrets_cut rejects the whole remove",
         );
-        assert!(h.is_effective(&add_b), "B stays enrolled — the misbound remove never took effect");
+        assert!(
+            h.is_effective(&add_b.into()),
+            "B stays enrolled — the misbound remove never took effect"
+        );
     }
 
     #[test]
@@ -5787,19 +6231,25 @@ mod tests {
         // without an ancestry lookup, so the watermarks need not be held.)
         let (fdr, a, b, d) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&d, DeviceRole::Owner));
         // Control cuts Empty (comparable); secrets cuts at the same seq with distinct hashes.
         f.author(
             &a,
-            Some(add_a),
-            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: [0xaa; 32] }),
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes([0xaa; 32]),
+            }),
         );
         f.author(
             &b,
-            Some(add_b),
-            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: [0xbb; 32] }),
+            Some(OwnerId::from_bytes(add_b)),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes([0xbb; 32]),
+            }),
         );
 
         let h = f.fold();
@@ -5808,7 +6258,11 @@ mod tests {
             AccountClassification::Contested { state_before_depth: 1 },
             "incomparable secrets cuts for one key fold contested",
         );
-        assert!(h.is_effective(&add_a) && h.is_effective(&add_b) && h.is_effective(&add_d));
+        assert!(
+            h.is_effective(&add_a.into())
+                && h.is_effective(&add_b.into())
+                && h.is_effective(&add_d.into())
+        );
         // Arrival-order-free: the incomparable join is symmetric (I9).
         for rot in 0..f.entries.len() {
             assert_eq!(
@@ -5835,14 +6289,17 @@ mod tests {
         let mut f = Fixture::genesis(&fdr);
         // g is a DEEPER incarnation than the founder, so its cut sits at a strictly LATER stratum —
         // it deterministically joins AFTER the founder's remove installs d's registers.
-        let add_g = f.author(&fdr, Some(f.genesis_hash), &device_add(&g, DeviceRole::Owner));
-        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&e, DeviceRole::Owner)); // spare owner
+        let add_g = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&g, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&d, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&e, DeviceRole::Owner)); // spare owner
         // Founder removes d, installing d's control register (Empty) and secrets register (At{0}).
         let remove_d = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: [0x50; 32] }),
+            Some(f.genesis_hash.into()),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes([0x50; 32]),
+            }),
         );
         // g removes d again: its control cut WOULD raise d's control register (Empty ⊔ At{0} =
         // At{0}), but its secrets cut is undecidable — the higher watermark [0x52] is not held, so
@@ -5850,22 +6307,23 @@ mod tests {
         // secrets join parks.
         let remove_d_by_g = f.author(
             &g,
-            Some(add_g),
-            &device_remove_with_secrets(&d, Cut::At { seq: 0, hash: [0xc0; 32] }, Cut::At {
-                seq: 2,
-                hash: [0x52; 32],
-            }),
+            Some(OwnerId::from_bytes(add_g)),
+            &device_remove_with_secrets(
+                &d,
+                Cut::At { seq: 0, hash: AccountEntryHash::from_bytes([0xc0; 32]) },
+                Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0x52; 32]) },
+            ),
         );
 
         let h = f.fold();
         // g's op parks (one chain undecidable) — NOT effective.
         assert_eq!(
-            h.outcome(&remove_d_by_g),
+            h.outcome(&remove_d_by_g.into()),
             Some(Outcome::Parked(ParkReason::UnknownCutTarget)),
             "the op parks because one chain's cut is undecidable",
         );
-        assert!(h.is_effective(&remove_d), "the founder's remove is unaffected");
-        let fact = h.roster_refs.get(&add_d).expect("d has a roster fact");
+        assert!(h.is_effective(&remove_d.into()), "the founder's remove is unaffected");
+        let fact = h.roster_refs.get(&add_d.into()).expect("d has a roster fact");
         // DISCRIMINATOR: g parked, so it raised NEITHER register. d's control boundary stays at the
         // founder's Empty cut (Closed) — a commit-as-you-go join would have advanced it to
         // Cut{seq:0, hash:0xc0}.
@@ -5877,7 +6335,7 @@ mod tests {
         // And the secrets register stays at the founder's watermark too.
         assert_eq!(
             fact.secrets_boundary,
-            AuthorityBoundary::Cut { seq: 0, hash: [0x50; 32] },
+            AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes([0x50; 32]) },
             "a parked op must not advance the secrets register",
         );
         // Arrival-order-free: strata are content-derived, so the parked op raises no register under
@@ -5885,7 +6343,7 @@ mod tests {
         for rot in 0..f.entries.len() {
             let rotated = f.fold_rotated(rot);
             assert_eq!(
-                rotated.roster_refs.get(&add_d).unwrap().control_boundary,
+                rotated.roster_refs.get(&add_d.into()).unwrap().control_boundary,
                 AuthorityBoundary::Closed,
                 "rotation {rot}: the parked op still raises no register",
             );
@@ -5911,33 +6369,42 @@ mod tests {
         let (fdr, p, s) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let (a, d) = (Dev::new(4), Dev::new(5));
         let mut f = Fixture::genesis(&fdr);
-        let add_p = f.author(&fdr, Some(f.genesis_hash), &device_add(&p, DeviceRole::Owner));
-        f.author(&fdr, Some(f.genesis_hash), &device_add(&s, DeviceRole::Owner)); // spare owner
+        let add_p = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&p, DeviceRole::Owner));
+        f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&s, DeviceRole::Owner)); // spare owner
         // P (a depth-1 owner) mints A and D at depth 2 — so A's/D's own ops sit at stratum 2.
-        let add_a = f.author(&p, Some(add_p), &device_add(&a, DeviceRole::Owner));
-        let add_d = f.author(&p, Some(add_p), &device_add(&d, DeviceRole::Owner));
+        let add_a =
+            f.author(&p, Some(OwnerId::from_bytes(add_p)), &device_add(&a, DeviceRole::Owner));
+        let add_d =
+            f.author(&p, Some(OwnerId::from_bytes(add_p)), &device_add(&d, DeviceRole::Owner));
         // D removes A (a plain, valid mutual-removal partner: both cuts empty).
-        let d_removes_a =
-            f.author(&d, Some(add_d), &device_remove_with_secrets(&a, Cut::Empty, Cut::Empty));
+        let d_removes_a = f.author(
+            &d,
+            Some(OwnerId::from_bytes(add_d)),
+            &device_remove_with_secrets(&a, Cut::Empty, Cut::Empty),
+        );
         // F's early remove of D: at stratum 0 (before D is enrolled at stratum 1) it is
         // state-ineffective, but installs D's `Device{log:1}` secrets register (At{0}) and a
         // `Device{log:0}` control register whose cut names D's OWN op, so it condemns nothing D
         // does.
         f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &device_remove_with_secrets(&d, Cut::At { seq: 0, hash: d_removes_a }, Cut::At {
-                seq: 0,
-                hash: [0x50; 32],
-            }),
+            Some(f.genesis_hash.into()),
+            &device_remove_with_secrets(
+                &d,
+                Cut::At { seq: 0, hash: AccountEntryHash::from_bytes(d_removes_a) },
+                Cut::At { seq: 0, hash: AccountEntryHash::from_bytes([0x50; 32]) },
+            ),
         );
         // A removes D: its control cut WOULD condemn D's op (the A→D cycle edge), but its secrets
         // cut is undecidable against the pre-existing At{0} secrets register (higher watermark
         // [0x52] not held) → A parks, and must NOT drive cycle-detection.
         let a_removes_d = f.author(
             &a,
-            Some(add_a),
-            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 2, hash: [0x52; 32] }),
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At {
+                seq: 2,
+                hash: AccountEntryHash::from_bytes([0x52; 32]),
+            }),
         );
 
         let h = f.fold();
@@ -5949,10 +6416,16 @@ mod tests {
             AccountClassification::Live,
             "a parked op must not manufacture a contested cycle",
         );
-        assert!(h.is_effective(&d_removes_a), "D's valid removal of A takes effect");
-        assert!(!h.is_effective(&a_removes_d), "A's own removal never goes effective (it parked)");
+        assert!(h.is_effective(&d_removes_a.into()), "D's valid removal of A takes effect");
         assert!(
-            matches!(h.owner_incarnation_effective(add_a, a.fp), AuthorityQuery::Invalid(_)),
+            !h.is_effective(&a_removes_d.into()),
+            "A's own removal never goes effective (it parked)"
+        );
+        assert!(
+            matches!(
+                h.owner_incarnation_effective(OwnerId::from_bytes(add_a), a.fp),
+                AuthorityQuery::Invalid(_)
+            ),
             "A's incarnation is closed by D's removal",
         );
         // Order-independent (I9).
@@ -5982,22 +6455,33 @@ mod tests {
         // P is a depth-1 owner, so its extends sit at stratum 1 — AFTER the founder's stratum-0
         // remove installs D's secrets register (so the removal stays effective and D keeps a roster
         // fact whose secrets_boundary we can inspect on the contested fold).
-        let add_p = f.author(&fdr, Some(f.genesis_hash), &device_add(&p, DeviceRole::Owner));
-        let add_d = f.author(&fdr, Some(f.genesis_hash), &device_add(&d, DeviceRole::Owner));
+        let add_p = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&p, DeviceRole::Owner));
+        let add_d = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&d, DeviceRole::Owner));
         // D's secrets chain: s0, then an EQUIVOCATION at seq 1 (two distinct siblings off s0).
         let s0 = f.author_secrets_entry(&d, &d, 0, None);
-        let e1a = f.author_secrets_entry(&d, &t8, 1, Some(s0));
-        let e1b = f.author_secrets_entry(&d, &t9, 1, Some(s0));
+        let e1a = f.author_secrets_entry(&d, &t8, 1, Some(AccountEntryHash::from_bytes(s0)));
+        let e1b = f.author_secrets_entry(&d, &t9, 1, Some(AccountEntryHash::from_bytes(s0)));
         assert_ne!(e1a, e1b, "the two seq-1 secrets watermarks must be distinct");
         // Founder removes D (stratum 0, effective): installs D's secrets register at At{0, s0}.
         f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &device_remove_with_secrets(&d, Cut::Empty, Cut::At { seq: 0, hash: s0 }),
+            Some(f.genesis_hash.into()),
+            &device_remove_with_secrets(&d, Cut::Empty, Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(s0),
+            }),
         );
         // Two stratum-1 extends of D's secrets register to the two incomparable seq-1 watermarks.
-        f.author(&p, Some(add_p), &cut_extend_secrets(f.account_id, &d, None, 1, e1a));
-        f.author(&p, Some(add_p), &cut_extend_secrets(f.account_id, &d, None, 1, e1b));
+        f.author(
+            &p,
+            Some(OwnerId::from_bytes(add_p)),
+            &cut_extend_secrets(f.account_id, &d, None, 1, AccountEntryHash::from_bytes(e1a)),
+        );
+        f.author(
+            &p,
+            Some(OwnerId::from_bytes(add_p)),
+            &cut_extend_secrets(f.account_id, &d, None, 1, AccountEntryHash::from_bytes(e1b)),
+        );
 
         let h = f.fold();
         assert_eq!(
@@ -6007,11 +6491,13 @@ mod tests {
         );
         // DISCRIMINATOR: the contested stratum leaked NO watermark — D's secrets_boundary is still
         // the founder's original cut (At{0, s0}), NOT the first extend's raised At{1, e1a}.
-        let fact =
-            h.roster_refs.get(&add_d).expect("D has a roster fact from the stratum-0 remove");
+        let fact = h
+            .roster_refs
+            .get(&add_d.into())
+            .expect("D has a roster fact from the stratum-0 remove");
         assert_eq!(
             fact.secrets_boundary,
-            AuthorityBoundary::Cut { seq: 0, hash: s0 },
+            AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
             "a contested extend stratum must not leak the first extend's watermark",
         );
         // Order-independent (I9): same verdict + same non-leaked boundary under any rotation.
@@ -6023,8 +6509,8 @@ mod tests {
                 "rotation {rot}: same contested verdict",
             );
             assert_eq!(
-                rotated.roster_refs.get(&add_d).unwrap().secrets_boundary,
-                AuthorityBoundary::Cut { seq: 0, hash: s0 },
+                rotated.roster_refs.get(&add_d.into()).unwrap().secrets_boundary,
+                AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
                 "rotation {rot}: still no leaked watermark",
             );
         }
@@ -6038,20 +6524,29 @@ mod tests {
         // at `state.owners.len() == 1`. Guards against over-rejection by either.
         let (fdr, a, b) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let remove_b = f.author(&fdr, Some(f.genesis_hash), &device_remove(&b, Cut::Empty));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let remove_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_remove(&b, Cut::Empty));
 
         let h = f.fold();
         assert_eq!(h.classification(), AccountClassification::Live);
-        assert!(h.is_effective(&remove_b), "removing one of several owners is effective");
-        assert!(h.is_effective(&add_a) && h.is_effective(&add_b), "both devices were enrolled");
+        assert!(h.is_effective(&remove_b.into()), "removing one of several owners is effective");
         assert!(
-            matches!(h.owner_incarnation_effective(add_b, b.fp), AuthorityQuery::Invalid(_)),
+            h.is_effective(&add_a.into()) && h.is_effective(&add_b.into()),
+            "both devices were enrolled"
+        );
+        assert!(
+            matches!(
+                h.owner_incarnation_effective(OwnerId::from_bytes(add_b), b.fp),
+                AuthorityQuery::Invalid(_)
+            ),
             "B's owner incarnation is closed by the removal",
         );
         assert!(
-            matches!(h.owner_incarnation_effective(add_a, a.fp), AuthorityQuery::Effective(_)),
+            matches!(
+                h.owner_incarnation_effective(OwnerId::from_bytes(add_a), a.fp),
+                AuthorityQuery::Effective(_)
+            ),
             "A's owner incarnation stays open — the owner set is not emptied",
         );
     }
@@ -6068,23 +6563,26 @@ mod tests {
         // equivocation is genuine compromise.
         let (fdr, a) = (Dev::new(1), Dev::new(2));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
         // A removes the founder (A's seq 0), then equivocates its OWN removal at A's seq 1.
-        let remove_f =
-            f.author(&a, Some(add_a), &device_remove(&fdr, Cut::At { seq: 1, hash: add_a }));
+        let remove_f = f.author(
+            &a,
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove(&fdr, Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(add_a) }),
+        );
         let self_x = f.author_forked(
             &a,
-            Some(add_a),
-            &device_remove(&a, Cut::At { seq: 5, hash: [0xc1; 32] }),
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove(&a, Cut::At { seq: 5, hash: AccountEntryHash::from_bytes([0xc1; 32]) }),
             1,
-            Some(remove_f),
+            Some(AccountEntryHash::from_bytes(remove_f)),
         );
         let self_y = f.author_forked(
             &a,
-            Some(add_a),
-            &device_remove(&a, Cut::At { seq: 5, hash: [0xc2; 32] }),
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove(&a, Cut::At { seq: 5, hash: AccountEntryHash::from_bytes([0xc2; 32]) }),
             1,
-            Some(remove_f),
+            Some(AccountEntryHash::from_bytes(remove_f)),
         );
         let _ = (self_x, self_y);
 
@@ -6110,12 +6608,14 @@ mod tests {
         // CITED incarnation, not "is the device an owner".
         let (founder, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&founder);
-        f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let add_b2 = f.author(&founder, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
-        let op = f.author(&b, Some(add_b2), &device_add(&c, DeviceRole::Member));
+        f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let add_b2 =
+            f.author(&founder, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
+        let op =
+            f.author(&b, Some(OwnerId::from_bytes(add_b2)), &device_add(&c, DeviceRole::Member));
         let h = f.fold();
         assert_eq!(
-            h.outcome(&op),
+            h.outcome(&op.into()),
             Some(Outcome::Rejected(RejectReason::StaleAuthority)),
             "an op under a rejected incarnation is stale_authority",
         );
@@ -6206,25 +6706,41 @@ mod tests {
         // only the prefilter stops it.
         let (fdr, x, y) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let mut f = Fixture::genesis(&fdr);
-        let add_x = f.author(&fdr, Some(f.genesis_hash), &device_add(&x, DeviceRole::Owner));
+        let add_x = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&x, DeviceRole::Owner));
         // X (depth-1 owner) mints Y as a deeper owner, removes the founder, and demotes Y with a
         // cut that COVERS Y's later removal op — so Y's incarnation stays live and its removal is
         // admitted (not condemned) at depth 2.
-        let add_y = f.author(&x, Some(add_x), &device_add(&y, DeviceRole::Owner)); // X seq 0
-        let remove_x = f.author(&y, Some(add_y), &device_remove(&x, Cut::Empty)); // Y seq 0 (depth 2)
-        f.author(&x, Some(add_x), &owner_demote(&y, add_y, Cut::At { seq: 0, hash: remove_x })); // X seq 1
-        f.author(&x, Some(add_x), &device_remove(&fdr, Cut::At { seq: 1, hash: add_x })); // X seq 2
+        let add_y =
+            f.author(&x, Some(OwnerId::from_bytes(add_x)), &device_add(&y, DeviceRole::Owner)); // X seq 0
+        let remove_x =
+            f.author(&y, Some(OwnerId::from_bytes(add_y)), &device_remove(&x, Cut::Empty)); // Y seq 0 (depth 2)
+        f.author(
+            &x,
+            Some(OwnerId::from_bytes(add_x)),
+            &owner_demote(&y, OwnerId::from_bytes(add_y), Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(remove_x),
+            }),
+        ); // X seq 1
+        f.author(
+            &x,
+            Some(OwnerId::from_bytes(add_x)),
+            &device_remove(&fdr, Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(add_x) }),
+        ); // X seq 2
 
         let h = f.fold();
         assert_eq!(
-            h.outcome(&remove_x),
+            h.outcome(&remove_x.into()),
             Some(Outcome::Rejected(RejectReason::LastOwner)),
             "removing the sole remaining owner is reserved LastOwner by the intrinsic prefilter",
         );
         assert_eq!(h.classification(), AccountClassification::Live, "the account stays live");
-        assert!(!h.is_effective(&remove_x), "the sole-owner removal does not fold");
+        assert!(!h.is_effective(&remove_x.into()), "the sole-owner removal does not fold");
         assert!(
-            matches!(h.owner_incarnation_effective(add_x, x.fp), AuthorityQuery::Effective(_)),
+            matches!(
+                h.owner_incarnation_effective(OwnerId::from_bytes(add_x), x.fp),
+                AuthorityQuery::Effective(_)
+            ),
             "X's owner incarnation stays open — the owner set is never emptied",
         );
         // Arrival order cannot change the verdict (I9): the intrinsic prefilter is order-free.
@@ -6232,12 +6748,15 @@ mod tests {
             let r = f.fold_rotated(rot);
             assert_eq!(r.classification(), AccountClassification::Live, "rotation {rot} class");
             assert_eq!(
-                r.outcome(&remove_x),
+                r.outcome(&remove_x.into()),
                 Some(Outcome::Rejected(RejectReason::LastOwner)),
                 "rotation {rot}: still reserved LastOwner",
             );
             assert!(
-                matches!(r.owner_incarnation_effective(add_x, x.fp), AuthorityQuery::Effective(_)),
+                matches!(
+                    r.owner_incarnation_effective(OwnerId::from_bytes(add_x), x.fp),
+                    AuthorityQuery::Effective(_)
+                ),
                 "rotation {rot}: X stays the sole open owner",
             );
         }
@@ -6256,47 +6775,66 @@ mod tests {
         // vacuous-survivor lottery decided by the sort.
         let (fdr, a, b, c) = (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
         let mut f = Fixture::genesis(&fdr);
-        let add_a = f.author(&fdr, Some(f.genesis_hash), &device_add(&a, DeviceRole::Owner));
+        let add_a = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&a, DeviceRole::Owner));
         // A (depth-1 owner) mints B and C as deeper owners, then removes F and demotes C — leaving
         // the prior-depth owner set at depth 2 exactly {A, B}. C's demotion cut COVERS both of C's
         // later removals, so C's incarnation stays live and both cuts are admitted at depth 2.
-        let add_b = f.author(&a, Some(add_a), &device_add(&b, DeviceRole::Owner)); // A seq 0
-        let add_c = f.author(&a, Some(add_a), &device_add(&c, DeviceRole::Owner)); // A seq 1
-        let remove_a = f.author(&c, Some(add_c), &device_remove(&a, Cut::Empty)); // C seq 0 (depth 2)
-        let remove_b = f.author(&c, Some(add_c), &device_remove(&b, Cut::Empty)); // C seq 1 (depth 2)
-        f.author(&a, Some(add_a), &owner_demote(&c, add_c, Cut::At { seq: 1, hash: remove_b })); // A seq 2
-        f.author(&a, Some(add_a), &device_remove(&fdr, Cut::At { seq: 1, hash: add_a })); // A seq 3
+        let add_b =
+            f.author(&a, Some(OwnerId::from_bytes(add_a)), &device_add(&b, DeviceRole::Owner)); // A seq 0
+        let add_c =
+            f.author(&a, Some(OwnerId::from_bytes(add_a)), &device_add(&c, DeviceRole::Owner)); // A seq 1
+        let remove_a =
+            f.author(&c, Some(OwnerId::from_bytes(add_c)), &device_remove(&a, Cut::Empty)); // C seq 0 (depth 2)
+        let remove_b =
+            f.author(&c, Some(OwnerId::from_bytes(add_c)), &device_remove(&b, Cut::Empty)); // C seq 1 (depth 2)
+        f.author(
+            &a,
+            Some(OwnerId::from_bytes(add_a)),
+            &owner_demote(&c, OwnerId::from_bytes(add_c), Cut::At {
+                seq: 1,
+                hash: AccountEntryHash::from_bytes(remove_b),
+            }),
+        ); // A seq 2
+        f.author(
+            &a,
+            Some(OwnerId::from_bytes(add_a)),
+            &device_remove(&fdr, Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(add_a) }),
+        ); // A seq 3
 
         let h = f.fold();
         assert_eq!(h.classification(), AccountClassification::Live, "the standoff stays live");
         // Exactly one of the two same-depth removals folds; the other is reserved LastOwner.
-        let a_removed = h.is_effective(&remove_a);
-        let b_removed = h.is_effective(&remove_b);
+        let a_removed = h.is_effective(&remove_a.into());
+        let b_removed = h.is_effective(&remove_b.into());
         assert!(a_removed ^ b_removed, "exactly one owner removal folds — the other is reserved");
         let (effective, reserved) =
             if a_removed { (remove_a, remove_b) } else { (remove_b, remove_a) };
-        assert!(h.is_effective(&effective), "the first-in-order removal is effective");
+        assert!(h.is_effective(&effective.into()), "the first-in-order removal is effective");
         assert_eq!(
-            h.outcome(&reserved),
+            h.outcome(&reserved.into()),
             Some(Outcome::Rejected(RejectReason::LastOwner)),
             "the removal that would empty the owner set is reserved LastOwner",
         );
         // One owner incarnation stays open (the reserved survivor); the other is closed.
-        let a_open =
-            matches!(h.owner_incarnation_effective(add_a, a.fp), AuthorityQuery::Effective(_));
-        let b_open =
-            matches!(h.owner_incarnation_effective(add_b, b.fp), AuthorityQuery::Effective(_));
+        let a_open = matches!(
+            h.owner_incarnation_effective(OwnerId::from_bytes(add_a), a.fp),
+            AuthorityQuery::Effective(_)
+        );
+        let b_open = matches!(
+            h.owner_incarnation_effective(OwnerId::from_bytes(add_b), b.fp),
+            AuthorityQuery::Effective(_)
+        );
         assert!(a_open ^ b_open, "exactly one owner incarnation stays open");
         // Arrival order (I9): the SAME reserved survivor and verdict under every rotation.
         for rot in 0..f.entries.len() {
             let r = f.fold_rotated(rot);
             assert_eq!(r.classification(), AccountClassification::Live, "rotation {rot} class");
             assert_eq!(
-                r.outcome(&reserved),
+                r.outcome(&reserved.into()),
                 Some(Outcome::Rejected(RejectReason::LastOwner)),
                 "rotation {rot}: the same removal is reserved LastOwner",
             );
-            assert!(r.is_effective(&effective), "rotation {rot}: the same removal folds");
+            assert!(r.is_effective(&effective.into()), "rotation {rot}: the same removal folds");
         }
     }
 
@@ -6312,30 +6850,34 @@ mod tests {
         let (fdr, b, x) = (Dev::new(1), Dev::new(2), Dev::new(3));
         let grantee = AccountId::from_bytes([0x44; 32]);
         let mut f = Fixture::genesis(&fdr);
-        let add_b = f.author(&fdr, Some(f.genesis_hash), &device_add(&b, DeviceRole::Owner));
+        let add_b = f.author(&fdr, Some(f.genesis_hash.into()), &device_add(&b, DeviceRole::Owner));
         // B's control chain (per-device seq numbering starts at 0 on B's own chain — add_b lives on
         // F's chain, not B's): StreamOwn (seq 0), StreamGrant (seq 1), a member add BEYOND the cut
         // (seq 2).
         let (stream, own_op) = stream_own(f.account_id);
-        let own = f.author(&b, Some(add_b), &own_op); // B seq 0
-        let grant = f.author(&b, Some(add_b), &stream_grant(stream, grantee)); // B seq 1
-        let beyond = f.author(&b, Some(add_b), &device_add(&x, DeviceRole::Member)); // B seq 2
+        let own = f.author(&b, Some(OwnerId::from_bytes(add_b)), &own_op); // B seq 0
+        let grant = f.author(&b, Some(OwnerId::from_bytes(add_b)), &stream_grant(stream, grantee)); // B seq 1
+        let beyond =
+            f.author(&b, Some(OwnerId::from_bytes(add_b)), &device_add(&x, DeviceRole::Member)); // B seq 2
         // F removes B with the valid prefix pinned AT the grant (B seq 1) — own + grant are within.
         let remove_b = f.author(
             &fdr,
-            Some(f.genesis_hash),
-            &device_remove(&b, Cut::At { seq: 1, hash: grant }),
+            Some(f.genesis_hash.into()),
+            &device_remove(&b, Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(grant) }),
         );
 
         let h = f.fold();
-        assert!(h.is_effective(&remove_b), "the removal of B is effective");
-        assert!(h.is_effective(&own), "B's within-cut StreamOwn survives the removal (no cascade)");
+        assert!(h.is_effective(&remove_b.into()), "the removal of B is effective");
         assert!(
-            h.is_effective(&grant),
+            h.is_effective(&own.into()),
+            "B's within-cut StreamOwn survives the removal (no cascade)"
+        );
+        assert!(
+            h.is_effective(&grant.into()),
             "B's within-cut StreamGrant survives the removal (no cascade)",
         );
         assert_eq!(
-            h.grant_effective(grant, stream, grantee),
+            h.grant_effective(GrantId::from_bytes(grant), stream, grantee),
             AuthorityQuery::Effective(GrantAuthority {
                 stream_id: stream,
                 grantee_account_id: grantee,
@@ -6344,7 +6886,7 @@ mod tests {
             "the grant stays queryable authority after its author is removed",
         );
         assert_eq!(
-            h.outcome(&beyond),
+            h.outcome(&beyond.into()),
             Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
             "B's op beyond the cut is condemned — the prefix is bounded, the within-cut grant is \
              not",
@@ -6352,9 +6894,9 @@ mod tests {
         // Arrival order (I9): same no-cascade result under every rotation.
         for rot in 0..f.entries.len() {
             let r = f.fold_rotated(rot);
-            assert!(r.is_effective(&grant), "rotation {rot}: grant survives");
+            assert!(r.is_effective(&grant.into()), "rotation {rot}: grant survives");
             assert_eq!(
-                r.grant_effective(grant, stream, grantee),
+                r.grant_effective(GrantId::from_bytes(grant), stream, grantee),
                 AuthorityQuery::Effective(GrantAuthority {
                     stream_id: stream,
                     grantee_account_id: grantee,
@@ -6363,7 +6905,7 @@ mod tests {
                 "rotation {rot}: grant stays effective",
             );
             assert_eq!(
-                r.outcome(&beyond),
+                r.outcome(&beyond.into()),
                 Some(Outcome::Condemned(CondemnedReason::BeyondCut)),
                 "rotation {rot}: beyond-cut op condemned",
             );

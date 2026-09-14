@@ -48,7 +48,7 @@ fn author_control_op(conn: &Connection, account: super::super::AccountId, op: &A
         crypto_suite: 0,
         auth_len: storage::account_effective_count(&tx, account).unwrap(),
         key_id: None,
-        authority_ref: Some(genesis_hash),
+        authority_ref: Some(genesis_hash.into()),
     };
     let payload = control_ops::encode(op).unwrap();
     let signed = sign_account_entry(founder.secret(), &header, &payload).unwrap();

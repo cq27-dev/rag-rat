@@ -3,6 +3,7 @@
 use super::AccountId;
 use super::envelope::{AccountEntryHeader, sign_account_entry};
 use super::fold::CONTROL_LOG;
+use super::id::{AccountEntryHash, OwnerId};
 use super::ops::{self as control_ops, AccountOp};
 use crate::device::{DeviceSecret, DeviceX25519Secret};
 use crate::op::DeviceFingerprint;
@@ -31,10 +32,10 @@ pub(in crate::account) fn control_op(
     account: AccountId,
     signer: &Dev,
     seq: u64,
-    prev: Option<[u8; 32]>,
-    authority_ref: Option<[u8; 32]>,
+    prev: Option<AccountEntryHash>,
+    authority_ref: Option<OwnerId>,
     op: &AccountOp,
-) -> (Vec<u8>, [u8; 32]) {
+) -> (Vec<u8>, AccountEntryHash) {
     let payload = control_ops::encode(op).unwrap();
     let header = AccountEntryHeader {
         account_id: account,

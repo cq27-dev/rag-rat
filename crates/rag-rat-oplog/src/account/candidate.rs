@@ -12,16 +12,17 @@ use super::AccountId;
 use super::branch::{self, AncestryRelation, UnknownAncestry, WalkEnd};
 use super::cut::Cut;
 use super::envelope::AccountEntryHeader;
+use super::id::AccountEntryHash;
 use crate::op::DeviceFingerprint;
 
 /// A read view over candidate entries keyed by `entry_hash` — the seam the ancestry walk and cut
 /// binding use without depending on the fold's storage.
 pub(super) trait HeaderView {
-    fn header(&self, entry_hash: &[u8; 32]) -> Option<&AccountEntryHeader>;
+    fn header(&self, entry_hash: &AccountEntryHash) -> Option<&AccountEntryHeader>;
 }
 
-impl HeaderView for HashMap<[u8; 32], AccountEntryHeader> {
-    fn header(&self, entry_hash: &[u8; 32]) -> Option<&AccountEntryHeader> {
+impl HeaderView for HashMap<AccountEntryHash, AccountEntryHeader> {
+    fn header(&self, entry_hash: &AccountEntryHash) -> Option<&AccountEntryHeader> {
         self.get(entry_hash)
     }
 }
@@ -29,7 +30,11 @@ impl HeaderView for HashMap<[u8; 32], AccountEntryHeader> {
 /// Walk `prev_hash` from `cut`'s watermark and decide whether `target` lies on that branch (§11). A
 /// withheld watermark / missing link parks (`Unknown`); it NEVER flips an on/off verdict. `Empty`
 /// has no branch, so ancestry is `OffBranch` (callers test [`super::cut::beyond`] first).
-pub(super) fn ancestry(target: &[u8; 32], cut: &Cut, view: &dyn HeaderView) -> AncestryRelation {
+pub(super) fn ancestry(
+    target: &AccountEntryHash,
+    cut: &Cut,
+    view: &dyn HeaderView,
+) -> AncestryRelation {
     let Some(watermark) = cut.hash() else {
         return AncestryRelation::OffBranch;
     };
@@ -148,10 +153,10 @@ mod tests {
     /// Build a header at `(account 0xaa, log 0, device 0xbb, seq)` with `prev_hash`, keyed in
     /// `view` under `entry_hash`.
     fn insert_chain_entry(
-        view: &mut HashMap<[u8; 32], AccountEntryHeader>,
-        entry_hash: [u8; 32],
+        view: &mut HashMap<AccountEntryHash, AccountEntryHeader>,
+        entry_hash: AccountEntryHash,
         seq: u64,
-        prev_hash: Option<[u8; 32]>,
+        prev_hash: Option<AccountEntryHash>,
     ) {
         view.insert(entry_hash, AccountEntryHeader {
             account_id: AccountId::from_bytes([0xaa; 32]),
@@ -170,23 +175,33 @@ mod tests {
     }
 
     /// A three-entry chain g(seq0) <- m(seq1) <- t(seq2), hashes g/m/t.
-    fn linear_chain() -> HashMap<[u8; 32], AccountEntryHeader> {
+    fn linear_chain() -> HashMap<AccountEntryHash, AccountEntryHeader> {
         let mut view = HashMap::new();
-        insert_chain_entry(&mut view, [0x0a; 32], 0, None);
-        insert_chain_entry(&mut view, [0x0b; 32], 1, Some([0x0a; 32]));
-        insert_chain_entry(&mut view, [0x0c; 32], 2, Some([0x0b; 32]));
+        insert_chain_entry(&mut view, AccountEntryHash::from_bytes([0x0a; 32]), 0, None);
+        insert_chain_entry(
+            &mut view,
+            AccountEntryHash::from_bytes([0x0b; 32]),
+            1,
+            Some(AccountEntryHash::from_bytes([0x0a; 32])),
+        );
+        insert_chain_entry(
+            &mut view,
+            AccountEntryHash::from_bytes([0x0c; 32]),
+            2,
+            Some(AccountEntryHash::from_bytes([0x0b; 32])),
+        );
         view
     }
 
     #[test]
     fn ancestry_on_and_off_branch() {
         let view = linear_chain();
-        let cut = Cut::At { seq: 2, hash: [0x0c; 32] };
+        let cut = Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0x0c; 32]) };
         // g and m are ancestors of the seq-2 watermark; a stranger is not.
-        assert_eq!(ancestry(&[0x0a; 32], &cut, &view), Ancestry::OnBranch);
-        assert_eq!(ancestry(&[0x0b; 32], &cut, &view), Ancestry::OnBranch);
-        assert_eq!(ancestry(&[0x0c; 32], &cut, &view), Ancestry::OnBranch);
-        assert_eq!(ancestry(&[0xff; 32], &cut, &view), Ancestry::OffBranch);
+        assert_eq!(ancestry(&[0x0a; 32].into(), &cut, &view), Ancestry::OnBranch);
+        assert_eq!(ancestry(&[0x0b; 32].into(), &cut, &view), Ancestry::OnBranch);
+        assert_eq!(ancestry(&[0x0c; 32].into(), &cut, &view), Ancestry::OnBranch);
+        assert_eq!(ancestry(&[0xff; 32].into(), &cut, &view), Ancestry::OffBranch);
     }
 
     #[test]
@@ -194,12 +209,12 @@ mod tests {
         let mut view = linear_chain(); // g/m/t on (account 0xaa, log 0, device 0xbb)
         // A forged watermark on device 0xbb whose prev_hash points at an entry on a DIFFERENT
         // device chain (0xcc) — a fabricated cross-device link, not a real predecessor.
-        view.insert([0xf0; 32], AccountEntryHeader {
+        view.insert(AccountEntryHash::from_bytes([0xf0; 32]), AccountEntryHeader {
             account_id: AccountId::from_bytes([0xaa; 32]),
             log_id: 0,
             device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
             seq: 5,
-            prev_hash: Some([0xcc; 32]), // points off-chain
+            prev_hash: Some(AccountEntryHash::from_bytes([0xcc; 32])), // points off-chain
             parent_ref: None,
             entry_type: 3,
             op_version: 1,
@@ -208,7 +223,7 @@ mod tests {
             key_id: None,
             authority_ref: None,
         });
-        view.insert([0xcc; 32], AccountEntryHeader {
+        view.insert(AccountEntryHash::from_bytes([0xcc; 32]), AccountEntryHeader {
             account_id: AccountId::from_bytes([0xaa; 32]),
             log_id: 0,
             device_fingerprint: DeviceFingerprint::from_bytes([0xcc; 32]), // foreign device
@@ -223,25 +238,35 @@ mod tests {
             authority_ref: None,
         });
         // The foreign entry is NOT on the forged watermark's branch — the link is rejected.
-        let forged = Cut::At { seq: 5, hash: [0xf0; 32] };
-        assert_eq!(ancestry(&[0xcc; 32], &forged, &view), Ancestry::OffBranch);
+        let forged = Cut::At { seq: 5, hash: AccountEntryHash::from_bytes([0xf0; 32]) };
+        assert_eq!(ancestry(&[0xcc; 32].into(), &forged, &view), Ancestry::OffBranch);
 
         // A non-decreasing-seq link is forged: a watermark at seq 1 whose prev points at a
         // same-device entry at seq 1 (not a lower slot).
         let mut v2 = HashMap::new();
-        insert_chain_entry(&mut v2, [0x01; 32], 1, Some([0x02; 32]));
-        insert_chain_entry(&mut v2, [0x02; 32], 1, None); // sibling at the SAME seq
-        let flat = Cut::At { seq: 1, hash: [0x01; 32] };
-        assert_eq!(ancestry(&[0x02; 32], &flat, &v2), Ancestry::OffBranch);
+        insert_chain_entry(
+            &mut v2,
+            AccountEntryHash::from_bytes([0x01; 32]),
+            1,
+            Some(AccountEntryHash::from_bytes([0x02; 32])),
+        );
+        insert_chain_entry(&mut v2, AccountEntryHash::from_bytes([0x02; 32]), 1, None); // sibling at the SAME seq
+        let flat = Cut::At { seq: 1, hash: AccountEntryHash::from_bytes([0x01; 32]) };
+        assert_eq!(ancestry(&[0x02; 32].into(), &flat, &v2), Ancestry::OffBranch);
 
         // A seq-SKIPPING link is forged: a chain must be contiguous, so a seq-5 header whose prev
         // is seq 3 (skipping 4) is off-branch — otherwise the skipped slots would look
         // off-branch.
         let mut v3 = HashMap::new();
-        insert_chain_entry(&mut v3, [0x05; 32], 5, Some([0x03; 32]));
-        insert_chain_entry(&mut v3, [0x03; 32], 3, None);
-        let skip = Cut::At { seq: 5, hash: [0x05; 32] };
-        assert_eq!(ancestry(&[0x03; 32], &skip, &v3), Ancestry::OffBranch);
+        insert_chain_entry(
+            &mut v3,
+            AccountEntryHash::from_bytes([0x05; 32]),
+            5,
+            Some(AccountEntryHash::from_bytes([0x03; 32])),
+        );
+        insert_chain_entry(&mut v3, AccountEntryHash::from_bytes([0x03; 32]), 3, None);
+        let skip = Cut::At { seq: 5, hash: AccountEntryHash::from_bytes([0x05; 32]) };
+        assert_eq!(ancestry(&[0x03; 32].into(), &skip, &v3), Ancestry::OffBranch);
     }
 
     #[test]
@@ -250,19 +275,24 @@ mod tests {
         // points at that entry is a non-contiguous (forged) link — it must be rejected as
         // off-branch, not overflow `seq + 1` and panic the fold on a checked build.
         let mut view = HashMap::new();
-        insert_chain_entry(&mut view, [0xff; 32], u64::MAX, None);
-        insert_chain_entry(&mut view, [0xf0; 32], 0, Some([0xff; 32]));
-        let cut = Cut::At { seq: 0, hash: [0xf0; 32] };
-        assert_eq!(ancestry(&[0xff; 32], &cut, &view), Ancestry::OffBranch);
+        insert_chain_entry(&mut view, AccountEntryHash::from_bytes([0xff; 32]), u64::MAX, None);
+        insert_chain_entry(
+            &mut view,
+            AccountEntryHash::from_bytes([0xf0; 32]),
+            0,
+            Some(AccountEntryHash::from_bytes([0xff; 32])),
+        );
+        let cut = Cut::At { seq: 0, hash: AccountEntryHash::from_bytes([0xf0; 32]) };
+        assert_eq!(ancestry(&[0xff; 32].into(), &cut, &view), Ancestry::OffBranch);
     }
 
     #[test]
     fn ancestry_parks_on_a_withheld_watermark_but_not_forever() {
         let view = linear_chain();
         // A watermark we don't hold ⇒ Unknown(UnknownCutTarget), never a flipped verdict (I11).
-        let cut = Cut::At { seq: 9, hash: [0x99; 32] };
+        let cut = Cut::At { seq: 9, hash: AccountEntryHash::from_bytes([0x99; 32]) };
         assert_eq!(
-            ancestry(&[0x0a; 32], &cut, &view),
+            ancestry(&[0x0a; 32].into(), &cut, &view),
             Ancestry::Unknown(UnknownCause::UnknownCutTarget),
         );
     }
@@ -271,10 +301,15 @@ mod tests {
     fn ancestry_parks_on_a_missing_mid_chain_link() {
         // Hold the seq-2 watermark but NOT its predecessor: the walk can't reach the target.
         let mut view = HashMap::new();
-        insert_chain_entry(&mut view, [0x0c; 32], 2, Some([0x0b; 32]));
-        let cut = Cut::At { seq: 2, hash: [0x0c; 32] };
+        insert_chain_entry(
+            &mut view,
+            AccountEntryHash::from_bytes([0x0c; 32]),
+            2,
+            Some(AccountEntryHash::from_bytes([0x0b; 32])),
+        );
+        let cut = Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0x0c; 32]) };
         assert_eq!(
-            ancestry(&[0x0a; 32], &cut, &view),
+            ancestry(&[0x0a; 32].into(), &cut, &view),
             Ancestry::Unknown(UnknownCause::IncompleteCutAncestry),
         );
     }
@@ -289,25 +324,41 @@ mod tests {
         };
         // The seq-2 watermark names (aa,0,bb,2) — Ok.
         assert_eq!(
-            validate_cut_target(&Cut::At { seq: 2, hash: [0x0c; 32] }, &coord, &view),
+            validate_cut_target(
+                &Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0x0c; 32]) },
+                &coord,
+                &view
+            ),
             CutBinding::Ok
         );
         // Empty is always Ok (no target).
         assert_eq!(validate_cut_target(&Cut::Empty, &coord, &view), CutBinding::Ok);
         // A watermark whose entry claims seq 2 but the cut says seq 1 ⇒ Mismatch.
         assert_eq!(
-            validate_cut_target(&Cut::At { seq: 1, hash: [0x0c; 32] }, &coord, &view),
+            validate_cut_target(
+                &Cut::At { seq: 1, hash: AccountEntryHash::from_bytes([0x0c; 32]) },
+                &coord,
+                &view
+            ),
             CutBinding::Mismatch
         );
         // A different device coordinate ⇒ Mismatch.
         let other = CutCoordinate { device: DeviceFingerprint::from_bytes([0xcc; 32]), ..coord };
         assert_eq!(
-            validate_cut_target(&Cut::At { seq: 2, hash: [0x0c; 32] }, &other, &view),
+            validate_cut_target(
+                &Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0x0c; 32]) },
+                &other,
+                &view
+            ),
             CutBinding::Mismatch
         );
         // A not-yet-held watermark parks.
         assert_eq!(
-            validate_cut_target(&Cut::At { seq: 5, hash: [0x55; 32] }, &coord, &view),
+            validate_cut_target(
+                &Cut::At { seq: 5, hash: AccountEntryHash::from_bytes([0x55; 32]) },
+                &coord,
+                &view
+            ),
             CutBinding::TargetNotHeld
         );
     }
@@ -315,31 +366,54 @@ mod tests {
     #[test]
     fn join_extends_on_one_branch_and_flags_incomparable_forks() {
         let view = linear_chain();
-        let lo = Cut::At { seq: 1, hash: [0x0b; 32] };
-        let hi = Cut::At { seq: 2, hash: [0x0c; 32] };
+        let lo = Cut::At { seq: 1, hash: AccountEntryHash::from_bytes([0x0b; 32]) };
+        let hi = Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0x0c; 32]) };
         // hi descends lo ⇒ Extended(hi).
         assert_eq!(join_cuts(&lo, &hi, &view), JoinResult::Extended(hi.clone()));
         assert_eq!(join_cuts(&hi, &lo, &view), JoinResult::Extended(hi.clone()));
         // Empty ⊔ anything = anything.
         assert_eq!(join_cuts(&Cut::Empty, &hi, &view), JoinResult::Extended(hi.clone()));
         // Equal seq, different hash ⇒ Incomparable (the contested trigger).
-        let other_at_2 = Cut::At { seq: 2, hash: [0xee; 32] };
+        let other_at_2 = Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0xee; 32]) };
         assert_eq!(join_cuts(&hi, &other_at_2, &view), JoinResult::Incomparable);
         // Higher seq on a FULLY-HELD divergent branch (forks at genesis) ⇒ OffBranch ⇒
         // Incomparable.
         let mut forked = view.clone();
-        insert_chain_entry(&mut forked, [0xd1; 32], 1, Some([0x0a; 32])); // sibling of 0x0b off genesis
-        insert_chain_entry(&mut forked, [0xd2; 32], 2, Some([0xd1; 32]));
+        insert_chain_entry(
+            &mut forked,
+            AccountEntryHash::from_bytes([0xd1; 32]),
+            1,
+            Some(AccountEntryHash::from_bytes([0x0a; 32])),
+        ); // sibling of 0x0b off genesis
+        insert_chain_entry(
+            &mut forked,
+            AccountEntryHash::from_bytes([0xd2; 32]),
+            2,
+            Some(AccountEntryHash::from_bytes([0xd1; 32])),
+        );
         assert_eq!(
-            join_cuts(&lo, &Cut::At { seq: 2, hash: [0xd2; 32] }, &forked),
+            join_cuts(
+                &lo,
+                &Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0xd2; 32]) },
+                &forked
+            ),
             JoinResult::Incomparable,
         );
         // Higher seq whose branch has a WITHHELD predecessor ⇒ Unknown (park, never a flipped
         // verdict).
         let mut incomplete = view.clone();
-        insert_chain_entry(&mut incomplete, [0xdd; 32], 3, Some([0xff; 32])); // 0xff is not held
+        insert_chain_entry(
+            &mut incomplete,
+            AccountEntryHash::from_bytes([0xdd; 32]),
+            3,
+            Some(AccountEntryHash::from_bytes([0xff; 32])),
+        ); // 0xff is not held
         assert_eq!(
-            join_cuts(&lo, &Cut::At { seq: 3, hash: [0xdd; 32] }, &incomplete),
+            join_cuts(
+                &lo,
+                &Cut::At { seq: 3, hash: AccountEntryHash::from_bytes([0xdd; 32]) },
+                &incomplete
+            ),
             JoinResult::Unknown,
         );
     }

@@ -45,6 +45,7 @@ use super::super::envelope::{
     AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, signed_entry_len,
 };
 use super::super::fold::{EntryStatus, SECRETS_LOG, SUPPORTED_OP_VERSION};
+use super::super::id::{AccountEntryHash, OwnerId};
 use super::super::keywrap::{self, ContentKey, SealedKeyWrap, WrapContext};
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
@@ -54,8 +55,6 @@ use crate::identity::LocalDevice;
 use crate::local_device;
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
-
-type AccountEntryHash = [u8; 32];
 
 /// The key epoch a stream's content key first mints at. C4.4 lazy rotation bumps it on device
 /// removal; C4.3a only ever mints the initial epoch.
@@ -550,14 +549,14 @@ pub(in crate::account) fn single_recipient_wrap_envelope_bytes() -> usize {
         log_id: SECRETS_LOG,
         device_fingerprint: DeviceFingerprint::from_bytes([u8::MAX; 32]),
         seq: u64::MAX,
-        prev_hash: Some([u8::MAX; 32]),
-        parent_ref: Some([u8::MAX; 32]),
+        prev_hash: Some(AccountEntryHash::from_bytes([u8::MAX; 32])),
+        parent_ref: Some(AccountEntryHash::from_bytes([u8::MAX; 32])),
         entry_type: ops::entry_type_of(&wrap),
         op_version: SUPPORTED_OP_VERSION,
         crypto_suite: 0,
         auth_len: u64::MAX,
         key_id: None,
-        authority_ref: Some([u8::MAX; 32]),
+        authority_ref: Some(OwnerId::from_bytes([u8::MAX; 32])),
     };
     signed_entry_len(&header, &payload)
 }
@@ -813,7 +812,7 @@ mod tests {
             lamport: 0,
             prev_hash: None,
             grant_id: None,
-            roster_ref: genesis_hash,
+            roster_ref: genesis_hash.into(),
             owner_auth_len: 0,
             author_auth_len: 0,
             crypto_suite: 0,
@@ -876,7 +875,7 @@ mod tests {
         conn: &Connection,
         account: AccountId,
         signer: &crate::device::DeviceSecret,
-        authority_ref: AccountEntryHash,
+        authority_ref: OwnerId,
         wrap: &StreamKeyWrap,
     ) -> AccountEntryHash {
         let LocalAccountRef { genesis_hash, .. } =
@@ -1248,7 +1247,7 @@ mod tests {
             &conn,
             account,
             &remote_owner,
-            remote_authority,
+            remote_authority.into(),
             &remote_wrap,
         );
         let before: i64 = conn
@@ -1323,7 +1322,7 @@ mod tests {
             &conn,
             account,
             &remote_owner,
-            remote_authority,
+            remote_authority.into(),
             &remote_wrap,
         );
 
@@ -1400,7 +1399,11 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].0, 2);
-        assert_eq!(rows[0].1, b.to_vec(), "the batch starts at the shared pre-batch tail");
+        assert_eq!(
+            rows[0].1,
+            b.as_slice().to_vec(),
+            "the batch starts at the shared pre-batch tail"
+        );
         assert_eq!(rows[1].0, 3);
         assert_eq!(rows[1].1, rows[0].2, "the second stream chains from the first sibling");
         assert_eq!(header_of(&conn, &a).seq, 0);
@@ -1833,13 +1836,19 @@ mod tests {
             .expect("the founder has a control chain");
         let secrets_tail = chain_tail(&conn, account, founder.fingerprint(), SECRETS_LOG)
             .expect("the founder authored the mint on its secrets chain");
-        author_control_op_as(&conn, account, &owner_b_ed, owner_id_b, &AccountOp::OwnerDemote {
-            device_fingerprint: founder.fingerprint(),
-            owner_id: founder_owner_id,
-            control_cut: Cut::At { seq: ctrl_tail.0, hash: ctrl_tail.1 },
-            secrets_cut: Cut::At { seq: secrets_tail.0, hash: secrets_tail.1 },
-            reason: "demote".to_string(),
-        });
+        author_control_op_as(
+            &conn,
+            account,
+            &owner_b_ed,
+            owner_id_b.into(),
+            &AccountOp::OwnerDemote {
+                device_fingerprint: founder.fingerprint(),
+                owner_id: founder_owner_id,
+                control_cut: Cut::At { seq: ctrl_tail.0, hash: ctrl_tail.1 },
+                secrets_cut: Cut::At { seq: secrets_tail.0, hash: secrets_tail.1 },
+                reason: "demote".to_string(),
+            },
+        );
 
         // The founder is now a plain member: still a recipient (can seal), but not an owner.
         assert!(
@@ -1916,7 +1925,7 @@ mod tests {
         conn: &Connection,
         account: AccountId,
         signer: &crate::device::DeviceSecret,
-        authority_ref: AccountEntryHash,
+        authority_ref: OwnerId,
         op: &AccountOp,
     ) -> AccountEntryHash {
         use crate::account::ops as control_ops;
@@ -1985,7 +1994,7 @@ mod tests {
             crypto_suite: 0,
             auth_len: storage::account_effective_count(&tx, account).unwrap(),
             key_id: None,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(genesis_hash.into()),
         };
         let payload = control_ops::encode(op).unwrap();
         let signed = sign_account_entry(founder.secret(), &header, &payload).unwrap();
@@ -2059,14 +2068,14 @@ mod tests {
             log_id: CONTROL_LOG,
             device_fingerprint: founder.fingerprint(),
             seq: 99, // stranded slot with a bogus predecessor ⇒ parked, never effective
-            prev_hash: Some([0xee; 32]),
+            prev_hash: Some(AccountEntryHash::from_bytes([0xee; 32])),
             parent_ref: Some(genesis_hash),
             entry_type: control_ops::entry_type_of(&add_bad),
             op_version: 1,
             crypto_suite: 0,
             auth_len: 0,
             key_id: None,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(genesis_hash.into()),
         };
         let payload = control_ops::encode(&add_bad).unwrap();
         let signed = sign_account_entry(founder.secret(), &header, &payload).unwrap();
@@ -2204,8 +2213,8 @@ mod wrap_packing_tests {
             log_id: SECRETS_LOG,
             device_fingerprint: device.fingerprint(),
             seq: u64::MAX,
-            prev_hash: Some([0xff; 32]),
-            parent_ref: Some([0xff; 32]),
+            prev_hash: Some(AccountEntryHash::from_bytes([0xff; 32])),
+            parent_ref: Some(AccountEntryHash::from_bytes([0xff; 32])),
             entry_type: ops::entry_type::STREAM_KEY_WRAP,
             op_version: SUPPORTED_OP_VERSION,
             crypto_suite: 0,
@@ -2214,7 +2223,7 @@ mod wrap_packing_tests {
             // Every OTHER field is at its widest so the reserve is measured against the largest
             // header a real wrap op can have.
             key_id: None,
-            authority_ref: Some([0xff; 32]),
+            authority_ref: Some(OwnerId::from_bytes([0xff; 32])),
         };
         let signed = sign_account_entry(device.secret(), &header, &payload)
             .expect("a maximally packed op must sign within the envelope");

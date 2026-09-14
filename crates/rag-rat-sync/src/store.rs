@@ -188,7 +188,7 @@ impl SyncStore for OplogSyncStore<'_> {
         };
         Ok(entries
             .into_iter()
-            .map(|e| (account_signed_hash(&e.signed_bytes), e.signed_bytes))
+            .map(|e| (account_signed_hash(&e.signed_bytes).to_bytes(), e.signed_bytes))
             .collect())
     }
 
@@ -300,7 +300,7 @@ impl SyncStore for OplogContentSyncStore<'_> {
         };
         Ok(entries
             .into_iter()
-            .map(|e| (content_signed_hash(&e.signed_bytes), e.signed_bytes))
+            .map(|e| (content_signed_hash(&e.signed_bytes).to_bytes(), e.signed_bytes))
             .collect())
     }
 

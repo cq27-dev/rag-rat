@@ -35,7 +35,7 @@ use super::AccountId;
 use super::envelope::{
     self, AccountEntryHeader, SignedAccountEntry, VerifiedAccountEntry, sign_account_entry,
 };
-use super::id::account_id_from_genesis_payload;
+use super::id::{self, AccountEntryHash};
 use super::ops::{self, AccountOp};
 use super::storage::{self, CandidateInsert};
 use crate::local_device;
@@ -76,7 +76,7 @@ pub fn local_account(conn: &Connection, now_ms: i64) -> anyhow::Result<AccountId
 pub fn adopt_local_account(
     conn: &Connection,
     account_id: AccountId,
-    genesis_hash: [u8; 32],
+    genesis_hash: AccountEntryHash,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     if let Some(existing) = read_local_account(conn)? {
@@ -97,9 +97,9 @@ pub fn adopt_local_account(
 pub struct EnrollmentBootstrap<'a> {
     pub account_entries: &'a [Vec<u8>],
     pub account_id: AccountId,
-    pub genesis_hash: [u8; 32],
+    pub genesis_hash: AccountEntryHash,
     pub device_fingerprint: DeviceFingerprint,
-    pub device_add_hash: [u8; 32],
+    pub device_add_hash: AccountEntryHash,
     pub now_ms: i64,
 }
 
@@ -201,7 +201,7 @@ pub fn prune_account_candidate_reservations_in_tx(
 pub fn held_account_entry_hashes(
     conn: &Connection,
     account_id: AccountId,
-) -> anyhow::Result<Vec<[u8; 32]>> {
+) -> anyhow::Result<Vec<AccountEntryHash>> {
     let mut stmt = conn.prepare(
         "SELECT entry_hash FROM account_entries WHERE account_id = ?1 ORDER BY entry_hash",
     )?;
@@ -215,7 +215,7 @@ pub fn held_account_entry_hashes(
     hashes
         .into_iter()
         .map(|hash| {
-            <[u8; 32]>::try_from(hash.as_slice())
+            AccountEntryHash::try_from(hash.as_slice())
                 .map_err(|_| anyhow::anyhow!("stored entry_hash is not exactly 32 bytes"))
         })
         .collect()
@@ -340,7 +340,7 @@ pub fn adopt_enrollment_bootstrap(
 fn adopt_local_account_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
-    genesis_hash: [u8; 32],
+    genesis_hash: AccountEntryHash,
     now_ms: i64,
 ) -> anyhow::Result<()> {
     if let Some(existing) = read_local_account(tx)? {
@@ -398,7 +398,7 @@ fn mint_local_account_in_tx(tx: &Transaction<'_>, now_ms: i64) -> anyhow::Result
     };
     let payload = ops::encode(&op)
         .map_err(|err| anyhow::anyhow!("encoding the account genesis op failed: {err}"))?;
-    let account_id = account_id_from_genesis_payload(&payload);
+    let account_id = id::account_id_from_genesis_payload(&payload);
     let header = AccountEntryHeader {
         account_id,
         log_id: 0,
@@ -468,7 +468,7 @@ fn mint_local_account_in_tx(tx: &Transaction<'_>, now_ms: i64) -> anyhow::Result
 /// that names its self-authorizing genesis (the roster_ref an owner-authored `/3` entry cites).
 pub(super) struct LocalAccountRef {
     pub(super) account_id: AccountId,
-    pub(super) genesis_hash: [u8; 32],
+    pub(super) genesis_hash: AccountEntryHash,
 }
 
 /// Resolve the already-minted local account from the pointer WITHOUT minting — the in-tx content
@@ -503,7 +503,7 @@ pub fn read_local_account(conn: &Connection) -> anyhow::Result<Option<AccountId>
 /// a genesis absent from `account_entries` is a corrupted pointer and errors.
 fn resolve_account_for_genesis(
     conn: &Connection,
-    genesis_hash: &[u8; 32],
+    genesis_hash: &AccountEntryHash,
 ) -> anyhow::Result<AccountId> {
     let account_bytes: Vec<u8> = conn
         .query_row(
@@ -530,19 +530,19 @@ fn resolve_account_for_genesis(
 /// digests of the same genesis payload, so holding one does not yield the other. That asymmetry is
 /// load-bearing for callers that need a value every enrolled device shares but a peer who has only
 /// seen the account_id cannot compute. Non-minting, like [`read_local_account`].
-pub fn read_local_account_genesis(conn: &Connection) -> anyhow::Result<Option<[u8; 32]>> {
+pub fn read_local_account_genesis(conn: &Connection) -> anyhow::Result<Option<AccountEntryHash>> {
     read_pointer_hash(conn)
 }
 
 /// Read the single-row pointer's genesis hash, or `None` when no account has been minted.
-fn read_pointer_hash(conn: &Connection) -> anyhow::Result<Option<[u8; 32]>> {
+fn read_pointer_hash(conn: &Connection) -> anyhow::Result<Option<AccountEntryHash>> {
     let hash: Option<Vec<u8>> = conn
         .query_row("SELECT genesis_entry_hash FROM oplog_local_account WHERE id = 0", [], |row| {
             row.get(0)
         })
         .optional()?;
     hash.map(|bytes| {
-        <[u8; 32]>::try_from(bytes.as_slice())
+        AccountEntryHash::try_from(bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("stored genesis_entry_hash is not exactly 32 bytes"))
     })
     .transpose()
@@ -672,7 +672,7 @@ mod tests {
             .unwrap();
         let signed = super::super::envelope::decode_account_signed(&signed_bytes).unwrap();
         assert_eq!(
-            account_id_from_genesis_payload(&signed.payload),
+            id::account_id_from_genesis_payload(&signed.payload),
             account_id,
             "the resolved account_id is the genesis commitment",
         );
@@ -720,8 +720,8 @@ mod tests {
 
         let hashes = held_account_entry_hashes(&conn, account).unwrap();
         assert_eq!(hashes.len(), 121, "genesis and every authenticated candidate are advertised");
-        assert!(!hashes.contains(&parked_signed_hash));
-        assert!(!hashes.contains(&parked_entry_hash));
+        assert!(!hashes.contains(&AccountEntryHash::from_bytes(parked_signed_hash)));
+        assert!(!hashes.contains(&AccountEntryHash::from_bytes(parked_entry_hash)));
         assert!(hashes.windows(2).all(|pair| pair[0] < pair[1]));
     }
 

@@ -18,6 +18,7 @@
 use super::AccountId;
 use super::cut::Cut;
 use super::envelope::AccountEntryHeader;
+use super::id::{GrantId, OwnerId};
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
 
@@ -29,10 +30,10 @@ pub(super) enum RegisterKey {
     Device { account: AccountId, log: u8, device: DeviceFingerprint },
     /// From `OwnerDemote` — entries on `(account, log, device)` whose `authority_ref` cites
     /// `owner_id`.
-    OwnerIncarnation { account: AccountId, log: u8, device: DeviceFingerprint, owner_id: [u8; 32] },
+    OwnerIncarnation { account: AccountId, log: u8, device: DeviceFingerprint, owner_id: OwnerId },
     /// From `StreamRevoke` — `/3` content on `(stream, grantee, grant_id, device)` (C2 consumes
     /// it).
-    Grant { stream: StreamId, grantee: AccountId, grant_id: [u8; 32], device: DeviceFingerprint },
+    Grant { stream: StreamId, grantee: AccountId, grant_id: GrantId, device: DeviceFingerprint },
 }
 
 /// An extend-only revocation register: a chain key + its valid-prefix cut.
@@ -67,21 +68,22 @@ impl RegisterKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::id::AccountEntryHash;
 
     /// A control-log header on `(account 0xaa, log 0, device 0xbb)` citing `authority_ref`.
     fn header(
         account: u8,
         log: u8,
         device: u8,
-        authority_ref: Option<[u8; 32]>,
+        authority_ref: Option<OwnerId>,
     ) -> AccountEntryHeader {
         AccountEntryHeader {
             account_id: AccountId::from_bytes([account; 32]),
             log_id: log,
             device_fingerprint: DeviceFingerprint::from_bytes([device; 32]),
             seq: 4,
-            prev_hash: Some([0x01; 32]),
-            parent_ref: Some([0x02; 32]),
+            prev_hash: Some(AccountEntryHash::from_bytes([0x01; 32])),
+            parent_ref: Some(AccountEntryHash::from_bytes([0x02; 32])),
             entry_type: 3,
             op_version: 1,
             crypto_suite: 0,
@@ -100,7 +102,7 @@ mod tests {
         };
         assert!(key.scopes(&header(0xaa, 0, 0xbb, None)), "same chain, any authority_ref");
         assert!(
-            key.scopes(&header(0xaa, 0, 0xbb, Some([0x77; 32]))),
+            key.scopes(&header(0xaa, 0, 0xbb, Some(OwnerId::from_bytes([0x77; 32])))),
             "same chain, any authority_ref"
         );
         assert!(!key.scopes(&header(0xaa, 0, 0xcc, None)), "different device");
@@ -115,15 +117,21 @@ mod tests {
             account: AccountId::from_bytes([0xaa; 32]),
             log: 0,
             device: DeviceFingerprint::from_bytes([0xbb; 32]),
-            owner_id,
+            owner_id: OwnerId::from_bytes(owner_id),
         };
-        assert!(key.scopes(&header(0xaa, 0, 0xbb, Some(owner_id))), "cites this incarnation");
         assert!(
-            !key.scopes(&header(0xaa, 0, 0xbb, Some([0x88; 32]))),
+            key.scopes(&header(0xaa, 0, 0xbb, Some(OwnerId::from_bytes(owner_id)))),
+            "cites this incarnation"
+        );
+        assert!(
+            !key.scopes(&header(0xaa, 0, 0xbb, Some(OwnerId::from_bytes([0x88; 32])))),
             "cites a different incarnation"
         );
         assert!(!key.scopes(&header(0xaa, 0, 0xbb, None)), "cites nothing (genesis-scope)");
-        assert!(!key.scopes(&header(0xaa, 0, 0xcc, Some(owner_id))), "different device");
+        assert!(
+            !key.scopes(&header(0xaa, 0, 0xcc, Some(OwnerId::from_bytes(owner_id)))),
+            "different device"
+        );
     }
 
     #[test]
@@ -131,11 +139,11 @@ mod tests {
         let key = RegisterKey::Grant {
             stream: StreamId::from_bytes([0x33; 32]),
             grantee: AccountId::from_bytes([0x99; 32]),
-            grant_id: [0xaa; 32],
+            grant_id: GrantId::from_bytes([0xaa; 32]),
             device: DeviceFingerprint::from_bytes([0xbb; 32]),
         };
         assert!(
-            !key.scopes(&header(0xaa, 0, 0xbb, Some([0xaa; 32]))),
+            !key.scopes(&header(0xaa, 0, 0xbb, Some(OwnerId::from_bytes([0xaa; 32])))),
             "grant scopes content, not control"
         );
     }

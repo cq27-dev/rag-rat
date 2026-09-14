@@ -323,7 +323,7 @@ pub fn redeem_writer_invite(
     )
     .map_err(|error| InviteError::Storage(error.into()))?;
     locked.tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
-    Ok(WriterGrantReceipt { grant_id, stream_id })
+    Ok(WriterGrantReceipt { grant_id: grant_id.into(), stream_id })
 }
 
 /// The deterministic writer-redemption refusals, evaluated identically before and inside the
@@ -473,15 +473,18 @@ pub fn redeem_invite(
     // of the receipt and those grow-only extras and could leave the acknowledged DeviceAdd
     // ineffective — burning the nonce on a bootstrap that can never succeed. Refuse BEFORE the
     // consume boundary, rolling back the authored entries and restoring the reservation.
-    let receipt_hashes: std::collections::HashSet<&[u8; 32]> =
-        bootstrap_entries.iter().map(|entry| &entry.entry_hash).collect();
+    let receipt_hashes: std::collections::HashSet<[u8; 32]> =
+        bootstrap_entries.iter().map(|entry| entry.entry_hash.to_bytes()).collect();
     if request.held_entry_hashes.iter().any(|hash| !receipt_hashes.contains(hash)) {
         return Err(InviteError::HeldStateConflict);
     }
     let account_entries =
         bootstrap_entries.iter().map(|entry| entry.signed_bytes.clone()).collect();
-    let receipt =
-        EnrollmentReceipt { device_add_hash: device_add, device_add_signed, account_entries };
+    let receipt = EnrollmentReceipt {
+        device_add_hash: device_add.into(),
+        device_add_signed,
+        account_entries,
+    };
     // The receipt must FIT the state the joiner declared: candidate capacity is grow-only, so
     // consuming the one-time nonce for a receipt the joiner can never hold would burn the
     // enrollment — a deterministic failure checked BEFORE the consume boundary (#945).
@@ -494,7 +497,7 @@ pub fn redeem_invite(
     let mut new_entries = 0u64;
     let mut new_bytes = 0u64;
     for entry in &bootstrap_entries {
-        if held.contains(&entry.entry_hash) {
+        if held.contains(&entry.entry_hash.to_bytes()) {
             continue;
         }
         new_entries += 1;
@@ -519,7 +522,7 @@ pub fn redeem_invite(
     // (quadratic across a fleet, #945).
     let mut receipt_manifest = Vec::with_capacity(32 * bootstrap_entries.len());
     for entry in &bootstrap_entries {
-        receipt_manifest.extend_from_slice(&entry.entry_hash);
+        receipt_manifest.extend_from_slice(entry.entry_hash.as_slice());
     }
     let changed = tx
         .execute(
@@ -794,7 +797,7 @@ fn replay_receipt(
         let mut signed_by_hash: std::collections::HashMap<[u8; 32], Vec<u8>> =
             account_entries_for_enrollment(conn, account_id)?
                 .into_iter()
-                .map(|entry| (entry.entry_hash, entry.signed_bytes))
+                .map(|entry| (entry.entry_hash.to_bytes(), entry.signed_bytes))
                 .collect();
         let mut account_entries = Vec::with_capacity(manifest.len() / 32);
         for &hash in manifest.as_chunks::<32>().0 {

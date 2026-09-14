@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use super::super::branch::BranchSelection;
+use super::super::branch::{BranchSelection, CitedFreshness};
+#[cfg(test)]
+use super::super::id::OwnerId;
+use super::super::id::{AccountEntryHash, GrantId, RosterRef, SignedHash};
 use super::super::ops::{self, AccountOp, DecodedAccountOp};
 use super::super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
 use super::super::{envelope as account_envelope, storage as account_storage};
@@ -34,8 +37,6 @@ use crate::{cbor, content_projection, identity};
 pub(super) fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<[u8; N]> {
     bytes.try_into().map_err(|_| anyhow::anyhow!("expected {N} bytes, got {}", bytes.len()))
 }
-
-type AccountEntryHash = [u8; 32];
 
 const PENDING_REFOLD_CONTENT_CANDIDATE: i64 = 1;
 const PENDING_REFOLD_ACCOUNT_CHANGE: i64 = 2;
@@ -247,7 +248,7 @@ fn resolve_roster_key(
         return Ok(None);
     };
     let roster = account_envelope::decode_account_signed(&raw)?;
-    if roster.entry_hash != content.header.roster_ref
+    if roster.entry_hash != content.header.roster_ref.into()
         || roster.header.account_id != content.header.author_account_id
         || roster.header.log_id != 0
         || roster.header.op_version != 1
@@ -282,7 +283,7 @@ fn park_pre_verify(
     now_ms: i64,
 ) -> rusqlite::Result<ContentIngestOutcome> {
     let signed_hash = cbor::sha256(raw);
-    if PRE_VERIFY.contains(tx, &signed_hash)? {
+    if PRE_VERIFY.contains(tx, &signed_hash.into())? {
         return Ok(ContentIngestOutcome::PreVerify);
     }
     let author = signed.header.author_account_id.to_bytes();
@@ -302,13 +303,13 @@ fn park_pre_verify(
             now_ms,
         ],
     )?;
-    enforce_pre_verify_budget(tx, signed.header.author_account_id, &signed_hash)
+    enforce_pre_verify_budget(tx, signed.header.author_account_id, &signed_hash.into())
 }
 
 fn enforce_pre_verify_budget(
     tx: &Transaction<'_>,
     author: super::super::AccountId,
-    inserted_hash: &AccountEntryHash,
+    inserted_hash: &SignedHash,
 ) -> rusqlite::Result<ContentIngestOutcome> {
     let outcome = PRE_VERIFY.enforce_budget(
         tx,
@@ -634,8 +635,8 @@ fn reclassify_chain(tx: &Transaction<'_>, entry: &VerifiedContentEntry) -> anyho
             if child_seq != expected {
                 continue;
             }
-            set_status(tx, &child, ContentStatus::RetainedUnfolded)?;
-            queue.push_back((child, child_seq));
+            set_status(tx, &child.into(), ContentStatus::RetainedUnfolded)?;
+            queue.push_back((AccountEntryHash::from_bytes(child), child_seq));
         }
     }
     Ok(())
@@ -1837,7 +1838,7 @@ pub(in crate::account) fn accepted_chain_tails(
         .map(|(fingerprint, (seq, hash))| ops::DeviceCut {
             device_fingerprint: DeviceFingerprint::from_bytes(fingerprint),
             seq,
-            hash,
+            hash: AccountEntryHash::from_bytes(hash),
         })
         .collect();
     cuts.sort_by_key(|cut| cut.device_fingerprint.to_bytes());
@@ -1853,7 +1854,7 @@ pub(in crate::account) fn accepted_entry_at(
     author_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
     seq: u64,
-) -> anyhow::Result<Option<[u8; 32]>> {
+) -> anyhow::Result<Option<AccountEntryHash>> {
     Ok(tx
         .query_row(
             "SELECT entry_hash FROM content_entries
@@ -1867,7 +1868,8 @@ pub(in crate::account) fn accepted_entry_at(
             ],
             |row| row.get::<_, [u8; 32]>(0),
         )
-        .optional()?)
+        .optional()?
+        .map(AccountEntryHash::from_bytes))
 }
 
 /// Persist (or clear) one stream's lamport clock floor, as derived by the refold's
@@ -1977,7 +1979,7 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
             let (entry_hash, signed_bytes, accepted, status) = row?;
             if let Ok(signed) = envelope::decode_content_signed(&signed_bytes) {
                 streams.entry(signed.header.stream_id.to_bytes()).or_default().push(LegacyRow {
-                    entry_hash,
+                    entry_hash: AccountEntryHash::from_bytes(entry_hash),
                     header: signed.header,
                     accepted,
                     condemned: status.starts_with("condemned"),
@@ -2014,7 +2016,7 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
         // Close over stored hash descendants: a row chained onto a doomed row can never regain a
         // stored predecessor, so it retires too — but ONLY the doomed branch; a valid sibling at
         // the same (chain, seq) is untouched.
-        let mut children: HashMap<[u8; 32], Vec<AccountEntryHash>> = HashMap::new();
+        let mut children: HashMap<AccountEntryHash, Vec<AccountEntryHash>> = HashMap::new();
         for row in &members {
             if let Some(previous) = row.header.prev_hash {
                 children.entry(previous).or_default().push(row.entry_hash);
@@ -2136,8 +2138,8 @@ fn declassify_rows_absent_from(
     };
     for bytes in hashes {
         let hash = fixed::<32>(&bytes)?;
-        if !handled.contains(&hash) {
-            set_status(tx, &hash, ContentStatus::RetainedUnfolded)?;
+        if !handled.contains(&hash.into()) {
+            set_status(tx, &hash.into(), ContentStatus::RetainedUnfolded)?;
         }
     }
     Ok(())
@@ -2313,14 +2315,9 @@ fn resolve_stream_authority(
 /// a fresh instance per `resolve_stream_authority`, never shared across refolds.
 #[derive(Default)]
 struct AuthorityCaches {
-    roster: HashMap<
-        (AccountId, AccountEntryHash, DeviceFingerprint),
-        AuthorityQuery<CitedRosterAuthority>,
-    >,
-    grant: HashMap<
-        (AccountEntryHash, AccountId, DeviceFingerprint),
-        AuthorityQuery<CitedGrantAuthority>,
-    >,
+    roster:
+        HashMap<(AccountId, RosterRef, DeviceFingerprint), AuthorityQuery<CitedRosterAuthority>>,
+    grant: HashMap<(GrantId, AccountId, DeviceFingerprint), AuthorityQuery<CitedGrantAuthority>>,
     held_control_log: HashMap<AccountId, u64>,
     contested: HashMap<AccountId, bool>,
 }
@@ -2370,7 +2367,7 @@ fn load_stream_headers(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for (entry_hash, signed_bytes) in rows {
-        let entry_hash = fixed::<32>(&entry_hash)?;
+        let entry_hash = AccountEntryHash::from_bytes(fixed::<32>(&entry_hash)?);
         // `content_ingest` only ever stores verified, decodable envelopes, so a decode failure here
         // means the row was written by some other path (or the blob is corrupt). Skip it rather
         // than abort the whole account fold on one bad row — an undecodable candidate cannot belong
@@ -2562,7 +2559,7 @@ fn map_roster(
 fn map_grant(
     query: AuthorityQuery<crate::account::GrantDeviceAuthority>,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
 ) -> AuthorityQuery<CitedGrantAuthority> {
     match query {
         AuthorityQuery::Effective(authority) =>
@@ -2624,7 +2621,7 @@ pub struct SyncContentEntry {
     pub stream_id: StreamId,
     pub author_account_id: AccountId,
     pub seq: u64,
-    pub entry_hash: [u8; 32],
+    pub entry_hash: AccountEntryHash,
     pub signed_bytes: Vec<u8>,
 }
 
@@ -2637,7 +2634,9 @@ pub struct SyncContentEntry {
 /// for the claimed `(stream, author, roster_ref)` and rejects anything not signed by a device in
 /// that roster, so a forged author claim cannot land a candidate. A decode failure means the bytes
 /// are not a well-formed content entry — the session treats that as a peer to distrust.
-pub fn content_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(StreamId, AccountId, [u8; 32])> {
+pub fn content_entry_ref(
+    signed_bytes: &[u8],
+) -> anyhow::Result<(StreamId, AccountId, AccountEntryHash)> {
     let signed = envelope::decode_content_signed(signed_bytes)?;
     Ok((signed.header.stream_id, signed.header.author_account_id, signed.entry_hash))
 }
@@ -2646,8 +2645,8 @@ pub fn content_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(StreamId, Accou
 /// `content_pre_verify` keys its rows by. Distinguishes competing SIGNATURES of one body — two
 /// envelopes can share an `entry_hash` yet differ in signature — so the sync layer treats them as
 /// distinct. Never diff content sync inventory by `entry_hash`.
-pub fn content_signed_hash(signed_bytes: &[u8]) -> [u8; 32] {
-    cbor::sha256(signed_bytes)
+pub fn content_signed_hash(signed_bytes: &[u8]) -> SignedHash {
+    SignedHash::from_bytes(cbor::sha256(signed_bytes))
 }
 
 /// Whether `account_id` already holds this EXACT signed content envelope — as a stored candidate
@@ -2719,7 +2718,7 @@ pub fn content_entries_for_sync(
             stream_id: StreamId::from_bytes(fixed::<32>(&stream)?),
             author_account_id: account_id,
             seq: u64::from_be_bytes(fixed::<8>(&seq)?),
-            entry_hash: fixed::<32>(&hash)?,
+            entry_hash: AccountEntryHash::from_bytes(fixed::<32>(&hash)?),
             signed_bytes,
         });
     }
@@ -2747,7 +2746,7 @@ pub fn content_entries_for_sync(
             stream_id,
             author_account_id: account_id,
             seq,
-            entry_hash: fixed::<32>(&hash)?,
+            entry_hash: AccountEntryHash::from_bytes(fixed::<32>(&hash)?),
             signed_bytes,
         });
     }
@@ -2815,7 +2814,7 @@ pub fn content_entries_for_public_sync(
             stream_id,
             author_account_id: account_id,
             seq: u64::from_be_bytes(fixed::<8>(&seq)?),
-            entry_hash: fixed::<32>(&hash)?,
+            entry_hash: AccountEntryHash::from_bytes(fixed::<32>(&hash)?),
             signed_bytes,
         });
     }
@@ -2891,7 +2890,7 @@ fn relayed_content_entries(
                 stream_id: StreamId::from_bytes(fixed::<32>(&stream)?),
                 author_account_id: AccountId::from_bytes(fixed::<32>(&author)?),
                 seq: u64::from_be_bytes(fixed::<8>(&seq)?),
-                entry_hash: fixed::<32>(&hash)?,
+                entry_hash: AccountEntryHash::from_bytes(fixed::<32>(&hash)?),
                 signed_bytes,
             })
         })
@@ -3124,7 +3123,7 @@ mod tests {
             crypto_suite: 0,
             auth_len,
             key_id: None,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(genesis_hash.into()),
         };
         sign_account_entry(founder, &header, &payload).unwrap()
     }
@@ -3132,7 +3131,7 @@ mod tests {
     fn content(
         secret: &DeviceSecret,
         account_id: super::super::super::AccountId,
-        roster_ref: AccountEntryHash,
+        roster_ref: RosterRef,
         seq: u64,
         previous: Option<AccountEntryHash>,
     ) -> SignedContentEntry {
@@ -3237,7 +3236,7 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[1; 32]);
         let (account, roster_ref) = roster(&conn, &secret);
-        let signed = content(&secret, account, roster_ref, 0, None);
+        let signed = content(&secret, account, roster_ref.into(), 0, None);
         assert_eq!(
             content_ingest(&conn, &signed.signed_bytes, 2).unwrap(),
             ContentIngestOutcome::Ingested { status: "retained_unfolded".into() }
@@ -3260,8 +3259,8 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[2; 32]);
         let (account, roster_ref) = roster(&conn, &secret);
-        let genesis = content(&secret, account, roster_ref, 0, None);
-        let child = content(&secret, account, roster_ref, 1, Some(genesis.entry_hash));
+        let genesis = content(&secret, account, roster_ref.into(), 0, None);
+        let child = content(&secret, account, roster_ref.into(), 1, Some(genesis.entry_hash));
         assert_eq!(
             content_ingest(&conn, &child.signed_bytes, 2).unwrap(),
             ContentIngestOutcome::Ingested { status: "parked{missing_predecessor}".into() }
@@ -3278,16 +3277,16 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[3; 32]);
         let account = super::super::super::AccountId::from_bytes([0x55; 32]);
-        let signed = content(&secret, account, [0x66; 32], 0, None);
+        let signed = content(&secret, account, RosterRef::from_bytes([0x66; 32]), 0, None);
         assert_eq!(
             content_ingest(&conn, &signed.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::PreVerify
         );
 
         let (account, roster_ref) = roster(&conn, &secret);
-        let genesis = content(&secret, account, roster_ref, 0, None);
+        let genesis = content(&secret, account, roster_ref.into(), 0, None);
         content_ingest(&conn, &genesis.signed_bytes, 2).unwrap();
-        let mut wrong = content(&secret, account, roster_ref, 1, Some(genesis.entry_hash));
+        let mut wrong = content(&secret, account, roster_ref.into(), 1, Some(genesis.entry_hash));
         wrong.header.stream_id = StreamId::from_bytes([0x77; 32]);
         wrong = envelope::sign_content_entry(&secret, &wrong.header, &[0xf6]).unwrap();
         assert_eq!(
@@ -3297,9 +3296,14 @@ mod tests {
 
         let reverse = db();
         let (reverse_account, reverse_roster) = roster(&reverse, &secret);
-        let reverse_genesis = content(&secret, reverse_account, reverse_roster, 0, None);
-        let mut reverse_wrong =
-            content(&secret, reverse_account, reverse_roster, 1, Some(reverse_genesis.entry_hash));
+        let reverse_genesis = content(&secret, reverse_account, reverse_roster.into(), 0, None);
+        let mut reverse_wrong = content(
+            &secret,
+            reverse_account,
+            reverse_roster.into(),
+            1,
+            Some(reverse_genesis.entry_hash),
+        );
         reverse_wrong.header.stream_id = StreamId::from_bytes([0x77; 32]);
         reverse_wrong =
             envelope::sign_content_entry(&secret, &reverse_wrong.header, &[0xf6]).unwrap();
@@ -3328,7 +3332,7 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[4; 32]);
         let (account, roster) = signed_roster(&secret);
-        let signed = content(&secret, account, roster.entry_hash, 0, None);
+        let signed = content(&secret, account, roster.entry_hash.into(), 0, None);
         assert_eq!(
             content_ingest(&conn, &signed.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::PreVerify
@@ -3366,7 +3370,7 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[7; 32]);
         let (account, roster) = signed_roster(&secret);
-        let signed = content(&secret, account, roster.entry_hash, 0, None);
+        let signed = content(&secret, account, roster.entry_hash.into(), 0, None);
 
         assert_eq!(
             content_ingest(&conn, &signed.signed_bytes, 1).unwrap(),
@@ -3394,7 +3398,7 @@ mod tests {
         let (account, roster) = signed_roster(&secret);
         // The roster is deliberately NOT ingested, so the content's roster key cannot resolve and
         // it parks in pre-verify rather than becoming a stored candidate.
-        let parked = content(&secret, account, roster.entry_hash, 0, None);
+        let parked = content(&secret, account, roster.entry_hash.into(), 0, None);
         assert_eq!(
             content_ingest(&conn, &parked.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::PreVerify,
@@ -3418,7 +3422,7 @@ mod tests {
         let (account, roster) = signed_roster(&secret);
         // A parked candidate: the roster is NOT ingested, so its key cannot resolve and it lands in
         // content_pre_verify rather than content_entries.
-        let parked = content(&secret, account, roster.entry_hash, 0, None);
+        let parked = content(&secret, account, roster.entry_hash.into(), 0, None);
         assert_eq!(
             content_ingest(&conn, &parked.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::PreVerify,
@@ -3462,7 +3466,7 @@ mod tests {
         let stranger = AccountId::from_bytes([0x33; 32]);
         let (member, forger, outsider) = ([0x71; 32], [0x72; 32], [0x73; 32]);
         seed_ownership(&conn, owner);
-        seed_grant(&conn, [0x55; 32], owner, granted, "writer");
+        seed_grant(&conn, GrantId::from_bytes([0x55; 32]), owner, granted, "writer");
         for (account, device) in [(granted, member), (stranger, outsider)] {
             conn.execute(
                 "INSERT INTO account_roster_history(
@@ -3503,7 +3507,10 @@ mod tests {
             .into_iter()
             .map(|entry| entry.entry_hash)
             .collect();
-        assert_eq!(relayed, vec![[1; 32], [2; 32]]);
+        assert_eq!(relayed, vec![
+            AccountEntryHash::from_bytes([1; 32]),
+            AccountEntryHash::from_bytes([2; 32])
+        ]);
     }
 
     /// `content_signed_entry_exists` is signed-envelope precise, not entry_hash precise, and
@@ -3516,7 +3523,7 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[7; 32]);
         let (account, roster) = signed_roster(&secret);
         super::super::super::storage::account_ingest(&conn, &roster.signed_bytes, 1).unwrap();
-        let entry = content(&secret, account, roster.entry_hash, 0, None);
+        let entry = content(&secret, account, roster.entry_hash.into(), 0, None);
         content_ingest(&conn, &entry.signed_bytes, 2).unwrap();
 
         assert!(
@@ -3547,7 +3554,7 @@ mod tests {
         let (account, genesis) = signed_roster(&founder);
         super::super::super::storage::account_ingest(&conn, &genesis.signed_bytes, 1).unwrap();
         let add = signed_device_add(&founder, &member, account, genesis.entry_hash);
-        let first = content(&member, account, add.entry_hash, 0, None);
+        let first = content(&member, account, add.entry_hash.into(), 0, None);
         assert_eq!(
             content_ingest(&conn, &first.signed_bytes, 2).unwrap(),
             ContentIngestOutcome::PreVerify
@@ -3560,14 +3567,14 @@ mod tests {
                 .unwrap(),
             0
         );
-        let second = content(&member, account, add.entry_hash, 1, Some(first.entry_hash));
+        let second = content(&member, account, add.entry_hash.into(), 1, Some(first.entry_hash));
         assert_eq!(
             content_ingest(&conn, &second.signed_bytes, 4).unwrap(),
             ContentIngestOutcome::Ingested { status: "retained_unfolded".into() }
         );
 
         let outsider = DeviceSecret::from_seed(&[15; 32]);
-        let wrong = content(&outsider, account, add.entry_hash, 0, None);
+        let wrong = content(&outsider, account, add.entry_hash.into(), 0, None);
         assert!(matches!(
             content_ingest(&conn, &wrong.signed_bytes, 5).unwrap(),
             ContentIngestOutcome::Rejected(_)
@@ -3579,7 +3586,7 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[5; 32]);
         let account = super::super::super::AccountId::from_bytes([0x65; 32]);
-        let signed = content(&secret, account, [0x75; 32], 0, None);
+        let signed = content(&secret, account, RosterRef::from_bytes([0x75; 32]), 0, None);
         for now in 1..=3 {
             assert_eq!(
                 content_ingest(&conn, &signed.signed_bytes, now).unwrap(),
@@ -3601,13 +3608,14 @@ mod tests {
         let attacker = DeviceSecret::from_seed(&[7; 32]);
         let (account, roster_ref) = roster(&conn, &enrolled);
 
-        let wrong_device = content(&attacker, account, roster_ref, 0, None);
+        let wrong_device = content(&attacker, account, roster_ref.into(), 0, None);
         assert!(matches!(
             content_ingest(&conn, &wrong_device.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::Rejected(_)
         ));
 
-        let mut bad_signature = content(&enrolled, account, roster_ref, 0, None).signed_bytes;
+        let mut bad_signature =
+            content(&enrolled, account, roster_ref.into(), 0, None).signed_bytes;
         let last = bad_signature.last_mut().unwrap();
         *last ^= 1;
         assert!(matches!(
@@ -3626,12 +3634,12 @@ mod tests {
         let conn = db();
         let secret = DeviceSecret::from_seed(&[8; 32]);
         let (account, roster_ref) = roster(&conn, &secret);
-        let first = content(&secret, account, roster_ref, 0, None);
+        let first = content(&secret, account, roster_ref.into(), 0, None);
         let mut second_header = first.header.clone();
         second_header.lamport += 1;
         let second = envelope::sign_content_entry(&secret, &second_header, &[0xf6]).unwrap();
-        let first_child = content(&secret, account, roster_ref, 1, Some(first.entry_hash));
-        let second_child = content(&secret, account, roster_ref, 1, Some(second.entry_hash));
+        let first_child = content(&secret, account, roster_ref.into(), 1, Some(first.entry_hash));
+        let second_child = content(&secret, account, roster_ref.into(), 1, Some(second.entry_hash));
         for (received, signed) in
             [&second_child, &first_child, &second, &first].into_iter().enumerate()
         {
@@ -3665,7 +3673,13 @@ mod tests {
         let mut newest_hash = None;
         for seq in 0..=PRE_VERIFY_PER_AUTHOR_MAX as u64 {
             let previous = (seq > 0).then_some([seq as u8; 32]);
-            let signed = content(&secret, account, [seq as u8; 32], seq, previous);
+            let signed = content(
+                &secret,
+                account,
+                RosterRef::from_bytes([seq as u8; 32]),
+                seq,
+                previous.map(Into::into),
+            );
             let hash = cbor::sha256(&signed.signed_bytes);
             first_hash.get_or_insert(hash);
             newest_hash = Some(hash);
@@ -3682,8 +3696,8 @@ mod tests {
                 .unwrap(),
             PRE_VERIFY_PER_AUTHOR_MAX as i64
         );
-        assert!(!PRE_VERIFY.contains(&conn, &first_hash.unwrap()).unwrap());
-        assert!(PRE_VERIFY.contains(&conn, &newest_hash.unwrap()).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &first_hash.unwrap().into()).unwrap());
+        assert!(PRE_VERIFY.contains(&conn, &newest_hash.unwrap().into()).unwrap());
     }
 
     #[test]
@@ -3705,7 +3719,7 @@ mod tests {
 
         // Author B parks one row FIRST, at the oldest received_at_ms — the globally-oldest row, so
         // a global-scoped eviction would target exactly this one.
-        let b_entry = content(&secret, author_b, [0xee; 32], 0, None);
+        let b_entry = content(&secret, author_b, RosterRef::from_bytes([0xee; 32]), 0, None);
         let b_hash = cbor::sha256(&b_entry.signed_bytes);
         assert_eq!(
             content_ingest(&conn, &b_entry.signed_bytes, 0).unwrap(),
@@ -3718,7 +3732,13 @@ mod tests {
             // A garbage but non-null predecessor for seq > 0 (prev_hash must be null iff seq == 0);
             // it keeps every row a distinct pre-verify entry and never resolves (still parked).
             let previous = (seq > 0).then_some([seq as u8; 32]);
-            let a_entry = content(&secret, author_a, [0xee; 32], seq, previous);
+            let a_entry = content(
+                &secret,
+                author_a,
+                RosterRef::from_bytes([0xee; 32]),
+                seq,
+                previous.map(Into::into),
+            );
             let received_at_ms = seq as i64 + 1; // strictly newer than author B's 0
             let outcome = content_ingest(&conn, &a_entry.signed_bytes, received_at_ms).unwrap();
             if seq == PRE_VERIFY_PER_AUTHOR_MAX as u64 {
@@ -3732,7 +3752,7 @@ mod tests {
 
         // Author B's older row survives — author A's per-author eviction must not reach across it.
         assert!(
-            PRE_VERIFY.contains(&conn, &b_hash).unwrap(),
+            PRE_VERIFY.contains(&conn, &b_hash.into()).unwrap(),
             "author A's flood must NOT evict author B's parked row",
         );
         // Author A is held to EXACTLY the per-author cap.
@@ -3763,7 +3783,7 @@ mod tests {
         let mut entries = Vec::new();
         let mut previous = None;
         for seq in 0..256 {
-            let signed = content(&secret, account, roster_ref, seq, previous);
+            let signed = content(&secret, account, roster_ref.into(), seq, previous);
             previous = Some(signed.entry_hash);
             entries.push(signed);
         }
@@ -3789,9 +3809,9 @@ mod tests {
         // An explicit in-ceiling lamport: the `content` helper's `seq + 1` mint would saturate to
         // `u64::MAX` here and trip the ingest ceiling — this test is about SEQ overflow, not the
         // lamport clamp.
-        let signed = authored(&secret, account, roster_ref, ContentSpec {
+        let signed = authored(&secret, account, roster_ref.into(), ContentSpec {
             seq: u64::MAX,
-            previous: Some([0xaa; 32]),
+            previous: Some(AccountEntryHash::from_bytes([0xaa; 32])),
             lamport: Some(1),
             ..ContentSpec::default()
         });
@@ -3811,7 +3831,7 @@ mod tests {
         let mut conn = db();
         let secret = DeviceSecret::from_seed(&[12; 32]);
         let (account, roster) = signed_roster(&secret);
-        let signed = content(&secret, account, roster.entry_hash, 0, None);
+        let signed = content(&secret, account, roster.entry_hash.into(), 0, None);
         assert_eq!(
             content_ingest(&conn, &signed.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::PreVerify
@@ -3875,7 +3895,7 @@ mod tests {
 
         let author_count = db();
         let (account, roster_ref) = roster(&author_count, &secret);
-        let signed = content(&secret, account, roster_ref, 0, None);
+        let signed = content(&secret, account, roster_ref.into(), 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &secret.public()).unwrap();
         seed_content_candidates(
@@ -3894,7 +3914,7 @@ mod tests {
 
         let author_bytes = db();
         let (account, roster_ref) = roster(&author_bytes, &secret);
-        let signed = content(&secret, account, roster_ref, 0, None);
+        let signed = content(&secret, account, roster_ref.into(), 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &secret.public()).unwrap();
         seed_content_candidates(
@@ -3923,7 +3943,7 @@ mod tests {
             );
         }
         let (account, roster_ref) = roster(&global_count, &secret);
-        let signed = content(&secret, account, roster_ref, 0, None);
+        let signed = content(&secret, account, roster_ref.into(), 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &secret.public()).unwrap();
         let tx = global_count.unchecked_transaction().unwrap();
@@ -3944,7 +3964,7 @@ mod tests {
             );
         }
         let (account, roster_ref) = roster(&global_bytes, &secret);
-        let signed = content(&secret, account, roster_ref, 0, None);
+        let signed = content(&secret, account, roster_ref.into(), 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &secret.public()).unwrap();
         let tx = global_bytes.unchecked_transaction().unwrap();
@@ -3991,7 +4011,7 @@ mod tests {
         }
         conn.execute("UPDATE content_entries SET accepted = 1", []).unwrap();
 
-        let signed = content(&secret, account, roster_ref, 0, None);
+        let signed = content(&secret, account, roster_ref.into(), 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &secret.public()).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
@@ -4023,18 +4043,18 @@ mod tests {
         let oldest = cbor::sha256(&0_i64.to_be_bytes());
         let secret = DeviceSecret::from_seed(&[17; 32]);
         let unknown_account = super::super::super::AccountId::from_bytes([0xf1; 32]);
-        let parked = content(&secret, unknown_account, [0xf2; 32], 0, None);
+        let parked = content(&secret, unknown_account, RosterRef::from_bytes([0xf2; 32]), 0, None);
         assert_eq!(
             content_ingest(&conn, &parked.signed_bytes, PRE_VERIFY_GLOBAL_MAX as i64 + 1).unwrap(),
             ContentIngestOutcome::PreVerifyWithEviction {
                 scopes: vec![ContentCapacityScope::PreVerifyGlobal]
             }
         );
-        assert!(!PRE_VERIFY.contains(&conn, &oldest).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &oldest.into()).unwrap());
 
         let replay = db();
         let (account, roster_ref) = roster(&replay, &secret);
-        let signed = content(&secret, account, roster_ref, 0, None);
+        let signed = content(&secret, account, roster_ref.into(), 0, None);
         let expected = content_ingest(&replay, &signed.signed_bytes, 1).unwrap();
         seed_content_candidates(
             &replay,
@@ -4066,7 +4086,7 @@ mod tests {
     /// it at `u64::MAX`, always `Ahead`, which would park every accept path), body `0xf6`.
     #[derive(Clone, Copy)]
     struct ContentSpec {
-        grant_id: Option<AccountEntryHash>,
+        grant_id: Option<GrantId>,
         seq: u64,
         previous: Option<AccountEntryHash>,
         auth_len: u64,
@@ -4087,7 +4107,7 @@ mod tests {
     fn authored(
         secret: &DeviceSecret,
         author: AccountId,
-        roster_ref: AccountEntryHash,
+        roster_ref: RosterRef,
         spec: ContentSpec,
     ) -> SignedContentEntry {
         let header = ContentEntryHeader {
@@ -4112,7 +4132,7 @@ mod tests {
     fn authored_op(
         secret: &DeviceSecret,
         author: AccountId,
-        roster_ref: AccountEntryHash,
+        roster_ref: RosterRef,
         spec: ContentSpec,
         memory_op: &crate::op::MemoryOp,
     ) -> SignedContentEntry {
@@ -4172,7 +4192,7 @@ mod tests {
 
     fn seed_roster_fact(
         conn: &Connection,
-        roster_ref: AccountEntryHash,
+        roster_ref: RosterRef,
         account: AccountId,
         device: &DeviceSecret,
         role: &str,
@@ -4193,10 +4213,10 @@ mod tests {
 
     fn seed_roster_content_cut(
         conn: &Connection,
-        roster_ref: AccountEntryHash,
+        roster_ref: RosterRef,
         account: AccountId,
         seq: u64,
-        watermark: [u8; 32],
+        watermark: AccountEntryHash,
     ) {
         conn.execute(
             "INSERT INTO account_roster_content_boundaries(
@@ -4215,7 +4235,7 @@ mod tests {
 
     fn seed_grant(
         conn: &Connection,
-        grant_id: AccountEntryHash,
+        grant_id: GrantId,
         owner: AccountId,
         grantee: AccountId,
         role: &str,
@@ -4241,12 +4261,12 @@ mod tests {
     /// pin.
     fn seed_closed_grant_with_cut(
         conn: &Connection,
-        grant_id: AccountEntryHash,
+        grant_id: GrantId,
         owner: AccountId,
         grantee: AccountId,
         role: &str,
         device: &DeviceSecret,
-        watermark: [u8; 32],
+        watermark: AccountEntryHash,
     ) {
         conn.execute(
             "INSERT INTO account_stream_grants(
@@ -4315,9 +4335,9 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         // Ingest DEFERS the acceptance fold (#652), so it returns the STRUCTURAL status; the
         // acceptance verdict appears once the stream is settled.
         assert_eq!(
@@ -4337,11 +4357,11 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x67; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
 
-        let entry = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let entry = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &entry), ("accepted".into(), 1));
@@ -4355,10 +4375,10 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // At the ceiling, a resolvable author is rejected outright.
-        let poison = authored(&secret, owner, genesis, ContentSpec {
+        let poison = authored(&secret, owner, genesis.into(), ContentSpec {
             lamport: Some(crate::entry::MAX_ENTRY_LAMPORT),
             ..ContentSpec::default()
         });
@@ -4374,10 +4394,11 @@ mod tests {
         // reject BEFORE parking, or an attacker parks a poison entry behind a withheld roster.
         let stranger = DeviceSecret::from_seed(&[0x99; 32]);
         let strange_account = AccountId::from_bytes([0x99; 32]);
-        let parked_poison = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
-            lamport: Some(u64::MAX),
-            ..ContentSpec::default()
-        });
+        let parked_poison =
+            authored(&stranger, strange_account, RosterRef::from_bytes([0x98; 32]), ContentSpec {
+                lamport: Some(u64::MAX),
+                ..ContentSpec::default()
+            });
         assert!(matches!(
             content_ingest(&conn, &parked_poison.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::Rejected(_)
@@ -4399,12 +4420,12 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
-        let over_ceiling = authored(&secret, owner, genesis, ContentSpec {
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
+        let over_ceiling = authored(&secret, owner, genesis.into(), ContentSpec {
             lamport: Some(u64::MAX),
             ..ContentSpec::default()
         });
-        let over_advance = authored(&secret, owner, genesis, ContentSpec {
+        let over_advance = authored(&secret, owner, genesis.into(), ContentSpec {
             lamport: Some(1 << 33),
             ..ContentSpec::default()
         });
@@ -4456,8 +4477,8 @@ mod tests {
                 entry.header.author_account_id.to_bytes().as_slice(),
                 entry.header.device_fingerprint.to_bytes().as_slice(),
                 entry.header.seq.to_be_bytes().as_slice(),
-                entry.header.prev_hash.as_ref().map(<[u8; 32]>::as_slice),
-                entry.header.grant_id.as_ref().map(<[u8; 32]>::as_slice),
+                entry.header.prev_hash.as_ref().map(AccountEntryHash::as_slice),
+                entry.header.grant_id.as_ref().map(GrantId::as_slice),
                 entry.header.roster_ref.as_slice(),
                 entry.header.owner_auth_len.to_be_bytes().as_slice(),
                 entry.header.author_auth_len.to_be_bytes().as_slice(),
@@ -4487,14 +4508,14 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x67; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, owner_genesis.into(), owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
 
         let honest = authored_op(
             &owner_secret,
             owner,
-            owner_genesis,
+            owner_genesis.into(),
             ContentSpec::default(),
             &node_create("honest"),
         );
@@ -4506,9 +4527,9 @@ mod tests {
         let poison = authored_op(
             &author_secret,
             author,
-            author_genesis,
+            author_genesis.into(),
             ContentSpec {
-                grant_id: Some(grant_id),
+                grant_id: Some(GrantId::from_bytes(grant_id)),
                 lamport: Some(2 + crate::entry::MAX_LAMPORT_ADVANCE),
                 ..ContentSpec::default()
             },
@@ -4529,7 +4550,7 @@ mod tests {
         let next = authored_op(
             &owner_secret,
             owner,
-            owner_genesis,
+            owner_genesis.into(),
             ContentSpec { seq: 1, previous: Some(honest.entry_hash), ..ContentSpec::default() },
             &node_create("next"),
         );
@@ -4546,10 +4567,11 @@ mod tests {
         let conn = db();
         let stranger = DeviceSecret::from_seed(&[0x99; 32]);
         let strange_account = AccountId::from_bytes([0x99; 32]);
-        let jump = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
-            lamport: Some(1 << 33),
-            ..ContentSpec::default()
-        });
+        let jump =
+            authored(&stranger, strange_account, RosterRef::from_bytes([0x98; 32]), ContentSpec {
+                lamport: Some(1 << 33),
+                ..ContentSpec::default()
+            });
         assert_eq!(
             content_ingest(&conn, &jump.signed_bytes, 1).unwrap(),
             ContentIngestOutcome::PreVerify
@@ -4565,22 +4587,22 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x67; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, owner_genesis.into(), owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
 
         // The pre-clamp wreck, planted as the old binary left it: the grantee's poison was
         // ACCEPTED, and the owner then honestly minted `poison + 1` — both over-advance now, and
         // the owner's high entry is its chain tail, so merely parking them wedges every future
         // owner write (each continuation ticks backwards from the parked tail).
-        let honest = authored(&owner_secret, owner, owner_genesis, ContentSpec::default());
+        let honest = authored(&owner_secret, owner, owner_genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
-        let poison = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let poison = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             lamport: Some(1 << 33),
             ..ContentSpec::default()
         });
-        let inherited = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+        let inherited = authored(&owner_secret, owner, owner_genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(honest.entry_hash),
             lamport: Some((1 << 33) + 1),
@@ -4597,7 +4619,11 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(remaining, vec![honest.entry_hash.to_vec()], "only the sane prefix survives");
+        assert_eq!(
+            remaining,
+            vec![honest.entry_hash.as_slice().to_vec()],
+            "only the sane prefix survives"
+        );
         let orphaned_status: i64 = conn
             .query_row(
                 "SELECT count(*) FROM content_entry_status WHERE entry_hash != ?1",
@@ -4610,7 +4636,7 @@ mod tests {
         // The repair the purge exists for: with the chain re-rooted at the surviving prefix, an
         // honestly-clocked continuation folds ACCEPTED — parked-in-place tails would have forced
         // this to park as a backwards tick forever.
-        let continuation = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+        let continuation = authored(&owner_secret, owner, owner_genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(honest.entry_hash),
             lamport: Some(2),
@@ -4625,8 +4651,8 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
-        let honest = authored(&secret, owner, genesis, ContentSpec::default());
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
+        let honest = authored(&secret, owner, genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
 
         // A pre-clamp over-ceiling envelope the old fold REJECTED (never accepted): excluded from
@@ -4635,16 +4661,18 @@ mod tests {
         // suffix with it (density).
         let stranger = DeviceSecret::from_seed(&[0x99; 32]);
         let strange_account = AccountId::from_bytes([0x99; 32]);
-        let over_ceiling = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
-            lamport: Some(u64::MAX),
-            ..ContentSpec::default()
-        });
-        let suffix = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
-            seq: 1,
-            previous: Some(over_ceiling.entry_hash),
-            lamport: Some(3),
-            ..ContentSpec::default()
-        });
+        let over_ceiling =
+            authored(&stranger, strange_account, RosterRef::from_bytes([0x98; 32]), ContentSpec {
+                lamport: Some(u64::MAX),
+                ..ContentSpec::default()
+            });
+        let suffix =
+            authored(&stranger, strange_account, RosterRef::from_bytes([0x98; 32]), ContentSpec {
+                seq: 1,
+                previous: Some(over_ceiling.entry_hash),
+                lamport: Some(3),
+                ..ContentSpec::default()
+            });
         plant_legacy_candidate(&conn, &over_ceiling, false);
         plant_legacy_candidate(&conn, &suffix, false);
 
@@ -4658,7 +4686,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             remaining,
-            vec![honest.entry_hash.to_vec()],
+            vec![honest.entry_hash.as_slice().to_vec()],
             "the never-accepted over-ceiling row and its chain suffix are purged"
         );
     }
@@ -4672,19 +4700,19 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x67; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, owner_genesis.into(), owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
 
         // The granted writer legitimately pushes the clock to the edge of the bound, and the
         // owner then honestly ticks past it.
         let advance = crate::entry::MAX_LAMPORT_ADVANCE;
-        let g0 = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let g0 = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             ..ContentSpec::default()
         });
-        let basis = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let basis = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             seq: 1,
             previous: Some(g0.entry_hash),
             lamport: Some(advance + 1),
@@ -4692,7 +4720,7 @@ mod tests {
         });
         assert_eq!(verdict_after_ingest(&conn, &g0), ("accepted".into(), 1));
         assert_eq!(verdict_after_ingest(&conn, &basis), ("accepted".into(), 1));
-        let dependent = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+        let dependent = authored(&owner_secret, owner, owner_genesis.into(), ContentSpec {
             lamport: Some(advance + 2),
             ..ContentSpec::default()
         });
@@ -4720,7 +4748,7 @@ mod tests {
         // The owner keeps authoring after the revocation: the condemned basis props the clock
         // floor, so the dependent tick stays accepted and its continuation folds accepted —
         // revocation repairs the stream, it must not wedge it.
-        let continuation = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+        let continuation = authored(&owner_secret, owner, owner_genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(dependent.entry_hash),
             lamport: Some(advance + 3),
@@ -4738,25 +4766,25 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A fork at seq 1: the ACCEPTED winner is honest; the loser is over-ceiling and carries a
         // stored child. Deletion keyed by (chain, seq) would sweep the honest winner with the
         // loser — irreversible accepted-content loss — so the purge must follow the loser's hash
         // branch only.
-        let root = authored(&secret, owner, genesis, ContentSpec::default());
-        let winner = authored(&secret, owner, genesis, ContentSpec {
+        let root = authored(&secret, owner, genesis.into(), ContentSpec::default());
+        let winner = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(root.entry_hash),
             ..ContentSpec::default()
         });
-        let loser = authored(&secret, owner, genesis, ContentSpec {
+        let loser = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(root.entry_hash),
             lamport: Some(u64::MAX),
             ..ContentSpec::default()
         });
-        let loser_child = authored(&secret, owner, genesis, ContentSpec {
+        let loser_child = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 2,
             previous: Some(loser.entry_hash),
             lamport: Some(3),
@@ -4776,7 +4804,8 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         remaining.sort();
-        let mut expected = vec![root.entry_hash.to_vec(), winner.entry_hash.to_vec()];
+        let mut expected =
+            vec![root.entry_hash.as_slice().to_vec(), winner.entry_hash.as_slice().to_vec()];
         expected.sort();
         assert_eq!(
             remaining, expected,
@@ -4790,17 +4819,17 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A crafted pre-clamp accepted chain whose descendant ticks BACKWARDS: the ascending
         // walk meets the descendant first, and without the monotonicity cuts its lamport would
         // advance the running max far enough to make the poisoned ancestor look in-bounds —
         // leaving the whole chain stored, parked at refold, and wedging future authoring.
-        let poison = authored(&secret, owner, genesis, ContentSpec {
+        let poison = authored(&secret, owner, genesis.into(), ContentSpec {
             lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE),
             ..ContentSpec::default()
         });
-        let backwards = authored(&secret, owner, genesis, ContentSpec {
+        let backwards = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(poison.entry_hash),
             lamport: Some(crate::entry::MAX_LAMPORT_ADVANCE),
@@ -4821,7 +4850,7 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         // A legacy row: stored without the denormalized column (as a pre-V114 binary left it).
-        let entry = authored(&secret, owner, genesis, ContentSpec {
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec {
             lamport: Some(7),
             ..ContentSpec::default()
         });
@@ -4886,11 +4915,17 @@ mod tests {
         let stranger = DeviceSecret::from_seed(&[0x99; 32]);
         let strange_account = AccountId::from_bytes([0x99; 32]);
         // Both rows have an unresolvable roster (the legacy park state); only the lamport differs.
-        let over_ceiling = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
-            lamport: Some(u64::MAX),
-            ..ContentSpec::default()
-        });
-        let sane = authored(&stranger, strange_account, [0x98; 32], ContentSpec::default());
+        let over_ceiling =
+            authored(&stranger, strange_account, RosterRef::from_bytes([0x98; 32]), ContentSpec {
+                lamport: Some(u64::MAX),
+                ..ContentSpec::default()
+            });
+        let sane = authored(
+            &stranger,
+            strange_account,
+            RosterRef::from_bytes([0x98; 32]),
+            ContentSpec::default(),
+        );
         for entry in [&over_ceiling, &sane] {
             conn.execute(
                 "INSERT INTO content_pre_verify(
@@ -4917,7 +4952,11 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(kept, vec![sane.entry_hash.to_vec()], "only the over-ceiling row is dropped");
+        assert_eq!(
+            kept,
+            vec![sane.entry_hash.as_slice().to_vec()],
+            "only the over-ceiling row is dropped"
+        );
     }
 
     #[test]
@@ -4929,14 +4968,14 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x67; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, owner_genesis.into(), owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
 
         let honest = authored_op(
             &owner_secret,
             owner,
-            owner_genesis,
+            owner_genesis.into(),
             ContentSpec::default(),
             &node_create("honest"),
         );
@@ -4948,9 +4987,9 @@ mod tests {
         let poison = authored_op(
             &author_secret,
             author,
-            author_genesis,
+            author_genesis.into(),
             ContentSpec {
-                grant_id: Some(grant_id),
+                grant_id: Some(GrantId::from_bytes(grant_id)),
                 lamport: Some(2 + crate::entry::MAX_LAMPORT_ADVANCE),
                 ..ContentSpec::default()
             },
@@ -4966,7 +5005,7 @@ mod tests {
         let next = authored_op(
             &owner_secret,
             owner,
-            owner_genesis,
+            owner_genesis.into(),
             ContentSpec { seq: 1, previous: Some(honest.entry_hash), ..ContentSpec::default() },
             &node_create("next"),
         );
@@ -4979,16 +5018,16 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // seq 0 jumps past the bound; seq 1 carries a modest lamport of its own. Accepting the
         // descendant over its parked ancestor would break the dense-prefix invariant, so the
         // chain truncates at the violation. Planted, since ingest refuses the jump outright.
-        let violator = authored(&secret, owner, genesis, ContentSpec {
+        let violator = authored(&secret, owner, genesis.into(), ContentSpec {
             lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE),
             ..ContentSpec::default()
         });
-        let descendant = authored(&secret, owner, genesis, ContentSpec {
+        let descendant = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(violator.entry_hash),
             lamport: Some(2),
@@ -5012,26 +5051,27 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x67; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, owner_genesis, owner, &owner_secret, "owner");
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, owner_genesis.into(), owner, &owner_secret, "owner");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
 
-        let honest = authored(&owner_secret, owner, owner_genesis, ContentSpec::default());
+        let honest = authored(&owner_secret, owner, owner_genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &honest), ("accepted".into(), 1));
         // An UNGRANTED author's stored-but-never-accepted candidate, its lamport sitting exactly
         // one bound above zero. If the purge clock ranged over every stored row, this row would
         // advance the running max far enough to legitimize the accepted poison below — which the
         // queued refold (judging accepted work only) would then park as a wedging chain tail.
-        let shield = authored(&stranger, strange_account, [0x98; 32], ContentSpec {
-            lamport: Some(crate::entry::MAX_LAMPORT_ADVANCE),
-            ..ContentSpec::default()
-        });
-        let poison = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let shield =
+            authored(&stranger, strange_account, RosterRef::from_bytes([0x98; 32]), ContentSpec {
+                lamport: Some(crate::entry::MAX_LAMPORT_ADVANCE),
+                ..ContentSpec::default()
+            });
+        let poison = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE),
             ..ContentSpec::default()
         });
-        let inherited = authored(&owner_secret, owner, owner_genesis, ContentSpec {
+        let inherited = authored(&owner_secret, owner, owner_genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(honest.entry_hash),
             lamport: Some(2 * crate::entry::MAX_LAMPORT_ADVANCE + 1),
@@ -5050,7 +5090,8 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         remaining.sort();
-        let mut expected = vec![honest.entry_hash.to_vec(), shield.entry_hash.to_vec()];
+        let mut expected =
+            vec![honest.entry_hash.as_slice().to_vec(), shield.entry_hash.as_slice().to_vec()];
         expected.sort();
         assert_eq!(
             remaining, expected,
@@ -5065,16 +5106,16 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // Both lamports sit comfortably inside the bounded advance — what demotes seq 1 is the
         // chain ticking backwards, which honest authoring (`max accepted + 1` per entry) never
         // produces. The prefix below the violation keeps its verdict.
-        let first = authored(&secret, owner, genesis, ContentSpec {
+        let first = authored(&secret, owner, genesis.into(), ContentSpec {
             lamport: Some(5),
             ..ContentSpec::default()
         });
-        let backwards = authored(&secret, owner, genesis, ContentSpec {
+        let backwards = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(first.entry_hash),
             lamport: Some(3),
@@ -5093,7 +5134,7 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x21; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A partition's worth of catch-up: each entry ticks the clock by one, so every step stays
         // inside the bounded advance and the whole backlog accepts in a single fold — the clamp
@@ -5101,7 +5142,7 @@ mod tests {
         let mut previous = None;
         let mut entries = Vec::new();
         for seq in 0..5_u64 {
-            let entry = authored(&secret, owner, genesis, ContentSpec {
+            let entry = authored(&secret, owner, genesis.into(), ContentSpec {
                 seq,
                 previous,
                 ..ContentSpec::default()
@@ -5146,12 +5187,12 @@ mod tests {
         seed_ownership(&conn, owner);
         seed_auth_state_live(&conn, owner);
         let grant_id = [0x71; 32];
-        seed_grant(&conn, grant_id, owner, grantee, "writer");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, grantee, "writer");
 
         // The contributor can find its own grant on the owner's stream.
         assert_eq!(
             crate::account::effective_writer_grant(&conn, owner, stream, grantee).unwrap(),
-            Some(grant_id),
+            Some(Into::into(grant_id)),
             "the reverse resolver finds the contributor's effective writer grant",
         );
 
@@ -5165,7 +5206,7 @@ mod tests {
                 &tx,
                 stream,
                 owner,
-                grant_id,
+                GrantId::from_bytes(grant_id),
                 &[node_create("g1")],
                 NOW,
             )
@@ -5198,7 +5239,7 @@ mod tests {
         seed_ownership(&conn, owner);
         seed_auth_state_live(&conn, owner);
         let grant_id = [0x71; 32];
-        seed_grant(&conn, grant_id, owner, grantee, "writer");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, grantee, "writer");
 
         let anchors = vec![crate::op::PortableAnchor {
             binding_kind: "symbol".to_string(),
@@ -5223,7 +5264,7 @@ mod tests {
             &tx,
             stream,
             owner,
-            grant_id,
+            GrantId::from_bytes(grant_id),
             &[node_create("g1"), crate::op::MemoryOp::NodeAnchors {
                 node_id: crate::op::NodeId::from("g1"),
                 anchors,
@@ -5247,11 +5288,11 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x68; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "reader");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "reader");
 
-        let entry = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let entry = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &entry), ("rejected{grant_not_writer}".into(), 0));
@@ -5263,14 +5304,16 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x51; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // Two seq-0 entries on one coordinate — an equivocation. Both are authority-eligible, so
         // branch selection resolves the unforced fork by the smaller entry_hash; the loser is
         // terminal `forked`, never accepted.
-        let a = authored(&secret, owner, genesis, ContentSpec::default());
-        let b =
-            authored(&secret, owner, genesis, ContentSpec { body: 0xf7, ..ContentSpec::default() });
+        let a = authored(&secret, owner, genesis.into(), ContentSpec::default());
+        let b = authored(&secret, owner, genesis.into(), ContentSpec {
+            body: 0xf7,
+            ..ContentSpec::default()
+        });
         content_ingest(&conn, &a.signed_bytes, 1).unwrap();
         content_ingest(&conn, &b.signed_bytes, 2).unwrap();
         settle_all(&conn);
@@ -5286,14 +5329,14 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x61; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A real seq-0 entry, then a roster content cut bounding this coordinate AT that held
         // watermark. seq 0 is on the cut (accepted); seq 1 is beyond it → condemned.
-        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
-        seed_roster_content_cut(&conn, genesis, owner, 0, s0.entry_hash);
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        seed_roster_content_cut(&conn, genesis.into(), owner, 0, s0.entry_hash);
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             ..ContentSpec::default()
@@ -5308,16 +5351,16 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x62; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
         // A cut bounds this coordinate at seq 3, but its watermark has not synced. I11: the `[seq]`
         // condemns a beyond-cut entry from seq alone even while the watermark is withheld — a
         // withheld watermark must NOT launder a back-dated forgery into a park (the divergence this
         // guards against; parity with the account fold's P10 beyond-cut verdict).
-        seed_roster_content_cut(&conn, genesis, owner, 3, [0xcc; 32]);
+        seed_roster_content_cut(&conn, genesis.into(), owner, 3, [0xcc; 32].into());
 
-        let entry = authored(&secret, owner, genesis, ContentSpec {
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 5,
-            previous: Some([0xaa; 32]),
+            previous: Some(AccountEntryHash::from_bytes([0xaa; 32])),
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &entry), ("condemned{beyond_cut}".into(), 0));
@@ -5329,14 +5372,14 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x64; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
         // The same withheld cut at seq 3, but the entry is UNDER the cut (seq 0). Its on/off-branch
         // placement can't be decided until the watermark syncs, so it PARKS as `unknown_cut_target`
         // — never silently accepted, never condemned (I11: a withheld watermark never flips a
         // verdict). This is the correct under-cut park the beyond-cut fix must preserve.
-        seed_roster_content_cut(&conn, genesis, owner, 3, [0xcc; 32]);
+        seed_roster_content_cut(&conn, genesis.into(), owner, 3, [0xcc; 32].into());
 
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &entry), ("parked{unknown_cut_target}".into(), 0));
     }
 
@@ -5346,20 +5389,20 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x63; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A dense chain seq 0 → 1, both accepted. Then a cut claims to bound seq 0 but names the
         // seq-1 entry as its watermark — a coordinate/seq mismatch. A malformed cut must not
         // condemn honest content (the §11.3 laundering guard); both stay accepted.
-        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             ..ContentSpec::default()
         });
         content_ingest(&conn, &s1.signed_bytes, 2).unwrap();
-        seed_roster_content_cut(&conn, genesis, owner, 0, s1.entry_hash);
+        seed_roster_content_cut(&conn, genesis.into(), owner, 0, s1.entry_hash);
         run_account_trigger(&conn, owner);
 
         assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1));
@@ -5372,10 +5415,10 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x71; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
         seed_contested(&conn, owner);
 
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &entry), ("parked{contested_subject}".into(), 0));
     }
 
@@ -5385,12 +5428,12 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0x81; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // The author cites a control-fold length we have not reached (our effective_count is 0).
         // Freshness is the LAST axis (§13): with authority and branch otherwise clear, this parks
         // for refetch rather than hardening into a rejection we would later walk back.
-        let entry = authored(&secret, owner, genesis, ContentSpec {
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec {
             auth_len: 9,
             ..ContentSpec::default()
         });
@@ -5424,13 +5467,13 @@ mod tests {
         // No `StreamOwn` fact yet: the ingest-time refold cannot evaluate authority, so the entry
         // keeps its structural `retained_unfolded` status rather than being wrongly
         // parked/rejected.
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &entry), ("retained_unfolded".into(), 0));
 
         // The owner's ownership + roster facts fold; the account→content trigger reclassifies the
         // stream in that account-refold txn, and the entry reaches its real verdict.
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
         run_account_trigger(&conn, owner);
         assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
     }
@@ -5441,12 +5484,12 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xa1; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A dense chain seq 0 → 1, both accepted once the ingests settle.
-        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             ..ContentSpec::default()
@@ -5459,7 +5502,7 @@ mod tests {
         // A revocation bounds the coordinate at seq 0 (watermark = s0). On the next account fold
         // the trigger retro-condemns seq 1 (beyond the cut) while seq 0 stays accepted —
         // the revocation takes effect without any new content arriving (L2 enforceable).
-        seed_roster_content_cut(&conn, genesis, owner, 0, s0.entry_hash);
+        seed_roster_content_cut(&conn, genesis.into(), owner, 0, s0.entry_hash);
         run_account_trigger(&conn, owner);
         assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1));
         assert_eq!(verdict(&conn, &s1.entry_hash), ("condemned{beyond_cut}".into(), 0));
@@ -5474,13 +5517,13 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x69; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
 
         // A contributor's entry accepts. The owner neither authored it nor (after the next step)
         // owns the stream, so only the pre-rewrite owned set can rediscover it.
-        let entry = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let entry = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &entry), ("accepted".into(), 1));
@@ -5511,14 +5554,14 @@ mod tests {
         let (author, author_genesis) = roster(&conn, &author_secret);
         let grant_id = [0x6a; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, grant_id, owner, author, "writer");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
         // The OWNER is contested while the contributor stays live. The writer grant lives in the
         // owner's log, so a compromised owner poisons it: the content must fail closed.
         seed_contested(&conn, owner);
 
-        let entry = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(grant_id),
+        let entry = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(grant_id)),
             ..ContentSpec::default()
         });
         assert_eq!(verdict_after_ingest(&conn, &entry), ("parked{contested_subject}".into(), 0));
@@ -5530,9 +5573,9 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xd1; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &entry), ("accepted".into(), 1));
 
         // The stored envelope is corrupted (a torn write / bad blob). The next refold cannot decode
@@ -5553,9 +5596,9 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xe1; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &entry), ("accepted".into(), 1));
 
         // Worst case: ownership disappears AND the sole stored envelope is corrupt, so the refold
@@ -5580,16 +5623,18 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xf1; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
-        let a = authored(&secret, owner, genesis, ContentSpec::default());
+        let a = authored(&secret, owner, genesis.into(), ContentSpec::default());
         assert_eq!(verdict_after_ingest(&conn, &a), ("accepted".into(), 1));
 
         // Replace A's stored blob with a DIFFERENT (still valid) envelope, under A's row key. The
         // refold must not classify A's row under B's header just because B decodes — the decoded
         // `entry_hash` no longer matches the key, so the row is treated as absent and declassified.
-        let b =
-            authored(&secret, owner, genesis, ContentSpec { body: 0xf7, ..ContentSpec::default() });
+        let b = authored(&secret, owner, genesis.into(), ContentSpec {
+            body: 0xf7,
+            ..ContentSpec::default()
+        });
         assert_ne!(a.entry_hash, b.entry_hash);
         conn.execute(
             "UPDATE content_entries SET signed_bytes = ?1 WHERE entry_hash = ?2",
@@ -5606,18 +5651,18 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xd2; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // seq 0 cites a control-fold length ahead of ours (parks on freshness); seq 1 cites a
         // current length. An attacker varies `auth_len` DOWN the chain to try to slip seq 1 in as
         // accepted over a parked seq 0. The accepted set must stay a prefix from seq 0, so neither
         // accepts while seq 0 is parked.
-        let s0 = authored(&secret, owner, genesis, ContentSpec {
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec {
             auth_len: 9,
             ..ContentSpec::default()
         });
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             auth_len: 0,
@@ -5636,17 +5681,17 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xd3; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // seq 0 is the owner citing a grant it must not have → rejected (ineligible). seq 1 is a
         // clean owner entry building on it: authority-eligible, but with no accepted parent to
         // extend. It is stranded, not a contest loser, so it parks (recoverable) — never `forked`.
-        let s0 = authored(&secret, owner, genesis, ContentSpec {
-            grant_id: Some([0x6b; 32]),
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes([0x6b; 32])),
             ..ContentSpec::default()
         });
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             ..ContentSpec::default()
@@ -5685,9 +5730,9 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xe3; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
         run_account_trigger(&conn, owner);
         assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
@@ -5702,16 +5747,21 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xe4; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A dense chain seq 0 → 1 carrying real ops; both accept and project on settle.
-        let s0 =
-            authored_op(&secret, owner, genesis, ContentSpec::default(), &node_create("mem_a"));
+        let s0 = authored_op(
+            &secret,
+            owner,
+            genesis.into(),
+            ContentSpec::default(),
+            &node_create("mem_a"),
+        );
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
         let s1 = authored_op(
             &secret,
             owner,
-            genesis,
+            genesis.into(),
             ContentSpec { seq: 1, previous: Some(s0.entry_hash), ..ContentSpec::default() },
             &node_create("mem_b"),
         );
@@ -5723,7 +5773,7 @@ mod tests {
         // A revocation bounds the coordinate at seq 0: the account fold retro-condemns seq 1, and
         // the same txn must drop its node from the projection — a stale row here would make the
         // reconcile's anti-join treat mem_b as still authored.
-        seed_roster_content_cut(&conn, genesis, owner, 0, s0.entry_hash);
+        seed_roster_content_cut(&conn, genesis.into(), owner, 0, s0.entry_hash);
         run_account_trigger(&conn, owner);
         assert_eq!(verdict(&conn, &s1.entry_hash), ("condemned{beyond_cut}".into(), 0));
         assert_eq!(
@@ -5742,13 +5792,18 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xe5; 32]);
         let (owner, genesis) = roster(&conn, &secret);
 
-        let entry =
-            authored_op(&secret, owner, genesis, ContentSpec::default(), &node_create("mem_a"));
+        let entry = authored_op(
+            &secret,
+            owner,
+            genesis.into(),
+            ContentSpec::default(),
+            &node_create("mem_a"),
+        );
         assert_eq!(verdict_after_ingest(&conn, &entry), ("retained_unfolded".into(), 0));
         assert_eq!(projected_node_ids(&conn), Vec::<String>::new());
 
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
         run_account_trigger(&conn, owner);
         assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
         assert_eq!(
@@ -5768,18 +5823,18 @@ mod tests {
         let writer_grant = [0x71; 32];
         let reader_grant = [0x72; 32];
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, author_genesis, author, &author_secret, "member");
-        seed_grant(&conn, writer_grant, owner, author, "writer");
+        seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+        seed_grant(&conn, GrantId::from_bytes(writer_grant), owner, author, "writer");
 
         // Two writer entries at seq 0 (equivocation): the smaller entry_hash wins the unforced
         // fork.
-        let a = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(writer_grant),
+        let a = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(writer_grant)),
             body: 0xf6,
             ..ContentSpec::default()
         });
-        let b = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(writer_grant),
+        let b = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(writer_grant)),
             body: 0xf7,
             ..ContentSpec::default()
         });
@@ -5792,15 +5847,15 @@ mod tests {
         // a peer could hijack the accepted branch by storing a rejected reader-grant entry.
         seed_closed_grant_with_cut(
             &conn,
-            reader_grant,
+            GrantId::from_bytes(reader_grant),
             owner,
             author,
             "reader",
             &author_secret,
             loser.entry_hash,
         );
-        let reader_entry = authored(&author_secret, author, author_genesis, ContentSpec {
-            grant_id: Some(reader_grant),
+        let reader_entry = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+            grant_id: Some(GrantId::from_bytes(reader_grant)),
             body: 0xf5,
             ..ContentSpec::default()
         });
@@ -5895,13 +5950,13 @@ mod tests {
         let genesis = genesis.entry_hash;
 
         // A dense honest chain seq 0 → 1 → 2, all fresh (auth_len 0) → all accept.
-        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             ..ContentSpec::default()
         });
-        let s2 = authored(&secret, owner, genesis, ContentSpec {
+        let s2 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 2,
             previous: Some(s1.entry_hash),
             ..ContentSpec::default()
@@ -5910,7 +5965,7 @@ mod tests {
         let setup = |conn: &Connection| {
             roster(conn, &secret);
             seed_ownership(conn, owner);
-            seed_roster_fact(conn, genesis, owner, &secret, "owner");
+            seed_roster_fact(conn, genesis.into(), owner, &secret, "owner");
         };
 
         let per_entry = drive_ingest(&entries, &setup, RefoldCadence::PerEntry);
@@ -5937,11 +5992,15 @@ mod tests {
         // Ingested OUT OF ORDER (descendant first, then one sibling, then the other) so the
         // per-entry cadence genuinely folds partial states mid-flight while the batch
         // cadence sees the whole set at once. Both must converge.
-        let a0 =
-            authored(&secret, owner, genesis, ContentSpec { body: 0xf6, ..ContentSpec::default() });
-        let b0 =
-            authored(&secret, owner, genesis, ContentSpec { body: 0xf7, ..ContentSpec::default() });
-        let child = authored(&secret, owner, genesis, ContentSpec {
+        let a0 = authored(&secret, owner, genesis.into(), ContentSpec {
+            body: 0xf6,
+            ..ContentSpec::default()
+        });
+        let b0 = authored(&secret, owner, genesis.into(), ContentSpec {
+            body: 0xf7,
+            ..ContentSpec::default()
+        });
+        let child = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(a0.entry_hash),
             auth_len: 9,
@@ -5951,7 +6010,7 @@ mod tests {
         let setup = |conn: &Connection| {
             roster(conn, &secret);
             seed_ownership(conn, owner);
-            seed_roster_fact(conn, genesis, owner, &secret, "owner");
+            seed_roster_fact(conn, genesis.into(), owner, &secret, "owner");
         };
 
         let per_entry = drive_ingest(&entries, &setup, RefoldCadence::PerEntry);
@@ -5975,9 +6034,9 @@ mod tests {
 
         // seq 0 sits ON a roster content cut (accepted); seq 1 is BEYOND the bound watermark
         // (condemned). The cut exercises the condemn fold path under both cadences.
-        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
         let s0_hash = s0.entry_hash;
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0_hash),
             ..ContentSpec::default()
@@ -5986,8 +6045,8 @@ mod tests {
         let setup = |conn: &Connection| {
             roster(conn, &secret);
             seed_ownership(conn, owner);
-            seed_roster_fact(conn, genesis, owner, &secret, "owner");
-            seed_roster_content_cut(conn, genesis, owner, 0, s0_hash);
+            seed_roster_fact(conn, genesis.into(), owner, &secret, "owner");
+            seed_roster_content_cut(conn, genesis.into(), owner, 0, s0_hash);
         };
 
         let per_entry = drive_ingest(&entries, &setup, RefoldCadence::PerEntry);
@@ -6009,14 +6068,14 @@ mod tests {
         // Authority is present BEFORE ingest, so a refold — if one ran mid-ingest — WOULD accept
         // these entries. Observing them still structural after N ingests is the proof it did not.
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // A dense honest chain. Pre-#652 this ran one whole-stream refold PER entry (O(n) each,
         // O(n^2) cumulative under the writer lock).
         let mut entries = Vec::new();
         let mut previous = None;
         for seq in 0..6_u64 {
-            let entry = authored(&secret, owner, genesis, ContentSpec {
+            let entry = authored(&secret, owner, genesis.into(), ContentSpec {
                 seq,
                 previous,
                 ..ContentSpec::default()
@@ -6062,9 +6121,9 @@ mod tests {
         let member_b = DeviceSecret::from_seed(&[0xb7; 32]);
         let (account, genesis) = roster(&conn, &founder);
         seed_ownership(&conn, account);
-        seed_roster_fact(&conn, genesis, account, &founder, "owner");
+        seed_roster_fact(&conn, genesis.into(), account, &founder, "owner");
 
-        let entry = authored(&founder, account, genesis, ContentSpec::default());
+        let entry = authored(&founder, account, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
         assert_eq!(settle_all(&conn).settled_streams, 1);
         assert_eq!(verdict(&conn, &entry.entry_hash), ("accepted".into(), 1));
@@ -6099,9 +6158,9 @@ mod tests {
         let member = DeviceSecret::from_seed(&[0xb9; 32]);
         let (account, genesis) = roster(&conn, &founder);
         seed_ownership(&conn, account);
-        seed_roster_fact(&conn, genesis, account, &founder, "owner");
+        seed_roster_fact(&conn, genesis.into(), account, &founder, "owner");
 
-        let entry = authored(&founder, account, genesis, ContentSpec::default());
+        let entry = authored(&founder, account, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &entry.signed_bytes, 5).unwrap();
         assert_eq!(pending_refold_state(&conn), (PENDING_REFOLD_CONTENT_CANDIDATE, 5, 5),);
 
@@ -6120,11 +6179,11 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xba; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
         let entry = authored_op(
             &secret,
             owner,
-            genesis,
+            genesis.into(),
             ContentSpec::default(),
             &node_create("sealed-later"),
         );
@@ -6152,14 +6211,14 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xb2; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // Two ingests to one stream leave exactly one queued refold (dedup), and it persists across
         // the separate ingest calls (crash-safety: the mark survives until a fold consumes it).
-        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
         assert_eq!(pending_refold_count(&conn), 1, "the first ingest queues the stream");
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             ..ContentSpec::default()
@@ -6196,11 +6255,11 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xb4; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // Ingest seq 0 and SETTLE it — its status becomes `accepted`, no longer
         // `retained_unfolded`.
-        let s0 = authored(&secret, owner, genesis, ContentSpec::default());
+        let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
         assert_eq!(settle_all(&conn).settled_streams, 1);
         assert_eq!(verdict(&conn, &s0.entry_hash), ("accepted".into(), 1));
@@ -6210,7 +6269,7 @@ mod tests {
         // lands `retained_unfolded` — NOT wrongly `missing_predecessor` just because s0's
         // status moved off `retained_unfolded` at settle. The RETURNED status is the
         // contract, so assert it directly.
-        let s1 = authored(&secret, owner, genesis, ContentSpec {
+        let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
             seq: 1,
             previous: Some(s0.entry_hash),
             ..ContentSpec::default()
@@ -6262,7 +6321,7 @@ mod tests {
             1,
         );
         let (foreign, foreign_roster) = roster(&excluded, &foreign_secret);
-        let signed = content(&foreign_secret, foreign, foreign_roster, 0, None);
+        let signed = content(&foreign_secret, foreign, foreign_roster.into(), 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &foreign_secret.public())
                 .unwrap();
@@ -6287,7 +6346,7 @@ mod tests {
             1,
         );
         let (foreign, foreign_roster) = roster(&flooded, &foreign_secret);
-        let signed = content(&foreign_secret, foreign, foreign_roster, 0, None);
+        let signed = content(&foreign_secret, foreign, foreign_roster.into(), 0, None);
         let verified =
             envelope::verify_content_signed(&signed.signed_bytes, &foreign_secret.public())
                 .unwrap();
@@ -6305,13 +6364,13 @@ mod tests {
         let secret = DeviceSecret::from_seed(&[0xb3; 32]);
         let (owner, genesis) = roster(&conn, &secret);
         seed_ownership(&conn, owner);
-        seed_roster_fact(&conn, genesis, owner, &secret, "owner");
+        seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
 
         // Empty queue: settle folds nothing and returns 0.
         assert_eq!(settle_all(&conn).settled_streams, 0, "settle on an empty queue is a no-op",);
 
         // Ingest, then settle drains it; a SECOND settle finds the queue empty and changes nothing.
-        let entry = authored(&secret, owner, genesis, ContentSpec::default());
+        let entry = authored(&secret, owner, genesis.into(), ContentSpec::default());
         content_ingest(&conn, &entry.signed_bytes, 1).unwrap();
         assert_eq!(settle_all(&conn).settled_streams, 1, "the first settle folds the dirty stream",);
         let after_first = verdict(&conn, &entry.entry_hash);
@@ -7378,8 +7437,8 @@ mod tests {
         /// and signs real entries so `fold_account` runs over verified input.
         struct AccountLog {
             account_id: AccountId,
-            genesis_hash: [u8; 32],
-            chains: HashMap<[u8; 32], (u64, Option<[u8; 32]>)>,
+            genesis_hash: AccountEntryHash,
+            chains: HashMap<[u8; 32], (u64, Option<AccountEntryHash>)>,
             entries: Vec<VerifiedAccountEntry>,
         }
 
@@ -7420,7 +7479,7 @@ mod tests {
             fn author(
                 &mut self,
                 author: &Dev,
-                authority_ref: Option<[u8; 32]>,
+                authority_ref: Option<OwnerId>,
                 op: &AccountOp,
             ) -> [u8; 32] {
                 let payload = account_ops::encode(op).unwrap();
@@ -7446,7 +7505,7 @@ mod tests {
                 let hash = verified.entry_hash;
                 self.chains.insert(author.fp.to_bytes(), (seq + 1, Some(hash)));
                 self.entries.push(verified);
-                hash
+                hash.into()
             }
         }
 
@@ -7468,24 +7527,26 @@ mod tests {
             let founder = Dev::new(0xF1);
             let b = Dev::new(0xB1);
             let mut log = AccountLog::genesis(&founder);
-            let add_b = log.author(&founder, Some(log.genesis_hash), &AccountOp::DeviceAdd {
-                device_fingerprint: b.fp,
-                ed25519_pubkey: b.ed,
-                x25519_pubkey: b.x,
-                role: DeviceRole::Owner,
-                label: None,
-            });
-            let b0 = log.author(&b, Some(add_b), &member_add(&Dev::new(0xD1)));
-            let b1 = log.author(&b, Some(add_b), &member_add(&Dev::new(0xE1)));
-            let b2 = log.author(&b, Some(add_b), &member_add(&Dev::new(0x71)));
+            let add_b =
+                log.author(&founder, Some(log.genesis_hash.into()), &AccountOp::DeviceAdd {
+                    device_fingerprint: b.fp,
+                    ed25519_pubkey: b.ed,
+                    x25519_pubkey: b.x,
+                    role: DeviceRole::Owner,
+                    label: None,
+                });
+            let b0 = log.author(&b, Some(OwnerId::from_bytes(add_b)), &member_add(&Dev::new(0xD1)));
+            let b1 = log.author(&b, Some(OwnerId::from_bytes(add_b)), &member_add(&Dev::new(0xE1)));
+            let b2 = log.author(&b, Some(OwnerId::from_bytes(add_b)), &member_add(&Dev::new(0x71)));
             let control_cut = match watermark {
                 // A misbound watermark names the WRONG seq on B's chain (b0 is seq 0, the cut
                 // claims seq 1): the §11.3 guard rejects the whole remove, so B
                 // (and b0/b2) survives.
-                Watermark::Misbound => Cut::At { seq: 1, hash: b0 },
-                Watermark::Held | Watermark::Withheld => Cut::At { seq: 1, hash: b1 },
+                Watermark::Misbound => Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(b0) },
+                Watermark::Held | Watermark::Withheld =>
+                    Cut::At { seq: 1, hash: AccountEntryHash::from_bytes(b1) },
             };
-            log.author(&founder, Some(log.genesis_hash), &AccountOp::DeviceRemove {
+            log.author(&founder, Some(log.genesis_hash.into()), &AccountOp::DeviceRemove {
                 device_fingerprint: b.fp,
                 control_cut,
                 secrets_cut: Cut::Empty,
@@ -7495,8 +7556,12 @@ mod tests {
             // A withheld watermark models b1 not yet synced — fold every entry EXCEPT b1.
             let history: AccountAuthHistory = match watermark {
                 Watermark::Withheld => {
-                    let held: Vec<VerifiedAccountEntry> =
-                        log.entries.iter().filter(|e| e.entry_hash != b1).cloned().collect();
+                    let held: Vec<VerifiedAccountEntry> = log
+                        .entries
+                        .iter()
+                        .filter(|e| e.entry_hash != AccountEntryHash::from_bytes(b1))
+                        .cloned()
+                        .collect();
                     fold_account(&held)
                 },
                 _ => fold_account(&log.entries),
@@ -7505,7 +7570,7 @@ mod tests {
                 Target::BeyondCut => b2,
                 Target::UnderCut => b0,
             };
-            match history.outcome(&target_hash) {
+            match history.outcome(&target_hash.into()) {
                 Some(Outcome::Condemned(CondemnedReason::BeyondCut)) =>
                     CutParity::CondemnedBeyondCut,
                 Some(Outcome::Parked(ParkReason::UnknownCutTarget)) =>
@@ -7523,14 +7588,14 @@ mod tests {
             let secret = DeviceSecret::from_seed(&[0xC0; 32]);
             let (owner, genesis) = roster(&conn, &secret);
             seed_ownership(&conn, owner);
-            seed_roster_fact(&conn, genesis, owner, &secret, "owner");
-            let s0 = authored(&secret, owner, genesis, ContentSpec::default());
-            let s1 = authored(&secret, owner, genesis, ContentSpec {
+            seed_roster_fact(&conn, genesis.into(), owner, &secret, "owner");
+            let s0 = authored(&secret, owner, genesis.into(), ContentSpec::default());
+            let s1 = authored(&secret, owner, genesis.into(), ContentSpec {
                 seq: 1,
                 previous: Some(s0.entry_hash),
                 ..ContentSpec::default()
             });
-            let s2 = authored(&secret, owner, genesis, ContentSpec {
+            let s2 = authored(&secret, owner, genesis.into(), ContentSpec {
                 seq: 2,
                 previous: Some(s1.entry_hash),
                 ..ContentSpec::default()
@@ -7541,7 +7606,7 @@ mod tests {
                 Watermark::Misbound => s0.entry_hash,
                 Watermark::Held | Watermark::Withheld => s1.entry_hash,
             };
-            seed_roster_content_cut(&conn, genesis, owner, 1, cut_watermark);
+            seed_roster_content_cut(&conn, genesis.into(), owner, 1, cut_watermark);
             content_ingest(&conn, &s0.signed_bytes, 1).unwrap();
             // A withheld watermark models s1 not yet ingested — the content analog of dropping b1.
             if !matches!(watermark, Watermark::Withheld) {
@@ -7646,5 +7711,3 @@ mod tests {
         );
     }
 }
-
-use super::super::branch::CitedFreshness;

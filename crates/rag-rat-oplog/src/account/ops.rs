@@ -19,6 +19,7 @@ use minicbor::decode::{Decoder, Error as CborError};
 
 use super::AccountId;
 use super::cut::Cut;
+use super::id::{AccountEntryHash, GrantId, OwnerId};
 use super::limits::{CONTENT_CUTS_MAX, DEVICE_CUTS_MAX};
 use crate::cbor::{self, VecEncoderExt};
 use crate::device::{DevicePublic, DeviceX25519Public};
@@ -165,7 +166,7 @@ impl ChainKind {
 pub(super) struct ContentCut {
     pub(super) stream_id: StreamId,
     pub(super) seq: u64,
-    pub(super) hash: [u8; 32],
+    pub(super) hash: AccountEntryHash,
 }
 
 /// One device-chain cut inside a `StreamRevoke`: `[device_fingerprint, seq, entry_hash]`.
@@ -173,7 +174,7 @@ pub(super) struct ContentCut {
 pub struct DeviceCut {
     pub device_fingerprint: DeviceFingerprint,
     pub seq: u64,
-    pub hash: [u8; 32],
+    pub hash: AccountEntryHash,
 }
 
 /// The ten control-log ops (§10). Field order is the frozen wire order; goldens pin the bytes.
@@ -205,7 +206,7 @@ pub(super) enum AccountOp {
     },
     OwnerDemote {
         device_fingerprint: DeviceFingerprint,
-        owner_id: [u8; 32],
+        owner_id: OwnerId,
         control_cut: Cut,
         secrets_cut: Cut,
         reason: String,
@@ -213,11 +214,11 @@ pub(super) enum AccountOp {
     CutExtend {
         chain_kind: ChainKind,
         stream_id: Option<StreamId>,
-        incarnation_id: Option<[u8; 32]>,
+        incarnation_id: Option<AccountEntryHash>,
         subject_account_id: AccountId,
         device_fingerprint: DeviceFingerprint,
         new_seq: u64,
-        new_entry_hash: [u8; 32],
+        new_entry_hash: AccountEntryHash,
     },
     StreamOwn {
         stream_id: StreamId,
@@ -231,7 +232,7 @@ pub(super) enum AccountOp {
     StreamRevoke {
         stream_id: StreamId,
         grantee_account_id: AccountId,
-        grant_id: [u8; 32],
+        grant_id: GrantId,
         device_cuts: Vec<DeviceCut>,
         reason: String,
     },
@@ -395,7 +396,7 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
             } => {
                 enc.put_array(5);
                 enc.put_bytes(&device_fingerprint.to_bytes());
-                enc.put_bytes(owner_id);
+                enc.put_bytes(owner_id.as_slice());
                 control_cut.encode_into(&mut enc);
                 secrets_cut.encode_into(&mut enc);
                 enc.put_str(reason);
@@ -412,11 +413,11 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 enc.put_array(7);
                 enc.put_u8(chain_kind.as_u8());
                 encode_opt_b32(&mut enc, stream_id.map(StreamId::to_bytes));
-                encode_opt_b32(&mut enc, *incarnation_id);
+                encode_opt_b32(&mut enc, (*incarnation_id).map(Into::into));
                 enc.put_bytes(&subject_account_id.to_bytes());
                 enc.put_bytes(&device_fingerprint.to_bytes());
                 enc.put_u64(*new_seq);
-                enc.put_bytes(new_entry_hash);
+                enc.put_bytes(new_entry_hash.as_slice());
             },
             AccountOp::StreamOwn { stream_id, stream_spec_bytes } => {
                 enc.put_array(2);
@@ -439,7 +440,7 @@ fn encode_canonical(op: &AccountOp) -> Vec<u8> {
                 enc.put_array(5);
                 enc.put_bytes(&stream_id.to_bytes());
                 enc.put_bytes(&grantee_account_id.to_bytes());
-                enc.put_bytes(grant_id);
+                enc.put_bytes(grant_id.as_slice());
                 write_device_cuts(&mut enc, device_cuts);
                 enc.put_str(reason);
             },
@@ -554,7 +555,13 @@ fn decode_owner_demote(bytes: &[u8]) -> Result<AccountOp, CborError> {
     let control_cut = Cut::decode(&mut d)?;
     let secrets_cut = Cut::decode(&mut d)?;
     let reason = d.str()?.to_string();
-    Ok(AccountOp::OwnerDemote { device_fingerprint, owner_id, control_cut, secrets_cut, reason })
+    Ok(AccountOp::OwnerDemote {
+        device_fingerprint,
+        owner_id: OwnerId::from_bytes(owner_id),
+        control_cut,
+        secrets_cut,
+        reason,
+    })
 }
 
 fn decode_cut_extend(bytes: &[u8]) -> Result<AccountOp, CborError> {
@@ -575,11 +582,11 @@ fn decode_cut_extend(bytes: &[u8]) -> Result<AccountOp, CborError> {
     Ok(AccountOp::CutExtend {
         chain_kind,
         stream_id,
-        incarnation_id,
+        incarnation_id: incarnation_id.map(Into::into),
         subject_account_id,
         device_fingerprint,
         new_seq,
-        new_entry_hash,
+        new_entry_hash: AccountEntryHash::from_bytes(new_entry_hash),
     })
 }
 
@@ -607,7 +614,13 @@ fn decode_stream_revoke(bytes: &[u8]) -> Result<AccountOp, CborError> {
     let grant_id = cbor::fixed_bytes::<32>(d.bytes()?, "grant_id")?;
     let device_cuts = decode_device_cuts(&mut d)?;
     let reason = d.str()?.to_string();
-    Ok(AccountOp::StreamRevoke { stream_id, grantee_account_id, grant_id, device_cuts, reason })
+    Ok(AccountOp::StreamRevoke {
+        stream_id,
+        grantee_account_id,
+        grant_id: GrantId::from_bytes(grant_id),
+        device_cuts,
+        reason,
+    })
 }
 
 fn decode_account_reroot(bytes: &[u8]) -> Result<AccountOp, CborError> {
@@ -657,7 +670,7 @@ fn write_content_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[ContentCut]) {
         enc.put_array(3);
         enc.put_bytes(&cut.stream_id.to_bytes());
         enc.put_u64(cut.seq);
-        enc.put_bytes(&cut.hash);
+        enc.put_bytes(cut.hash.as_slice());
     }
 }
 
@@ -678,7 +691,11 @@ fn decode_content_cuts(d: &mut Decoder<'_>) -> Result<Vec<ContentCut>, CborError
         prev = Some(stream_bytes);
         let seq = d.u64()?;
         let hash = cbor::fixed_bytes::<32>(d.bytes()?, "content_cut hash")?;
-        cuts.push(ContentCut { stream_id: StreamId::from_bytes(stream_bytes), seq, hash });
+        cuts.push(ContentCut {
+            stream_id: StreamId::from_bytes(stream_bytes),
+            seq,
+            hash: AccountEntryHash::from_bytes(hash),
+        });
     }
     Ok(cuts)
 }
@@ -705,7 +722,7 @@ fn write_device_cuts(enc: &mut Encoder<&mut Vec<u8>>, cuts: &[DeviceCut]) {
         enc.put_array(3);
         enc.put_bytes(&cut.device_fingerprint.to_bytes());
         enc.put_u64(cut.seq);
-        enc.put_bytes(&cut.hash);
+        enc.put_bytes(cut.hash.as_slice());
     }
 }
 
@@ -728,7 +745,7 @@ fn decode_device_cuts(d: &mut Decoder<'_>) -> Result<Vec<DeviceCut>, CborError> 
         cuts.push(DeviceCut {
             device_fingerprint: DeviceFingerprint::from_bytes(fp_bytes),
             seq,
-            hash,
+            hash: AccountEntryHash::from_bytes(hash),
         });
     }
     Ok(cuts)
@@ -827,12 +844,12 @@ mod tests {
             },
             entry_type::DEVICE_REMOVE => AccountOp::DeviceRemove {
                 device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
-                control_cut: Cut::At { seq: 3, hash: [0x11; 32] },
+                control_cut: Cut::At { seq: 3, hash: AccountEntryHash::from_bytes([0x11; 32]) },
                 secrets_cut: Cut::Empty,
                 content_cuts: vec![ContentCut {
                     stream_id: stream(0x33),
                     seq: 7,
-                    hash: [0x44; 32],
+                    hash: AccountEntryHash::from_bytes([0x44; 32]),
                 }],
                 reason: "left".to_string(),
             },
@@ -841,19 +858,19 @@ mod tests {
             },
             entry_type::OWNER_DEMOTE => AccountOp::OwnerDemote {
                 device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
-                owner_id: [0x55; 32],
-                control_cut: Cut::At { seq: 2, hash: [0x66; 32] },
+                owner_id: OwnerId::from_bytes([0x55; 32]),
+                control_cut: Cut::At { seq: 2, hash: AccountEntryHash::from_bytes([0x66; 32]) },
                 secrets_cut: Cut::Empty,
                 reason: "demoted".to_string(),
             },
             entry_type::CUT_EXTEND => AccountOp::CutExtend {
                 chain_kind: ChainKind::Ctrl,
                 stream_id: None,
-                incarnation_id: Some([0x77; 32]),
+                incarnation_id: Some(AccountEntryHash::from_bytes([0x77; 32])),
                 subject_account_id: account(0xaa),
                 device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
                 new_seq: 9,
-                new_entry_hash: [0x88; 32],
+                new_entry_hash: AccountEntryHash::from_bytes([0x88; 32]),
             },
             entry_type::STREAM_OWN => AccountOp::StreamOwn {
                 stream_id: stream(0x33),
@@ -867,11 +884,11 @@ mod tests {
             entry_type::STREAM_REVOKE => AccountOp::StreamRevoke {
                 stream_id: stream(0x33),
                 grantee_account_id: account(0x99),
-                grant_id: [0xaa; 32],
+                grant_id: GrantId::from_bytes([0xaa; 32]),
                 device_cuts: vec![DeviceCut {
                     device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
                     seq: 41,
-                    hash: [0xcc; 32],
+                    hash: AccountEntryHash::from_bytes([0xcc; 32]),
                 }],
                 reason: "revoked".to_string(),
             },
@@ -1135,19 +1152,19 @@ mod tests {
         let cut = DeviceCut {
             device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
             seq: 41,
-            hash: [0xcc; 32],
+            hash: AccountEntryHash::from_bytes([0xcc; 32]),
         };
         let doubled = AccountOp::StreamRevoke {
             stream_id: stream(0x33),
             grantee_account_id: account(0x99),
-            grant_id: [0xaa; 32],
+            grant_id: GrantId::from_bytes([0xaa; 32]),
             device_cuts: vec![cut.clone(), cut.clone()],
             reason: "revoked".to_string(),
         };
         let single = AccountOp::StreamRevoke {
             stream_id: stream(0x33),
             grantee_account_id: account(0x99),
-            grant_id: [0xaa; 32],
+            grant_id: GrantId::from_bytes([0xaa; 32]),
             device_cuts: vec![cut],
             reason: "revoked".to_string(),
         };
@@ -1167,7 +1184,7 @@ mod tests {
         AccountOp::StreamRevoke {
             stream_id: stream(0x33),
             grantee_account_id: account(0x99),
-            grant_id: [0xaa; 32],
+            grant_id: GrantId::from_bytes([0xaa; 32]),
             device_cuts,
             reason: "r".to_string(),
         }
@@ -1181,12 +1198,12 @@ mod tests {
             DeviceCut {
                 device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
                 seq: 1,
-                hash: [0x01; 32],
+                hash: AccountEntryHash::from_bytes([0x01; 32]),
             },
             DeviceCut {
                 device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
                 seq: 2,
-                hash: [0x02; 32],
+                hash: AccountEntryHash::from_bytes([0x02; 32]),
             },
         ]);
         assert!(encode(&conflicting).is_err(), "conflicting device_cuts rejected at encode");
@@ -1199,7 +1216,7 @@ mod tests {
                 DeviceCut {
                     device_fingerprint: DeviceFingerprint::from_bytes(fp),
                     seq: 1,
-                    hash: [0u8; 32],
+                    hash: AccountEntryHash::from_bytes([0u8; 32]),
                 }
             })
             .collect();
@@ -1248,7 +1265,7 @@ mod tests {
             subject_account_id: account(0xaa),
             device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
             new_seq: 1,
-            new_entry_hash: [0x88; 32],
+            new_entry_hash: AccountEntryHash::from_bytes([0x88; 32]),
         };
         assert!(encode(&bad).is_err(), "content CutExtend without stream_id rejected at encode");
     }

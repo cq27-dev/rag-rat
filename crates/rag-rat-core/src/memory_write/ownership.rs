@@ -309,7 +309,7 @@ pub(crate) fn ensure_not_mirroring_another_account(
 pub(super) struct GranteeContext {
     pub(super) owner_account: rag_rat_oplog::AccountId,
     pub(super) stream: StreamId,
-    pub(super) grant_id: [u8; 32],
+    pub(super) grant_id: rag_rat_oplog::GrantId,
 }
 
 /// Resolve grantee-authoring context for `repo_id`: the configured contribution owner, its

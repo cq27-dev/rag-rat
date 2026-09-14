@@ -16,7 +16,7 @@
 use anyhow::Context;
 use rusqlite::{Connection, params};
 
-use super::super::id::fixed;
+use super::super::id::{self, AccountEntryHash};
 use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
 use super::super::{AccountId, bootstrap, content, envelope, fold, storage};
 use super::ops::{self, DecodedSecretsOp, StreamKeyWrap};
@@ -32,7 +32,7 @@ use crate::stream::StreamId;
 pub struct SelectedWrap {
     pub key_id: KeyId,
     pub key_epoch: u64,
-    pub minting_entry_hash: [u8; 32],
+    pub minting_entry_hash: AccountEntryHash,
 }
 
 /// One exact live content-key group that a newly enrolled device may need. Epoch is part of the
@@ -92,13 +92,13 @@ enum KeyRecovery {
 }
 
 struct WrapRecoveryFailure {
-    entry_hash: [u8; 32],
+    entry_hash: AccountEntryHash,
     observed_key_id: Option<KeyId>,
 }
 
 /// One EFFECTIVE accepted `StreamKeyWrap` op for a stream, decoded from its stored bytes.
 struct AcceptedStreamWrap {
-    entry_hash: [u8; 32],
+    entry_hash: AccountEntryHash,
     wrap: StreamKeyWrap,
 }
 
@@ -201,7 +201,7 @@ pub(super) fn live_stream_key_epochs(
         .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .map(|raw| Ok(StreamId::from_bytes(fixed::<32>(&raw)?)))
+        .map(|raw| Ok(StreamId::from_bytes(id::fixed::<32>(&raw)?)))
         .collect::<anyhow::Result<Vec<_>>>()?;
     for stream in streams {
         anyhow::ensure!(
@@ -552,7 +552,7 @@ fn list_accepted_stream_key_wraps_with_mode(
                      sealed-ratchet wrap evidence",
                 ),
         };
-        if signed.entry_hash != entry_hash {
+        if signed.entry_hash != AccountEntryHash::from_bytes(entry_hash) {
             if matches!(mode, AcceptedWrapDecodeMode::Tolerant) {
                 continue;
             }
@@ -563,7 +563,10 @@ fn list_accepted_stream_key_wraps_with_mode(
         }
         match ops::decode(signed.header.entry_type, &signed.payload) {
             Ok(DecodedSecretsOp::StreamKeyWrap(wrap)) if wrap.stream_id == stream_id => {
-                out.push(AcceptedStreamWrap { entry_hash, wrap });
+                out.push(AcceptedStreamWrap {
+                    entry_hash: AccountEntryHash::from_bytes(entry_hash),
+                    wrap,
+                });
             },
             Ok(_) => {},
             Err(_) if matches!(mode, AcceptedWrapDecodeMode::Tolerant) => continue,
@@ -595,7 +598,9 @@ mod tests {
     };
     use crate::account::cut::Cut;
     use crate::account::envelope::{AccountEntryHeader, sign_account_entry};
-    use crate::account::id::account_id_from_genesis_payload;
+    use crate::account::id::{
+        AccountEntryHash, OwnerId, RosterRef, account_id_from_genesis_payload,
+    };
     use crate::account::keywrap::{ContentKey, WrapContext, seal_content_key};
     use crate::account::ops::{self as control_ops, AccountOp, DeviceRole};
     use crate::account::storage::{IngestOutcome, account_ingest, account_is_contested};
@@ -644,7 +649,7 @@ mod tests {
             authority_ref: None,
         };
         let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
-        (account_id, signed.signed_bytes, signed.entry_hash)
+        (account_id, signed.signed_bytes, signed.entry_hash.into())
     }
 
     fn device_add(dev: &Dev, role: DeviceRole) -> AccountOp {
@@ -711,7 +716,7 @@ mod tests {
         signer: &Dev,
         seq: u64,
         prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
+        authority_ref: Option<OwnerId>,
         wrap: &StreamKeyWrap,
     ) -> (Vec<u8>, [u8; 32]) {
         let payload = super::super::ops::encode(wrap).unwrap();
@@ -720,8 +725,8 @@ mod tests {
             log_id: SECRETS_LOG,
             device_fingerprint: signer.fp,
             seq,
-            prev_hash: prev,
-            parent_ref: Some([0u8; 32]),
+            prev_hash: prev.map(Into::into),
+            parent_ref: Some(AccountEntryHash::from_bytes([0u8; 32])),
             entry_type: secrets_entry_type::STREAM_KEY_WRAP,
             op_version: 1,
             crypto_suite: 0,
@@ -730,14 +735,14 @@ mod tests {
             authority_ref,
         };
         let signed = sign_account_entry(&signer.secret, &header, &payload).unwrap();
-        (signed.signed_bytes, signed.entry_hash)
+        (signed.signed_bytes, signed.entry_hash.into())
     }
 
     fn ingest(conn: &Connection, bytes: &[u8]) -> IngestOutcome {
         account_ingest(conn, bytes, NOW).unwrap()
     }
 
-    fn mark_as_local_account(conn: &Connection, genesis_hash: [u8; 32]) {
+    fn mark_as_local_account(conn: &Connection, genesis_hash: AccountEntryHash) {
         conn.execute(
             "INSERT INTO oplog_local_account(id, genesis_entry_hash, created_at_ms)
              VALUES(0, ?1, ?2)",
@@ -752,7 +757,7 @@ mod tests {
         account: AccountId,
         stream: StreamId,
         author: &Dev,
-        roster_ref: [u8; 32],
+        roster_ref: RosterRef,
         seq: u64,
         key: Option<&ContentKey>,
     ) {
@@ -762,7 +767,7 @@ mod tests {
             device_fingerprint: author.fp,
             seq,
             lamport: seq,
-            prev_hash: (seq != 0).then_some([seq as u8; 32]),
+            prev_hash: (seq != 0).then_some(AccountEntryHash::from_bytes([seq as u8; 32])),
             grant_id: None,
             roster_ref,
             owner_auth_len: 0,
@@ -813,7 +818,10 @@ mod tests {
     /// The SHARED fold verdict for one entry: its `accepted` flag plus the persisted §16.3
     /// `(status, detail)` taxonomy. This is exactly the device-independent state the read-time
     /// cross-check must NEVER touch (the fold firewall).
-    fn fold_verdict(conn: &Connection, entry_hash: [u8; 32]) -> (i64, String, Option<String>) {
+    fn fold_verdict(
+        conn: &Connection,
+        entry_hash: AccountEntryHash,
+    ) -> (i64, String, Option<String>) {
         conn.query_row(
             "SELECT e.accepted, s.status, s.detail
              FROM account_entries e JOIN account_entry_status s ON s.entry_hash = e.entry_hash
@@ -838,8 +846,14 @@ mod tests {
         let (account, genesis_bytes, genesis_hash) = genesis(&founder);
         ingest(conn, &genesis_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, _) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, _) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(conn, &own_bytes);
         (account, founder, genesis_hash, stream_id)
     }
@@ -875,7 +889,7 @@ mod tests {
     fn live_key_targets_include_referenced_history_and_no_content_current_only() {
         let conn = db();
         let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
-        mark_as_local_account(&conn, genesis_hash);
+        mark_as_local_account(&conn, AccountEntryHash::from_bytes(genesis_hash));
         let historical = ContentKey::from_seed(&[0x30; 32]);
         let unused = ContentKey::from_seed(&[0x31; 32]);
         let current = ContentKey::from_seed(&[0x32; 32]);
@@ -892,8 +906,14 @@ mod tests {
                 key,
                 epoch,
             );
-            let (bytes, hash) =
-                wrap_entry(account, &founder, seq as u64, prev, Some(genesis_hash), &wrap);
+            let (bytes, hash) = wrap_entry(
+                account,
+                &founder,
+                seq as u64,
+                prev,
+                Some(OwnerId::from_bytes(genesis_hash)),
+                &wrap,
+            );
             ingest(&conn, &bytes);
             prev = Some(hash);
         }
@@ -902,7 +922,7 @@ mod tests {
             account,
             stream_id,
             &founder,
-            genesis_hash,
+            RosterRef::from_bytes(genesis_hash),
             0,
             Some(&historical),
         );
@@ -911,11 +931,19 @@ mod tests {
             account,
             stream_id,
             &founder,
-            genesis_hash,
+            RosterRef::from_bytes(genesis_hash),
             1,
             Some(&same_epoch_other),
         );
-        insert_accepted_content(&conn, account, stream_id, &founder, genesis_hash, 2, None);
+        insert_accepted_content(
+            &conn,
+            account,
+            stream_id,
+            &founder,
+            RosterRef::from_bytes(genesis_hash),
+            2,
+            None,
+        );
         let condemned_wrap = honest_wrap(
             account,
             stream_id,
@@ -924,8 +952,14 @@ mod tests {
             &condemned_only,
             9,
         );
-        let (condemned_bytes, condemned_hash) =
-            wrap_entry(account, &founder, 99, prev, Some(genesis_hash), &condemned_wrap);
+        let (condemned_bytes, condemned_hash) = wrap_entry(
+            account,
+            &founder,
+            99,
+            prev,
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &condemned_wrap,
+        );
         conn.execute(
             "INSERT INTO account_entries(entry_hash, account_id, log_id, device_fingerprint, seq,
                  prev_hash, parent_ref, authority_ref, entry_type, accepted, signed_bytes,
@@ -947,7 +981,7 @@ mod tests {
             account,
             stream_id,
             &founder,
-            genesis_hash,
+            RosterRef::from_bytes(genesis_hash),
             3,
             Some(&condemned_only),
         );
@@ -970,7 +1004,7 @@ mod tests {
     fn live_key_targets_require_an_effective_target_and_union_sibling_coverage() {
         let conn = db();
         let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
-        mark_as_local_account(&conn, genesis_hash);
+        mark_as_local_account(&conn, AccountEntryHash::from_bytes(genesis_hash));
         let target = Dev::new(9);
         let mut shadow = Dev::new(9);
         shadow.x = Dev::new(10).x;
@@ -978,15 +1012,15 @@ mod tests {
         let founder_x = DeviceX25519Public::from_bytes(&founder.x).unwrap();
         let first = honest_wrap(account, stream_id, founder.fp, &founder_x, &key, 0);
         let (first_bytes, first_hash) =
-            wrap_entry(account, &founder, 0, None, Some(genesis_hash), &first);
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &first);
         ingest(&conn, &first_bytes);
 
         let (add_bytes, add_hash) = control_op(
             account,
             &founder,
             2,
-            Some(first_hash),
-            Some(genesis_hash),
+            Some(AccountEntryHash::from_bytes(first_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&target, DeviceRole::Member),
         );
         // The read follows the effective projection's exact enrollment ref. A same-fingerprint
@@ -1010,7 +1044,7 @@ mod tests {
             &founder,
             3,
             Some(add_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&shadow, DeviceRole::Member),
         );
         conn.execute(
@@ -1079,7 +1113,8 @@ mod tests {
         let other_x = DeviceX25519Public::from_bytes(&other.x).unwrap();
         let key = ContentKey::from_seed(&[0x20; 32]);
         let wrap = honest_wrap(account, stream_id, other.fp, &other_x, &key, 0);
-        let (bytes, _) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (bytes, _) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         ingest(&conn, &bytes);
 
         // A current key exists (selection is Some) but this device is not a recipient.
@@ -1099,7 +1134,8 @@ mod tests {
         let key = ContentKey::from_seed(&[0x20; 32]);
         let wrap =
             honest_wrap(account, stream_id, device.fingerprint(), &device.x25519_public(), &key, 0);
-        let (bytes, _) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (bytes, _) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         ingest(&conn, &bytes);
 
         let recovered =
@@ -1153,8 +1189,14 @@ mod tests {
         ];
         let mut prev = None;
         for (seq, op) in ops.iter().enumerate() {
-            let (bytes, hash) =
-                wrap_entry(account, &founder, seq as u64, prev, Some(genesis_hash), op);
+            let (bytes, hash) = wrap_entry(
+                account,
+                &founder,
+                seq as u64,
+                prev,
+                Some(OwnerId::from_bytes(genesis_hash)),
+                op,
+            );
             ingest(&conn, &bytes);
             prev = Some(hash);
         }
@@ -1182,7 +1224,8 @@ mod tests {
         let key = ContentKey::from_seed(&[0x20; 32]);
         let wrap =
             honest_wrap(account, stream_id, device.fingerprint(), &device.x25519_public(), &key, 0);
-        let (bytes, entry_hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (bytes, entry_hash) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         ingest(&conn, &bytes);
         conn.execute("UPDATE account_entries SET signed_bytes = X'00' WHERE entry_hash = ?1", [
             entry_hash.as_slice(),
@@ -1214,12 +1257,13 @@ mod tests {
             0,
             lie,
         );
-        let (bytes, entry_hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (bytes, entry_hash) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         ingest(&conn, &bytes);
 
         // FOLD FIREWALL: the wrap is validly signed by an owner, so the shared fold ACCEPTS it
         // (device-independent). The read-time cross-check below must leave that verdict untouched.
-        let verdict_before = fold_verdict(&conn, entry_hash);
+        let verdict_before = fold_verdict(&conn, AccountEntryHash::from_bytes(entry_hash));
         assert_eq!(
             verdict_before,
             (1, "accepted".to_string(), None),
@@ -1235,7 +1279,7 @@ mod tests {
         // persisted status/detail) is byte-for-byte unchanged. A regression that let the read path
         // condemn/unaccept the offending wrap would break fold device-independence and fail here.
         assert_eq!(
-            fold_verdict(&conn, entry_hash),
+            fold_verdict(&conn, AccountEntryHash::from_bytes(entry_hash)),
             verdict_before,
             "a key_id mismatch must NOT mutate the shared fold verdict",
         );
@@ -1271,13 +1315,14 @@ mod tests {
         let mut wrap =
             honest_wrap(account, stream_id, device.fingerprint(), &device.x25519_public(), &key, 0);
         wrap.wraps[0].sealed.ciphertext[0] ^= 1; // still a structurally-valid SealedKeyWrap
-        let (bytes, entry_hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (bytes, entry_hash) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         ingest(&conn, &bytes);
 
         // FOLD FIREWALL: the corrupted-ciphertext wrap is still a validly-signed owner op, so the
         // shared fold ACCEPTS it (the AEAD failure is a device-LOCAL read-time fact, not a fold
         // input). Capture the accepted verdict so the cross-check below can be proven inert on it.
-        let verdict_before = fold_verdict(&conn, entry_hash);
+        let verdict_before = fold_verdict(&conn, AccountEntryHash::from_bytes(entry_hash));
         assert_eq!(
             verdict_before,
             (1, "accepted".to_string(), None),
@@ -1291,7 +1336,7 @@ mod tests {
         assert_eq!(security_event_kinds(&conn), vec!["wrap_unwrap_failed".to_string()]);
         // The unwrap failure recorded LOCAL evidence only; the shared fold verdict is unchanged.
         assert_eq!(
-            fold_verdict(&conn, entry_hash),
+            fold_verdict(&conn, AccountEntryHash::from_bytes(entry_hash)),
             verdict_before,
             "an unwrap failure must NOT mutate the shared fold verdict",
         );
@@ -1338,9 +1383,23 @@ mod tests {
             0,
         );
         // A dense chain: two ops at epoch 0, same (stream) — both accept (SET, never LWW).
-        let (a_bytes, ha) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap_a);
+        let (a_bytes, ha) = wrap_entry(
+            account,
+            &founder,
+            0,
+            None,
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &wrap_a,
+        );
         ingest(&conn, &a_bytes);
-        let (b_bytes, hb) = wrap_entry(account, &founder, 1, Some(ha), Some(genesis_hash), &wrap_b);
+        let (b_bytes, hb) = wrap_entry(
+            account,
+            &founder,
+            1,
+            Some(ha),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &wrap_b,
+        );
         ingest(&conn, &b_bytes);
 
         // The tiebreak is MIN entry_hash; the recovered key must be that op's key.
@@ -1348,7 +1407,7 @@ mod tests {
         let selected =
             select_current_sealing_wrap(&conn, account, stream_id).unwrap().expect("a current key");
         assert_eq!(selected.key_id, expected_key.key_id(), "min entry_hash decides the key_id");
-        assert_eq!(selected.minting_entry_hash, ha.min(hb));
+        assert_eq!(selected.minting_entry_hash, AccountEntryHash::from_bytes(ha.min(hb)));
 
         let recovered =
             expect_ready(current_sealing_key(&conn, account, stream_id, &device, NOW).unwrap());
@@ -1375,16 +1434,22 @@ mod tests {
             account,
             &founder,
             1,
-            Some(genesis_hash),
-            Some(genesis_hash),
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&owner_b, DeviceRole::Owner),
         );
         ingest(conn, &add_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, own_hash) =
-            control_op(account, &founder, 2, Some(owner_id_b), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = control_op(
+            account,
+            &founder,
+            2,
+            Some(owner_id_b),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(conn, &own_bytes);
-        (account, founder, owner_b, owner_id_b, stream_id, own_hash, genesis_hash)
+        (account, founder, owner_b, owner_id_b.into(), stream_id, own_hash.into(), genesis_hash)
     }
 
     #[test]
@@ -1404,7 +1469,7 @@ mod tests {
             &owner_b,
             0,
             None,
-            Some(owner_id_b),
+            Some(OwnerId::from_bytes(owner_id_b)),
             &honest_wrap(account, stream_id, fp, &x, &key0, 0),
         );
         ingest(&conn, &w0_bytes);
@@ -1413,7 +1478,7 @@ mod tests {
             &owner_b,
             1,
             Some(w0),
-            Some(owner_id_b),
+            Some(OwnerId::from_bytes(owner_id_b)),
             &honest_wrap(account, stream_id, fp, &x, &key1, 1),
         );
         ingest(&conn, &w1_bytes);
@@ -1428,13 +1493,19 @@ mod tests {
         // reverts to the LOWER epoch.
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner_b.fp,
-            owner_id: owner_id_b,
+            owner_id: OwnerId::from_bytes(owner_id_b),
             control_cut: Cut::Empty,
-            secrets_cut: Cut::At { seq: 0, hash: w0 },
+            secrets_cut: Cut::At { seq: 0, hash: AccountEntryHash::from_bytes(w0) },
             reason: "demote".to_string(),
         };
-        let (demote_bytes, _) =
-            control_op(account, &founder, 3, Some(own_hash), Some(genesis_hash), &demote);
+        let (demote_bytes, _) = control_op(
+            account,
+            &founder,
+            3,
+            Some(AccountEntryHash::from_bytes(own_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &demote,
+        );
         ingest(&conn, &demote_bytes);
 
         let recovered =
@@ -1463,7 +1534,7 @@ mod tests {
             &owner_b,
             0,
             None,
-            Some(owner_id_b),
+            Some(OwnerId::from_bytes(owner_id_b)),
             &honest_wrap(account, stream_id, fp, &x, &key0, 0),
         );
         ingest(&conn, &w0_bytes);
@@ -1472,7 +1543,7 @@ mod tests {
             &owner_b,
             1,
             Some(w0),
-            Some(owner_id_b),
+            Some(OwnerId::from_bytes(owner_id_b)),
             &honest_wrap(account, stream_id, fp, &x, &key1, 1),
         );
         ingest(&conn, &w1_bytes);
@@ -1484,13 +1555,19 @@ mod tests {
         // An Empty secrets cut condemns owner_b's WHOLE secrets chain → no accepted wrap remains.
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner_b.fp,
-            owner_id: owner_id_b,
+            owner_id: OwnerId::from_bytes(owner_id_b),
             control_cut: Cut::Empty,
             secrets_cut: Cut::Empty,
             reason: "demote".to_string(),
         };
-        let (demote_bytes, _) =
-            control_op(account, &founder, 3, Some(own_hash), Some(genesis_hash), &demote);
+        let (demote_bytes, _) = control_op(
+            account,
+            &founder,
+            3,
+            Some(AccountEntryHash::from_bytes(own_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &demote,
+        );
         ingest(&conn, &demote_bytes);
 
         assert!(select_current_sealing_wrap(&conn, account, stream_id).unwrap().is_none());
@@ -1509,8 +1586,14 @@ mod tests {
         let (account, genesis_bytes, genesis_hash) = genesis(&founder);
         ingest(&conn, &genesis_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, own_hash) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(&conn, &own_bytes);
         // Two owner devices, added so the mutual removal below is a genuine owner-vs-owner contest.
         let a = Dev::new(2);
@@ -1520,7 +1603,7 @@ mod tests {
             &founder,
             2,
             Some(own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&a, DeviceRole::Owner),
         );
         ingest(&conn, &add_a_bytes);
@@ -1529,7 +1612,7 @@ mod tests {
             &founder,
             3,
             Some(add_a),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&b, DeviceRole::Owner),
         );
         ingest(&conn, &add_b_bytes);
@@ -1539,7 +1622,8 @@ mod tests {
         let key = ContentKey::from_seed(&[0x20; 32]);
         let wrap =
             honest_wrap(account, stream_id, device.fingerprint(), &device.x25519_public(), &key, 0);
-        let (wrap_bytes, _) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (wrap_bytes, _) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         ingest(&conn, &wrap_bytes);
         assert!(
             matches!(
@@ -1565,9 +1649,9 @@ mod tests {
             content_cuts: Vec::new(),
             reason: "revoked".to_string(),
         };
-        let (remove_b_bytes, _) = control_op(account, &a, 0, None, Some(add_a), &remove_b);
+        let (remove_b_bytes, _) = control_op(account, &a, 0, None, Some(add_a.into()), &remove_b);
         ingest(&conn, &remove_b_bytes);
-        let (remove_a_bytes, _) = control_op(account, &b, 0, None, Some(add_b), &remove_a);
+        let (remove_a_bytes, _) = control_op(account, &b, 0, None, Some(add_b.into()), &remove_a);
         ingest(&conn, &remove_a_bytes);
 
         assert!(account_is_contested(&conn, account).unwrap(), "the account is contested");
@@ -1607,8 +1691,14 @@ mod tests {
         let (account, genesis_bytes, genesis_hash) = genesis(&founder);
         ingest(&conn, &genesis_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, own_hash) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(&conn, &own_bytes);
 
         let m1 = Dev::new(4);
@@ -1618,7 +1708,7 @@ mod tests {
             &founder,
             2,
             Some(own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&m1, DeviceRole::Member),
         );
         ingest(&conn, &add1_bytes);
@@ -1627,7 +1717,7 @@ mod tests {
             &founder,
             3,
             Some(add1),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&m2, DeviceRole::Member),
         );
         ingest(&conn, &add2_bytes);
@@ -1642,7 +1732,7 @@ mod tests {
             &founder,
             0,
             None,
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &honest_wrap(account, stream_id, m1.fp, &m1_x, &key, 0),
         );
         ingest(&conn, &w1_bytes);
@@ -1651,7 +1741,7 @@ mod tests {
             &founder,
             1,
             Some(h1),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &honest_wrap(account, stream_id, m2.fp, &m2_x, &key, 0),
         );
         ingest(&conn, &w2_bytes);
@@ -1666,8 +1756,14 @@ mod tests {
             content_cuts: Vec::new(),
             reason: "revoked".to_string(),
         };
-        let (rem_bytes, _) =
-            control_op(account, &founder, 4, Some(add2), Some(genesis_hash), &remove);
+        let (rem_bytes, _) = control_op(
+            account,
+            &founder,
+            4,
+            Some(add2),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &remove,
+        );
         ingest(&conn, &rem_bytes);
 
         assert!(
@@ -1693,8 +1789,14 @@ mod tests {
         let (account, genesis_bytes, genesis_hash) = genesis(&founder);
         ingest(&conn, &genesis_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, own_hash) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(&conn, &own_bytes);
 
         // A wrap sealed to the founder only (an effective device).
@@ -1705,7 +1807,7 @@ mod tests {
             &founder,
             0,
             None,
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &honest_wrap(account, stream_id, founder.fp, &founder_x, &key, 0),
         );
         ingest(&conn, &bytes);
@@ -1721,7 +1823,7 @@ mod tests {
             &founder,
             2,
             Some(own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&newcomer, DeviceRole::Member),
         );
         ingest(&conn, &add_bytes);
@@ -1752,7 +1854,7 @@ mod tests {
             &founder,
             0,
             None,
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &honest_wrap(account, stream_id, fp, &x, &key0, 0),
         );
         ingest(&conn, &w0_bytes);
@@ -1765,7 +1867,7 @@ mod tests {
             &founder,
             1,
             Some(w0),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &honest_wrap(account, stream_id, fp, &x, &key1_founder, 1),
         );
         ingest(&conn, &wf_bytes);
@@ -1774,7 +1876,7 @@ mod tests {
             &owner_b,
             0,
             None,
-            Some(owner_id_b),
+            Some(OwnerId::from_bytes(owner_id_b)),
             &honest_wrap(account, stream_id, fp, &x, &key1_owner_b, 1),
         );
         ingest(&conn, &wb_bytes);
@@ -1785,7 +1887,7 @@ mod tests {
         assert_eq!(selected.key_epoch, 1, "the max accepted epoch is the rotated one");
         assert_eq!(
             selected.minting_entry_hash,
-            wf.min(wb),
+            AccountEntryHash::from_bytes(wf.min(wb)),
             "min entry_hash tiebreaks the two concurrent rotations",
         );
 
@@ -1882,13 +1984,19 @@ mod tests {
             account,
             &founder,
             1,
-            Some(genesis_hash),
-            Some(genesis_hash),
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&owner_b, DeviceRole::Owner),
         );
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, own_hash) =
-            control_op(account, &founder, 2, Some(owner_id_b), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = control_op(
+            account,
+            &founder,
+            2,
+            Some(owner_id_b),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
 
         let key1_founder = ContentKey::from_seed(&[0x51; 32]);
         let key1_owner_b = ContentKey::from_seed(&[0x52; 32]);
@@ -1905,7 +2013,7 @@ mod tests {
             &founder,
             0,
             None,
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &honest_wrap(account, stream_id, recipient_fp, &recipient_x, &key1_founder, 1),
         );
         let (wb0_bytes, wb0) = wrap_entry(
@@ -1913,7 +2021,7 @@ mod tests {
             &owner_b,
             0,
             None,
-            Some(owner_id_b),
+            Some(owner_id_b.into()),
             &honest_wrap(account, stream_id, recipient_fp, &recipient_x, &key1_owner_b, 1),
         );
         // owner_b's epoch-2 wrap (seq 1) — the eventual max epoch that gets retro-condemned.
@@ -1922,7 +2030,7 @@ mod tests {
             &owner_b,
             1,
             Some(wb0),
-            Some(owner_id_b),
+            Some(owner_id_b.into()),
             &honest_wrap(account, stream_id, recipient_fp, &recipient_x, &key2, 2),
         );
         // Demote owner_b with a secrets cut at seq 0: its epoch-1 wrap (seq 0) survives, its
@@ -1930,13 +2038,19 @@ mod tests {
         // back to 1.
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner_b.fp,
-            owner_id: owner_id_b,
+            owner_id: owner_id_b.into(),
             control_cut: Cut::Empty,
-            secrets_cut: Cut::At { seq: 0, hash: wb0 },
+            secrets_cut: Cut::At { seq: 0, hash: AccountEntryHash::from_bytes(wb0) },
             reason: "demote".to_string(),
         };
-        let (demote_bytes, _) =
-            control_op(account, &founder, 3, Some(own_hash), Some(genesis_hash), &demote);
+        let (demote_bytes, _) = control_op(
+            account,
+            &founder,
+            3,
+            Some(own_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &demote,
+        );
 
         let entries =
             [genesis_bytes, add_bytes, own_bytes, wf_bytes, wb0_bytes, wb1_bytes, demote_bytes];
@@ -1973,7 +2087,8 @@ mod tests {
         );
         assert_eq!(sel_natural.key_epoch, 1, "the epoch-2 wrap was condemned; epoch 1 is the max");
         assert_eq!(
-            sel_natural.minting_entry_hash, winner_hash,
+            sel_natural.minting_entry_hash,
+            AccountEntryHash::from_bytes(winner_hash),
             "min entry_hash tiebreaks the two concurrent epoch-1 wraps",
         );
         assert_eq!(

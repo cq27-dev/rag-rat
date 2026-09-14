@@ -46,6 +46,7 @@
 use minicbor::decode::{Decoder, Error as CborError};
 
 use super::super::AccountId;
+use super::super::id::AccountEntryHash;
 use crate::cbor;
 use crate::op::DeviceFingerprint;
 use crate::stream::StreamId;
@@ -68,7 +69,7 @@ pub(in crate::account) const SNAPSHOT_STATE_FORMAT_V1: u32 = 1;
 pub(in crate::account) struct CoveredWatermark {
     pub(in crate::account) device_fingerprint: DeviceFingerprint,
     pub(in crate::account) seq: u64,
-    pub(in crate::account) entry_hash: [u8; 32],
+    pub(in crate::account) entry_hash: AccountEntryHash,
 }
 
 /// One log (or, from #406, one content stream) a snapshot covers, with the hash of the canonical
@@ -204,7 +205,9 @@ mod format_v1 {
     use super::super::super::AccountId;
     use super::super::super::limits::{SNAPSHOT_COVERED_MAX, SNAPSHOT_TARGETS_MAX};
     use super::super::super::ops::{decode_opt_b32, encode_opt_b32};
-    use super::{CoveredWatermark, SNAPSHOT_STATE_FORMAT_V1, SnapshotOp, SnapshotTarget};
+    use super::{
+        AccountEntryHash, CoveredWatermark, SNAPSHOT_STATE_FORMAT_V1, SnapshotOp, SnapshotTarget,
+    };
     use crate::cbor::{self, VecEncoderExt};
     use crate::op::DeviceFingerprint;
     use crate::stream::StreamId;
@@ -353,7 +356,7 @@ mod format_v1 {
                             enc.put_array(3);
                             enc.put_bytes(&w.device_fingerprint.to_bytes());
                             enc.put_u64(w.seq);
-                            enc.put_bytes(&w.entry_hash);
+                            enc.put_bytes(w.entry_hash.as_slice());
                         }
                     }
                 },
@@ -421,7 +424,7 @@ mod format_v1 {
             covered.push(CoveredWatermark {
                 device_fingerprint: DeviceFingerprint::from_bytes(fp),
                 seq,
-                entry_hash,
+                entry_hash: AccountEntryHash::from_bytes(entry_hash),
             });
         }
         Ok(covered)
@@ -466,7 +469,7 @@ mod tests {
                 .map(|fp| CoveredWatermark {
                     device_fingerprint: DeviceFingerprint::from_bytes([*fp; 32]),
                     seq: 1,
-                    entry_hash: [0x1d; 32],
+                    entry_hash: AccountEntryHash::from_bytes([0x1d; 32]),
                 })
                 .collect(),
         }
@@ -478,7 +481,7 @@ mod tests {
             covered: vec![CoveredWatermark {
                 device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
                 seq: 12,
-                entry_hash: [0x1d; 32],
+                entry_hash: AccountEntryHash::from_bytes([0x1d; 32]),
             }],
             ..account_target(0, &[])
         }])
@@ -600,7 +603,7 @@ mod tests {
                 covered: vec![CoveredWatermark {
                     device_fingerprint: DeviceFingerprint::from_bytes([0x77; 32]),
                     seq: 9,
-                    entry_hash: [0x88; 32],
+                    entry_hash: AccountEntryHash::from_bytes([0x88; 32]),
                 }],
             },
         ]);
@@ -633,7 +636,7 @@ mod tests {
         conflicting.covered.push(CoveredWatermark {
             device_fingerprint: DeviceFingerprint::from_bytes([0x11; 32]),
             seq: 99,
-            entry_hash: [0xee; 32],
+            entry_hash: AccountEntryHash::from_bytes([0xee; 32]),
         });
         assert!(
             encode(&snapshot(vec![conflicting])).is_err(),
@@ -719,7 +722,7 @@ mod tests {
                 .map(|i| CoveredWatermark {
                     device_fingerprint: DeviceFingerprint::from_bytes(fp_bytes(i)),
                     seq: 1,
-                    entry_hash: [0x1d; 32],
+                    entry_hash: AccountEntryHash::from_bytes([0x1d; 32]),
                 })
                 .collect(),
             ..account_target(0, &[])
@@ -735,7 +738,7 @@ mod tests {
                 CoveredWatermark {
                     device_fingerprint: DeviceFingerprint::from_bytes([0x11; 32]),
                     seq: 1,
-                    entry_hash: [0x1d; 32],
+                    entry_hash: AccountEntryHash::from_bytes([0x1d; 32]),
                 };
                 SNAPSHOT_COVERED_MAX + 50
             ],

@@ -270,7 +270,7 @@ fn replay_pending_entry(
     let account_id = store::stream_account_id(tx, pending.stream_id)?;
     match crate::account::repo_incarnation_state(tx, account_id, &context.repo_id)? {
         crate::account::RepoIncarnationState::Current(current)
-            if current == context.incarnation_ref => {},
+            if current == crate::AccountEntryHash::from_bytes(context.incarnation_ref) => {},
         // Account evidence is non-monotone: a late secrets cut can condemn the apparent successor
         // and restore this stream's reference. A different current reference is therefore no more
         // terminal than absent/contested authority for already-retained history.

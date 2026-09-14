@@ -42,6 +42,7 @@
 use minicbor::Encoder;
 
 use super::super::fold::{AccountAuthHistory, AccountClassification, AuthorityBoundary};
+use super::super::id::AccountEntryHash;
 use super::super::ops::DeviceCut;
 use crate::cbor::{self, VecEncoderExt};
 
@@ -90,12 +91,12 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     enc.put_u64(history.effective_count());
 
     // 3. The effective set, sorted by entry hash.
-    let mut effective: Vec<([u8; 32], u64)> = history.effective_entries().collect();
+    let mut effective: Vec<(AccountEntryHash, u64)> = history.effective_entries().collect();
     effective.sort_unstable();
     enc.put_array(effective.len() as u64);
     for (hash, auth_epoch) in effective {
         enc.put_array(2);
-        enc.put_bytes(&hash);
+        enc.put_bytes(hash.as_slice());
         enc.put_u64(auth_epoch);
     }
 
@@ -105,7 +106,7 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     enc.put_array(roster.len() as u64);
     for (hash, fact) in roster {
         enc.put_array(7);
-        enc.put_bytes(hash);
+        enc.put_bytes(hash.as_slice());
         enc.put_bytes(&fact.authority.device_fingerprint.to_bytes());
         enc.put_u8(fact.authority.current_role.as_u8());
         write_window(&mut enc, fact.effective_at, fact.closed_at);
@@ -127,7 +128,7 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     enc.put_array(incarnations.len() as u64);
     for (hash, fact) in incarnations {
         enc.put_array(5);
-        enc.put_bytes(hash);
+        enc.put_bytes(hash.as_slice());
         enc.put_bytes(&fact.authority.device_fingerprint.to_bytes());
         write_window(&mut enc, fact.effective_at, fact.closed_at);
         write_boundary(&mut enc, fact.control_boundary);
@@ -141,7 +142,7 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     for (stream, fact) in ownership {
         enc.put_array(3);
         enc.put_bytes(&stream.to_bytes());
-        enc.put_bytes(&fact.own_id);
+        enc.put_bytes(fact.own_id.as_slice());
         enc.put_u64(fact.effective_at);
     }
 
@@ -154,7 +155,7 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
         // two values. A miscounted nested arity makes the decoder consume following top-level items
         // to fill this one, which is how a malformed frame hides behind a stable hash.
         enc.put_array(5);
-        enc.put_bytes(grant_id);
+        enc.put_bytes(grant_id.as_slice());
         enc.put_bytes(&fact.authority.stream_id.to_bytes());
         enc.put_bytes(&fact.authority.grantee_account_id.to_bytes());
         enc.put_u8(fact.authority.role.as_u8());
@@ -167,7 +168,7 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
     enc.put_array(grant_cuts.len() as u64);
     for (grant_id, cuts) in grant_cuts {
         enc.put_array(2);
-        enc.put_bytes(grant_id);
+        enc.put_bytes(grant_id.as_slice());
         let mut sorted: Vec<&DeviceCut> = cuts.iter().collect();
         sorted.sort_unstable_by_key(|cut| (cut.device_fingerprint.to_bytes(), cut.seq, cut.hash));
         enc.put_array(sorted.len() as u64);
@@ -175,7 +176,7 @@ pub(in crate::account) fn encoded(history: &AccountAuthHistory) -> Vec<u8> {
             enc.put_array(3);
             enc.put_bytes(&cut.device_fingerprint.to_bytes());
             enc.put_u64(cut.seq);
-            enc.put_bytes(&cut.hash);
+            enc.put_bytes(cut.hash.as_slice());
         }
     }
 
@@ -214,7 +215,7 @@ fn write_boundary(enc: &mut Encoder<&mut Vec<u8>>, boundary: AuthorityBoundary) 
             enc.put_array(3);
             enc.put_u8(1);
             enc.put_u64(seq);
-            enc.put_bytes(&hash);
+            enc.put_bytes(hash.as_slice());
         },
         AuthorityBoundary::Closed => {
             enc.put_array(1);

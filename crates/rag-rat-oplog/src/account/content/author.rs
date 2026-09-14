@@ -34,6 +34,9 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::super::bootstrap::{self, LocalAccountRef};
+#[cfg(test)]
+use super::super::id::OwnerId;
+use super::super::id::{AccountEntryHash, GrantId, RosterRef};
 use super::super::keywrap::ContentKey;
 use super::super::limits::CONTENT_ENVELOPE_MAX_BYTES;
 use super::super::secrets::{self, SealingKeyOutcome};
@@ -43,8 +46,6 @@ use super::storage::{self as content_storage, fixed};
 use crate::op::{self, DeviceFingerprint, MemoryOp};
 use crate::stream::StreamId;
 use crate::{LocalDevice, content_projection, local_device};
-
-type AccountEntryHash = [u8; 32];
 
 /// The PROVEN worst-case byte overhead a signed `/3` content entry adds around an op body —
 /// `signed_bytes.len() - payload.len()` maximized over every header field value and every payload
@@ -168,7 +169,7 @@ pub fn author_content_batch_in_tx(
             stream_id,
             account_id,
             device: &device,
-            roster_ref: genesis_hash,
+            roster_ref: genesis_hash.into(),
             // Owner-authored: author == owner, so no delegated grant.
             grant_id: None,
             owner_auth_len: auth_len,
@@ -185,9 +186,9 @@ struct BatchAuthoring<'a> {
     stream_id: StreamId,
     account_id: AccountId,
     device: &'a LocalDevice,
-    roster_ref: AccountEntryHash,
+    roster_ref: RosterRef,
     /// `None` for the stream owner; the delegating grant for a contributor.
-    grant_id: Option<AccountEntryHash>,
+    grant_id: Option<GrantId>,
     owner_auth_len: u64,
     author_auth_len: u64,
 }
@@ -312,7 +313,7 @@ pub fn author_grantee_content_batch_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
     ops: &[MemoryOp],
     now_ms: i64,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
@@ -335,7 +336,7 @@ pub fn author_grantee_content_batch_in_tx(
             stream_id,
             account_id,
             device: &device,
-            roster_ref: genesis_hash,
+            roster_ref: genesis_hash.into(),
             grant_id: Some(grant_id),
             owner_auth_len,
             author_auth_len,
@@ -679,7 +680,7 @@ fn seal_and_author_in_tx(
             lamport,
             prev_hash,
             grant_id: None,
-            roster_ref: genesis_hash,
+            roster_ref: genesis_hash.into(),
             owner_auth_len: auth_len,
             author_auth_len: auth_len,
             crypto_suite: 0,
@@ -814,7 +815,10 @@ fn content_chain_tail(
         .optional()?;
     row.map(|(seq, entry_hash)| {
         let seq = u64::from_be_bytes(fixed::<8>(&seq)?);
-        Ok(ContentChainTail { seq, entry_hash: fixed::<32>(&entry_hash)? })
+        Ok(ContentChainTail {
+            seq,
+            entry_hash: AccountEntryHash::from_bytes(fixed::<32>(&entry_hash)?),
+        })
     })
     .transpose()
 }
@@ -1132,9 +1136,9 @@ mod tests {
             device_fingerprint: secret.public().fingerprint(),
             seq: u64::MAX,
             lamport: u64::MAX,
-            prev_hash: Some([0x33; 32]),
-            grant_id: Some([0x44; 32]),
-            roster_ref: [0x55; 32],
+            prev_hash: Some(AccountEntryHash::from_bytes([0x33; 32])),
+            grant_id: Some(GrantId::from_bytes([0x44; 32])),
+            roster_ref: RosterRef::from_bytes([0x55; 32]),
             owner_auth_len: u64::MAX,
             author_auth_len: u64::MAX,
             crypto_suite: 0,
@@ -1188,13 +1192,15 @@ mod tests {
     }
 
     fn genesis_ref(conn: &Connection) -> AccountEntryHash {
-        conn.query_row(
-            "SELECT genesis_entry_hash FROM oplog_local_account WHERE id = 0",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
+        AccountEntryHash::from_bytes(
+            conn.query_row(
+                "SELECT genesis_entry_hash FROM oplog_local_account WHERE id = 0",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map(|bytes| fixed::<32>(&bytes).unwrap())
+            .unwrap(),
         )
-        .map(|bytes| fixed::<32>(&bytes).unwrap())
-        .unwrap()
     }
 
     fn tail(conn: &Connection, stream: StreamId, account: AccountId) -> Option<ContentChainTail> {
@@ -1301,7 +1307,11 @@ mod tests {
             assert_eq!(header.seq, ordinal as u64, "seqs are dense from 0");
             assert_eq!(header.lamport, header.seq, "lamport == seq");
             assert_eq!(header.grant_id, None, "owner-authored: no grant");
-            assert_eq!(header.roster_ref, genesis_ref(&conn), "roster_ref is the genesis hash");
+            assert_eq!(
+                header.roster_ref,
+                genesis_ref(&conn).into(),
+                "roster_ref is the genesis hash"
+            );
             assert_eq!(header.author_account_id, account, "authored under the local account");
         }
 
@@ -1427,9 +1437,9 @@ mod tests {
             device_fingerprint: device.fingerprint(),
             seq: 99,
             lamport: 99,
-            prev_hash: Some([0xab; 32]),
+            prev_hash: Some(AccountEntryHash::from_bytes([0xab; 32])),
             grant_id: None,
-            roster_ref: genesis_ref(&conn),
+            roster_ref: genesis_ref(&conn).into(),
             owner_auth_len: 0,
             author_auth_len: 0,
             crypto_suite: 0,
@@ -1810,7 +1820,7 @@ mod tests {
             crypto_suite: 0,
             auth_len: account_storage::account_effective_count(&tx, account).unwrap(),
             key_id: None,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(genesis_hash.into()),
         };
         let payload = control_ops::encode(op).unwrap();
         let signed = sign_account_entry(founder.secret(), &header, &payload).unwrap();
@@ -1833,7 +1843,7 @@ mod tests {
         conn: &Connection,
         account: AccountId,
         signer: &crate::device::DeviceSecret,
-        authority_ref: AccountEntryHash,
+        authority_ref: OwnerId,
         op: &crate::account::ops::AccountOp,
     ) -> AccountEntryHash {
         use crate::account::envelope::{
@@ -2191,8 +2201,8 @@ mod tests {
             seq: 0,
             lamport: 0,
             prev_hash: None,
-            grant_id: Some([0x92; 32]),
-            roster_ref: [0x93; 32],
+            grant_id: Some(GrantId::from_bytes([0x92; 32])),
+            roster_ref: RosterRef::from_bytes([0x93; 32]),
             owner_auth_len: 0,
             author_auth_len: 0,
             crypto_suite: 0,
@@ -2236,8 +2246,8 @@ mod tests {
             seq: 0,
             lamport: 1,
             prev_hash: None,
-            grant_id: Some([0xa2; 32]),
-            roster_ref: [0xa3; 32],
+            grant_id: Some(GrantId::from_bytes([0xa2; 32])),
+            roster_ref: RosterRef::from_bytes([0xa3; 32]),
             owner_auth_len: 0,
             author_auth_len: 0,
             crypto_suite: 1,
@@ -2255,7 +2265,7 @@ mod tests {
             device.secret(),
             &ContentEntryHeader {
                 author_account_id: AccountId::from_bytes([0xb1; 32]),
-                grant_id: Some([0xb2; 32]),
+                grant_id: Some(GrantId::from_bytes([0xb2; 32])),
                 ..base.clone()
             },
             &op::encode(&node_create("bad", "tag")),
@@ -2275,7 +2285,7 @@ mod tests {
             device.secret(),
             &ContentEntryHeader {
                 author_account_id: AccountId::from_bytes([0xc1; 32]),
-                grant_id: Some([0xc2; 32]),
+                grant_id: Some(GrantId::from_bytes([0xc2; 32])),
                 crypto_suite: 99,
                 ..base
             },
@@ -2527,7 +2537,7 @@ mod tests {
                 lamport: 0,
                 prev_hash: None,
                 grant_id: None,
-                roster_ref: genesis_ref(&conn),
+                roster_ref: genesis_ref(&conn).into(),
                 owner_auth_len: 0,
                 author_auth_len: 0,
                 crypto_suite: 0,
@@ -2681,7 +2691,7 @@ mod tests {
             lamport: 0,
             prev_hash: None,
             grant_id: None,
-            roster_ref: genesis_ref(&conn),
+            roster_ref: genesis_ref(&conn).into(),
             owner_auth_len: 0,
             author_auth_len: 0,
             crypto_suite: 0,
@@ -2767,9 +2777,9 @@ mod tests {
             device_fingerprint: secret.public().fingerprint(),
             seq: u64::MAX,
             lamport: u64::MAX,
-            prev_hash: Some([0x33; 32]),
-            grant_id: Some([0x44; 32]),
-            roster_ref: [0x55; 32],
+            prev_hash: Some(AccountEntryHash::from_bytes([0x33; 32])),
+            grant_id: Some(GrantId::from_bytes([0x44; 32])),
+            roster_ref: RosterRef::from_bytes([0x55; 32]),
             owner_auth_len: u64::MAX,
             author_auth_len: u64::MAX,
             crypto_suite: 0,
@@ -3076,7 +3086,7 @@ mod tests {
             &conn,
             account,
             &owner_b_ed,
-            owner_id_b,
+            owner_id_b.into(),
             &crate::account::ops::AccountOp::OwnerDemote {
                 device_fingerprint: founder.fingerprint(),
                 owner_id: founder_owner_id,

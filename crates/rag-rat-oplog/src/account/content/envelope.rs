@@ -12,6 +12,7 @@ use minicbor::decode::{Decoder, Error as CborError};
 use zeroize::Zeroizing;
 
 use super::super::AccountId;
+use super::super::id::{AccountEntryHash, GrantId, RosterRef};
 use super::super::keywrap::ContentKey;
 use super::super::limits::{
     CONTENT_ENTRY_DOMAIN, CONTENT_ENVELOPE_MAX_BYTES, CONTENT_SIGNED_DOMAIN,
@@ -44,9 +45,9 @@ pub struct ContentEntryHeader {
     pub device_fingerprint: DeviceFingerprint,
     pub seq: u64,
     pub lamport: u64,
-    pub prev_hash: Option<[u8; 32]>,
-    pub grant_id: Option<[u8; 32]>,
-    pub roster_ref: [u8; 32],
+    pub prev_hash: Option<AccountEntryHash>,
+    pub grant_id: Option<GrantId>,
+    pub roster_ref: RosterRef,
     pub owner_auth_len: u64,
     pub author_auth_len: u64,
     pub crypto_suite: u64,
@@ -62,7 +63,7 @@ pub struct SignedContentEntry {
     pub header_bytes: Vec<u8>,
     pub body_bytes: Vec<u8>,
     pub signed_bytes: Vec<u8>,
-    pub entry_hash: [u8; 32],
+    pub entry_hash: AccountEntryHash,
 }
 
 /// A decoded and signature-verified `/3` entry. Authority and branch acceptance are C3 concerns.
@@ -71,7 +72,7 @@ pub struct VerifiedContentEntry {
     pub header: ContentEntryHeader,
     pub payload: Vec<u8>,
     pub header_bytes: Vec<u8>,
-    pub entry_hash: [u8; 32],
+    pub entry_hash: AccountEntryHash,
 }
 
 /// Encode and sign one `/3` entry. The signing key always determines the device fingerprint.
@@ -111,7 +112,7 @@ pub fn sign_content_entry(
         header_bytes,
         body_bytes,
         signed_bytes,
-        entry_hash,
+        entry_hash: AccountEntryHash::from_bytes(entry_hash),
     })
 }
 
@@ -192,7 +193,7 @@ pub fn sign_sealed_content_entry(
         header_bytes,
         body_bytes,
         signed_bytes,
-        entry_hash,
+        entry_hash: AccountEntryHash::from_bytes(entry_hash),
     })
 }
 
@@ -233,7 +234,7 @@ pub(super) fn sign_opaque_content_entry_for_test(
         header_bytes,
         body_bytes,
         signed_bytes,
-        entry_hash,
+        entry_hash: AccountEntryHash::from_bytes(entry_hash),
     })
 }
 
@@ -290,9 +291,9 @@ fn encode_header(header: &ContentEntryHeader) -> Vec<u8> {
     encoder.put_bytes(&header.device_fingerprint.to_bytes());
     encoder.put_u64(header.seq);
     encoder.put_u64(header.lamport);
-    encode_opt_hash(&mut encoder, header.prev_hash);
-    encode_opt_hash(&mut encoder, header.grant_id);
-    encoder.put_bytes(&header.roster_ref);
+    encode_opt_hash(&mut encoder, header.prev_hash.map(Into::into));
+    encode_opt_hash(&mut encoder, header.grant_id.map(Into::into));
+    encoder.put_bytes(header.roster_ref.as_slice());
     encoder.put_u64(header.owner_auth_len);
     encoder.put_u64(header.author_auth_len);
     encoder.put_u64(header.crypto_suite);
@@ -381,7 +382,7 @@ fn decode_content_signed_cbor(bytes: &[u8]) -> Result<SignedContentEntry, CborEr
         header_bytes,
         body_bytes,
         signed_bytes: bytes.to_vec(),
-        entry_hash,
+        entry_hash: AccountEntryHash::from_bytes(entry_hash),
     })
 }
 
@@ -416,9 +417,9 @@ fn decode_header(bytes: &[u8]) -> Result<ContentEntryHeader, CborError> {
         device_fingerprint,
         seq: decoder.u64()?,
         lamport: decoder.u64()?,
-        prev_hash: decode_opt_hash(&mut decoder, "prev_hash")?,
-        grant_id: decode_opt_hash(&mut decoder, "grant_id")?,
-        roster_ref: cbor::fixed_bytes::<32>(decoder.bytes()?, "roster_ref")?,
+        prev_hash: (decode_opt_hash(&mut decoder, "prev_hash")?).map(Into::into),
+        grant_id: (decode_opt_hash(&mut decoder, "grant_id")?).map(Into::into),
+        roster_ref: RosterRef::from_bytes(cbor::fixed_bytes::<32>(decoder.bytes()?, "roster_ref")?),
         owner_auth_len: decoder.u64()?,
         author_auth_len: decoder.u64()?,
         crypto_suite: decoder.u64()?,
@@ -465,8 +466,8 @@ mod tests {
             seq: 0,
             lamport: 9,
             prev_hash: None,
-            grant_id: Some([0x33; 32]),
-            roster_ref: [0x44; 32],
+            grant_id: Some(GrantId::from_bytes([0x33; 32])),
+            roster_ref: RosterRef::from_bytes([0x44; 32]),
             owner_auth_len: 5,
             author_auth_len: 7,
             crypto_suite: 0,
@@ -489,9 +490,12 @@ mod tests {
             hex(&signed.signed_bytes),
             "83767261672d7261742f7369676e65642d656e7472792f3158c88258c28d6f7261672d7261742f656e7472792f3358201111111111111111111111111111111111111111111111111111111111111111582022222222222222222222222222222222222222222222222222222222222222225820fe812c12f3ab4ce6ac5db69ac352f906cb1b11ef43fb33e252ef7ff5522638890009f65820333333333333333333333333333333333333333333333333333333333333333358204444444444444444444444444444444444444444444444444444444444444444050700f64281015840fc886fdaa187e6708853dcec77a399dc03dbc094c0e125d1081eabdcdf8cf68d2765aba308b540b49c0a301b2d40148bb5d4b48a6734dca6b136769420289c08",
         );
-        assert_eq!(signed.entry_hash, cbor::sha256(&signed.body_bytes));
         assert_eq!(
-            hex(&signed.entry_hash),
+            signed.entry_hash,
+            AccountEntryHash::from_bytes(cbor::sha256(&signed.body_bytes))
+        );
+        assert_eq!(
+            hex(signed.entry_hash.as_slice()),
             "a459efda17f48afb37d4beb4501461b8aef49a33fd3987cc8d2d08d46fdc4f99"
         );
     }
@@ -532,7 +536,7 @@ mod tests {
         let mut bad_prev = header();
         bad_prev.seq = 1;
         let mut bad_genesis = header();
-        bad_genesis.prev_hash = Some([1; 32]);
+        bad_genesis.prev_hash = Some(AccountEntryHash::from_bytes([1; 32]));
         let mut bad_plaintext = header();
         bad_plaintext.key_id = Some([2; 32]);
         let mut bad_sealed = header();
@@ -571,7 +575,7 @@ mod tests {
         let signature = secret().sign(&body);
         assert!(decode_content_signed(&encode_signed(&body, &signature)).is_err());
 
-        short_roster.roster_ref = [0x55; 32];
+        short_roster.roster_ref = RosterRef::from_bytes([0x55; 32]);
         assert!(sign_content_entry(&secret(), &short_roster, &[0xf6]).is_ok());
     }
 
@@ -596,7 +600,7 @@ mod tests {
         let mut full = header();
         full.seq = u64::MAX;
         full.lamport = u64::MAX;
-        full.prev_hash = Some([0x88; 32]);
+        full.prev_hash = Some(AccountEntryHash::from_bytes([0x88; 32]));
         full.grant_id = None;
         full.owner_auth_len = u64::MAX;
         full.author_auth_len = u64::MAX;
@@ -731,7 +735,7 @@ mod tests {
             "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5cd28d288c5c101ae99a532ea8621a1487e26f",
         );
         assert_eq!(
-            hex(&signed.entry_hash),
+            hex(signed.entry_hash.as_slice()),
             "dd019c5639f96b715d0e1c9254b175e8d98a890e5e49e2dcdcb997f2c9e7438a",
         );
         // Byte-reproducible under the same key + nonce.

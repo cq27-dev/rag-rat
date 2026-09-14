@@ -536,7 +536,7 @@ fn redemption_charges_only_receipt_entries_the_joiner_does_not_hold() {
     // DeviceAdd is charged, so a one-entry budget fits.
     let prior = rag_rat_oplog::account_entries_for_sync(&conn, account).unwrap();
     assert_eq!(prior.len(), 2, "genesis plus the first DeviceAdd");
-    let mut held = vec![prior[0].entry_hash, prior[1].entry_hash];
+    let mut held = [prior[0].entry_hash, prior[1].entry_hash];
     held.sort_unstable();
     let second_ticket = ticket(&conn, account, DeviceRole::Member);
     let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
@@ -547,7 +547,7 @@ fn redemption_charges_only_receipt_entries_the_joiner_does_not_hold() {
         x25519_pubkey,
         transport_node_id: [9; 32],
         budget: EnrollmentBudget { account_entries_remaining: 1, ..generous_budget() },
-        held_entry_hashes: held.clone(),
+        held_entry_hashes: held.iter().map(|hash| hash.to_bytes()).collect(),
     };
     let _ = redeem_invite(&conn, request.clone(), [9; 32], &|| NOW + 2).unwrap();
 }
@@ -782,7 +782,7 @@ fn synced_key_target_growth_tops_up_the_outstanding_reservation() {
     let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
         &receipt.account_entries,
         account,
-        receipt.device_add_hash,
+        receipt.device_add_hash.into(),
         &receipt.device_add_signed,
         ed25519_pubkey,
         x25519_pubkey,
@@ -794,7 +794,7 @@ fn synced_key_target_growth_tops_up_the_outstanding_reservation() {
         account_id: account,
         genesis_hash,
         device_fingerprint: fingerprint,
-        device_add_hash: receipt.device_add_hash,
+        device_add_hash: receipt.device_add_hash.into(),
         now_ms: NOW + 1,
     })
     .unwrap();
@@ -947,7 +947,7 @@ fn replay_reconstructs_the_exact_acknowledged_receipt_from_the_manifest() {
     let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
         &replayed.account_entries,
         account,
-        replayed.device_add_hash,
+        replayed.device_add_hash.into(),
         &replayed.device_add_signed,
         first_ed,
         first_x,
@@ -959,7 +959,7 @@ fn replay_reconstructs_the_exact_acknowledged_receipt_from_the_manifest() {
         account_id: account,
         genesis_hash,
         device_fingerprint: fingerprint,
-        device_add_hash: replayed.device_add_hash,
+        device_add_hash: replayed.device_add_hash.into(),
         now_ms: NOW + 3,
     })
     .unwrap();
@@ -1087,7 +1087,7 @@ async fn a_writer_invite_redeems_over_the_wire_and_replays_for_the_same_contribu
             contributor,
         )
         .unwrap(),
-        Some(receipt.grant_id),
+        Some(Into::into(receipt.grant_id)),
         "the grant folds effective for the contributor",
     );
 
@@ -1336,7 +1336,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
     let (response_account, response_hash) =
         rag_rat_oplog::account_entry_ref(&receipt.device_add_signed).unwrap();
     assert_eq!(response_account, account);
-    assert_eq!(response_hash, receipt.device_add_hash);
+    assert_eq!(response_hash, receipt.device_add_hash.into());
     assert!(
         receipt.account_entries.len() >= 2,
         "the receipt bootstraps genesis plus the DeviceAdd"
@@ -1344,7 +1344,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
     verify_enrollment_device_add(
         &receipt.account_entries,
         account,
-        receipt.device_add_hash,
+        receipt.device_add_hash.into(),
         &receipt.device_add_signed,
         ed25519_pubkey,
         x25519_pubkey,
@@ -1354,7 +1354,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
         verify_enrollment_device_add(
             &receipt.account_entries,
             AccountId::from_bytes([0xff; 32]),
-            receipt.device_add_hash,
+            receipt.device_add_hash.into(),
             &receipt.device_add_signed,
             ed25519_pubkey,
             x25519_pubkey,
@@ -1366,7 +1366,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
         verify_enrollment_device_add(
             &receipt.account_entries,
             account,
-            receipt.device_add_hash,
+            receipt.device_add_hash.into(),
             &receipt.device_add_signed,
             [0xee; 32],
             x25519_pubkey,
@@ -1380,7 +1380,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
         verify_enrollment_device_add(
             &receipt.account_entries,
             account,
-            receipt.device_add_hash,
+            receipt.device_add_hash.into(),
             &forged_signed,
             ed25519_pubkey,
             x25519_pubkey,
@@ -1393,7 +1393,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
     let genesis_hash = verify_enrollment_device_add(
         &receipt.account_entries,
         account,
-        receipt.device_add_hash,
+        receipt.device_add_hash.into(),
         &receipt.device_add_signed,
         ed25519_pubkey,
         x25519_pubkey,
@@ -1405,7 +1405,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
         account_id: account,
         genesis_hash,
         device_fingerprint: joiner_fingerprint,
-        device_add_hash: receipt.device_add_hash,
+        device_add_hash: receipt.device_add_hash.into(),
         now_ms: NOW + 2,
     })
     .unwrap();
@@ -1434,7 +1434,7 @@ fn redemption_replays_only_the_same_request_and_uses_the_server_side_role() {
                 account_id: account,
                 genesis_hash,
                 device_fingerprint: joiner_fingerprint,
-                device_add_hash: receipt.device_add_hash,
+                device_add_hash: receipt.device_add_hash.into(),
                 now_ms: NOW + 2,
             },
         )

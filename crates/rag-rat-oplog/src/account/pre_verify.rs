@@ -9,6 +9,7 @@
 use rusqlite::{Connection, params};
 
 use super::AccountId;
+use super::id::SignedHash;
 
 /// One pre-verify park table: rows keyed by `signed_hash`, owned by `owner_column`.
 pub(in crate::account) struct PreVerifyQueue {
@@ -34,7 +35,7 @@ impl PreVerifyQueue {
     pub(in crate::account) fn contains(
         &self,
         conn: &Connection,
-        signed_hash: &[u8; 32],
+        signed_hash: &SignedHash,
     ) -> rusqlite::Result<bool> {
         conn.query_row(
             &format!("SELECT EXISTS(SELECT 1 FROM {} WHERE signed_hash = ?1)", self.table),
@@ -58,7 +59,7 @@ impl PreVerifyQueue {
         &self,
         conn: &Connection,
         owner: AccountId,
-        inserted_signed_hash: &[u8; 32],
+        inserted_signed_hash: &SignedHash,
         per_owner: QueueBudget<S>,
         global: QueueBudget<S>,
     ) -> rusqlite::Result<BudgetOutcome<S>> {

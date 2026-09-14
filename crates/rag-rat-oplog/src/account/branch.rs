@@ -19,7 +19,7 @@ use std::hash::Hash;
 use std::ops::ControlFlow;
 
 use super::fold::AuthorityFreshness;
-use super::id::AccountId;
+use super::id::{AccountEntryHash, AccountId};
 
 /// Why an ancestry walk against a cut watermark could not be decided (a withheld watermark parks,
 /// and never flips a verdict — I11).
@@ -48,8 +48,6 @@ pub struct CitedFreshness {
     pub asserted_auth_len: u64,
     pub state: AuthorityFreshness,
 }
-
-type AccountEntryHash = [u8; 32];
 
 /// The header fields the branch walks read: which dense chain an entry extends, its slot on that
 /// chain, and the predecessor it names.

@@ -514,7 +514,7 @@ fn load_accepted_entries(
         let signed = decode_content_signed(&signed_bytes)
             .context("stored accepted /3 entry failed to decode")?;
         anyhow::ensure!(
-            signed.entry_hash == stored_entry_hash,
+            signed.entry_hash == crate::AccountEntryHash::from_bytes(stored_entry_hash),
             "stored accepted /3 signed envelope does not match its entry_hash row"
         );
         anyhow::ensure!(

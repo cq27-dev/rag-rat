@@ -35,6 +35,7 @@ use std::collections::HashMap;
 
 use super::super::envelope::VerifiedAccountEntry;
 use super::super::fold::{self, AccountClassification};
+use super::super::id::AccountEntryHash;
 use super::ops::{CoveredWatermark, SnapshotTarget};
 use super::projection;
 use crate::op::DeviceFingerprint;
@@ -99,7 +100,7 @@ pub(in crate::account) fn verify_snapshot(
     held: &[VerifiedAccountEntry],
     targets: &[SnapshotTarget],
 ) -> SnapshotVerdict {
-    let by_hash: HashMap<[u8; 32], &VerifiedAccountEntry> =
+    let by_hash: HashMap<AccountEntryHash, &VerifiedAccountEntry> =
         held.iter().map(|entry| (entry.entry_hash, entry)).collect();
 
     // Classification duty runs over EVERYTHING this device holds, never over the claimed branch
@@ -151,7 +152,7 @@ pub(in crate::account) fn ignores_held_evidence(
     prefix: &[VerifiedAccountEntry],
     held: &[VerifiedAccountEntry],
 ) -> bool {
-    let covered_slots: HashMap<(u8, DeviceFingerprint, u64), [u8; 32]> = prefix
+    let covered_slots: HashMap<(u8, DeviceFingerprint, u64), AccountEntryHash> = prefix
         .iter()
         .map(|entry| {
             let h = &entry.header;
@@ -178,7 +179,7 @@ pub(in crate::account) fn ignores_held_evidence(
 /// valid contiguous link — so a forged chain must not be walkable into the verification input.
 pub(in crate::account) fn on_branch_prefix(
     covered: &[CoveredWatermark],
-    by_hash: &HashMap<[u8; 32], &VerifiedAccountEntry>,
+    by_hash: &HashMap<AccountEntryHash, &VerifiedAccountEntry>,
 ) -> Result<Vec<VerifiedAccountEntry>, Unverifiable> {
     let mut collected: Vec<&VerifiedAccountEntry> = Vec::new();
     for watermark in covered {

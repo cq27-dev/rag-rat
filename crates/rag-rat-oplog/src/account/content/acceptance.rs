@@ -12,14 +12,13 @@
 //! parks as `auth_len_ahead` instead of hardening into a rejection.
 
 use super::super::branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
+use super::super::id::{AccountEntryHash, GrantId, RosterRef};
 use super::ContentEntryHeader;
 use crate::account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
     GrantDeviceAuthority, GrantDeviceBoundary, GrantRole, RosterContentAuthority,
 };
 use crate::stream::StreamId;
-
-type AccountEntryHash = [u8; 32];
 
 /// A whole-coordinate authority hold that fails content closed regardless of the revocation
 /// registers. A withheld cut watermark is NOT one of these: it is bound at the register (the cut
@@ -40,7 +39,7 @@ pub struct CitedOwnership {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CitedRosterAuthority {
     pub account_id: AccountId,
-    pub roster_ref: AccountEntryHash,
+    pub roster_ref: RosterRef,
     pub stream_id: StreamId,
     pub authority: RosterContentAuthority,
 }
@@ -48,7 +47,7 @@ pub struct CitedRosterAuthority {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CitedGrantAuthority {
     pub owner_account_id: AccountId,
-    pub grant_id: AccountEntryHash,
+    pub grant_id: GrantId,
     pub authority: GrantDeviceAuthority,
 }
 
@@ -386,7 +385,7 @@ mod tests {
     use crate::account::{DeviceCut, DeviceRole, GrantAuthority};
     use crate::op::DeviceFingerprint;
 
-    const ENTRY_HASH: AccountEntryHash = [9; 32];
+    const ENTRY_HASH: AccountEntryHash = AccountEntryHash::from_bytes([9; 32]);
     fn owner() -> AccountId {
         AccountId::from_bytes([5; 32])
     }
@@ -395,20 +394,16 @@ mod tests {
         AccountId::from_bytes([6; 32])
     }
 
-    fn header(
-        author: AccountId,
-        grant_id: Option<AccountEntryHash>,
-        seq: u64,
-    ) -> ContentEntryHeader {
+    fn header(author: AccountId, grant_id: Option<GrantId>, seq: u64) -> ContentEntryHeader {
         ContentEntryHeader {
             stream_id: StreamId::from_bytes([1; 32]),
             author_account_id: author,
             device_fingerprint: DeviceFingerprint::from_bytes([2; 32]),
             seq,
             lamport: u64::MAX,
-            prev_hash: (seq > 0).then_some([3; 32]),
+            prev_hash: (seq > 0).then_some(AccountEntryHash::from_bytes([3; 32])),
             grant_id,
-            roster_ref: [4; 32],
+            roster_ref: RosterRef::from_bytes([4; 32]),
             owner_auth_len: 1,
             author_auth_len: 1,
             crypto_suite: 0,
@@ -509,7 +504,7 @@ mod tests {
             ),
             ContentAcceptance::Accepted
         );
-        let contributor = header(author(), Some([7; 32]), 0);
+        let contributor = header(author(), Some(GrantId::from_bytes([7; 32])), 0);
         assert_eq!(
             evaluate(
                 &contributor,
@@ -552,7 +547,7 @@ mod tests {
             evaluate(&owner_hdr, read_only(&owner_hdr), None, AncestryRelation::OnBranch),
             ContentAcceptance::Rejected(ContentRejectReason::RoleForbidsAuthoring),
         );
-        let contributor = header(author(), Some([7; 32]), 0);
+        let contributor = header(author(), Some(GrantId::from_bytes([7; 32])), 0);
         assert_eq!(
             evaluate(
                 &contributor,
@@ -566,7 +561,7 @@ mod tests {
 
     #[test]
     fn structural_grant_coupling_precedes_cut_classification() {
-        let malformed_owner = header(owner(), Some([7; 32]), 3);
+        let malformed_owner = header(owner(), Some(GrantId::from_bytes([7; 32])), 3);
         assert_eq!(
             evaluate(
                 &malformed_owner,
@@ -590,12 +585,12 @@ mod tests {
 
     #[test]
     fn exact_query_provenance_prevents_cross_owner_and_readd_laundering() {
-        let entry = header(author(), Some([7; 32]), 0);
+        let entry = header(author(), Some(GrantId::from_bytes([7; 32])), 0);
         let mut wrong_roster = match roster(&entry, AuthorityBoundary::Open) {
             AuthorityQuery::Effective(fact) => fact,
             _ => unreachable!(),
         };
-        wrong_roster.roster_ref = [0xaa; 32];
+        wrong_roster.roster_ref = RosterRef::from_bytes([0xaa; 32]);
         assert_eq!(
             evaluate(
                 &entry,
@@ -654,8 +649,12 @@ mod tests {
 
     #[test]
     fn definite_boundary_outcomes_dominate_incomplete_sibling_boundaries() {
-        let entry = header(author(), Some([7; 32]), 3);
-        let cut = DeviceCut { device_fingerprint: entry.device_fingerprint, seq: 2, hash: [8; 32] };
+        let entry = header(author(), Some(GrantId::from_bytes([7; 32])), 3);
+        let cut = DeviceCut {
+            device_fingerprint: entry.device_fingerprint,
+            seq: 2,
+            hash: AccountEntryHash::from_bytes([8; 32]),
+        };
         // The grant cut condemns on `seq` alone (no ancestry needed). Neither undecided ancestry
         // cause on the roster's register may mask it — otherwise a peer could park a condemnation
         // indefinitely by withholding one watermark.
@@ -664,7 +663,10 @@ mod tests {
             assert_eq!(
                 evaluate(
                     &entry,
-                    roster(&entry, AuthorityBoundary::Cut { seq: 9, hash: [0xaa; 32] }),
+                    roster(&entry, AuthorityBoundary::Cut {
+                        seq: 9,
+                        hash: AccountEntryHash::from_bytes([0xaa; 32])
+                    }),
                     Some(grant(&entry, GrantRole::Writer, GrantDeviceBoundary::Cut(cut.clone()))),
                     AncestryRelation::Unknown(undecided)
                 ),
@@ -689,7 +691,8 @@ mod tests {
     #[test]
     fn undecided_ancestry_causes_stay_distinct_and_keep_the_folds_precedence() {
         let entry = header(owner(), None, 2);
-        let boundary = AuthorityBoundary::Cut { seq: 5, hash: [7; 32] };
+        let boundary =
+            AuthorityBoundary::Cut { seq: 5, hash: AccountEntryHash::from_bytes([7; 32]) };
         assert_eq!(
             evaluate(
                 &entry,
@@ -709,9 +712,12 @@ mod tests {
             ContentAcceptance::Parked(ContentParkReason::IncompleteCutAncestry)
         );
         // Two registers, each undecided for a different reason: the withheld watermark wins.
-        let contributor = header(author(), Some([7; 32]), 2);
-        let cut =
-            DeviceCut { device_fingerprint: contributor.device_fingerprint, seq: 5, hash: [8; 32] };
+        let contributor = header(author(), Some(GrantId::from_bytes([7; 32])), 2);
+        let cut = DeviceCut {
+            device_fingerprint: contributor.device_fingerprint,
+            seq: 5,
+            hash: AccountEntryHash::from_bytes([8; 32]),
+        };
         let decision = evaluate_content_acceptance(&ContentAcceptanceInput {
             header: &contributor,
             entry_hash: ENTRY_HASH,
@@ -735,7 +741,7 @@ mod tests {
             // The roster's watermark [7; 32] is held but its chain has a gap; the grant's watermark
             // [8; 32] is not held at all.
             ancestry: |_, watermark| {
-                if watermark == [8; 32] {
+                if watermark == AccountEntryHash::from_bytes([8; 32]) {
                     AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget)
                 } else {
                     AncestryRelation::Unknown(UnknownAncestry::IncompleteCutAncestry)
@@ -812,7 +818,8 @@ mod tests {
         use std::cell::Cell;
 
         let entry = header(owner(), None, 2);
-        let boundary = AuthorityBoundary::Cut { seq: 2, hash: [7; 32] };
+        let boundary =
+            AuthorityBoundary::Cut { seq: 2, hash: AccountEntryHash::from_bytes([7; 32]) };
         for (relation, expected) in [
             (AncestryRelation::OnBranch, ContentAcceptance::Accepted),
             (
@@ -853,7 +860,7 @@ mod tests {
             },
         });
         assert_eq!(decision, Ok(ContentAcceptance::Accepted));
-        assert_eq!(arguments.get(), Some((ENTRY_HASH, [7; 32])));
+        assert_eq!(arguments.get(), Some((ENTRY_HASH, [7; 32].into())));
     }
 
     #[test]
@@ -939,11 +946,11 @@ mod tests {
     fn grant_cut_requires_same_device_and_obeys_exact_and_closed_boundaries() {
         use std::cell::Cell;
 
-        let entry = header(author(), Some([7; 32]), 2);
+        let entry = header(author(), Some(GrantId::from_bytes([7; 32])), 2);
         let exact = DeviceCut {
             device_fingerprint: entry.device_fingerprint,
             seq: entry.seq,
-            hash: [7; 32],
+            hash: AccountEntryHash::from_bytes([7; 32]),
         };
         assert_eq!(
             evaluate(
@@ -1028,7 +1035,7 @@ mod tests {
 
     #[test]
     fn unresolved_and_invalid_authority_states_are_contextual_and_fail_closed() {
-        let entry = header(author(), Some([7; 32]), 0);
+        let entry = header(author(), Some(GrantId::from_bytes([7; 32])), 0);
         let base = ContentAcceptanceInput {
             header: &entry,
             entry_hash: ENTRY_HASH,
@@ -1090,7 +1097,10 @@ mod tests {
         let entry = header(owner(), None, u64::MAX);
         for (boundary, expected) in [
             (
-                AuthorityBoundary::Cut { seq: u64::MAX - 1, hash: [7; 32] },
+                AuthorityBoundary::Cut {
+                    seq: u64::MAX - 1,
+                    hash: AccountEntryHash::from_bytes([7; 32]),
+                },
                 ContentAcceptance::Condemned(ContentCondemnReason::BeyondCut),
             ),
             (
@@ -1163,7 +1173,7 @@ mod tests {
 
     #[test]
     fn every_authority_provenance_component_is_enforced() {
-        let entry = header(author(), Some([7; 32]), 0);
+        let entry = header(author(), Some(GrantId::from_bytes([7; 32])), 0);
         let expected = Ok(ContentAcceptance::Rejected(ContentRejectReason::OwnerReferenceInvalid));
         for fact in [
             CitedOwnership { owner_account_id: author(), stream_id: entry.stream_id },
@@ -1203,7 +1213,7 @@ mod tests {
         };
         for fact in [
             CitedRosterAuthority { account_id: owner(), ..valid_roster },
-            CitedRosterAuthority { roster_ref: [0xa2; 32], ..valid_roster },
+            CitedRosterAuthority { roster_ref: RosterRef::from_bytes([0xa2; 32]), ..valid_roster },
             CitedRosterAuthority { stream_id: StreamId::from_bytes([0xa3; 32]), ..valid_roster },
             CitedRosterAuthority {
                 authority: RosterContentAuthority {
@@ -1230,7 +1240,7 @@ mod tests {
             _ => unreachable!(),
         };
         let mut wrong_grant_id = valid_grant.clone();
-        wrong_grant_id.grant_id = [0xa5; 32];
+        wrong_grant_id.grant_id = GrantId::from_bytes([0xa5; 32]);
         let mut wrong_stream = valid_grant.clone();
         wrong_stream.authority.grant.stream_id = StreamId::from_bytes([0xa6; 32]);
         let mut wrong_grantee = valid_grant.clone();
@@ -1255,7 +1265,7 @@ mod tests {
 
     #[test]
     fn every_freshness_provenance_component_is_enforced() {
-        let entry = header(author(), Some([7; 32]), 0);
+        let entry = header(author(), Some(GrantId::from_bytes([7; 32])), 0);
         let base = ContentAcceptanceInput {
             header: &entry,
             entry_hash: ENTRY_HASH,
@@ -1321,14 +1331,13 @@ mod tests {
 
     #[test]
     fn combined_boundaries_and_subject_holds_have_stable_precedence() {
-        let boundaries =
-            [AuthorityBoundary::Cut { seq: 9, hash: [1; 32] }, AuthorityBoundary::Cut {
-                seq: 1,
-                hash: [2; 32],
-            }];
+        let boundaries = [
+            AuthorityBoundary::Cut { seq: 9, hash: AccountEntryHash::from_bytes([1; 32]) },
+            AuthorityBoundary::Cut { seq: 1, hash: AccountEntryHash::from_bytes([2; 32]) },
+        ];
         assert_eq!(
             combine_boundaries(&boundaries, 2, ENTRY_HASH, &|_, hash| {
-                if hash == [1; 32] {
+                if hash == AccountEntryHash::from_bytes([1; 32]) {
                     AncestryRelation::OffBranch
                 } else {
                     AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget)
@@ -1338,7 +1347,10 @@ mod tests {
         );
         assert_eq!(
             combine_boundaries(
-                &[AuthorityBoundary::Cut { seq: 9, hash: [1; 32] }, AuthorityBoundary::Closed],
+                &[
+                    AuthorityBoundary::Cut { seq: 9, hash: AccountEntryHash::from_bytes([1; 32]) },
+                    AuthorityBoundary::Closed
+                ],
                 2,
                 ENTRY_HASH,
                 &|_, _| AncestryRelation::OffBranch,
@@ -1355,13 +1367,13 @@ mod tests {
                 ContentAcceptance::Condemned(ContentCondemnReason::ClosedIncarnation),
             ),
             (
-                AuthorityBoundary::Cut { seq: 0, hash: [1; 32] },
+                AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes([1; 32]) },
                 SubjectAuthorityHold::Contested,
                 false,
                 ContentAcceptance::Condemned(ContentCondemnReason::BeyondCut),
             ),
             (
-                AuthorityBoundary::Cut { seq: 1, hash: [1; 32] },
+                AuthorityBoundary::Cut { seq: 1, hash: AccountEntryHash::from_bytes([1; 32]) },
                 SubjectAuthorityHold::Contested,
                 true,
                 ContentAcceptance::Parked(ContentParkReason::ContestedSubject),
@@ -1390,7 +1402,7 @@ mod tests {
     #[test]
     fn owner_rejects_an_unexpected_supplied_grant_fact() {
         let owner_entry = header(owner(), None, 0);
-        let contributor_entry = header(author(), Some([7; 32]), 0);
+        let contributor_entry = header(author(), Some(GrantId::from_bytes([7; 32])), 0);
         assert_eq!(
             evaluate(
                 &owner_entry,

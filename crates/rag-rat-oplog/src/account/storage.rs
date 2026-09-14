@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
 use super::fold::{self, AuthorityChain, EntryStatus};
-use super::id::{account_id_from_genesis_payload, fixed};
+use super::id::{self, AccountEntryHash, GrantId, OwnerId, RosterRef, SignedHash};
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
 use super::{AccountId, content, secrets, snapshot};
@@ -24,7 +24,6 @@ use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
 use crate::stream::{AccessMode, StreamId};
 
-type AccountEntryHash = [u8; 32];
 type BranchKey = (u8, DeviceFingerprint, Option<AccountEntryHash>);
 type BranchChild = (u64, AccountEntryHash);
 type BranchChildren = HashMap<BranchKey, Vec<BranchChild>>;
@@ -367,7 +366,7 @@ pub fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<(
         stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for account_bytes in account_ids {
-        let result = fixed(&account_bytes)
+        let result = id::fixed(&account_bytes)
             .map(AccountId::from_bytes)
             .and_then(|account_id| refold_in_tx(tx, account_id, 0));
         if let Err(err) = result {
@@ -386,7 +385,7 @@ pub fn backfill_authority_projection(tx: &Transaction<'_>) -> rusqlite::Result<(
 pub fn roster_ref_effective(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: AccountEntryHash,
+    roster_ref: RosterRef,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -396,13 +395,13 @@ pub fn roster_ref_effective(
 fn roster_ref_effective_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: AccountEntryHash,
+    roster_ref: RosterRef,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
     let Some((authority, effective_at, closed_at)) =
         load_roster_fact(conn, account_id, &roster_ref)?
     else {
-        return missing_reference(conn, account_id, &roster_ref);
+        return missing_reference(conn, account_id, &roster_ref.into());
     };
     if authority.device_fingerprint != device_fingerprint {
         return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
@@ -415,7 +414,7 @@ fn roster_ref_effective_in_snapshot(
 fn load_roster_fact(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: &AccountEntryHash,
+    roster_ref: &RosterRef,
 ) -> anyhow::Result<Option<(fold::RosterAuthority, i64, Option<i64>)>> {
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
@@ -429,7 +428,7 @@ fn load_roster_fact(
         return Ok(None);
     };
     let authority = fold::RosterAuthority {
-        device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?),
+        device_fingerprint: DeviceFingerprint::from_bytes(id::fixed(&device)?),
         current_role: DeviceRole::from_db_str(&role)?,
     };
     Ok(Some((authority, effective_at, closed_at)))
@@ -438,7 +437,7 @@ fn load_roster_fact(
 pub fn roster_content_authority(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: AccountEntryHash,
+    roster_ref: RosterRef,
     device_fingerprint: DeviceFingerprint,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
@@ -461,13 +460,13 @@ pub fn roster_content_authority(
 pub fn roster_content_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: AccountEntryHash,
+    roster_ref: RosterRef,
     device_fingerprint: DeviceFingerprint,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
     let Some((roster, effective_at, closed_at)) = load_roster_fact(conn, account_id, &roster_ref)?
     else {
-        return missing_reference(conn, account_id, &roster_ref);
+        return missing_reference(conn, account_id, &roster_ref.into());
     };
     if roster.device_fingerprint != device_fingerprint {
         return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
@@ -489,8 +488,8 @@ pub fn roster_content_authority_in_snapshot(
         .optional()?;
     let boundary = match cut {
         Some((seq, hash)) => fold::AuthorityBoundary::Cut {
-            seq: u64::from_be_bytes(fixed(&seq)?),
-            hash: fixed(&hash)?,
+            seq: u64::from_be_bytes(id::fixed(&seq)?),
+            hash: AccountEntryHash::from_bytes(id::fixed(&hash)?),
         },
         None if closed_at.is_none() => fold::AuthorityBoundary::Open,
         None => fold::AuthorityBoundary::Closed,
@@ -505,7 +504,7 @@ pub fn roster_content_authority_in_snapshot(
 pub fn owner_control_authority(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: AccountEntryHash,
+    owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority(conn, account_id, owner_id, device_fingerprint, AuthorityChain::Control)
@@ -517,7 +516,7 @@ pub fn owner_control_authority(
 pub fn owner_control_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: AccountEntryHash,
+    owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority_in_snapshot(
@@ -532,7 +531,7 @@ pub fn owner_control_authority_in_snapshot(
 pub fn owner_secrets_authority(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: AccountEntryHash,
+    owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority(conn, account_id, owner_id, device_fingerprint, AuthorityChain::Secrets)
@@ -545,7 +544,7 @@ pub fn owner_secrets_authority(
 pub fn owner_secrets_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: AccountEntryHash,
+    owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     owner_chain_authority_in_snapshot(
@@ -560,7 +559,7 @@ pub fn owner_secrets_authority_in_snapshot(
 fn owner_chain_authority(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: AccountEntryHash,
+    owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
     chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
@@ -572,7 +571,7 @@ fn owner_chain_authority(
 fn owner_chain_authority_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: AccountEntryHash,
+    owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
     chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
@@ -630,10 +629,11 @@ fn owner_chain_authority_in_snapshot(
         device_hash,
     )) = row
     else {
-        return missing_reference(conn, account_id, &owner_id);
+        return missing_reference(conn, account_id, &owner_id.into());
     };
-    let owner =
-        fold::OwnerAuthority { device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?) };
+    let owner = fold::OwnerAuthority {
+        device_fingerprint: DeviceFingerprint::from_bytes(id::fixed(&device)?),
+    };
     if owner.device_fingerprint != device_fingerprint {
         return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
     }
@@ -791,7 +791,7 @@ pub(in crate::account) fn selected_snapshot(
 pub fn owner_incarnation_effective(
     conn: &Connection,
     account_id: AccountId,
-    owner_id: AccountEntryHash,
+    owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -805,10 +805,11 @@ pub fn owner_incarnation_effective(
         )
         .optional()?;
     let Some((device, effective_at, closed_at)) = row else {
-        return missing_reference(conn, account_id, &owner_id);
+        return missing_reference(conn, account_id, &owner_id.into());
     };
-    let authority =
-        fold::OwnerAuthority { device_fingerprint: DeviceFingerprint::from_bytes(fixed(&device)?) };
+    let authority = fold::OwnerAuthority {
+        device_fingerprint: DeviceFingerprint::from_bytes(id::fixed(&device)?),
+    };
     if authority.device_fingerprint != device_fingerprint {
         return Ok(fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject));
     }
@@ -820,7 +821,7 @@ type StoredGrantRow = (Vec<u8>, Vec<u8>, String, i64, Option<i64>);
 pub fn grant_effective(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
@@ -834,7 +835,7 @@ pub fn grant_effective(
 pub fn grant_effective_in_snapshot(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
@@ -847,11 +848,11 @@ pub fn grant_effective_in_snapshot(
         )
         .optional()?;
     let Some((stored_stream, stored_grantee, role, effective_at, closed_at)) = row else {
-        return missing_reference(conn, owner_account_id, &grant_id);
+        return missing_reference(conn, owner_account_id, &grant_id.into());
     };
     let authority = fold::GrantAuthority {
-        stream_id: StreamId::from_bytes(fixed(&stored_stream)?),
-        grantee_account_id: AccountId::from_bytes(fixed(&stored_grantee)?),
+        stream_id: StreamId::from_bytes(id::fixed(&stored_stream)?),
+        grantee_account_id: AccountId::from_bytes(id::fixed(&stored_grantee)?),
         role: GrantRole::from_db_str(&role)?,
     };
     if authority.stream_id != stream_id || authority.grantee_account_id != grantee_account_id {
@@ -871,7 +872,7 @@ pub fn effective_writer_grant(
     owner_account_id: AccountId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
-) -> anyhow::Result<Option<AccountEntryHash>> {
+) -> anyhow::Result<Option<GrantId>> {
     let grant_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT grant_id FROM account_stream_grants
@@ -886,7 +887,7 @@ pub fn effective_writer_grant(
             |row| row.get(0),
         )
         .optional()?;
-    grant_id.map(|bytes| fixed(&bytes)).transpose()
+    grant_id.map(|bytes| id::fixed(&bytes).map(GrantId::from_bytes)).transpose()
 }
 
 /// Every OPEN (not-closed) WRITER grant `owner_account_id` holds for `grantee_account_id` on
@@ -901,7 +902,7 @@ pub fn open_writer_grants(
     owner_account_id: AccountId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
-) -> anyhow::Result<Vec<AccountEntryHash>> {
+) -> anyhow::Result<Vec<GrantId>> {
     let mut stmt = conn.prepare(
         "SELECT grant_id FROM account_stream_grants
          WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
@@ -919,7 +920,7 @@ pub fn open_writer_grants(
     )?;
     let mut grants = Vec::new();
     for row in rows {
-        grants.push(fixed(&row?)?);
+        grants.push(GrantId::from_bytes(id::fixed(&row?)?));
     }
     Ok(grants)
 }
@@ -927,7 +928,7 @@ pub fn open_writer_grants(
 /// One row of the owner-facing grant listing (`sync grants`).
 #[derive(Debug, Clone)]
 pub struct StreamGrantListing {
-    pub grant_id: AccountEntryHash,
+    pub grant_id: GrantId,
     pub grantee_account_id: AccountId,
     /// The projected role token (`reader`/`writer`).
     pub role: String,
@@ -963,8 +964,8 @@ pub fn stream_grants_for_owner(
     for row in rows {
         let (grant_id, grantee, role, open) = row?;
         listings.push(StreamGrantListing {
-            grant_id: fixed(&grant_id)?,
-            grantee_account_id: AccountId::from_bytes(fixed(&grantee)?),
+            grant_id: GrantId::from_bytes(id::fixed(&grant_id)?),
+            grantee_account_id: AccountId::from_bytes(id::fixed(&grantee)?),
             role,
             open,
         });
@@ -993,7 +994,7 @@ pub fn effective_writer_grantees(
     )?;
     let mut grantees = Vec::new();
     for row in rows {
-        grantees.push(AccountId::from_bytes(fixed(&row?)?));
+        grantees.push(AccountId::from_bytes(id::fixed(&row?)?));
     }
     Ok(grantees)
 }
@@ -1031,7 +1032,7 @@ pub fn ever_granted_accounts(
     let rows = stmt
         .query_map(params![owner_account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.iter().map(|bytes| Ok(AccountId::from_bytes(fixed(bytes)?))).collect()
+    rows.iter().map(|bytes| Ok(AccountId::from_bytes(id::fixed(bytes)?))).collect()
 }
 
 /// Whether `grantee_account_id` holds an effective (not-closed) Writer grant on a stream that
@@ -1070,8 +1071,8 @@ pub fn account_holds_effective_public_writer_grant(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (owner, stream) in grants {
-        let owner = AccountId::from_bytes(fixed(&owner)?);
-        let stream = StreamId::from_bytes(fixed(&stream)?);
+        let owner = AccountId::from_bytes(id::fixed(&owner)?);
+        let stream = StreamId::from_bytes(id::fixed(&stream)?);
         if stream_access_mode(conn, owner, stream)? == crate::stream::AccessMode::PublicRead {
             return Ok(true);
         }
@@ -1085,7 +1086,7 @@ pub fn account_holds_effective_public_writer_grant(
 pub fn grant_effective_for_device(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
@@ -1106,7 +1107,7 @@ pub fn grant_effective_for_device(
 pub fn grant_effective_for_device_in_snapshot(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
     stream_id: StreamId,
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
@@ -1120,11 +1121,11 @@ pub fn grant_effective_for_device_in_snapshot(
         )
         .optional()?;
     let Some((stored_stream, stored_grantee, role, effective_at, closed_at)) = row else {
-        return missing_reference(conn, owner_account_id, &grant_id);
+        return missing_reference(conn, owner_account_id, &grant_id.into());
     };
     let grant = fold::GrantAuthority {
-        stream_id: StreamId::from_bytes(fixed(&stored_stream)?),
-        grantee_account_id: AccountId::from_bytes(fixed(&stored_grantee)?),
+        stream_id: StreamId::from_bytes(id::fixed(&stored_stream)?),
+        grantee_account_id: AccountId::from_bytes(id::fixed(&stored_grantee)?),
         role: GrantRole::from_db_str(&role)?,
     };
     if grant.stream_id != stream_id || grant.grantee_account_id != grantee_account_id {
@@ -1170,7 +1171,7 @@ pub fn stream_owner_effective_in_snapshot(
     let Some((own_id, effective_at)) = row else {
         return Ok(fold::AuthorityQuery::Unknown);
     };
-    validated_fact(fixed(&own_id)?, effective_at, None)
+    validated_fact(AccountEntryHash::from_bytes(id::fixed(&own_id)?), effective_at, None)
 }
 
 /// Keyed per-device cut lookup for C2 content authorization. The grant's final effectiveness and
@@ -1178,7 +1179,7 @@ pub fn stream_owner_effective_in_snapshot(
 pub(super) fn grant_device_cut(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<Option<DeviceCut>>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
@@ -1192,7 +1193,7 @@ pub(super) fn grant_device_cut(
         |row| row.get(0),
     )?;
     if !grant_exists {
-        return missing_reference(conn, owner_account_id, &grant_id);
+        return missing_reference(conn, owner_account_id, &grant_id.into());
     }
     let cut = load_grant_device_cut(conn, owner_account_id, grant_id, device_fingerprint)?;
     Ok(fold::AuthorityQuery::Effective(cut))
@@ -1201,7 +1202,7 @@ pub(super) fn grant_device_cut(
 fn load_grant_device_cut(
     conn: &Connection,
     owner_account_id: AccountId,
-    grant_id: AccountEntryHash,
+    grant_id: GrantId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<DeviceCut>> {
     let row: Option<(Vec<u8>, Vec<u8>)> = conn
@@ -1219,8 +1220,8 @@ fn load_grant_device_cut(
     row.map(|(seq, hash)| -> anyhow::Result<DeviceCut> {
         Ok(DeviceCut {
             device_fingerprint,
-            seq: u64::from_be_bytes(fixed(&seq)?),
-            hash: fixed(&hash)?,
+            seq: u64::from_be_bytes(id::fixed(&seq)?),
+            hash: AccountEntryHash::from_bytes(id::fixed(&hash)?),
         })
     })
     .transpose()
@@ -1244,7 +1245,7 @@ pub fn stream_owner_account(
             |row| row.get(0),
         )
         .optional()?;
-    owner.map(|bytes| Ok(AccountId::from_bytes(fixed(&bytes)?))).transpose()
+    owner.map(|bytes| Ok(AccountId::from_bytes(id::fixed(&bytes)?))).transpose()
 }
 
 /// The [`AccessMode`] of `stream_id` as declared in `owner_account_id`'s effective `StreamOwn`
@@ -1427,7 +1428,7 @@ pub(in crate::account) fn effective_owner_incarnation_for_device(
     conn: &Connection,
     account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
-) -> anyhow::Result<Option<AccountEntryHash>> {
+) -> anyhow::Result<Option<OwnerId>> {
     let owner_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT owner_id FROM account_owner_incarnations
@@ -1437,7 +1438,7 @@ pub(in crate::account) fn effective_owner_incarnation_for_device(
             |row| row.get(0),
         )
         .optional()?;
-    owner_id.map(|bytes| fixed(&bytes)).transpose()
+    owner_id.map(|bytes| id::fixed(&bytes).map(OwnerId::from_bytes)).transpose()
 }
 
 fn missing_reference<T>(
@@ -1454,7 +1455,7 @@ fn missing_reference<T>(
         .optional()?;
     Ok(match stored_account {
         None => fold::AuthorityQuery::Unknown,
-        Some(stored) if fixed(&stored)? != account_id.to_bytes() =>
+        Some(stored) if id::fixed(&stored)? != account_id.to_bytes() =>
             fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject),
         Some(_) =>
             fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::ReferencedEntryNotEffective),
@@ -1489,7 +1490,8 @@ fn stored_boundary(
     match boundary {
         fold::AuthorityBoundary::Open => ("open", None, None),
         fold::AuthorityBoundary::Closed => ("closed", None, None),
-        fold::AuthorityBoundary::Cut { seq, hash } => ("cut", Some(seq.to_be_bytes()), Some(hash)),
+        fold::AuthorityBoundary::Cut { seq, hash } =>
+            ("cut", Some(seq.to_be_bytes()), Some(hash.into())),
     }
 }
 
@@ -1505,8 +1507,8 @@ fn decode_stored_boundary(
         ("open", None, None) => fold::AuthorityBoundary::Open,
         ("closed", None, None) => fold::AuthorityBoundary::Closed,
         ("cut", Some(seq), Some(hash)) => fold::AuthorityBoundary::Cut {
-            seq: u64::from_be_bytes(fixed(&seq)?),
-            hash: fixed(&hash)?,
+            seq: u64::from_be_bytes(id::fixed(&seq)?),
+            hash: AccountEntryHash::from_bytes(id::fixed(&hash)?),
         },
         _ => anyhow::bail!("malformed persisted authority boundary"),
     };
@@ -1529,7 +1531,7 @@ pub(super) fn refold_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
     now_ms: i64,
-) -> anyhow::Result<HashMap<[u8; 32], EntryStatus>> {
+) -> anyhow::Result<HashMap<AccountEntryHash, EntryStatus>> {
     let state = fold_account_state_in_tx(tx, account_id, now_ms, PreVerifyPromotion::Skip)?;
     super::content::finalize_affected_streams(tx, &state.affected_streams, now_ms)?;
     // `state.rejected_content_promotions` is deliberately DISCARDED here: this trusted/local path
@@ -1602,7 +1604,7 @@ fn fold_account_state_in_tx(
         account_id.to_bytes().as_slice()
     ])?;
 
-    let mut statuses: HashMap<[u8; 32], EntryStatus> = HashMap::new();
+    let mut statuses: HashMap<AccountEntryHash, EntryStatus> = HashMap::new();
     for row in rows {
         let accepted = projection.accepted.contains(&row.entry_hash);
         let (status, detail) = if accepted {
@@ -1672,7 +1674,7 @@ fn owned_stream_bytes(conn: &Connection, account_id: AccountId) -> anyhow::Resul
     let rows = stmt
         .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.iter().map(|bytes| fixed(bytes)).collect()
+    rows.iter().map(|bytes| id::fixed(bytes)).collect()
 }
 
 /// Replace every query-ready authority fact for this account. The caller's IMMEDIATE refold txn
@@ -1851,7 +1853,7 @@ fn rewrite_authority_projection(
 fn enqueue_readoption_for_closed_fact(
     tx: &Transaction<'_>,
     account_id: AccountId,
-    roster_ref: &[u8; 32],
+    roster_ref: &RosterRef,
     fact: &fold::RosterFact,
     closed_at: u64,
     now_ms: i64,
@@ -1871,7 +1873,7 @@ fn enqueue_readoption_for_closed_fact(
             account_id,
             fact.authority.device_fingerprint,
             StreamId::PRECONTEXT,
-            *roster_ref,
+            (*roster_ref).into(),
             closed_at,
             now_ms,
         )?;
@@ -1882,8 +1884,8 @@ fn enqueue_readoption_for_closed_fact(
             tx,
             account_id,
             fact.authority.device_fingerprint,
-            StreamId::from_bytes(fixed::<32>(&stream)?),
-            *roster_ref,
+            StreamId::from_bytes(id::fixed::<32>(&stream)?),
+            (*roster_ref).into(),
             closed_at,
             now_ms,
         )?;
@@ -1950,7 +1952,7 @@ fn select_coherent_branches(
     }
     let mut accepted_set = HashSet::new();
     for (log_id, device) in groups {
-        let mut parent: Option<[u8; 32]> = None;
+        let mut parent: Option<AccountEntryHash> = None;
         // Bounded by the candidate count; only the exact next sequence slot may extend a branch.
         for expected_seq in 0..=rows.len() {
             let Some((_, winner)) = children
@@ -1986,7 +1988,7 @@ fn close_selection_over_authority(
                 row.verified
                     .header
                     .authority_ref
-                    .is_some_and(|authority| !selected.contains(&authority))
+                    .is_some_and(|authority| !selected.contains(&authority.into()))
             })
             .map(|row| row.entry_hash)
             .collect();
@@ -2003,7 +2005,7 @@ fn close_selection_over_authority(
 /// signature was checked at ingest; the local DB is the trust boundary, so we re-decode STRUCTURE
 /// only rather than re-verify — which would need the device set we are loading).
 struct CandidateRow {
-    entry_hash: [u8; 32],
+    entry_hash: AccountEntryHash,
     log_id: u8,
     device_fingerprint: DeviceFingerprint,
     seq: u64,
@@ -2099,9 +2101,9 @@ fn load_candidates(conn: &Connection, account_id: AccountId) -> anyhow::Result<V
         let signed = envelope::decode_account_signed(&signed_bytes)
             .map_err(|err| anyhow::anyhow!("stored candidate re-decode failed: {err}"))?;
         out.push(CandidateRow {
-            entry_hash: fixed(&hash)?,
+            entry_hash: AccountEntryHash::from_bytes(id::fixed(&hash)?),
             log_id: signed.header.log_id,
-            device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
+            device_fingerprint: DeviceFingerprint::from_bytes(id::fixed(&fp)?),
             seq: seq as u64,
             verified: VerifiedAccountEntry {
                 header: signed.header,
@@ -2123,7 +2125,7 @@ pub struct SyncAccountEntry {
     pub device_fingerprint: DeviceFingerprint,
     pub log_id: u8,
     pub seq: u64,
-    pub entry_hash: [u8; 32],
+    pub entry_hash: AccountEntryHash,
     pub signed_bytes: Vec<u8>,
 }
 
@@ -2133,7 +2135,7 @@ pub struct SyncAccountEntry {
 /// accounts), and to skip re-offering one it already holds. Structure only — a full verify still
 /// happens in `account_ingest`; a decode failure here just means the bytes are not a well-formed
 /// account entry, which the session treats as a peer to distrust.
-pub fn account_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(AccountId, [u8; 32])> {
+pub fn account_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(AccountId, AccountEntryHash)> {
     let signed = envelope::decode_account_signed(signed_bytes)?;
     Ok((signed.header.account_id, signed.entry_hash))
 }
@@ -2145,11 +2147,11 @@ pub fn account_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(AccountId, [u8;
 pub fn verify_enrollment_device_add(
     account_entries: &[Vec<u8>],
     expected_account: AccountId,
-    expected_hash: [u8; 32],
+    expected_hash: AccountEntryHash,
     expected_signed: &[u8],
     expected_ed25519_pubkey: [u8; 32],
     expected_x25519_pubkey: [u8; 32],
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<AccountEntryHash> {
     let mut entries = Vec::with_capacity(account_entries.len());
     let mut device_add = None;
     for bytes in account_entries {
@@ -2193,7 +2195,7 @@ pub fn verify_enrollment_device_add(
     // `expected_account`, or an impostor's own founder-signed genesis + DeviceAdd (stamped with
     // the victim's account_id in their headers) would pass every signature check below.
     anyhow::ensure!(
-        account_id_from_genesis_payload(&genesis.payload) == expected_account,
+        id::account_id_from_genesis_payload(&genesis.payload) == expected_account,
         "enrollment genesis payload does not hash to the expected account"
     );
     let DecodedAccountOp::Known(AccountOp::AccountGenesis { ed25519_pubkey: founder_key, .. }) =
@@ -2206,7 +2208,7 @@ pub fn verify_enrollment_device_add(
     let device_add = device_add
         .ok_or_else(|| anyhow::anyhow!("enrollment bootstrap has no acknowledged DeviceAdd"))?;
     anyhow::ensure!(
-        device_add.header.authority_ref == Some(genesis.entry_hash),
+        device_add.header.authority_ref == Some(genesis.entry_hash.into()),
         "enrollment DeviceAdd does not cite the founder incarnation"
     );
     let verified =
@@ -2236,8 +2238,8 @@ pub fn verify_enrollment_device_add(
 /// two envelopes can share an `entry_hash` (same body) yet differ in signature, and the sync layer
 /// must treat them as distinct, or a peer holding the valid signature would suppress it against a
 /// peer holding only an invalid one. Never diff sync inventory by `entry_hash`.
-pub fn account_signed_hash(signed_bytes: &[u8]) -> [u8; 32] {
-    cbor::sha256(signed_bytes)
+pub fn account_signed_hash(signed_bytes: &[u8]) -> SignedHash {
+    SignedHash::from_bytes(cbor::sha256(signed_bytes))
 }
 
 /// Whether `account_id` already holds this EXACT signed envelope — as a stored candidate (matched
@@ -2290,11 +2292,11 @@ pub fn account_entries_for_enrollment(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (hash, fp, seq, log_id, signed_bytes) in held_rows {
         out.push(SyncAccountEntry {
-            device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
+            device_fingerprint: DeviceFingerprint::from_bytes(id::fixed(&fp)?),
             log_id: u8::try_from(log_id)
                 .map_err(|_| anyhow::anyhow!("stored log_id {log_id} out of range"))?,
             seq: seq as u64,
-            entry_hash: fixed(&hash)?,
+            entry_hash: AccountEntryHash::from_bytes(id::fixed(&hash)?),
             signed_bytes,
         });
     }
@@ -2340,10 +2342,10 @@ pub fn account_entries_for_sync(
             Err(_) => continue,
         };
         out.push(SyncAccountEntry {
-            device_fingerprint: DeviceFingerprint::from_bytes(fixed(&fp)?),
+            device_fingerprint: DeviceFingerprint::from_bytes(id::fixed(&fp)?),
             log_id,
             seq,
-            entry_hash: fixed(&hash)?,
+            entry_hash: AccountEntryHash::from_bytes(id::fixed(&hash)?),
             signed_bytes,
         });
     }
@@ -2435,9 +2437,9 @@ pub(super) fn insert_candidate(
             h.log_id,
             h.device_fingerprint.to_bytes().as_slice(),
             i64::try_from(h.seq).expect("seq range validated before candidate insert"),
-            h.prev_hash.map(|p| p.to_vec()),
-            h.parent_ref.map(|p| p.to_vec()),
-            h.authority_ref.map(|p| p.to_vec()),
+            h.prev_hash.map(|p| p.as_slice().to_vec()),
+            h.parent_ref.map(|p| p.as_slice().to_vec()),
+            h.authority_ref.map(|p| p.as_slice().to_vec()),
             h.entry_type,
             signed_bytes,
             now_ms,
@@ -2607,7 +2609,7 @@ pub(in crate::account) fn refresh_enrollment_reservations_for_stream_in_tx(
         )
         .optional()?;
     let Some(owner) = owner else { return Ok(()) };
-    let account_id = AccountId::from_bytes(fixed(&owner)?);
+    let account_id = AccountId::from_bytes(id::fixed(&owner)?);
     top_up_account_candidate_reservations_in_tx(tx, account_id, now_ms)
 }
 
@@ -2718,8 +2720,8 @@ pub(super) fn list_effective_roster_x25519_pubkeys(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for (fp, roster_ref) in rows {
-        let fingerprint = DeviceFingerprint::from_bytes(fixed(&fp)?);
-        let roster_ref: AccountEntryHash = fixed(&roster_ref)?;
+        let fingerprint = DeviceFingerprint::from_bytes(id::fixed(&fp)?);
+        let roster_ref: RosterRef = RosterRef::from_bytes(id::fixed(&roster_ref)?);
         out.push((fingerprint, enrollment_x25519(conn, account_id, &roster_ref, fingerprint)?));
     }
     Ok(out)
@@ -2744,7 +2746,14 @@ pub(super) fn effective_roster_x25519_pubkey(
         )
         .optional()?;
     roster_ref
-        .map(|roster_ref| enrollment_x25519(conn, account_id, &fixed(&roster_ref)?, fingerprint))
+        .map(|roster_ref| {
+            enrollment_x25519(
+                conn,
+                account_id,
+                &RosterRef::from_bytes(id::fixed(&roster_ref)?),
+                fingerprint,
+            )
+        })
         .transpose()
 }
 
@@ -2767,7 +2776,7 @@ pub(super) fn list_effective_roster_fingerprints(
     let rows = stmt
         .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    rows.into_iter().map(|fp| Ok(DeviceFingerprint::from_bytes(fixed(&fp)?))).collect()
+    rows.into_iter().map(|fp| Ok(DeviceFingerprint::from_bytes(id::fixed(&fp)?))).collect()
 }
 
 /// The effective enrollment entry and current role for `fingerprint`, read in the caller's
@@ -2777,7 +2786,7 @@ pub(super) fn effective_roster_entry_in_snapshot(
     conn: &Connection,
     account_id: AccountId,
     fingerprint: DeviceFingerprint,
-) -> anyhow::Result<Option<(AccountEntryHash, ops::DeviceRole)>> {
+) -> anyhow::Result<Option<(RosterRef, ops::DeviceRole)>> {
     let row: Option<(Vec<u8>, String)> = conn
         .query_row(
             "SELECT roster_ref, role FROM account_roster_history
@@ -2786,8 +2795,10 @@ pub(super) fn effective_roster_entry_in_snapshot(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    row.map(|(roster_ref, role)| Ok((fixed(&roster_ref)?, ops::DeviceRole::from_db_str(&role)?)))
-        .transpose()
+    row.map(|(roster_ref, role)| {
+        Ok((RosterRef::from_bytes(id::fixed(&roster_ref)?), ops::DeviceRole::from_db_str(&role)?))
+    })
+    .transpose()
 }
 
 /// Whether `fingerprint` is currently a roster-effective WRITER (`Member`/`Owner`, `closed_at IS
@@ -2898,7 +2909,7 @@ pub(crate) fn device_ever_enrolled_as_writer(
 fn enrollment_x25519(
     conn: &Connection,
     account_id: AccountId,
-    roster_ref: &AccountEntryHash,
+    roster_ref: &RosterRef,
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<DeviceX25519Public> {
     let signed_bytes: Vec<u8> = conn
@@ -2955,7 +2966,7 @@ fn enrollment_certified_x25519(
 
 fn insert_pre_verify(
     conn: &Connection,
-    entry_hash: &[u8; 32],
+    entry_hash: &AccountEntryHash,
     account_id: AccountId,
     fingerprint: DeviceFingerprint,
     signed_bytes: &[u8],
@@ -2979,14 +2990,14 @@ fn insert_pre_verify(
     if inserted == 0 {
         return Ok(PreVerifyInsert::Parked { evicted: Vec::new() });
     }
-    enforce_pre_verify_budget(conn, account_id, &signed_hash)
+    enforce_pre_verify_budget(conn, account_id, &signed_hash.into())
 }
 
 /// Keep the unauthenticated queue within its per-account and global budgets.
 fn enforce_pre_verify_budget(
     conn: &Connection,
     account_id: AccountId,
-    inserted_signed_hash: &AccountEntryHash,
+    inserted_signed_hash: &SignedHash,
 ) -> rusqlite::Result<PreVerifyInsert> {
     let outcome = PRE_VERIFY.enforce_budget(
         conn,
@@ -3033,7 +3044,7 @@ fn promote_pre_verify(
         };
         let mut promoted_any = false;
         for (signed_hash, fp_bytes, raw_bytes) in pending {
-            let fp = DeviceFingerprint::from_bytes(fixed(&fp_bytes)?);
+            let fp = DeviceFingerprint::from_bytes(id::fixed(&fp_bytes)?);
             let Some(pk_bytes) = pubkeys.get(&fp).copied() else {
                 continue; // still unresolvable — may resolve in a later round
             };
@@ -3163,7 +3174,7 @@ fn validate_genesis_binding(header: &AccountEntryHeader, payload: &[u8]) -> Resu
     if !is_current_control_plaintext(header) || !is_genesis(header) {
         return Ok(());
     }
-    if account_id_from_genesis_payload(payload) != header.account_id {
+    if id::account_id_from_genesis_payload(payload) != header.account_id {
         return Err("genesis payload does not hash to its account_id".into());
     }
     match ops::decode(header.entry_type, payload) {
@@ -3186,7 +3197,7 @@ fn is_device_add(verified: &VerifiedAccountEntry) -> bool {
 /// still in the pre-verify queue). A read helper for queries.
 pub(super) fn entry_status(
     conn: &Connection,
-    entry_hash: &[u8; 32],
+    entry_hash: &AccountEntryHash,
 ) -> anyhow::Result<Option<(String, Option<String>)>> {
     Ok(conn
         .query_row(
@@ -3291,7 +3302,7 @@ mod tests {
 
         assert_eq!(
             effective_owner_incarnation_for_device(&conn, account, device).unwrap(),
-            Some(open_owner),
+            Some(Into::into(open_owner)),
             "resolves the OPEN incarnation, never the closed prior one",
         );
         // A device with no open incarnation resolves None.
@@ -3312,7 +3323,7 @@ mod tests {
             label: None,
         };
         let payload = ops::encode(&op).unwrap();
-        let account_id = account_id_from_genesis_payload(&payload);
+        let account_id = id::account_id_from_genesis_payload(&payload);
         let header = AccountEntryHeader {
             account_id,
             log_id: 0,
@@ -3328,7 +3339,7 @@ mod tests {
             authority_ref: None,
         };
         let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
-        (account_id, signed.signed_bytes, signed.entry_hash)
+        (account_id, signed.signed_bytes, signed.entry_hash.into())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3337,7 +3348,7 @@ mod tests {
         signer: &Dev,
         seq: u64,
         prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
+        authority_ref: Option<OwnerId>,
         op: &AccountOp,
     ) -> (Vec<u8>, [u8; 32]) {
         let payload = ops::encode(op).unwrap();
@@ -3346,7 +3357,7 @@ mod tests {
             log_id: 0,
             device_fingerprint: signer.fp,
             seq,
-            prev_hash: prev,
+            prev_hash: prev.map(Into::into),
             parent_ref: None,
             entry_type: ops::entry_type_of(op),
             op_version: 1,
@@ -3356,7 +3367,7 @@ mod tests {
             authority_ref,
         };
         let signed = sign_account_entry(&signer.secret, &header, &payload).unwrap();
-        (signed.signed_bytes, signed.entry_hash)
+        (signed.signed_bytes, signed.entry_hash.into())
     }
 
     /// `op`, but signed by the store's OWN device — the local identity is minted, never seeded from
@@ -3368,7 +3379,7 @@ mod tests {
         device: &crate::identity::LocalDevice,
         seq: u64,
         prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
+        authority_ref: Option<OwnerId>,
         op: &AccountOp,
     ) -> (Vec<u8>, [u8; 32]) {
         let payload = ops::encode(op).unwrap();
@@ -3377,7 +3388,7 @@ mod tests {
             log_id: 0,
             device_fingerprint: device.fingerprint(),
             seq,
-            prev_hash: prev,
+            prev_hash: prev.map(Into::into),
             parent_ref: None,
             entry_type: ops::entry_type_of(op),
             op_version: 1,
@@ -3387,7 +3398,7 @@ mod tests {
             authority_ref,
         };
         let signed = sign_account_entry(device.secret(), &header, &payload).unwrap();
-        (signed.signed_bytes, signed.entry_hash)
+        (signed.signed_bytes, signed.entry_hash.into())
     }
 
     fn device_add(dev: &Dev, role: DeviceRole) -> AccountOp {
@@ -3410,14 +3421,14 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&joiner, DeviceRole::ReadOnly),
         );
         let bootstrap = vec![genesis_bytes, device_add_bytes.clone()];
         verify_enrollment_device_add(
             &bootstrap,
             account,
-            device_add_hash,
+            AccountEntryHash::from_bytes(device_add_hash),
             &device_add_bytes,
             joiner.ed,
             joiner.x,
@@ -3437,7 +3448,7 @@ mod tests {
             label: None,
         };
         let impostor_genesis_payload = ops::encode(&impostor_genesis_op).unwrap();
-        assert_ne!(account_id_from_genesis_payload(&impostor_genesis_payload), victim);
+        assert_ne!(id::account_id_from_genesis_payload(&impostor_genesis_payload), victim);
         let impostor_genesis_header = AccountEntryHeader {
             account_id: victim,
             log_id: 0,
@@ -3462,15 +3473,15 @@ mod tests {
             victim,
             &impostor,
             1,
-            Some(impostor_genesis.entry_hash),
-            Some(impostor_genesis.entry_hash),
+            Some(impostor_genesis.entry_hash.into()),
+            Some(impostor_genesis.entry_hash.into()),
             &device_add(&joiner, DeviceRole::ReadOnly),
         );
         let forged = vec![impostor_genesis.signed_bytes, impostor_add_bytes.clone()];
         let error = verify_enrollment_device_add(
             &forged,
             victim,
-            impostor_add_hash,
+            AccountEntryHash::from_bytes(impostor_add_hash),
             &impostor_add_bytes,
             joiner.ed,
             joiner.x,
@@ -3494,7 +3505,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&joiner, DeviceRole::ReadOnly),
         );
         assert!(matches!(
@@ -3546,20 +3557,20 @@ mod tests {
             verify_enrollment_device_add(
                 &receipt,
                 account,
-                device_add_hash,
+                AccountEntryHash::from_bytes(device_add_hash),
                 &device_add_bytes,
                 joiner.ed,
                 joiner.x,
             )
             .unwrap(),
-            genesis_hash,
+            genesis_hash.into(),
             "the fold's accepted current-version genesis wins over an opaque parked lookalike",
         );
     }
 
     struct InterleavedBootstrap {
         account: AccountId,
-        genesis_hash: [u8; 32],
+        genesis_hash: AccountEntryHash,
         device_b: Dev,
         b0_hash: [u8; 32],
         joiner: Dev,
@@ -3581,7 +3592,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&device_b, DeviceRole::Member),
         );
         let (add_c_bytes, add_c_hash) = op(
@@ -3589,7 +3600,7 @@ mod tests {
             &founder,
             2,
             Some(add_b_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&device_c, DeviceRole::Member),
         );
         let (add_joiner_bytes, add_joiner_hash) = op(
@@ -3597,7 +3608,7 @@ mod tests {
             &founder,
             3,
             Some(add_c_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&joiner, DeviceRole::Member),
         );
         let (_stream, own_op) = stream_own(account);
@@ -3615,7 +3626,7 @@ mod tests {
         ordered.sort_by_key(|(seq, hash, _)| (*seq, *hash));
         InterleavedBootstrap {
             account,
-            genesis_hash,
+            genesis_hash: AccountEntryHash::from_bytes(genesis_hash),
             device_b,
             b0_hash,
             joiner,
@@ -3689,7 +3700,7 @@ mod tests {
             account_id: fixture.account,
             genesis_hash: fixture.genesis_hash,
             device_fingerprint: fixture.joiner.fp,
-            device_add_hash: fixture.add_joiner_hash,
+            device_add_hash: AccountEntryHash::from_bytes(fixture.add_joiner_hash),
             now_ms: NOW + 1,
         })
         .expect("causal-order ingestion adopts without simultaneous parking");
@@ -3801,7 +3812,7 @@ mod tests {
             account_id: fixture.account,
             genesis_hash: fixture.genesis_hash,
             device_fingerprint: fixture.joiner.fp,
-            device_add_hash: fixture.add_joiner_hash,
+            device_add_hash: AccountEntryHash::from_bytes(fixture.add_joiner_hash),
             now_ms: NOW + 1,
         })
         .expect("pre-existing parked work must not displace the one-time receipt");
@@ -3907,7 +3918,7 @@ mod tests {
             &local,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&child, DeviceRole::Member),
         );
         let (_, own_op) = stream_own(account);
@@ -4078,8 +4089,8 @@ mod tests {
             fixture.account,
             &founder,
             1,
-            Some(fixture.genesis_hash),
-            Some(fixture.genesis_hash),
+            Some(fixture.genesis_hash.into()),
+            Some(fixture.genesis_hash.into()),
             &device_add(&fixture.joiner, DeviceRole::Owner),
         );
         let sibling_signed_hash = cbor::sha256(&sibling_bytes);
@@ -4152,7 +4163,7 @@ mod tests {
         let error = super::super::bootstrap::adopt_local_account(
             &conn,
             other_account,
-            other_genesis_hash,
+            AccountEntryHash::from_bytes(other_genesis_hash),
             NOW + 3,
         )
         .expect_err("a second account identity must be refused");
@@ -4162,7 +4173,7 @@ mod tests {
         let error = super::super::bootstrap::adopt_local_account(
             &stranger,
             fixture.account,
-            [0xfe; 32],
+            AccountEntryHash::from_bytes([0xfe; 32]),
             NOW,
         )
         .expect_err("adopting an unknown genesis must fail");
@@ -4186,7 +4197,7 @@ mod tests {
                 account_id: fixture.account,
                 genesis_hash: fixture.genesis_hash,
                 device_fingerprint: fixture.joiner.fp,
-                device_add_hash: fixture.add_joiner_hash,
+                device_add_hash: AccountEntryHash::from_bytes(fixture.add_joiner_hash),
                 now_ms: NOW + 1,
             },
         )
@@ -4210,7 +4221,7 @@ mod tests {
                 account_id: fixture.account,
                 genesis_hash: fixture.genesis_hash,
                 device_fingerprint: fixture.joiner.fp,
-                device_add_hash: fixture.add_joiner_hash,
+                device_add_hash: AccountEntryHash::from_bytes(fixture.add_joiner_hash),
                 now_ms: NOW + 1,
             },
         )
@@ -4379,8 +4390,14 @@ mod tests {
         // A public_read stream: the accessor decodes PublicRead from the folded StreamOwn spec.
         let (public_stream, public_op) =
             stream_own_mode(account_id, AccessMode::PublicRead, "repo-pub");
-        let (public_bytes, public_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &public_op);
+        let (public_bytes, public_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &public_op,
+        );
         account_ingest(&conn, &public_bytes, NOW + 1).unwrap();
         assert_eq!(
             stream_access_mode(&conn, account_id, public_stream).unwrap(),
@@ -4391,8 +4408,14 @@ mod tests {
         // mode folds into the stream identity.
         let (private_stream, private_op) =
             stream_own_mode(account_id, AccessMode::Private, "repo-priv");
-        let (private_bytes, _) =
-            op(account_id, &founder, 2, Some(public_hash), Some(genesis_hash), &private_op);
+        let (private_bytes, _) = op(
+            account_id,
+            &founder,
+            2,
+            Some(public_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &private_op,
+        );
         account_ingest(&conn, &private_bytes, NOW + 2).unwrap();
         assert_ne!(public_stream, private_stream);
         assert_eq!(
@@ -4419,16 +4442,28 @@ mod tests {
         // One public StreamOwn — still fully public.
         let (_pub_stream, public_op) =
             stream_own_mode(account_id, AccessMode::PublicRead, "repo-pub");
-        let (public_bytes, public_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &public_op);
+        let (public_bytes, public_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &public_op,
+        );
         account_ingest(&conn, &public_bytes, NOW + 1).unwrap();
         assert!(account_is_fully_public(&conn, account_id).unwrap());
 
         // Add a private StreamOwn — no longer fully public, so anonymous serving must be refused.
         let (_priv_stream, private_op) =
             stream_own_mode(account_id, AccessMode::Private, "repo-priv");
-        let (private_bytes, _) =
-            op(account_id, &founder, 2, Some(public_hash), Some(genesis_hash), &private_op);
+        let (private_bytes, _) = op(
+            account_id,
+            &founder,
+            2,
+            Some(public_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &private_op,
+        );
         account_ingest(&conn, &private_bytes, NOW + 2).unwrap();
         assert!(!account_is_fully_public(&conn, account_id).unwrap());
     }
@@ -4456,7 +4491,7 @@ mod tests {
             .unwrap()
     }
 
-    fn content_verdict(conn: &Connection, entry_hash: &[u8; 32]) -> (String, i64) {
+    fn content_verdict(conn: &Connection, entry_hash: &AccountEntryHash) -> (String, i64) {
         conn.query_row(
             "SELECT s.status, e.accepted FROM content_entries e
              JOIN content_entry_status s ON s.entry_hash = e.entry_hash
@@ -4471,7 +4506,7 @@ mod tests {
         member: &Dev,
         account_id: AccountId,
         stream_id: StreamId,
-        roster_ref: [u8; 32],
+        roster_ref: RosterRef,
         auth_len: u64,
     ) -> crate::account::content::SignedContentEntry {
         let header = ContentEntryHeader {
@@ -4503,7 +4538,7 @@ mod tests {
         sign_content_entry(&member.secret, &header, &crate::op::encode(&op)).unwrap()
     }
 
-    fn owner_demote(dev: &Dev, owner_id: AccountEntryHash) -> AccountOp {
+    fn owner_demote(dev: &Dev, owner_id: OwnerId) -> AccountOp {
         AccountOp::OwnerDemote {
             device_fingerprint: dev.fp,
             owner_id,
@@ -4531,7 +4566,7 @@ mod tests {
     }
 
     fn status(conn: &Connection, hash: &[u8; 32]) -> Option<String> {
-        entry_status(conn, hash).unwrap().map(|(s, _)| s)
+        entry_status(conn, &(*(hash)).into()).unwrap().map(|(s, _)| s)
     }
 
     fn seed_candidate_rows(
@@ -4601,22 +4636,34 @@ mod tests {
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
 
         let (stream_id, own_op) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own_op,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
         let grant_op = AccountOp::StreamGrant {
             stream_id,
             grantee_account_id: grantee,
             grant_role: GrantRole::Writer,
         };
-        let (grant_bytes, grant_id) =
-            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &grant_op);
+        let (grant_bytes, grant_id) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &grant_op,
+        );
         account_ingest(&conn, &grant_bytes, NOW + 2).unwrap();
         assert!(matches!(
             grant_effective_for_device(
                 &conn,
                 account_id,
-                grant_id,
+                GrantId::from_bytes(grant_id),
                 stream_id,
                 grantee,
                 grantee_device.fp,
@@ -4631,16 +4678,22 @@ mod tests {
         let revoke_op = AccountOp::StreamRevoke {
             stream_id,
             grantee_account_id: grantee,
-            grant_id,
+            grant_id: GrantId::from_bytes(grant_id),
             device_cuts: vec![DeviceCut {
                 device_fingerprint: grantee_device.fp,
                 seq: u64::MAX,
-                hash: cut_hash,
+                hash: AccountEntryHash::from_bytes(cut_hash),
             }],
             reason: "access ended".to_string(),
         };
-        let (revoke_bytes, _) =
-            op(account_id, &founder, 3, Some(grant_id), Some(genesis_hash), &revoke_op);
+        let (revoke_bytes, _) = op(
+            account_id,
+            &founder,
+            3,
+            Some(grant_id),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &revoke_op,
+        );
         account_ingest(&conn, &revoke_bytes, NOW + 3).unwrap();
 
         let state: (String, i64) = conn
@@ -4679,21 +4732,22 @@ mod tests {
         );
         assert_eq!(
             stream_owner_effective(&conn, account_id, stream_id).unwrap(),
-            fold::AuthorityQuery::Effective(own_hash),
+            fold::AuthorityQuery::Effective(own_hash.into()),
         );
         assert_eq!(
-            grant_device_cut(&conn, account_id, grant_id, grantee_device.fp).unwrap(),
+            grant_device_cut(&conn, account_id, GrantId::from_bytes(grant_id), grantee_device.fp)
+                .unwrap(),
             fold::AuthorityQuery::Effective(Some(DeviceCut {
                 device_fingerprint: grantee_device.fp,
                 seq: u64::MAX,
-                hash: cut_hash,
+                hash: AccountEntryHash::from_bytes(cut_hash),
             })),
         );
         assert_eq!(
             grant_effective_for_device(
                 &conn,
                 account_id,
-                grant_id,
+                GrantId::from_bytes(grant_id),
                 stream_id,
                 grantee,
                 grantee_device.fp,
@@ -4708,19 +4762,20 @@ mod tests {
                 boundary: fold::GrantDeviceBoundary::Cut(DeviceCut {
                     device_fingerprint: grantee_device.fp,
                     seq: u64::MAX,
-                    hash: cut_hash,
+                    hash: AccountEntryHash::from_bytes(cut_hash),
                 }),
             }),
         );
         assert_eq!(
-            grant_device_cut(&conn, account_id, grant_id, Dev::new(3).fp).unwrap(),
+            grant_device_cut(&conn, account_id, GrantId::from_bytes(grant_id), Dev::new(3).fp)
+                .unwrap(),
             fold::AuthorityQuery::Effective(None),
         );
         assert!(matches!(
             grant_effective_for_device(
                 &conn,
                 account_id,
-                grant_id,
+                GrantId::from_bytes(grant_id),
                 stream_id,
                 grantee,
                 Dev::new(3).fp,
@@ -4739,7 +4794,7 @@ mod tests {
             grant_device_cut(
                 &conn,
                 AccountId::from_bytes([0x66; 32]),
-                grant_id,
+                GrantId::from_bytes(grant_id),
                 grantee_device.fp,
             )
             .unwrap(),
@@ -4750,18 +4805,20 @@ mod tests {
             grant_device_cut(
                 &conn,
                 AccountId::from_bytes([0x66; 32]),
-                [0x77; 32],
+                GrantId::from_bytes([0x77; 32]),
                 grantee_device.fp,
             )
             .unwrap(),
             fold::AuthorityQuery::Unknown,
         );
         assert!(matches!(
-            grant_effective(&conn, account_id, grant_id, stream_id, grantee).unwrap(),
+            grant_effective(&conn, account_id, GrantId::from_bytes(grant_id), stream_id, grantee)
+                .unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantAuthority { role: GrantRole::Writer, .. })
         ));
         assert_eq!(
-            grant_effective(&conn, account_id, grant_id, stream_id, grantee).unwrap(),
+            grant_effective(&conn, account_id, GrantId::from_bytes(grant_id), stream_id, grantee)
+                .unwrap(),
             fold::AuthorityQuery::Effective(fold::GrantAuthority {
                 stream_id,
                 grantee_account_id: grantee,
@@ -4769,18 +4826,31 @@ mod tests {
             }),
         );
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp).unwrap(),
+            roster_ref_effective(
+                &conn,
+                account_id,
+                RosterRef::from_bytes(genesis_hash),
+                founder.fp
+            )
+            .unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 current_role: DeviceRole::Owner,
                 ..
             })
         ));
         assert!(matches!(
-            owner_incarnation_effective(&conn, account_id, genesis_hash, founder.fp).unwrap(),
+            owner_incarnation_effective(
+                &conn,
+                account_id,
+                OwnerId::from_bytes(genesis_hash),
+                founder.fp
+            )
+            .unwrap(),
             fold::AuthorityQuery::Effective(_)
         ));
         assert_eq!(
-            grant_effective(&conn, account_id, [0xaa; 32], stream_id, grantee).unwrap(),
+            grant_effective(&conn, account_id, GrantId::from_bytes([0xaa; 32]), stream_id, grantee)
+                .unwrap(),
             fold::AuthorityQuery::Unknown,
         );
 
@@ -4795,7 +4865,7 @@ mod tests {
         let error = grant_effective_for_device(
             &conn,
             account_id,
-            grant_id,
+            GrantId::from_bytes(grant_id),
             stream_id,
             grantee,
             grantee_device.fp,
@@ -4820,16 +4890,28 @@ mod tests {
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
         let (stream_id, own_op) =
             stream_own_mode(account_id, crate::stream::AccessMode::Private, "repo-a");
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own_op,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
         let grant_op = AccountOp::StreamGrant {
             stream_id,
             grantee_account_id: grantee,
             grant_role: GrantRole::Writer,
         };
-        let (grant_bytes, grant_id) =
-            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &grant_op);
+        let (grant_bytes, grant_id) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &grant_op,
+        );
         // The CURRENT fold rejects this at ingest; overwrite its verdict and plant the projected
         // row exactly as the pre-gate fold left them.
         account_ingest(&conn, &grant_bytes, NOW + 2).unwrap();
@@ -4852,7 +4934,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             open_writer_grants(&conn, account_id, stream_id, grantee).unwrap(),
-            vec![grant_id],
+            vec![GrantId::from(grant_id)],
             "the planted legacy projection answers Effective before the backfill",
         );
 
@@ -4882,16 +4964,28 @@ mod tests {
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
         let (stream_id, own_op) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own_op,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
         let writer_op = AccountOp::StreamGrant {
             stream_id,
             grantee_account_id: writer,
             grant_role: GrantRole::Writer,
         };
-        let (writer_bytes, grant_id) =
-            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &writer_op);
+        let (writer_bytes, grant_id) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &writer_op,
+        );
         account_ingest(&conn, &writer_bytes, NOW + 2).unwrap();
         // A Reader never authors content, so it must not become a pull target.
         let reader_op = AccountOp::StreamGrant {
@@ -4899,8 +4993,14 @@ mod tests {
             grantee_account_id: reader,
             grant_role: GrantRole::Reader,
         };
-        let (reader_bytes, reader_hash) =
-            op(account_id, &founder, 3, Some(grant_id), Some(genesis_hash), &reader_op);
+        let (reader_bytes, reader_hash) = op(
+            account_id,
+            &founder,
+            3,
+            Some(grant_id),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &reader_op,
+        );
         account_ingest(&conn, &reader_bytes, NOW + 3).unwrap();
         assert_eq!(effective_writer_grantees(&conn, account_id).unwrap(), vec![writer]);
         let stranger = AccountId::from_bytes([0x66; 32]);
@@ -4911,16 +5011,22 @@ mod tests {
         let revoke_op = AccountOp::StreamRevoke {
             stream_id,
             grantee_account_id: writer,
-            grant_id,
+            grant_id: GrantId::from_bytes(grant_id),
             device_cuts: vec![DeviceCut {
                 device_fingerprint: Dev::new(2).fp,
                 seq: u64::MAX,
-                hash: [0x99; 32],
+                hash: AccountEntryHash::from_bytes([0x99; 32]),
             }],
             reason: "access ended".to_string(),
         };
-        let (revoke_bytes, _) =
-            op(account_id, &founder, 4, Some(reader_hash), Some(genesis_hash), &revoke_op);
+        let (revoke_bytes, _) = op(
+            account_id,
+            &founder,
+            4,
+            Some(reader_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &revoke_op,
+        );
         account_ingest(&conn, &revoke_bytes, NOW + 4).unwrap();
         assert!(effective_writer_grantees(&conn, account_id).unwrap().is_empty());
         assert!(
@@ -4946,31 +5052,49 @@ mod tests {
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         account_ingest(&setup, &genesis_bytes, NOW).unwrap();
         let (stream_id, own_op) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own_op,
+        );
         account_ingest(&setup, &own_bytes, NOW + 1).unwrap();
         let grant_op = AccountOp::StreamGrant {
             stream_id,
             grantee_account_id: grantee,
             grant_role: GrantRole::Writer,
         };
-        let (grant_bytes, grant_id) =
-            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &grant_op);
+        let (grant_bytes, grant_id) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &grant_op,
+        );
         account_ingest(&setup, &grant_bytes, NOW + 2).unwrap();
         let cut_hash = [0x99; 32];
         let revoke_op = AccountOp::StreamRevoke {
             stream_id,
             grantee_account_id: grantee,
-            grant_id,
+            grant_id: GrantId::from_bytes(grant_id),
             device_cuts: vec![DeviceCut {
                 device_fingerprint: grantee_device.fp,
                 seq: 7,
-                hash: cut_hash,
+                hash: AccountEntryHash::from_bytes(cut_hash),
             }],
             reason: "access ended".to_string(),
         };
-        let (revoke_bytes, _) =
-            op(account_id, &founder, 3, Some(grant_id), Some(genesis_hash), &revoke_op);
+        let (revoke_bytes, _) = op(
+            account_id,
+            &founder,
+            3,
+            Some(grant_id),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &revoke_op,
+        );
         account_ingest(&setup, &revoke_bytes, NOW + 3).unwrap();
         drop(setup);
 
@@ -5002,7 +5126,7 @@ mod tests {
         let old_round = grant_effective_for_device_in_snapshot(
             &snapshot,
             account_id,
-            grant_id,
+            GrantId::from_bytes(grant_id),
             stream_id,
             grantee,
             grantee_device.fp,
@@ -5013,7 +5137,7 @@ mod tests {
             fold::AuthorityQuery::Effective(fold::GrantDeviceAuthority {
                 boundary: fold::GrantDeviceBoundary::Cut(DeviceCut { seq: 7, hash, .. }),
                 ..
-            }) if hash == cut_hash
+            }) if hash == AccountEntryHash::from_bytes(cut_hash)
         ));
         drop(snapshot);
 
@@ -5021,7 +5145,7 @@ mod tests {
             grant_effective_for_device(
                 &reader,
                 account_id,
-                grant_id,
+                GrantId::from_bytes(grant_id),
                 stream_id,
                 grantee,
                 grantee_device.fp,
@@ -5047,8 +5171,14 @@ mod tests {
         )
         .unwrap();
         let (_, own_op) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own_op,
+        );
 
         assert!(account_ingest(&conn, &own_bytes, NOW + 1).is_err());
         let candidate_count: i64 = conn
@@ -5081,15 +5211,21 @@ mod tests {
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
         let (stream_id, own) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
         let (add_owner_bytes, add_owner) = op(
             account_id,
             &founder,
             2,
             Some(own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&owner, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_owner_bytes, NOW + 2).unwrap();
@@ -5098,34 +5234,52 @@ mod tests {
             &founder,
             3,
             Some(add_owner),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_member_bytes, NOW + 3).unwrap();
         // The added owner authors two ops of its own.
-        let (o1_bytes, o1) =
-            op(account_id, &owner, 0, None, Some(add_owner), &device_add(&x, DeviceRole::Member));
+        let (o1_bytes, o1) = op(
+            account_id,
+            &owner,
+            0,
+            None,
+            Some(OwnerId::from_bytes(add_owner)),
+            &device_add(&x, DeviceRole::Member),
+        );
         account_ingest(&conn, &o1_bytes, NOW + 4).unwrap();
         let (o2_bytes, _) = op(
             account_id,
             &owner,
             1,
             Some(o1),
-            Some(add_owner),
+            Some(OwnerId::from_bytes(add_owner)),
             &device_add(&y, DeviceRole::Member),
         );
         account_ingest(&conn, &o2_bytes, NOW + 5).unwrap();
         assert_eq!(account_effective_count(&conn, account_id).unwrap(), 6);
 
-        let content = signed_member_content(&member, account_id, stream_id, add_member, 6);
+        let content = signed_member_content(
+            &member,
+            account_id,
+            stream_id,
+            RosterRef::from_bytes(add_member),
+            6,
+        );
         content_ingest(&conn, &content.signed_bytes, NOW + 6).unwrap();
         settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded(), NOW).unwrap();
         assert_eq!(content_verdict(&conn, &content.entry_hash), ("accepted".into(), 1));
 
         // The founder removes the owner and condemns everything it authored.
         let remove = device_remove(&owner, super::super::cut::Cut::Empty);
-        let (remove_bytes, remove_hash) =
-            op(account_id, &founder, 4, Some(add_member), Some(genesis_hash), &remove);
+        let (remove_bytes, remove_hash) = op(
+            account_id,
+            &founder,
+            4,
+            Some(add_member),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &remove,
+        );
         account_ingest(&conn, &remove_bytes, NOW + 7).unwrap();
         settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded(), NOW).unwrap();
         assert_eq!(status(&conn, &remove_hash).as_deref(), Some("accepted"));
@@ -5146,20 +5300,32 @@ mod tests {
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
 
         let (stream_id, own) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
         let (add_bytes, add_hash) = op(
             account_id,
             &founder,
             2,
             Some(own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
 
-        let content = signed_member_content(&member, account_id, stream_id, add_hash, 3);
+        let content = signed_member_content(
+            &member,
+            account_id,
+            stream_id,
+            RosterRef::from_bytes(add_hash),
+            3,
+        );
         content_ingest(&conn, &content.signed_bytes, NOW + 3).unwrap();
         assert_eq!(
             settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded(), NOW)
@@ -5171,12 +5337,19 @@ mod tests {
         assert_eq!(projected_nodes(&conn, stream_id), vec!["remote-node".to_string()]);
 
         let remove = device_remove(&member, super::super::cut::Cut::Empty);
-        let (remove_bytes, _) =
-            op(account_id, &founder, 3, Some(add_hash), Some(genesis_hash), &remove);
+        let (remove_bytes, _) = op(
+            account_id,
+            &founder,
+            3,
+            Some(add_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &remove,
+        );
         account_ingest(&conn, &remove_bytes, NOW + 4).unwrap();
 
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, add_hash, member.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(add_hash), member.fp)
+                .unwrap(),
             fold::AuthorityQuery::Invalid(_),
         ));
         assert_eq!(
@@ -5214,19 +5387,31 @@ mod tests {
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
         let (stream_id, own) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
         let (add_bytes, add_hash) = op(
             account_id,
             &founder,
             2,
             Some(own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
-        let content = signed_member_content(&member, account_id, stream_id, add_hash, 3);
+        let content = signed_member_content(
+            &member,
+            account_id,
+            stream_id,
+            RosterRef::from_bytes(add_hash),
+            3,
+        );
         content_ingest(&conn, &content.signed_bytes, NOW + 3).unwrap();
         settle_pending_content_refolds(&conn, &ContentRefoldBudget::unbounded(), NOW).unwrap();
 
@@ -5237,8 +5422,14 @@ mod tests {
         )
         .unwrap();
         let remove = device_remove(&member, super::super::cut::Cut::Empty);
-        let (remove_bytes, remove_hash) =
-            op(account_id, &founder, 3, Some(add_hash), Some(genesis_hash), &remove);
+        let (remove_bytes, remove_hash) = op(
+            account_id,
+            &founder,
+            3,
+            Some(add_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &remove,
+        );
         let signed =
             envelope::verify_account_signed(&remove_bytes, &founder.secret.public()).unwrap();
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
@@ -5248,7 +5439,8 @@ mod tests {
 
         assert_eq!(status(&conn, &remove_hash), None, "the trusted candidate rolled back");
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, add_hash, member.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(add_hash), member.fp)
+                .unwrap(),
             fold::AuthorityQuery::Effective(_),
         ));
         assert_eq!(content_verdict(&conn, &content.entry_hash), ("accepted".into(), 1));
@@ -5262,8 +5454,14 @@ mod tests {
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
         let (stream_id, own_op) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own_op,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
 
         conn.execute("DELETE FROM schema_version WHERE id = '064_account_authority_projection'", [
@@ -5282,10 +5480,16 @@ mod tests {
         schema::migrate_forward(&conn, &crate::test_hooks()).unwrap();
         assert_eq!(
             stream_owner_effective(&conn, account_id, stream_id).unwrap(),
-            fold::AuthorityQuery::Effective(own_hash),
+            fold::AuthorityQuery::Effective(own_hash.into()),
         );
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, genesis_hash, founder.fp).unwrap(),
+            roster_ref_effective(
+                &conn,
+                account_id,
+                RosterRef::from_bytes(genesis_hash),
+                founder.fp
+            )
+            .unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 current_role: DeviceRole::Owner,
                 ..
@@ -5347,15 +5551,21 @@ mod tests {
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
         let (stream_id, own_op) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own_op);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own_op,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
         let (grant_bytes, grant_id) = op(
             account_id,
             &founder,
             2,
             Some(own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &AccountOp::StreamGrant {
                 stream_id,
                 grantee_account_id: grantee,
@@ -5368,7 +5578,7 @@ mod tests {
             &founder,
             3,
             Some(grant_id),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &AccountOp::StreamGrant {
                 stream_id,
                 grantee_account_id: account_id,
@@ -5389,7 +5599,8 @@ mod tests {
             fold::AuthorityFreshness::CurrentOrBehind,
         );
         assert!(matches!(
-            grant_effective(&conn, account_id, grant_id, stream_id, grantee).unwrap(),
+            grant_effective(&conn, account_id, GrantId::from_bytes(grant_id), stream_id, grantee)
+                .unwrap(),
             fold::AuthorityQuery::Effective(_),
         ));
         assert_eq!(
@@ -5401,7 +5612,7 @@ mod tests {
             grant_effective(
                 &conn,
                 account_id,
-                grant_id,
+                GrantId::from_bytes(grant_id),
                 crate::stream::StreamId::from_bytes([0x55; 32]),
                 grantee,
             )
@@ -5409,7 +5620,14 @@ mod tests {
             fold::AuthorityQuery::Invalid(fold::AuthorityInvalidReason::WrongSubject),
         );
         assert_eq!(
-            grant_effective(&conn, account_id, self_grant_id, stream_id, account_id).unwrap(),
+            grant_effective(
+                &conn,
+                account_id,
+                GrantId::from_bytes(self_grant_id),
+                stream_id,
+                account_id
+            )
+            .unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
             ),
@@ -5419,14 +5637,20 @@ mod tests {
             grant_id.as_slice(),
         ])
         .unwrap();
-        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee).is_err());
+        assert!(
+            grant_effective(&conn, account_id, GrantId::from_bytes(grant_id), stream_id, grantee)
+                .is_err()
+        );
         conn.execute(
             "UPDATE account_stream_grants SET role = 'reader', effective_at = -1
              WHERE grant_id = ?1",
             [grant_id.as_slice()],
         )
         .unwrap();
-        assert!(grant_effective(&conn, account_id, grant_id, stream_id, grantee).is_err());
+        assert!(
+            grant_effective(&conn, account_id, GrantId::from_bytes(grant_id), stream_id, grantee)
+                .is_err()
+        );
         conn.execute("UPDATE account_stream_grants SET effective_at = 2 WHERE grant_id = ?1", [
             grant_id.as_slice(),
         ])
@@ -5454,7 +5678,7 @@ mod tests {
         };
         let payload = ops::encode(&genesis_op).unwrap();
         let wrong_account = AccountId::from_bytes([0x55; 32]);
-        assert_ne!(wrong_account, account_id_from_genesis_payload(&payload));
+        assert_ne!(wrong_account, id::account_id_from_genesis_payload(&payload));
         let header = AccountEntryHeader {
             account_id: wrong_account,
             log_id: 0,
@@ -5521,7 +5745,7 @@ mod tests {
             "the real founder holds it"
         );
         assert_ne!(
-            status(&conn, &signed.entry_hash).as_deref(),
+            status(&conn, &signed.entry_hash.into()).as_deref(),
             Some("accepted"),
             "the forged re-signed genesis never becomes the accepted root",
         );
@@ -5534,8 +5758,14 @@ mod tests {
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
         let b = Dev::new(2);
-        let (add_bytes, add_hash) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let (add_bytes, add_hash) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Owner),
+        );
         let out = account_ingest(&conn, &add_bytes, NOW).unwrap();
         assert_eq!(out, IngestOutcome::Ingested {
             status: "accepted".into(),
@@ -5590,17 +5820,29 @@ mod tests {
         // An entry signed by a device NOT yet known here parks in pre-verify — but it is real and a
         // peer with its authorizer can use it, so it must still be offered.
         let stranger = Dev::new(9);
-        let (parked_bytes, parked_hash) =
-            op(acct, &stranger, 0, None, Some(gh), &device_add(&Dev::new(3), DeviceRole::Owner));
+        let (parked_bytes, parked_hash) = op(
+            acct,
+            &stranger,
+            0,
+            None,
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&Dev::new(3), DeviceRole::Owner),
+        );
         assert_eq!(account_ingest(&conn, &parked_bytes, NOW).unwrap(), IngestOutcome::PreVerify);
         assert_eq!(status(&conn, &parked_hash), None, "parked, not a stored candidate");
 
         let offered = account_entries_for_sync(&conn, acct).unwrap();
-        let hashes: Vec<[u8; 32]> = offered.iter().map(|e| e.entry_hash).collect();
-        assert!(hashes.contains(&gh), "the held genesis is offered");
-        assert!(hashes.contains(&parked_hash), "the parked entry is offered too, not hidden");
+        let hashes: Vec<AccountEntryHash> = offered.iter().map(|e| e.entry_hash).collect();
+        assert!(hashes.contains(&gh.into()), "the held genesis is offered");
+        assert!(
+            hashes.contains(&parked_hash.into()),
+            "the parked entry is offered too, not hidden"
+        );
         // And its bytes are the exact parked bytes, so a peer re-ingests the real entry.
-        let parked = offered.iter().find(|e| e.entry_hash == parked_hash).unwrap();
+        let parked = offered
+            .iter()
+            .find(|e| e.entry_hash == AccountEntryHash::from_bytes(parked_hash))
+            .unwrap();
         assert_eq!(parked.signed_bytes, parked_bytes);
     }
 
@@ -5612,8 +5854,14 @@ mod tests {
         let founder = Dev::new(1);
         let (acct, gbytes, gh) = genesis(&founder);
         let b = Dev::new(2);
-        let (add_bytes, add_hash) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let (add_bytes, add_hash) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Owner),
+        );
 
         // The add arrives first — unresolvable device → pre-verify.
         assert_eq!(account_ingest(&conn, &add_bytes, NOW).unwrap(), IngestOutcome::PreVerify);
@@ -5649,27 +5897,45 @@ mod tests {
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
 
         let (stream_id, own) = stream_own(account_id);
-        let (own_bytes, own_hash) =
-            op(account_id, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         account_ingest(&conn, &own_bytes, NOW + 1).unwrap();
 
         // Build the rest of the chain up front: the content binds to the DeviceAdd's hash as its
         // roster_ref, so the add's exact bytes (and therefore its seq/prev) must be fixed before
         // the content is signed. Chain order is genesis -> own -> second_own -> add.
         let (_, second_own) = stream_own(account_id);
-        let (second_own_bytes, second_own_hash) =
-            op(account_id, &founder, 2, Some(own_hash), Some(genesis_hash), &second_own);
+        let (second_own_bytes, second_own_hash) = op(
+            account_id,
+            &founder,
+            2,
+            Some(own_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &second_own,
+        );
         let (add_bytes, add_hash) = op(
             account_id,
             &founder,
             3,
             Some(second_own_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
 
         // The member is not on the roster yet, so its content parks pre-verified.
-        let content = signed_member_content(&member, account_id, stream_id, add_hash, 4);
+        let content = signed_member_content(
+            &member,
+            account_id,
+            stream_id,
+            RosterRef::from_bytes(add_hash),
+            4,
+        );
         content_ingest(&conn, &content.signed_bytes, NOW + 2).unwrap();
         let parked = |conn: &Connection| -> i64 {
             conn.query_row("SELECT COUNT(*) FROM content_pre_verify", [], |row| row.get(0)).unwrap()
@@ -5731,7 +5997,7 @@ mod tests {
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(OwnerId::from_bytes(genesis_hash)),
         };
         let annex = sign_account_entry(&founder.secret, &header, &manifest).unwrap();
         assert_eq!(
@@ -5752,7 +6018,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
@@ -5762,7 +6028,7 @@ mod tests {
             Some("accepted"),
             "the annex entry did not orphan the control chain",
         );
-        assert_eq!(status(&conn, &annex.entry_hash).as_deref(), Some("retained_unfolded"));
+        assert_eq!(status(&conn, &annex.entry_hash.into()).as_deref(), Some("retained_unfolded"));
     }
 
     #[test]
@@ -5786,7 +6052,7 @@ mod tests {
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(OwnerId::from_bytes(genesis_hash)),
         };
         // A CBOR map where the manifest wire requires a 3-element array.
         let garbage = sign_account_entry(&founder.secret, &header, &[0xa1, 0x01, 0x02]).unwrap();
@@ -5795,7 +6061,11 @@ mod tests {
             matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("annex op payload")),
             "a structurally invalid manifest is rejected, not stored: {outcome:?}",
         );
-        assert_eq!(status(&conn, &garbage.entry_hash), None, "and it never became a chain link");
+        assert_eq!(
+            status(&conn, &garbage.entry_hash.into()),
+            None,
+            "and it never became a chain link"
+        );
 
         // An UNKNOWN annex tag is the forward-compat case and must still be stored — it is a valid
         // chain link for a binary that does not know it, exactly like an unknown secrets tag.
@@ -5831,14 +6101,14 @@ mod tests {
             log_id: fold::CONTROL_LOG,
             device_fingerprint: founder.fp,
             seq: 1,
-            prev_hash: Some(genesis_hash),
-            parent_ref: Some(genesis_hash),
+            prev_hash: Some(AccountEntryHash::from_bytes(genesis_hash)),
+            parent_ref: Some(AccountEntryHash::from_bytes(genesis_hash)),
             entry_type: ops::entry_type::DEVICE_ADD,
             op_version: fold::SUPPORTED_OP_VERSION + 1,
             crypto_suite: 0,
             key_id: None,
             auth_len: 1,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(OwnerId::from_bytes(genesis_hash)),
         };
         let retained = sign_account_entry(&founder.secret, &base, &[0x81, 0x01]).unwrap();
         assert_eq!(
@@ -5909,14 +6179,14 @@ mod tests {
                 log_id: fold::CONTROL_LOG,
                 device_fingerprint: founder.fp,
                 seq: 1,
-                prev_hash: Some(genesis_hash),
-                parent_ref: Some(genesis_hash),
+                prev_hash: Some(AccountEntryHash::from_bytes(genesis_hash)),
+                parent_ref: Some(AccountEntryHash::from_bytes(genesis_hash)),
                 entry_type: ops::entry_type::DEVICE_ADD,
                 op_version: fold::SUPPORTED_OP_VERSION,
                 crypto_suite: 0,
                 key_id: None,
                 auth_len: 1,
-                authority_ref: Some(genesis_hash),
+                authority_ref: Some(OwnerId::from_bytes(genesis_hash)),
             };
             let header = match retained_class {
                 Retained::UnknownTag => AccountEntryHeader { entry_type: 250, ..base },
@@ -5942,8 +6212,8 @@ mod tests {
                 account_id,
                 &founder,
                 2,
-                Some(retained.entry_hash),
-                Some(genesis_hash),
+                Some(retained.entry_hash.into()),
+                Some(OwnerId::from_bytes(genesis_hash)),
                 &device_add(&Dev::new(0x92), DeviceRole::Owner),
             );
             account_ingest(&conn, &add_bytes, NOW + 2).unwrap();
@@ -5985,7 +6255,7 @@ mod tests {
             crypto_suite: 1,
             key_id: Some([0x77; 32]),
             auth_len: 1,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(OwnerId::from_bytes(genesis_hash)),
         };
         let sealed = sign_account_entry(&founder.secret, &header, &[0x81, 0x01]).unwrap();
         let outcome = account_ingest(&conn, &sealed.signed_bytes, NOW + 1).unwrap();
@@ -5993,7 +6263,7 @@ mod tests {
             matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("plaintext-signed")),
             "a sealed snapshot is rejected: {outcome:?}",
         );
-        assert_eq!(status(&conn, &sealed.entry_hash), None, "and never became a chain link");
+        assert_eq!(status(&conn, &sealed.entry_hash.into()), None, "and never became a chain link");
 
         // "A snapshot is plaintext" is a property of the artifact CLASS, not of one version's
         // encoding, so a future-op_version sealed snapshot is refused just the same — it would be
@@ -6037,7 +6307,7 @@ mod tests {
         conn: &Connection,
         account_id: AccountId,
         founder: &Dev,
-        genesis_hash: [u8; 32],
+        genesis_hash: AccountEntryHash,
         mangle: impl FnOnce(&mut snapshot::ops::SnapshotTarget),
     ) -> [u8; 32] {
         // The honest claim: every device's control-chain head, and the hash of folding exactly
@@ -6052,28 +6322,29 @@ mod tests {
             }
             let slot = heads
                 .entry(entry.header.device_fingerprint)
-                .or_insert((entry.header.seq, entry.entry_hash));
+                .or_insert((entry.header.seq, entry.entry_hash.into()));
             if entry.header.seq >= slot.0 {
-                *slot = (entry.header.seq, entry.entry_hash);
+                *slot = (entry.header.seq, entry.entry_hash.into());
             }
         }
         let control_only: Vec<_> =
             held.iter().filter(|e| e.header.log_id == fold::CONTROL_LOG).cloned().collect();
-        let mut target =
-            snapshot::ops::SnapshotTarget {
-                log_id: fold::CONTROL_LOG,
-                stream_id: None,
-                subject_account_id: None,
-                folded_state_hash: snapshot::projection::folded_state_hash(&fold::fold_account(
-                    &control_only,
-                )),
-                covered: heads
-                    .into_iter()
-                    .map(|(device_fingerprint, (seq, entry_hash))| {
-                        snapshot::ops::CoveredWatermark { device_fingerprint, seq, entry_hash }
-                    })
-                    .collect(),
-            };
+        let mut target = snapshot::ops::SnapshotTarget {
+            log_id: fold::CONTROL_LOG,
+            stream_id: None,
+            subject_account_id: None,
+            folded_state_hash: snapshot::projection::folded_state_hash(&fold::fold_account(
+                &control_only,
+            )),
+            covered: heads
+                .into_iter()
+                .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+                    device_fingerprint,
+                    seq,
+                    entry_hash: AccountEntryHash::from_bytes(entry_hash),
+                })
+                .collect(),
+        };
         mangle(&mut target);
 
         let payload = snapshot::ops::encode(&snapshot::ops::SnapshotOp::Snapshot {
@@ -6094,11 +6365,11 @@ mod tests {
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(genesis_hash),
+            authority_ref: Some(genesis_hash.into()),
         };
         let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
         account_ingest(conn, &signed.signed_bytes, NOW + 9).unwrap();
-        signed.entry_hash
+        signed.entry_hash.into()
     }
 
     #[test]
@@ -6113,15 +6384,21 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
 
-        let honest = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |_| {});
+        let honest = author_snapshot_over(
+            &conn,
+            account_id,
+            &founder,
+            AccountEntryHash::from_bytes(genesis_hash),
+            |_| {},
+        );
         assert_eq!(
             verify_stored_snapshots(&conn, account_id).unwrap(),
-            vec![(honest, snapshot::verify::SnapshotVerdict::Verified)],
+            vec![(honest.into(), snapshot::verify::SnapshotVerdict::Verified)],
             "an honest claim over stored history verifies through the real read path",
         );
 
@@ -6130,11 +6407,17 @@ mod tests {
         let conn = db();
         let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
         account_ingest(&conn, &genesis_bytes, NOW).unwrap();
-        let forged = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |target| {
-            target.folded_state_hash = [0xff; 32];
-        });
+        let forged = author_snapshot_over(
+            &conn,
+            account_id,
+            &founder,
+            AccountEntryHash::from_bytes(genesis_hash),
+            |target| {
+                target.folded_state_hash = [0xff; 32];
+            },
+        );
         assert_eq!(verify_stored_snapshots(&conn, account_id).unwrap(), vec![(
-            forged,
+            forged.into(),
             snapshot::verify::SnapshotVerdict::Mismatch
         )],);
         assert_eq!(
@@ -6187,7 +6470,7 @@ mod tests {
         // authoring refolded in its own transaction — without that, the entry exists in
         // `account_entries` with no projection row and a status-based reader silently omits it.
         assert_eq!(
-            status(&conn, &hash).as_deref(),
+            status(&conn, &hash.into()).as_deref(),
             Some("retained_unfolded"),
             "an authored snapshot must be projected, and projected as unfolded",
         );
@@ -6235,7 +6518,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add_local(&device, DeviceRole::Member),
         );
         account_ingest(&conn, &add_local, NOW + 1).unwrap();
@@ -6271,7 +6554,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add_local(&device, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_local, NOW + 1).unwrap();
@@ -6283,7 +6566,7 @@ mod tests {
             &founder,
             2,
             Some(add_local_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&a, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_a, NOW + 2).unwrap();
@@ -6292,13 +6575,27 @@ mod tests {
             &founder,
             3,
             Some(owner_a),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&b, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_b, NOW + 3).unwrap();
-        let (remove_b, _) = op(account_id, &a, 0, None, Some(owner_a), &owner_demote(&b, owner_b));
+        let (remove_b, _) = op(
+            account_id,
+            &a,
+            0,
+            None,
+            Some(OwnerId::from_bytes(owner_a)),
+            &owner_demote(&b, OwnerId::from_bytes(owner_b)),
+        );
         account_ingest(&conn, &remove_b, NOW + 4).unwrap();
-        let (remove_a, _) = op(account_id, &b, 0, None, Some(owner_b), &owner_demote(&a, owner_a));
+        let (remove_a, _) = op(
+            account_id,
+            &b,
+            0,
+            None,
+            Some(OwnerId::from_bytes(owner_b)),
+            &owner_demote(&a, OwnerId::from_bytes(owner_a)),
+        );
         account_ingest(&conn, &remove_a, NOW + 5).unwrap();
 
         let held = account_entries_view(&conn, account_id).unwrap();
@@ -6359,7 +6656,7 @@ mod tests {
                 log_id: 0,
                 device_fingerprint: founder.fp,
                 seq, // <- the malformation: a genesis is seq 0 by definition (§6)
-                prev_hash: Some(genesis_hash), // ingest requires null iff seq == 0
+                prev_hash: Some(AccountEntryHash::from_bytes(genesis_hash)), /* ingest requires null iff seq == 0 */
                 parent_ref: None,
                 entry_type: ops::entry_type::ACCOUNT_GENESIS,
                 op_version: 1,
@@ -6369,7 +6666,7 @@ mod tests {
                 authority_ref: None,
             };
             let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
-            if signed.entry_hash < genesis_hash {
+            if signed.entry_hash < AccountEntryHash::from_bytes(genesis_hash) {
                 impostor = Some(signed);
                 break;
             }
@@ -6377,7 +6674,7 @@ mod tests {
         let impostor = impostor.expect("some off-origin seq hashes below the real root");
         account_ingest(&conn, &impostor.signed_bytes, NOW + 1).unwrap();
         assert!(
-            impostor.entry_hash < genesis_hash,
+            impostor.entry_hash < AccountEntryHash::from_bytes(genesis_hash),
             "the impostor must sort first, or this test cannot distinguish the two selections",
         );
 
@@ -6387,7 +6684,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add_local(&device, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_local, NOW + 2).unwrap();
@@ -6407,7 +6704,7 @@ mod tests {
             .expect("the authored snapshot is stored");
         assert_eq!(
             stored.verified.header.parent_ref,
-            Some(genesis_hash),
+            Some(Into::into(genesis_hash)),
             "the snapshot must parent the canonical root the fold selected",
         );
         assert_ne!(
@@ -6447,8 +6744,8 @@ mod tests {
             account_id,
             &device,
             1,
-            Some(genesis_hash),
-            Some(genesis_hash),
+            Some(genesis_hash.into()),
+            Some(genesis_hash.into()),
             &device_add(&doomed, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
@@ -6457,7 +6754,7 @@ mod tests {
             &device,
             2,
             Some(roster_ref),
-            Some(genesis_hash),
+            Some(genesis_hash.into()),
             &device_remove(&doomed, super::super::cut::Cut::Empty),
         );
         account_ingest(&conn, &remove_bytes, NOW + 2).unwrap();
@@ -6470,7 +6767,7 @@ mod tests {
                 &device,
                 3 + index as u64,
                 Some(prev),
-                Some(genesis_hash),
+                Some(genesis_hash.into()),
                 &device_add(&Dev::new(seed), DeviceRole::Member),
             );
             account_ingest(&conn, &bytes, NOW + 3 + index as i64).unwrap();
@@ -6512,7 +6809,7 @@ mod tests {
             &device,
             9,
             Some(prev),
-            Some(genesis_hash),
+            Some(genesis_hash.into()),
             &device_add(&doomed, DeviceRole::Member),
         );
         account_ingest(&conn, &readd_bytes, NOW + 21).unwrap();
@@ -6549,7 +6846,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add_local(&device, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_local, NOW + 1).unwrap();
@@ -6560,7 +6857,7 @@ mod tests {
             &founder,
             2,
             Some(add_local_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&Dev::new(0xb1), DeviceRole::Member),
         );
         account_ingest(&conn, &fork_x, NOW + 2).unwrap();
@@ -6569,7 +6866,7 @@ mod tests {
             &founder,
             2,
             Some(add_local_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&Dev::new(0xb2), DeviceRole::Member),
         );
         account_ingest(&conn, &fork_y, NOW + 3).unwrap();
@@ -6594,7 +6891,8 @@ mod tests {
             .find(|w| w.device_fingerprint == founder.fp)
             .expect("the founder's chain is covered");
         assert_eq!(
-            founder_head.entry_hash, winner,
+            founder_head.entry_hash,
+            AccountEntryHash::from_bytes(winner),
             "the watermark must name the branch the store accepted, not the higher hash",
         );
         assert_eq!(founder_head.seq, 2, "and it is still that device's head");
@@ -6637,7 +6935,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
@@ -6646,14 +6944,26 @@ mod tests {
         // this binary cannot check. The padded one is authored second so its entry_hash is not
         // guaranteed to lose the tiebreak — the assertion below is about coverage, so pin whichever
         // wins by comparing against the honest hash directly.
-        let honest = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |_| {});
-        let padded = author_snapshot_over(&conn, account_id, &founder, genesis_hash, |target| {
-            target.covered.push(snapshot::ops::CoveredWatermark {
-                device_fingerprint: member.fp,
-                seq: 0,
-                entry_hash: [0xcd; 32],
-            });
-        });
+        let honest = author_snapshot_over(
+            &conn,
+            account_id,
+            &founder,
+            AccountEntryHash::from_bytes(genesis_hash),
+            |_| {},
+        );
+        let padded = author_snapshot_over(
+            &conn,
+            account_id,
+            &founder,
+            AccountEntryHash::from_bytes(genesis_hash),
+            |target| {
+                target.covered.push(snapshot::ops::CoveredWatermark {
+                    device_fingerprint: member.fp,
+                    seq: 0,
+                    entry_hash: AccountEntryHash::from_bytes([0xcd; 32]),
+                });
+            },
+        );
         assert_ne!(honest, padded, "the two snapshots are distinct entries");
 
         let usable = usable_snapshots(&conn, account_id).unwrap();
@@ -6666,7 +6976,7 @@ mod tests {
         );
         assert_eq!(
             selected_snapshot(&conn, account_id).unwrap().map(|s| s.entry_hash),
-            Some(honest),
+            Some(Into::into(honest)),
             "the honest snapshot is chosen; unverifiable coverage buys no rank",
         );
     }
@@ -6693,19 +7003,25 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&owner_b, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_b, NOW + 1).unwrap();
 
         // `owner_b` snapshots under its own incarnation, BEFORE any revocation.
-        let snapshot_hash = author_snapshot_over(&conn, account_id, &owner_b, owner_b_id, |_| {});
+        let snapshot_hash = author_snapshot_over(
+            &conn,
+            account_id,
+            &owner_b,
+            AccountEntryHash::from_bytes(owner_b_id),
+            |_| {},
+        );
         let usable = usable_snapshots(&conn, account_id).unwrap();
         assert_eq!(usable.len(), 1, "an open incarnation's snapshot is usable");
-        assert_eq!(usable[0].entry_hash, snapshot_hash);
+        assert_eq!(usable[0].entry_hash, AccountEntryHash::from_bytes(snapshot_hash));
         assert_eq!(
             selected_snapshot(&conn, account_id).unwrap().map(|s| s.entry_hash),
-            Some(snapshot_hash),
+            Some(Into::into(snapshot_hash)),
         );
 
         // The founder closes that incarnation. The snapshot is untouched and still verifies against
@@ -6716,14 +7032,14 @@ mod tests {
             &founder,
             2,
             Some(owner_b_id),
-            Some(genesis_hash),
-            &owner_demote(&owner_b, owner_b_id),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &owner_demote(&owner_b, OwnerId::from_bytes(owner_b_id)),
         );
         account_ingest(&conn, &demote_bytes, NOW + 3).unwrap();
 
         assert_eq!(
             verify_stored_snapshots(&conn, account_id).unwrap(),
-            vec![(snapshot_hash, snapshot::verify::SnapshotVerdict::Verified)],
+            vec![(snapshot_hash.into(), snapshot::verify::SnapshotVerdict::Verified)],
             "the claim is still true — revocation is about authority, not correctness",
         );
         assert!(
@@ -6746,7 +7062,7 @@ mod tests {
             let raw = ordinal.to_be_bytes();
             insert_pre_verify(
                 &conn,
-                &cbor::sha256(&raw),
+                &cbor::sha256(&raw).into(),
                 account_a,
                 Dev::new(2).fp,
                 &raw,
@@ -6778,7 +7094,7 @@ mod tests {
                 let raw = [account_byte, ordinal as u8];
                 insert_pre_verify(
                     &conn,
-                    &cbor::sha256(&raw),
+                    &cbor::sha256(&raw).into(),
                     account,
                     Dev::new(3).fp,
                     &raw,
@@ -6804,7 +7120,7 @@ mod tests {
         assert_eq!(
             insert_pre_verify(
                 &conn,
-                &cbor::sha256(&evicted_raw),
+                &cbor::sha256(&evicted_raw).into(),
                 AccountId::from_bytes([0xcc; 32]),
                 Dev::new(4).fp,
                 &evicted_raw,
@@ -6827,7 +7143,7 @@ mod tests {
             expected_hashes.push(signed_hash);
             insert_pre_verify(
                 &conn,
-                &cbor::sha256(&signed_hash),
+                &cbor::sha256(&signed_hash).into(),
                 account_id,
                 Dev::new(2).fp,
                 &raw,
@@ -6845,7 +7161,7 @@ mod tests {
             .unwrap()
             .query_map(params![account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))
             .unwrap()
-            .map(|row| fixed(&row.unwrap()).unwrap())
+            .map(|row| id::fixed(&row.unwrap()).unwrap())
             .collect::<Vec<_>>();
         retained.sort_unstable();
         assert_eq!(retained, expected_hashes);
@@ -6861,7 +7177,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&added, DeviceRole::Owner),
         );
 
@@ -6871,7 +7187,7 @@ mod tests {
             assert_eq!(
                 insert_pre_verify(
                     &per_account,
-                    &cbor::sha256(&raw),
+                    &cbor::sha256(&raw).into(),
                     account_id,
                     Dev::new(3).fp,
                     &raw,
@@ -6894,7 +7210,7 @@ mod tests {
                 assert_eq!(
                     insert_pre_verify(
                         &global,
-                        &cbor::sha256(&raw),
+                        &cbor::sha256(&raw).into(),
                         parked_account,
                         Dev::new(4).fp,
                         &raw,
@@ -6922,7 +7238,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&added, DeviceRole::Owner),
         );
         let mut oldest_signed_hash = None;
@@ -6932,7 +7248,7 @@ mod tests {
             assert_eq!(
                 insert_pre_verify(
                     &conn,
-                    &cbor::sha256(&raw),
+                    &cbor::sha256(&raw).into(),
                     account_id,
                     Dev::new(3).fp,
                     &raw,
@@ -6955,8 +7271,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, PRE_VERIFY_PER_ACCOUNT_MAX as i64);
-        assert!(PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
-        assert!(!PRE_VERIFY.contains(&conn, &oldest_signed_hash.unwrap()).unwrap());
+        assert!(PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes).into()).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &oldest_signed_hash.unwrap().into()).unwrap());
     }
 
     #[test]
@@ -7114,12 +7430,19 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&pending_device, DeviceRole::Owner),
         );
         assert_eq!(
-            insert_pre_verify(&conn, &pending_hash, account_id, founder.fp, &pending_bytes, NOW,)
-                .unwrap(),
+            insert_pre_verify(
+                &conn,
+                &pending_hash.into(),
+                account_id,
+                founder.fp,
+                &pending_bytes,
+                NOW,
+            )
+            .unwrap(),
             PreVerifyInsert::Parked { evicted: Vec::new() },
         );
 
@@ -7132,7 +7455,7 @@ mod tests {
             &founder,
             2,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&trigger_device, DeviceRole::Member),
         );
         let outcome = account_ingest(&conn, &trigger_bytes, NOW + 1).unwrap();
@@ -7140,11 +7463,11 @@ mod tests {
             status: "forked".into(),
             account_promotions: PromotionOutcome {
                 scope: Some(CapacityScope::CandidateGlobal),
-                entry_hashes: vec![pending_hash]
+                entry_hashes: vec![AccountEntryHash::from_bytes(pending_hash)]
             },
             content_promotions: content::ContentPromotionOutcome::default(),
         },);
-        assert!(!PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes).into()).unwrap());
         assert_eq!(status(&conn, &trigger_hash), Some("forked".into()));
         assert_eq!(status(&conn, &pending_hash), None, "the rejected row was not half-promoted");
     }
@@ -7172,7 +7495,11 @@ mod tests {
         let mut forged_envelope = genesis_bytes.clone();
         *forged_envelope.last_mut().unwrap() ^= 1;
         let forged = envelope::decode_account_signed(&forged_envelope).unwrap();
-        assert_eq!(forged.entry_hash, genesis_hash, "signature bytes are outside the entry hash");
+        assert_eq!(
+            forged.entry_hash,
+            AccountEntryHash::from_bytes(genesis_hash),
+            "signature bytes are outside the entry hash"
+        );
         assert!(matches!(
             account_ingest(&conn, &forged_envelope, NOW + 2).unwrap(),
             IngestOutcome::Rejected(_)
@@ -7235,12 +7562,19 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&added, DeviceRole::Owner),
         );
         assert_eq!(
-            insert_pre_verify(&conn, &pending_hash, account_id, founder.fp, &pending_bytes, NOW,)
-                .unwrap(),
+            insert_pre_verify(
+                &conn,
+                &pending_hash.into(),
+                account_id,
+                founder.fp,
+                &pending_bytes,
+                NOW,
+            )
+            .unwrap(),
             PreVerifyInsert::Parked { evicted: Vec::new() },
         );
         seed_candidate_rows(&conn, account_id, founder.fp, 2, CANDIDATES_PER_ACCOUNT_MAX - 1);
@@ -7248,10 +7582,10 @@ mod tests {
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         assert_eq!(promote_pre_verify(&tx, account_id, NOW + 1).unwrap(), PromotionOutcome {
             scope: Some(CapacityScope::CandidateAccount),
-            entry_hashes: vec![pending_hash],
+            entry_hashes: vec![AccountEntryHash::from_bytes(pending_hash)],
         },);
         tx.commit().unwrap();
-        assert!(!PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes)).unwrap());
+        assert!(!PRE_VERIFY.contains(&conn, &cbor::sha256(&pending_bytes).into()).unwrap());
         assert_eq!(status(&conn, &pending_hash), None, "the blocked row was not half-promoted");
     }
 
@@ -7269,7 +7603,7 @@ mod tests {
                 &founder,
                 1,
                 Some(genesis_hash),
-                Some(genesis_hash),
+                Some(OwnerId::from_bytes(genesis_hash)),
                 &device_add(&a, DeviceRole::Member),
             );
             let second = op(
@@ -7277,13 +7611,14 @@ mod tests {
                 &founder,
                 2,
                 Some(genesis_hash),
-                Some(genesis_hash),
+                Some(OwnerId::from_bytes(genesis_hash)),
                 &device_add(&b, DeviceRole::Member),
             );
             let rows = if reverse { [&second, &first] } else { [&first, &second] };
             for (bytes, hash) in rows {
                 assert_eq!(
-                    insert_pre_verify(&conn, hash, account_id, founder.fp, bytes, NOW).unwrap(),
+                    insert_pre_verify(&conn, &(*(hash)).into(), account_id, founder.fp, bytes, NOW)
+                        .unwrap(),
                     PreVerifyInsert::Parked { evicted: Vec::new() },
                 );
             }
@@ -7324,12 +7659,24 @@ mod tests {
         let founder = Dev::new(1);
         let (acct, gbytes, gh) = genesis(&founder);
         let b = Dev::new(2);
-        let (add_b_bytes, add_b) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let (add_b_bytes, add_b) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Owner),
+        );
         // C added by owner B on B's own log (seq 0), authorized by the entry that made B an owner.
         let c = Dev::new(3);
-        let (add_c_bytes, add_c) =
-            op(acct, &b, 0, None, Some(add_b), &device_add(&c, DeviceRole::Member));
+        let (add_c_bytes, add_c) = op(
+            acct,
+            &b,
+            0,
+            None,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_add(&c, DeviceRole::Member),
+        );
 
         // Reverse delivery: the C-add parks (B unknown), then the B-add parks (founder unknown).
         assert_eq!(account_ingest(&conn, &add_c_bytes, NOW).unwrap(), IngestOutcome::PreVerify);
@@ -7365,22 +7712,43 @@ mod tests {
             let founder = Dev::new(1);
             let (acct, gbytes, gh) = genesis(&founder);
             let b = Dev::new(2);
-            let (add_bytes, add_b) =
-                op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+            let (add_bytes, add_b) = op(
+                acct,
+                &founder,
+                1,
+                Some(gh),
+                Some(OwnerId::from_bytes(gh)),
+                &device_add(&b, DeviceRole::Owner),
+            );
             // B's two equivocating seq-0 heads (each adds a throwaway member so they differ).
             let (t8, t9) = (Dev::new(8), Dev::new(9));
-            let (b0a_bytes, b0a) =
-                op(acct, &b, 0, None, Some(add_b), &device_add(&t8, DeviceRole::Member));
-            let (b0b_bytes, b0b) =
-                op(acct, &b, 0, None, Some(add_b), &device_add(&t9, DeviceRole::Member));
+            let (b0a_bytes, b0a) = op(
+                acct,
+                &b,
+                0,
+                None,
+                Some(OwnerId::from_bytes(add_b)),
+                &device_add(&t8, DeviceRole::Member),
+            );
+            let (b0b_bytes, b0b) = op(
+                acct,
+                &b,
+                0,
+                None,
+                Some(OwnerId::from_bytes(add_b)),
+                &device_add(&t9, DeviceRole::Member),
+            );
             // The founder removes B, watermark = b0b (keep b0b's branch).
             let (rm_bytes, _rm) = op(
                 acct,
                 &founder,
                 2,
                 Some(add_b),
-                Some(gh),
-                &device_remove(&b, super::super::cut::Cut::At { seq: 0, hash: b0b }),
+                Some(OwnerId::from_bytes(gh)),
+                &device_remove(&b, super::super::cut::Cut::At {
+                    seq: 0,
+                    hash: AccountEntryHash::from_bytes(b0b),
+                }),
             );
 
             // Ingest genesis + add_b first (so B resolves), then the three in a rotated order.
@@ -7417,18 +7785,24 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&owner, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_owner_bytes, NOW + 1).unwrap();
-        let (b0_bytes, b0) =
-            op(account_id, &owner, 0, None, Some(add_owner), &device_add(&d, DeviceRole::Member));
+        let (b0_bytes, b0) = op(
+            account_id,
+            &owner,
+            0,
+            None,
+            Some(OwnerId::from_bytes(add_owner)),
+            &device_add(&d, DeviceRole::Member),
+        );
         let (b1_bytes, b1) = op(
             account_id,
             &owner,
             1,
             Some(b0),
-            Some(add_owner),
+            Some(OwnerId::from_bytes(add_owner)),
             &device_add(&e, DeviceRole::Member),
         );
         let (b2_bytes, b2) = op(
@@ -7436,14 +7810,14 @@ mod tests {
             &owner,
             2,
             Some(b1),
-            Some(add_owner),
+            Some(OwnerId::from_bytes(add_owner)),
             &device_add(&g, DeviceRole::Member),
         );
         for (offset, bytes) in [&b0_bytes, &b1_bytes, &b2_bytes].into_iter().enumerate() {
             account_ingest(&conn, bytes, NOW + 2 + i64::try_from(offset).unwrap()).unwrap();
         }
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, b2, g.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(b2), g.fp).unwrap(),
             fold::AuthorityQuery::Effective(_)
         ));
 
@@ -7452,14 +7826,17 @@ mod tests {
             &founder,
             2,
             Some(add_owner),
-            Some(genesis_hash),
-            &device_remove(&owner, super::super::cut::Cut::At { seq: 0, hash: b0 }),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &device_remove(&owner, super::super::cut::Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(b0),
+            }),
         );
         account_ingest(&conn, &remove_bytes, NOW + 5).unwrap();
         assert_eq!(status(&conn, &b1).as_deref(), Some("condemned"));
         assert_eq!(status(&conn, &b2).as_deref(), Some("condemned"));
         assert_eq!(
-            roster_ref_effective(&conn, account_id, b2, g.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(b2), g.fp).unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective
             ),
@@ -7470,21 +7847,25 @@ mod tests {
             &founder,
             3,
             Some(remove_hash),
-            Some(genesis_hash),
-            &cut_extend_ctrl(account_id, &owner, 2, b2),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &cut_extend_ctrl(account_id, &owner, 2, AccountEntryHash::from_bytes(b2)),
         );
         account_ingest(&conn, &extend_bytes, NOW + 6).unwrap();
         assert_eq!(status(&conn, &b1).as_deref(), Some("accepted"));
         assert_eq!(status(&conn, &b2).as_deref(), Some("accepted"));
         assert!(matches!(
-            roster_ref_effective(&conn, account_id, b2, g.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(b2), g.fp).unwrap(),
             fold::AuthorityQuery::Effective(_)
         ));
         assert_eq!(
-            owner_control_authority(&conn, account_id, add_owner, owner.fp).unwrap(),
+            owner_control_authority(&conn, account_id, OwnerId::from_bytes(add_owner), owner.fp)
+                .unwrap(),
             fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
                 owner: fold::OwnerAuthority { device_fingerprint: owner.fp },
-                device_boundary: fold::AuthorityBoundary::Cut { seq: 2, hash: b2 },
+                device_boundary: fold::AuthorityBoundary::Cut {
+                    seq: 2,
+                    hash: AccountEntryHash::from_bytes(b2)
+                },
                 incarnation_boundary: fold::AuthorityBoundary::Open,
             }),
             "the query exposes the final joined device register and the independent incarnation",
@@ -7505,11 +7886,11 @@ mod tests {
         .unwrap();
         schema::migrate_forward(&conn, &crate::test_hooks()).unwrap();
         assert!(matches!(
-            owner_control_authority(&conn, account_id, add_owner, owner.fp).unwrap(),
+            owner_control_authority(&conn, account_id, OwnerId::from_bytes(add_owner), owner.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::OwnerChainAuthority {
                 device_boundary: fold::AuthorityBoundary::Cut { seq: 2, hash },
                 ..
-            }) if hash == b2
+            }) if hash == AccountEntryHash::from_bytes(b2)
         ));
     }
 
@@ -7524,7 +7905,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&a, DeviceRole::Owner),
         );
         let (add_b_bytes, add_b) = op(
@@ -7532,7 +7913,7 @@ mod tests {
             &founder,
             2,
             Some(add_a),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&b, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_a_bytes, NOW + 1).unwrap();
@@ -7542,7 +7923,7 @@ mod tests {
             &a,
             0,
             None,
-            Some(add_a),
+            Some(OwnerId::from_bytes(add_a)),
             &device_remove(&b, super::super::cut::Cut::Empty),
         );
         let (remove_a_bytes, remove_a) = op(
@@ -7550,7 +7931,7 @@ mod tests {
             &b,
             0,
             None,
-            Some(add_b),
+            Some(OwnerId::from_bytes(add_b)),
             &device_remove(&a, super::super::cut::Cut::Empty),
         );
         account_ingest(&conn, &remove_b_bytes, NOW + 3).unwrap();
@@ -7589,7 +7970,7 @@ mod tests {
             &founder,
             1,
             Some(genesis),
-            Some(genesis),
+            Some(OwnerId::from_bytes(genesis)),
             &device_add(&owner, DeviceRole::Owner),
         );
         account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
@@ -7602,7 +7983,7 @@ mod tests {
                 &owner,
                 seq,
                 prev,
-                Some(owner_id),
+                Some(OwnerId::from_bytes(owner_id)),
                 &device_add(&member, DeviceRole::Member),
             );
             account_ingest(&conn, &bytes, NOW + 2 + i64::try_from(seq).unwrap()).unwrap();
@@ -7611,21 +7992,27 @@ mod tests {
         }
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner.fp,
-            owner_id,
-            control_cut: super::super::cut::Cut::At { seq: 0, hash: heads[0] },
+            owner_id: OwnerId::from_bytes(owner_id),
+            control_cut: super::super::cut::Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(heads[0]),
+            },
             secrets_cut: super::super::cut::Cut::Empty,
             reason: "demote".to_string(),
         };
         let (demote_bytes, demote_hash) =
-            op(account, &founder, 2, Some(owner_id), Some(genesis), &demote);
+            op(account, &founder, 2, Some(owner_id), Some(OwnerId::from_bytes(genesis)), &demote);
         account_ingest(&conn, &demote_bytes, NOW + 5).unwrap();
         let (remove_bytes, remove_hash) = op(
             account,
             &founder,
             3,
             Some(demote_hash),
-            Some(genesis),
-            &device_remove(&owner, super::super::cut::Cut::At { seq: 1, hash: heads[1] }),
+            Some(OwnerId::from_bytes(genesis)),
+            &device_remove(&owner, super::super::cut::Cut::At {
+                seq: 1,
+                hash: AccountEntryHash::from_bytes(heads[1]),
+            }),
         );
         account_ingest(&conn, &remove_bytes, NOW + 6).unwrap();
         let expected = |device_boundary, incarnation_boundary| {
@@ -7636,29 +8023,49 @@ mod tests {
             })
         };
         assert_eq!(
-            owner_control_authority(&conn, account, owner_id, owner.fp).unwrap(),
+            owner_control_authority(&conn, account, OwnerId::from_bytes(owner_id), owner.fp)
+                .unwrap(),
             expected(
-                fold::AuthorityBoundary::Cut { seq: 1, hash: heads[1] },
-                fold::AuthorityBoundary::Cut { seq: 0, hash: heads[0] },
+                fold::AuthorityBoundary::Cut {
+                    seq: 1,
+                    hash: AccountEntryHash::from_bytes(heads[1])
+                },
+                fold::AuthorityBoundary::Cut {
+                    seq: 0,
+                    hash: AccountEntryHash::from_bytes(heads[0])
+                },
             ),
         );
         let extend_incarnation = AccountOp::CutExtend {
             chain_kind: super::super::ops::ChainKind::Ctrl,
             stream_id: None,
-            incarnation_id: Some(owner_id),
+            incarnation_id: Some(AccountEntryHash::from_bytes(owner_id)),
             subject_account_id: account,
             device_fingerprint: owner.fp,
             new_seq: 2,
-            new_entry_hash: heads[2],
+            new_entry_hash: AccountEntryHash::from_bytes(heads[2]),
         };
-        let (bytes, extend_hash) =
-            op(account, &founder, 4, Some(remove_hash), Some(genesis), &extend_incarnation);
+        let (bytes, extend_hash) = op(
+            account,
+            &founder,
+            4,
+            Some(remove_hash),
+            Some(OwnerId::from_bytes(genesis)),
+            &extend_incarnation,
+        );
         account_ingest(&conn, &bytes, NOW + 7).unwrap();
         assert_eq!(
-            owner_control_authority(&conn, account, owner_id, owner.fp).unwrap(),
+            owner_control_authority(&conn, account, OwnerId::from_bytes(owner_id), owner.fp)
+                .unwrap(),
             expected(
-                fold::AuthorityBoundary::Cut { seq: 1, hash: heads[1] },
-                fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
+                fold::AuthorityBoundary::Cut {
+                    seq: 1,
+                    hash: AccountEntryHash::from_bytes(heads[1])
+                },
+                fold::AuthorityBoundary::Cut {
+                    seq: 2,
+                    hash: AccountEntryHash::from_bytes(heads[2])
+                },
             ),
             "extending the incarnation register leaves the device register unchanged",
         );
@@ -7667,15 +8074,22 @@ mod tests {
             &founder,
             5,
             Some(extend_hash),
-            Some(genesis),
-            &cut_extend_ctrl(account, &owner, 2, heads[2]),
+            Some(OwnerId::from_bytes(genesis)),
+            &cut_extend_ctrl(account, &owner, 2, AccountEntryHash::from_bytes(heads[2])),
         );
         account_ingest(&conn, &bytes, NOW + 8).unwrap();
         assert_eq!(
-            owner_control_authority(&conn, account, owner_id, owner.fp).unwrap(),
+            owner_control_authority(&conn, account, OwnerId::from_bytes(owner_id), owner.fp)
+                .unwrap(),
             expected(
-                fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
-                fold::AuthorityBoundary::Cut { seq: 2, hash: heads[2] },
+                fold::AuthorityBoundary::Cut {
+                    seq: 2,
+                    hash: AccountEntryHash::from_bytes(heads[2])
+                },
+                fold::AuthorityBoundary::Cut {
+                    seq: 2,
+                    hash: AccountEntryHash::from_bytes(heads[2])
+                },
             ),
             "extending the device register leaves the incarnation register unchanged",
         );
@@ -7692,10 +8106,22 @@ mod tests {
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
         let (b, c) = (Dev::new(2), Dev::new(3));
-        let (b_bytes, b_hash) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Member));
-        let (c_bytes, c_hash) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&c, DeviceRole::Member));
+        let (b_bytes, b_hash) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Member),
+        );
+        let (c_bytes, c_hash) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&c, DeviceRole::Member),
+        );
         account_ingest(&conn, &b_bytes, NOW).unwrap();
         account_ingest(&conn, &c_bytes, NOW).unwrap();
 
@@ -7737,10 +8163,22 @@ mod tests {
 
             let (b, w, c, d, survivor_child) =
                 (Dev::new(2), Dev::new(3), Dev::new(4), Dev::new(5), Dev::new(6));
-            let (add_b_bytes, add_b) =
-                op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
-            let (add_w_bytes, add_w) =
-                op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&w, DeviceRole::Owner));
+            let (add_b_bytes, add_b) = op(
+                acct,
+                &founder,
+                1,
+                Some(gh),
+                Some(OwnerId::from_bytes(gh)),
+                &device_add(&b, DeviceRole::Owner),
+            );
+            let (add_w_bytes, add_w) = op(
+                acct,
+                &founder,
+                1,
+                Some(gh),
+                Some(OwnerId::from_bytes(gh)),
+                &device_add(&w, DeviceRole::Owner),
+            );
 
             let (loser, loser_add_bytes, loser_add, winner, winner_add_bytes, winner_add) =
                 if add_b < add_w {
@@ -7748,16 +8186,28 @@ mod tests {
                 } else {
                     (&b, &add_b_bytes, add_b, &w, &add_w_bytes, add_w)
                 };
-            let (add_c_bytes, add_c) =
-                op(acct, loser, 0, None, Some(loser_add), &device_add(&c, DeviceRole::Owner));
-            let (add_d_bytes, add_d) =
-                op(acct, &c, 0, None, Some(add_c), &device_add(&d, DeviceRole::Member));
+            let (add_c_bytes, add_c) = op(
+                acct,
+                loser,
+                0,
+                None,
+                Some(OwnerId::from_bytes(loser_add)),
+                &device_add(&c, DeviceRole::Owner),
+            );
+            let (add_d_bytes, add_d) = op(
+                acct,
+                &c,
+                0,
+                None,
+                Some(OwnerId::from_bytes(add_c)),
+                &device_add(&d, DeviceRole::Member),
+            );
             let (winner_child_bytes, winner_child) = op(
                 acct,
                 winner,
                 0,
                 None,
-                Some(winner_add),
+                Some(OwnerId::from_bytes(winner_add)),
                 &device_add(&survivor_child, DeviceRole::Member),
             );
 
@@ -7789,17 +8239,21 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
-        let (promote_bytes, promote) =
-            op(account_id, &founder, 2, Some(add), Some(genesis_hash), &AccountOp::OwnerPromote {
-                device_fingerprint: member.fp,
-            });
+        let (promote_bytes, promote) = op(
+            account_id,
+            &founder,
+            2,
+            Some(add),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &AccountOp::OwnerPromote { device_fingerprint: member.fp },
+        );
         account_ingest(&conn, &promote_bytes, NOW + 2).unwrap();
         assert_eq!(
-            roster_ref_effective(&conn, account_id, add, member.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(add), member.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Owner,
@@ -7811,19 +8265,20 @@ mod tests {
             &founder,
             3,
             Some(promote),
-            Some(genesis_hash),
-            &owner_demote(&member, promote),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &owner_demote(&member, OwnerId::from_bytes(promote)),
         );
         account_ingest(&conn, &demote_bytes, NOW + 3).unwrap();
         assert_eq!(
-            roster_ref_effective(&conn, account_id, add, member.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(add), member.fp).unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterAuthority {
                 device_fingerprint: member.fp,
                 current_role: DeviceRole::Member,
             }),
         );
         assert_eq!(
-            owner_incarnation_effective(&conn, account_id, promote, member.fp).unwrap(),
+            owner_incarnation_effective(&conn, account_id, OwnerId::from_bytes(promote), member.fp)
+                .unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
             ),
@@ -7834,12 +8289,12 @@ mod tests {
             &founder,
             4,
             Some(demote),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_remove(&member, super::super::cut::Cut::Empty),
         );
         account_ingest(&conn, &remove_bytes, NOW + 4).unwrap();
         assert_eq!(
-            roster_ref_effective(&conn, account_id, add, member.fp).unwrap(),
+            roster_ref_effective(&conn, account_id, RosterRef::from_bytes(add), member.fp).unwrap(),
             fold::AuthorityQuery::Invalid(
                 fold::AuthorityInvalidReason::ReferencedEntryNotEffective,
             ),
@@ -7859,8 +8314,14 @@ mod tests {
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
         let b = Dev::new(2);
-        let (add_b_bytes, add_b) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let (add_b_bytes, add_b) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Owner),
+        );
         // Find a deterministic rival whose hash is smaller, making the owner mint the losing
         // branch without depending on an assumed ordering of test keys.
         let (winner_bytes, winner_hash) = (3u8..=u8::MAX)
@@ -7871,14 +8332,20 @@ mod tests {
                     &founder,
                     1,
                     Some(gh),
-                    Some(gh),
+                    Some(OwnerId::from_bytes(gh)),
                     &device_add(&rival, DeviceRole::Member),
                 );
                 (candidate.1 < add_b).then_some(candidate)
             })
             .expect("the deterministic fixture set contains a lower-hash rival");
-        let (demote_bytes, demote) =
-            op(acct, &founder, 2, Some(winner_hash), Some(gh), &owner_demote(&b, add_b));
+        let (demote_bytes, demote) = op(
+            acct,
+            &founder,
+            2,
+            Some(winner_hash),
+            Some(OwnerId::from_bytes(gh)),
+            &owner_demote(&b, OwnerId::from_bytes(add_b)),
+        );
 
         account_ingest(&conn, &add_b_bytes, NOW).unwrap();
         account_ingest(&conn, &winner_bytes, NOW).unwrap();
@@ -7901,15 +8368,33 @@ mod tests {
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
         let b = Dev::new(2);
-        let (add_b_bytes, add_b) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let (add_b_bytes, add_b) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Owner),
+        );
         account_ingest(&conn, &add_b_bytes, NOW).unwrap();
         // B's two equivocating seq-0 heads (each adds a distinct throwaway member so they differ).
         let (t8, t9) = (Dev::new(8), Dev::new(9));
-        let (b0a_bytes, b0a) =
-            op(acct, &b, 0, None, Some(add_b), &device_add(&t8, DeviceRole::Member));
-        let (b0b_bytes, b0b) =
-            op(acct, &b, 0, None, Some(add_b), &device_add(&t9, DeviceRole::Member));
+        let (b0a_bytes, b0a) = op(
+            acct,
+            &b,
+            0,
+            None,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_add(&t8, DeviceRole::Member),
+        );
+        let (b0b_bytes, b0b) = op(
+            acct,
+            &b,
+            0,
+            None,
+            Some(OwnerId::from_bytes(add_b)),
+            &device_add(&t9, DeviceRole::Member),
+        );
         let ((win, win_bytes), (lose, lose_bytes)) = if b0a < b0b {
             ((b0a, &b0a_bytes), (b0b, &b0b_bytes))
         } else {
@@ -7917,8 +8402,14 @@ mod tests {
         };
         // B continues at seq 1 from the LOSING head.
         let t7 = Dev::new(7);
-        let (b1_bytes, b1) =
-            op(acct, &b, 1, Some(lose), Some(add_b), &device_add(&t7, DeviceRole::Member));
+        let (b1_bytes, b1) = op(
+            acct,
+            &b,
+            1,
+            Some(lose),
+            Some(OwnerId::from_bytes(add_b)),
+            &device_add(&t7, DeviceRole::Member),
+        );
 
         account_ingest(&conn, win_bytes, NOW).unwrap();
         account_ingest(&conn, lose_bytes, NOW).unwrap();
@@ -7958,14 +8449,14 @@ mod tests {
             log_id: 0,
             device_fingerprint: founder.fp,
             seq: 1,
-            prev_hash: Some(gh),
+            prev_hash: Some(AccountEntryHash::from_bytes(gh)),
             parent_ref: None,
             entry_type: ops::entry_type::DEVICE_ADD,
             op_version: 1,
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let signed = sign_account_entry(&founder.secret, &header, &[0xff, 0xff, 0xff]).unwrap();
         let out = account_ingest(&conn, &signed.signed_bytes, NOW).unwrap();
@@ -7973,7 +8464,7 @@ mod tests {
             matches!(out, IngestOutcome::Rejected(_)),
             "a malformed op payload is rejected: {out:?}"
         );
-        assert_eq!(status(&conn, &signed.entry_hash), None, "and is never stored");
+        assert_eq!(status(&conn, &signed.entry_hash.into()), None, "and is never stored");
     }
 
     #[test]
@@ -7991,14 +8482,14 @@ mod tests {
             log_id: 0,
             device_fingerprint: founder.fp,
             seq: 1,
-            prev_hash: Some(gh),
+            prev_hash: Some(AccountEntryHash::from_bytes(gh)),
             parent_ref: None,
             entry_type: ops::entry_type::DEVICE_ADD,
             op_version: 1,
             crypto_suite: 1,
             auth_len: 1,
             key_id: Some([0x44; 32]),
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let sealed = sign_account_entry(&founder.secret, &sealed_header, &opaque).unwrap();
         assert_eq!(
@@ -8027,8 +8518,8 @@ mod tests {
                 content_promotions: content::ContentPromotionOutcome::default()
             },
         );
-        assert_eq!(status(&conn, &sealed.entry_hash).as_deref(), Some("retained_unfolded"));
-        assert_eq!(status(&conn, &future.entry_hash).as_deref(), Some("retained_unfolded"));
+        assert_eq!(status(&conn, &sealed.entry_hash.into()).as_deref(), Some("retained_unfolded"));
+        assert_eq!(status(&conn, &future.entry_hash.into()).as_deref(), Some("retained_unfolded"));
     }
 
     #[test]
@@ -8051,7 +8542,7 @@ mod tests {
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let malformed =
             sign_account_entry(&b.secret, &malformed_header, &[0xff, 0xff, 0xff]).unwrap();
@@ -8059,7 +8550,7 @@ mod tests {
             account_ingest(&conn, &malformed.signed_bytes, NOW).unwrap(),
             IngestOutcome::Rejected(_)
         ));
-        assert_eq!(status(&conn, &malformed.entry_hash), None);
+        assert_eq!(status(&conn, &malformed.entry_hash.into()), None);
         let pending: i64 = conn
             .query_row("SELECT COUNT(*) FROM account_pre_verify", [], |row| row.get(0))
             .unwrap();
@@ -8079,26 +8570,32 @@ mod tests {
             log_id: 0,
             device_fingerprint: founder.fp,
             seq: 2,
-            prev_hash: Some(gh),
+            prev_hash: Some(AccountEntryHash::from_bytes(gh)),
             parent_ref: None,
             entry_type: ops::entry_type::DEVICE_ADD,
             op_version: 1,
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let gap = sign_account_entry(&founder.secret, &gap_header, &payload).unwrap();
         account_ingest(&conn, &gap.signed_bytes, NOW).unwrap();
-        assert_eq!(status(&conn, &gap.entry_hash).as_deref(), Some("forked"));
+        assert_eq!(status(&conn, &gap.entry_hash.into()).as_deref(), Some("forked"));
 
         let c = Dev::new(3);
-        let (next_bytes, next) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&c, DeviceRole::Member));
+        let (next_bytes, next) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&c, DeviceRole::Member),
+        );
         account_ingest(&conn, &next_bytes, NOW).unwrap();
         assert_eq!(status(&conn, &next).as_deref(), Some("accepted"));
         assert_eq!(
-            status(&conn, &gap.entry_hash).as_deref(),
+            status(&conn, &gap.entry_hash.into()).as_deref(),
             Some("forked"),
             "a seq-2 sibling of seq-1 cannot extend the accepted chain",
         );
@@ -8116,14 +8613,14 @@ mod tests {
             log_id: 0,
             device_fingerprint: founder.fp,
             seq: i64::MAX as u64 + 1,
-            prev_hash: Some(gh),
+            prev_hash: Some(AccountEntryHash::from_bytes(gh)),
             parent_ref: None,
             entry_type: ops::entry_type::DEVICE_ADD,
             op_version: 1,
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
         assert_eq!(
@@ -8138,8 +8635,14 @@ mod tests {
         let founder = Dev::new(1);
         let (acct, gbytes, gh) = genesis(&founder);
         let b = Dev::new(2);
-        let (valid_bytes, entry_hash) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let (valid_bytes, entry_hash) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Owner),
+        );
         let mut bad_bytes = valid_bytes.clone();
         *bad_bytes.last_mut().unwrap() ^= 1; // signature byte; body/entry_hash stays identical
 
@@ -8185,7 +8688,11 @@ mod tests {
             account_ingest(&conn, &forged.signed_bytes, NOW).unwrap(),
             IngestOutcome::Rejected(_)
         ));
-        assert_eq!(status(&conn, &forged.entry_hash), None, "founder binding refutes the forgery");
+        assert_eq!(
+            status(&conn, &forged.entry_hash.into()),
+            None,
+            "founder binding refutes the forgery"
+        );
         let parked: i64 = conn
             .query_row("SELECT COUNT(*) FROM account_pre_verify", [], |row| row.get(0))
             .unwrap();
@@ -8211,14 +8718,14 @@ mod tests {
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let opaque = sign_account_entry(&b.secret, &header, &payload).unwrap();
         assert_eq!(
             account_ingest(&conn, &opaque.signed_bytes, NOW).unwrap(),
             IngestOutcome::PreVerify
         );
-        assert_eq!(status(&conn, &opaque.entry_hash), None);
+        assert_eq!(status(&conn, &opaque.entry_hash.into()), None);
     }
 
     #[test]
@@ -8237,14 +8744,14 @@ mod tests {
             log_id: 1,
             device_fingerprint: founder.fp,
             seq: 1,
-            prev_hash: Some(gh),
+            prev_hash: Some(AccountEntryHash::from_bytes(gh)),
             parent_ref: None,
             entry_type: ops::entry_type::STREAM_OWN,
             op_version: 1,
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let signed = sign_account_entry(&founder.secret, &header, &[0x80]).unwrap();
         assert_eq!(
@@ -8272,14 +8779,14 @@ mod tests {
             log_id: 1,
             device_fingerprint: founder.fp,
             seq: 1,
-            prev_hash: Some(gh),
+            prev_hash: Some(AccountEntryHash::from_bytes(gh)),
             parent_ref: None,
             entry_type: ops::entry_type::DEVICE_ADD,
             op_version: 1,
             crypto_suite: 0,
             auth_len: 1,
             key_id: None,
-            authority_ref: Some(gh),
+            authority_ref: Some(OwnerId::from_bytes(gh)),
         };
         let signed = sign_account_entry(&founder.secret, &header, &[0xff, 0x00]).unwrap();
         assert!(
@@ -8289,7 +8796,11 @@ mod tests {
             ),
             "a non-canonical secrets plaintext payload is a structural reject",
         );
-        assert_eq!(status(&conn, &signed.entry_hash), None, "a rejected entry is not stored");
+        assert_eq!(
+            status(&conn, &signed.entry_hash.into()),
+            None,
+            "a rejected entry is not stored"
+        );
     }
 
     #[test]
@@ -8299,8 +8810,14 @@ mod tests {
         let (acct, gbytes, gh) = genesis(&founder);
         account_ingest(&conn, &gbytes, NOW).unwrap();
         let b = Dev::new(2);
-        let (add_bytes, add_hash) =
-            op(acct, &founder, 1, Some(gh), Some(gh), &device_add(&b, DeviceRole::Owner));
+        let (add_bytes, add_hash) = op(
+            acct,
+            &founder,
+            1,
+            Some(gh),
+            Some(OwnerId::from_bytes(gh)),
+            &device_add(&b, DeviceRole::Owner),
+        );
         account_ingest(&conn, &add_bytes, NOW).unwrap();
 
         refold_account(&conn, acct).unwrap();
@@ -8330,7 +8847,7 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&member, DeviceRole::Member),
         );
         account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
@@ -8340,23 +8857,50 @@ mod tests {
             device_fingerprint: member.fp,
             control_cut: super::super::cut::Cut::Empty,
             secrets_cut: super::super::cut::Cut::Empty,
-            content_cuts: vec![ContentCut { stream_id: listed, seq: u64::MAX, hash: [0xa5; 32] }],
+            content_cuts: vec![ContentCut {
+                stream_id: listed,
+                seq: u64::MAX,
+                hash: AccountEntryHash::from_bytes([0xa5; 32]),
+            }],
             reason: "revoked".to_string(),
         };
-        let (remove_bytes, _) =
-            op(account, &founder, 2, Some(roster_ref), Some(genesis_hash), &remove);
+        let (remove_bytes, _) = op(
+            account,
+            &founder,
+            2,
+            Some(roster_ref),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &remove,
+        );
         account_ingest(&conn, &remove_bytes, NOW + 2).unwrap();
 
         assert_eq!(
-            roster_content_authority(&conn, account, roster_ref, member.fp, listed).unwrap(),
+            roster_content_authority(
+                &conn,
+                account,
+                RosterRef::from_bytes(roster_ref),
+                member.fp,
+                listed
+            )
+            .unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
                 device_fingerprint: member.fp,
                 role: DeviceRole::Member,
-                boundary: fold::AuthorityBoundary::Cut { seq: u64::MAX, hash: [0xa5; 32] },
+                boundary: fold::AuthorityBoundary::Cut {
+                    seq: u64::MAX,
+                    hash: AccountEntryHash::from_bytes([0xa5; 32])
+                },
             }),
         );
         assert_eq!(
-            roster_content_authority(&conn, account, roster_ref, member.fp, unlisted).unwrap(),
+            roster_content_authority(
+                &conn,
+                account,
+                RosterRef::from_bytes(roster_ref),
+                member.fp,
+                unlisted
+            )
+            .unwrap(),
             fold::AuthorityQuery::Effective(fold::RosterContentAuthority {
                 device_fingerprint: member.fp,
                 role: DeviceRole::Member,
@@ -8382,12 +8926,20 @@ mod tests {
             &founder,
             1,
             Some(genesis_hash),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             &device_add(&reader, DeviceRole::ReadOnly),
         );
         account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
         let stream = StreamId::from_bytes([0x41; 32]);
-        match roster_content_authority(&conn, account, roster_ref, reader.fp, stream).unwrap() {
+        match roster_content_authority(
+            &conn,
+            account,
+            RosterRef::from_bytes(roster_ref),
+            reader.fp,
+            stream,
+        )
+        .unwrap()
+        {
             fold::AuthorityQuery::Effective(fact) => {
                 assert_eq!(fact.device_fingerprint, reader.fp);
                 assert_eq!(
@@ -8414,7 +8966,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            owner_control_authority(&conn, account, owner_id, founder.fp).is_err(),
+            owner_control_authority(&conn, account, OwnerId::from_bytes(owner_id), founder.fp)
+                .is_err(),
             "a partial cut tuple must never become open authority",
         );
         conn.execute(
@@ -8425,7 +8978,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            owner_control_authority(&conn, account, owner_id, founder.fp).is_err(),
+            owner_control_authority(&conn, account, OwnerId::from_bytes(owner_id), founder.fp)
+                .is_err(),
             "negative fact epochs fail closed",
         );
         conn.execute(
@@ -8439,7 +8993,8 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            owner_control_authority(&conn, account, owner_id, founder.fp).is_err(),
+            owner_control_authority(&conn, account, OwnerId::from_bytes(owner_id), founder.fp)
+                .is_err(),
             "a closed roster and owner cannot jointly retain Open/Open authority",
         );
     }

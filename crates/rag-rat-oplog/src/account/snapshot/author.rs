@@ -36,13 +36,12 @@ use rusqlite::Transaction;
 
 use super::super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry, sign_account_entry};
 use super::super::fold::{self, AccountClassification, EntryStatus};
+use super::super::id::AccountEntryHash;
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
 use super::ops::{SnapshotOp, SnapshotTarget};
 use super::{projection, verify};
 use crate::identity::LocalDevice;
-
-type AccountEntryHash = [u8; 32];
 
 /// What an authoring attempt did. Only `Authored` mints an entry; the rest are ordinary states this
 /// device can be in, reported so a caller can tell "nothing to do" from "something went wrong".
@@ -228,6 +227,7 @@ pub fn author_snapshot_in_tx(
 
 #[cfg(test)]
 mod coverage_ceiling_tests {
+    use super::super::super::id::OwnerId;
     use super::super::super::limits;
     use super::super::ops::{CoveredWatermark, SnapshotOp, SnapshotTarget, encode};
     use super::*;
@@ -241,14 +241,14 @@ mod coverage_ceiling_tests {
             log_id: fold::ANNEX_LOG,
             device_fingerprint: DeviceFingerprint::from_bytes([2; 32]),
             seq: u64::MAX,
-            prev_hash: Some([3; 32]),
-            parent_ref: Some([4; 32]),
+            prev_hash: Some(AccountEntryHash::from_bytes([3; 32])),
+            parent_ref: Some(AccountEntryHash::from_bytes([4; 32])),
             entry_type: super::super::ops::entry_type::SNAPSHOT,
             op_version: fold::SUPPORTED_OP_VERSION,
             crypto_suite: 0,
             auth_len: u64::MAX,
             key_id: None,
-            authority_ref: Some([5; 32]),
+            authority_ref: Some(OwnerId::from_bytes([5; 32])),
         }
     }
 
@@ -268,7 +268,7 @@ mod coverage_ceiling_tests {
                         CoveredWatermark {
                             device_fingerprint: DeviceFingerprint::from_bytes(fp),
                             seq: u64::MAX,
-                            entry_hash: [0xcd; 32],
+                            entry_hash: AccountEntryHash::from_bytes([0xcd; 32]),
                         }
                     })
                     .collect(),
@@ -343,7 +343,7 @@ mod coverage_ceiling_tests {
                             CoveredWatermark {
                                 device_fingerprint: DeviceFingerprint::from_bytes(fp),
                                 seq: 0,
-                                entry_hash: [0; 32],
+                                entry_hash: AccountEntryHash::from_bytes([0; 32]),
                             }
                         })
                         .collect(),

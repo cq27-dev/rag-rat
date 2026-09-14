@@ -234,7 +234,7 @@ pub(crate) fn grant_repo_writer(
         now_ms,
     )?;
     tx.commit()?;
-    Ok(grant_id)
+    Ok(grant_id.into())
 }
 
 /// One row of the owner-facing grant listing (`sync grants`), hex-rendered for display.
@@ -264,7 +264,7 @@ pub(crate) fn list_repo_grants(conn: &Connection) -> anyhow::Result<Vec<RepoGran
             grantee_account_id: rag_rat_base::hash::hex_lower(&grant.grantee_account_id.to_bytes()),
             role: grant.role,
             open: grant.open,
-            grant_id: rag_rat_base::hash::hex_lower(&grant.grant_id),
+            grant_id: rag_rat_base::hash::hex_lower(grant.grant_id.as_slice()),
         })
         .collect())
 }
@@ -315,12 +315,12 @@ pub(crate) fn revoke_repo_writer(
         grant_ids: revocation
             .grant_ids
             .iter()
-            .map(|id| rag_rat_base::hash::hex_lower(id))
+            .map(|id| rag_rat_base::hash::hex_lower(id.as_slice()))
             .collect(),
         revoke_ids: revocation
             .revoke_ids
             .iter()
-            .map(|id| rag_rat_base::hash::hex_lower(id))
+            .map(|id| rag_rat_base::hash::hex_lower(id.as_slice()))
             .collect(),
         reason: reason.as_db_str().to_string(),
         cuts: revocation

@@ -243,7 +243,7 @@ where
             verify_enrollment_device_add(
                 &receipt.account_entries,
                 expected_account,
-                receipt.device_add_hash,
+                receipt.device_add_hash.into(),
                 &receipt.device_add_signed,
                 request.ed25519_pubkey,
                 request.x25519_pubkey,

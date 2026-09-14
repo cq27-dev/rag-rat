@@ -107,7 +107,7 @@ pub use fold::{
     GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
     RosterContentAuthority,
 };
-pub use id::AccountId;
+pub use id::{AccountEntryHash, AccountId, GrantId, OwnerId, RosterRef, SignedHash};
 // C4.1 content-key primitives the C4.3b sealing surface exposes: `ContentKey` is the `Ready`
 // payload C5's seal path consumes; `KeyId` is the selection identity (#607).
 pub use keywrap::{ContentKey, KeyId};
