@@ -334,7 +334,13 @@ pub(crate) fn maintenance_pass_scoped(
 ) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, run_gc, false, overlay_scope, watch_counters, live_oracle)
+    run_pass(config, PassSpec {
+        run_gc,
+        retry_base_embedding_backlog: false,
+        overlay_scope,
+        watch_counters,
+        live_oracle,
+    })
 }
 
 /// Run one maintenance pass only if the write lock is free within `SKIP_TIMEOUT`; returns whether
@@ -344,7 +350,13 @@ pub fn maintenance_pass_or_skip(config: &Config, run_gc: bool) -> anyhow::Result
     let lock_repo = locks::write_lock_repo_id(config);
     match locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SKIP_TIMEOUT)? {
         Some(_lock) => {
-            run_pass(config, run_gc, false, &OverlayScope::All, None, None)?;
+            run_pass(config, PassSpec {
+                run_gc,
+                retry_base_embedding_backlog: false,
+                overlay_scope: &OverlayScope::All,
+                watch_counters: None,
+                live_oracle: None,
+            })?;
             Ok(true)
         },
         None => Ok(false),
@@ -358,36 +370,65 @@ pub(crate) fn startup_catchup_pass(
 ) -> anyhow::Result<()> {
     let lock_repo = locks::write_lock_repo_id(config);
     let _lock = locks::WriteLock::acquire_blocking(&config.database, &lock_repo)?;
-    run_pass(config, STARTUP_CATCHUP_RUN_GC, true, &OverlayScope::All, watch_counters, live_oracle)
+    run_pass(config, PassSpec {
+        run_gc: STARTUP_CATCHUP_RUN_GC,
+        retry_base_embedding_backlog: true,
+        overlay_scope: &OverlayScope::All,
+        watch_counters,
+        live_oracle,
+    })
 }
 
-fn run_pass(
-    config: &Config,
+struct PassSpec<'a> {
     run_gc: bool,
     retry_base_embedding_backlog: bool,
-    overlay_scope: &OverlayScope,
-    watch_counters: Option<&WatchPlacementCounters>,
-    live_oracle: Option<&mut LiveOracleTail>,
-) -> anyhow::Result<()> {
+    overlay_scope: &'a OverlayScope,
+    watch_counters: Option<&'a WatchPlacementCounters>,
+    live_oracle: Option<&'a mut LiveOracleTail>,
+}
+
+struct PassContext<'a> {
+    db: IndexDatabase,
+    config: &'a Config,
+    timings: PassTimings,
+    budget: ReconcileBudget,
+}
+
+struct Discovery {
+    db: IndexDatabase,
+    content_changed: bool,
+    clone_delta_hint: Option<std::collections::BTreeSet<String>>,
+}
+
+struct TailTriggers {
+    content_changed: bool,
+    run_gc: bool,
+    shutdown_reconcile_pending: bool,
+    retry_base_embedding_backlog: bool,
+}
+
+struct TailDecision {
+    base_tail_forced: bool,
+    base_embedding_backlog: bool,
+    clone_graph_due: bool,
+    run_base_tail: bool,
+}
+
+fn run_pass(config: &Config, spec: PassSpec<'_>) -> anyhow::Result<()> {
+    let PassSpec {
+        run_gc,
+        retry_base_embedding_backlog,
+        overlay_scope,
+        watch_counters,
+        live_oracle,
+    } = spec;
     let started = Instant::now();
     let mut timings = PassTimings::new(started);
-    // #427: the core refuses a first-time-empty registration (`rag-rat mcp` / a hook on a config
-    // with no `[target_bindings]` or no matching files). A maintenance/watch pass treats that as
-    // "nothing to index yet" and DEFERS silently — a later pass registers once real content
-    // appears. A recorded root going empty still prunes (not first-time → not refused). The
-    // one-shot `index` command instead surfaces the same error to the operator.
-    let discover = timings.stage("discover", || IndexDatabase::index_discover_reporting(config));
-    let (mut db, pass) = match discover {
-        Ok(result) => result,
-        Err(err) if err.downcast_ref::<crate::index::EmptyIndexRefused>().is_some() => {
-            return Ok(());
-        },
-        Err(err) => return Err(err),
+    let Some(Discovery { db, content_changed, clone_delta_hint }) =
+        discover_or_defer(config, &mut timings)?
+    else {
+        return Ok(());
     };
-    let content_changed = pass.content_changed;
-    // #830: the clone-delta changed-set hint this pass produced (the base paths it reindexed or
-    // deleted, or `None` when the pass can't offer a reliable superset — a heal / bootstrap).
-    let clone_delta_hint = pass.clone_delta_hint;
     // Persist the resident watcher's watch-placement failure count (as a high-water mark) so
     // `index_status` can surface silently-dropped watches — a directory whose watch failed (ENOSPC
     // on Linux) falls back to this very sweep, but without this the degradation is invisible. This
@@ -412,22 +453,117 @@ fn run_pass(
     // with several changed overlays can't blow past `PASS_RECONCILE_MAX_SECONDS` (N+1)× over (#219
     // review). Measured from `started` so discovery time already counts against it.
     let budget = ReconcileBudget::new(options, started);
+    let mut ctx = PassContext { db, config, timings, budget };
     // Keep every live linked worktree's branch overlay fresh (#219), so a `worktree`-scoped query
     // sees that branch's changes without a manual `index --worktree`. Delta-only and idle-safe (the
     // overlay pass writes nothing when a worktree is unchanged), so it can run every pass; a
     // worktree change counts toward running the tail below even when config.root itself didn't
     // change. Reconcile a CHANGED overlay's embeddings INLINE (while scoped to it) so a worktree
     // query isn't BM25-only for branch content — the base reconcile below can't see overlay chunks.
-    let overlays = timings.stage("overlays", || {
-        refresh_worktree_overlays(&mut db, config, Some(&budget), overlay_scope)
+    let overlays = ctx.timings.stage("overlays", || {
+        refresh_worktree_overlays(&mut ctx.db, ctx.config, Some(&ctx.budget), overlay_scope)
     });
     let overlays_changed = overlays.changed;
+    let mut decision = probe_tail(&ctx, TailTriggers {
+        content_changed,
+        run_gc,
+        shutdown_reconcile_pending,
+        retry_base_embedding_backlog,
+    });
+    // Live oracle (#74 slice 2 / #534): resolve this pass's changed Rust files through the
+    // resident LSP client, writing `ra-lsp` verdicts as a per-pass freshness patch (the batch
+    // pass stays canonical). Runs BEFORE the tail decision on purpose: on a quiet pass the work
+    // side is a cheap no-op (no changed set, empty backlog), but the idle-shutdown sweep inside
+    // must still fire so a gone-quiet server releases the resident language server. Only the
+    // resident watcher passes the state in — hook/CLI passes skip the stage entirely.
+    if let Some(live) = live_oracle {
+        // Both halves of the pass's changed set (#1010): the base scope's paths, and what each
+        // linked checkout's overlay refresh above changed. A linked worktree is a different source
+        // tree, so its edits can only be answered by a server rooted there — handing them to the
+        // main checkout's session would resolve them against the wrong files.
+        let changed = super::live_oracle::LiveChangedSets {
+            base: clone_delta_hint.as_ref(),
+            overlays: &overlays.reindexed,
+        };
+        // The only failure this stage propagates is a base scope it could not restore — see
+        // `on_pass`. Everything else about the live oracle is best-effort and logged.
+        ctx.timings.stage("live_oracle", || live.on_pass(&mut ctx.db, ctx.config, &changed))?;
+    }
+    // Idle backstop (issue #63, facet 2): when the sweep changed nothing, skip everything past
+    // discovery — an idle server should do no work. `run_gc` (every GC_EVERY_PASSES) still forces
+    // a full tail, so the cases that DON'T flip content_changed are still caught within that
+    // bound: a freshly-installed embedder, an embedding backlog left by a time-capped reconcile
+    // (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real content change runs the
+    // full tail immediately. Startup has two discover-only exceptions: a prior bounded shutdown
+    // discover that marked base reconcile owed, and an already-indexed base embedding backlog
+    // left by a time-capped or blocked prior pass.
+    // Overlay changes do NOT force the base tail (#817): the overlay stage above already
+    // reconciled a changed overlay's embeddings inline, so running the full base tail on every
+    // overlay keystroke would treadmill the base reconcile, the clone delta (whose corpus-scale
+    // `delta_paths` sweep was measured at 66–94 s per pass under worktree churn), and gc. An
+    // overlay edit does move the GLOBAL `content_revision()` (overlay rows are `main.files` rows),
+    // so that digest move — and any base work it implies — is picked up on the next content, gc,
+    // or backlog pass instead. Such a pass runs only `memory_validate` below — cheap next to the
+    // base stages, and overlay edits can move memory anchors.
+    decide_tail(&mut decision);
+    if !decision.run_base_tail && !overlays_changed {
+        ctx.timings
+            .stage("wal", || maybe_checkpoint_wal(&ctx.db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
+        ctx.timings.emit(false, content_changed, overlays_changed);
+        // No heap trim on the idle exit: a discover-only sweep allocates nothing worth
+        // returning, and any earlier heavy pass already trimmed at its own terminal — trimming
+        // here would just take the malloc locks every 60 s for nothing.
+        return Ok(());
+    }
+    let base_reconcile_status =
+        run_base_tail(&mut ctx, &decision, run_gc, clone_delta_hint.as_ref())?;
+    run_memory_tail(&mut ctx);
+    if shutdown_reconcile_pending
+        && base_reconcile_status == Some(crate::index::ai::ReconcileStatus::Current)
+    {
+        ctx.db.clear_watch_shutdown_reconcile_pending()?;
+    }
+    finish_pass(ctx, content_changed, overlays_changed)
+}
+
+fn discover_or_defer(
+    config: &Config,
+    timings: &mut PassTimings,
+) -> anyhow::Result<Option<Discovery>> {
+    // #427: the core refuses a first-time-empty registration (`rag-rat mcp` / a hook on a config
+    // with no `[target_bindings]` or no matching files). A maintenance/watch pass treats that as
+    // "nothing to index yet" and DEFERS silently — a later pass registers once real content
+    // appears. A recorded root going empty still prunes (not first-time → not refused). The
+    // one-shot `index` command instead surfaces the same error to the operator.
+    let discover = timings.stage("discover", || IndexDatabase::index_discover_reporting(config));
+    let (db, pass) = match discover {
+        Ok(result) => result,
+        Err(err) if err.downcast_ref::<crate::index::EmptyIndexRefused>().is_some() => {
+            return Ok(None);
+        },
+        Err(err) => return Err(err),
+    };
+    let content_changed = pass.content_changed;
+    // #830: the clone-delta changed-set hint this pass produced (the base paths it reindexed or
+    // deleted, or `None` when the pass can't offer a reliable superset — a heal / bootstrap).
+    let clone_delta_hint = pass.clone_delta_hint;
+    Ok(Some(Discovery { db, content_changed, clone_delta_hint }))
+}
+
+fn probe_tail(ctx: &PassContext<'_>, triggers: TailTriggers) -> TailDecision {
+    let TailTriggers {
+        content_changed,
+        run_gc,
+        shutdown_reconcile_pending,
+        retry_base_embedding_backlog,
+    } = triggers;
+    let PassContext { db, budget, .. } = ctx;
     let base_tail_forced =
         base_tail_forced_by_state(content_changed, run_gc, shutdown_reconcile_pending);
     let base_embedding_backlog = base_embedding_backlog_needs_tail(
         base_tail_forced,
         retry_base_embedding_backlog,
-        &budget,
+        budget,
         |options| {
             db.pending_embedding_jobs_with_available_incremental_embedder(options)
                 .is_ok_and(|pending| pending > 0)
@@ -454,58 +590,28 @@ fn run_pass(
     let clone_graph_due = db
         .clone_graph_rebuild_due(CLONE_GRAPH_QUIET_MS, base_tail_forced || base_embedding_backlog)
         .unwrap_or(false);
-    // Live oracle (#74 slice 2 / #534): resolve this pass's changed Rust files through the
-    // resident LSP client, writing `ra-lsp` verdicts as a per-pass freshness patch (the batch
-    // pass stays canonical). Runs BEFORE the tail decision on purpose: on a quiet pass the work
-    // side is a cheap no-op (no changed set, empty backlog), but the idle-shutdown sweep inside
-    // must still fire so a gone-quiet server releases the resident language server. Only the
-    // resident watcher passes the state in — hook/CLI passes skip the stage entirely.
-    if let Some(live) = live_oracle {
-        // Both halves of the pass's changed set (#1010): the base scope's paths, and what each
-        // linked checkout's overlay refresh above changed. A linked worktree is a different source
-        // tree, so its edits can only be answered by a server rooted there — handing them to the
-        // main checkout's session would resolve them against the wrong files.
-        let changed = super::live_oracle::LiveChangedSets {
-            base: clone_delta_hint.as_ref(),
-            overlays: &overlays.reindexed,
-        };
-        // The only failure this stage propagates is a base scope it could not restore — see
-        // `on_pass`. Everything else about the live oracle is best-effort and logged.
-        timings.stage("live_oracle", || live.on_pass(&mut db, config, &changed))?;
-    }
-    // Idle backstop (issue #63, facet 2): when the sweep changed nothing, skip everything past
-    // discovery — an idle server should do no work. `run_gc` (every GC_EVERY_PASSES) still forces
-    // a full tail, so the cases that DON'T flip content_changed are still caught within that
-    // bound: a freshly-installed embedder, an embedding backlog left by a time-capped reconcile
-    // (PASS_RECONCILE_MAX_SECONDS), and drifted memory anchors. Any real content change runs the
-    // full tail immediately. Startup has two discover-only exceptions: a prior bounded shutdown
-    // discover that marked base reconcile owed, and an already-indexed base embedding backlog
-    // left by a time-capped or blocked prior pass.
-    // Overlay changes do NOT force the base tail (#817): the overlay stage above already
-    // reconciled a changed overlay's embeddings inline, so running the full base tail on every
-    // overlay keystroke would treadmill the base reconcile, the clone delta (whose corpus-scale
-    // `delta_paths` sweep was measured at 66–94 s per pass under worktree churn), and gc. An
-    // overlay edit does move the GLOBAL `content_revision()` (overlay rows are `main.files` rows),
-    // so that digest move — and any base work it implies — is picked up on the next content, gc,
-    // or backlog pass instead. Such a pass runs only `memory_validate` below — cheap next to the
-    // base stages, and overlay edits can move memory anchors.
-    let run_base_tail = should_run_base_tail(
-        content_changed,
-        run_gc,
-        shutdown_reconcile_pending,
-        base_embedding_backlog,
-        clone_graph_due,
+    TailDecision { base_tail_forced, base_embedding_backlog, clone_graph_due, run_base_tail: false }
+}
+
+fn decide_tail(decision: &mut TailDecision) {
+    decision.run_base_tail = should_run_base_tail(
+        decision.base_tail_forced,
+        false,
+        false,
+        decision.base_embedding_backlog,
+        decision.clone_graph_due,
     );
-    if !run_base_tail && !overlays_changed {
-        timings.stage("wal", || maybe_checkpoint_wal(&db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
-        timings.emit(false, content_changed, overlays_changed);
-        // No heap trim on the idle exit: a discover-only sweep allocates nothing worth
-        // returning, and any earlier heavy pass already trimmed at its own terminal — trimming
-        // here would just take the malloc locks every 60 s for nothing.
-        return Ok(());
-    }
+}
+
+fn run_base_tail(
+    ctx: &mut PassContext<'_>,
+    decision: &TailDecision,
+    run_gc: bool,
+    clone_delta_hint: Option<&std::collections::BTreeSet<String>>,
+) -> anyhow::Result<Option<crate::index::ai::ReconcileStatus>> {
+    let PassContext { db, timings, budget, .. } = ctx;
     let mut base_reconcile_status = None;
-    if run_base_tail {
+    if decision.run_base_tail {
         // The base reconcile gets only the budget the overlays left behind; `None` → already
         // exhausted, so skip it (the embedding backlog rides the next pass) rather than spend a
         // fresh full budget.
@@ -562,7 +668,7 @@ fn run_pass(
         let force_revision_neutral_rebuild = matches!(&delta, Ok(d) if matches!(d.status, CloneDeltaStatus::Escalate))
             && !db.clone_graph_stale()?;
         if clone_full_rebuild_owed
-            && (clone_graph_due || force_revision_neutral_rebuild)
+            && (decision.clone_graph_due || force_revision_neutral_rebuild)
             && let Some(options) = budget.next_options()
         {
             let _ = timings.stage("clone_rebuild", || {
@@ -573,6 +679,11 @@ fn run_pass(
             let _ = timings.stage("gc", || db.garbage_collect());
         }
     }
+    Ok(base_reconcile_status)
+}
+
+fn run_memory_tail(ctx: &mut PassContext<'_>) {
+    let PassContext { db, timings, .. } = ctx;
     let _ = timings.stage("memory_validate", || db.memory_validate());
     // Materialize any accepted synced `/3` content pulled since the last pass into the local memory
     // tables (#691 A1) — the reverse of the reconcile. Best-effort like `memory_validate` above (a
@@ -580,11 +691,14 @@ fn run_pass(
     // no-op. This is the long-running-process backstop so a pull after open surfaces without a
     // reopen; open + consolidate drain at their own seams.
     let _ = timings.stage("memory_drain", || db.drain_synced_memory());
-    if shutdown_reconcile_pending
-        && base_reconcile_status == Some(crate::index::ai::ReconcileStatus::Current)
-    {
-        db.clear_watch_shutdown_reconcile_pending()?;
-    }
+}
+
+fn finish_pass(
+    ctx: PassContext<'_>,
+    content_changed: bool,
+    overlays_changed: bool,
+) -> anyhow::Result<()> {
+    let PassContext { db, mut timings, .. } = ctx;
     timings.stage("wal", || maybe_checkpoint_wal(&db, crate::index::WAL_CHECKPOINT_MIN_BYTES));
     // This exit is only reached when the pass did real work (a base tail ran or an overlay
     // refresh wrote), so the transient working set — SQLite's page cache and
