@@ -80,8 +80,7 @@ fn receiver_type_identity<'a>(
     };
     let original_path =
         original_hint.map(str::trim).filter(|hint| !hint.is_empty()).map(degeneric_path);
-    let original_root =
-        original_path.as_deref().map(|hint| hint.split_once("::").map_or(hint, |(root, _)| root));
+    let original_root = original_path.as_deref().map(scope_grammar::path_root);
     let resolved_path = resolved_hint.map(degeneric_path);
     if original_root.is_some_and(|root| {
         import_scope.is_glob_import_bound(file_id, root, ref_byte)
@@ -94,8 +93,7 @@ fn receiver_type_identity<'a>(
     }
     let identity = ReceiverTypeIdentity::classify(resolved_hint, |resolved_root| {
         let resolved_path = degeneric_path(resolved_root);
-        let resolved_root =
-            resolved_path.split_once("::").map_or(resolved_path.as_str(), |(root, _)| root);
+        let resolved_root = scope_grammar::path_root(&resolved_path);
         receiver_root_origin(
             import_scope,
             index,
@@ -115,7 +113,7 @@ fn receiver_type_identity<'a>(
 
 /// The package a receiver hint is confined to, or `None` when it may name a type from anywhere.
 ///
-/// The ROOT is the only segment an import can bind, and lexical qualification encodes no more crate
+/// Lexical qualification encodes no more crate
 /// identity than a bare name does: two crates each declaring `inner::Worker` store one key. So a
 /// qualified hint is restricted too unless a `use` says where it came from — `crate`/`self`/`super`
 /// are never import bindings, and they mean THIS crate, so they restrict as well.
@@ -130,7 +128,7 @@ fn receiver_package(
         return None;
     }
     let structural = degeneric_path(hint);
-    let root = structural.split_once("::").map_or(structural.as_str(), |(root, _)| root);
+    let root = scope_grammar::path_root(&structural);
     if import_scope.is_import_bound(file_id, root, ref_byte) {
         None
     } else {
@@ -154,7 +152,7 @@ struct ImportAliasResolveRequest<'a> {
 /// `use crate::Worker as Alias;` makes `Alias` the only spelling the source has, but the method is
 /// stored under `Worker::run` — so the written hint probes a scope that cannot exist, and because a
 /// present receiver type also closes the bare-name fallback it takes the call's last chance with
-/// it. Only the ROOT segment can be an import binding, so only that is rewritten. Unlike a bare
+/// it. Only the root is rewritten (see [`scope_grammar::path_root`]). Unlike a bare
 /// name rebind, the complete imported owner remains unambiguous when its leaf is defined in this
 /// file — that is the normal shape of an alias for an inline module.
 fn alias_resolved_receiver_hint(
@@ -164,10 +162,7 @@ fn alias_resolved_receiver_hint(
     ref_byte: usize,
 ) -> Option<String> {
     let hint = hint?.trim();
-    let (root, rest) = match hint.split_once("::") {
-        Some((root, rest)) => (root, Some(rest)),
-        None => (hint, None),
-    };
+    let (root, rest) = scope_grammar::split_path_root(hint);
     let target = import_scope.import_alias_target(file_id, root, ref_byte)?;
     if target == root {
         return None;
@@ -272,6 +267,8 @@ fn resolve_reference<'s>(
     let aliased_receiver_type =
         alias_resolved_receiver_hint(import_scope, file_id, receiver_type_hint, ref_byte);
     let receiver_alias_bound = receiver_type_hint.is_some_and(|hint| {
+        // Preserve the legacy probe: generic receiver aliases are not degenericized here.
+        // Changing this gate also changes which receiver fallback paths may bind.
         let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
         import_scope.has_import_alias(file_id, root, ref_byte)
     });
