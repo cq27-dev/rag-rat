@@ -727,7 +727,7 @@ pub(crate) struct SymbolTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct ImpactKey {
-    category: &'static str,
+    category: ImpactCategory,
     path: String,
     symbol: Option<String>,
     reason: String,
@@ -752,7 +752,7 @@ impl ImpactSurface {
     ) {
         let reason = reason.into();
         let key = ImpactKey {
-            category: category.as_str(),
+            category,
             path: file_symbol.path.clone(),
             symbol: file_symbol.symbol.clone(),
             reason: reason.clone(),
@@ -774,8 +774,8 @@ impl ImpactSurface {
 
     fn current_paths(&self) -> Vec<String> {
         let mut paths = BTreeSet::new();
-        for item in self.items.values() {
-            if item.category != ImpactCategory::HistoricalPapertrail.as_str() {
+        for (key, item) in &self.items {
+            if key.category != ImpactCategory::HistoricalPapertrail {
                 paths.insert(item.path.clone());
             }
         }
@@ -783,17 +783,19 @@ impl ImpactSurface {
     }
 
     fn into_items(self, limit: usize) -> Vec<ImpactItem> {
-        let mut items = self.items.into_values().collect::<Vec<_>>();
-        items.sort_by_key(|item| {
+        // Category precedence is `ImpactCategory`'s declaration order (its derived `Ord`).
+        let mut items =
+            self.items.into_iter().map(|(key, item)| (key.category, item)).collect::<Vec<_>>();
+        items.sort_by_key(|(category, item)| {
             (
-                category_rank(&item.category),
+                *category,
                 reason_rank(&item.reason),
                 item.path.clone(),
                 item.symbol.clone().unwrap_or_default(),
             )
         });
         items.truncate(limit);
-        items
+        items.into_iter().map(|(_, item)| item).collect()
     }
 }
 
