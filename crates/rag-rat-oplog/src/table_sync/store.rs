@@ -291,7 +291,7 @@ fn sign_next_row_entry(
         );
     }
     let lamport = next_stream_lamport(tx, stream)?;
-    let prev_hash = stored_tail.map(|(_, entry_hash)| entry_hash);
+    let prev_hash = stored_tail.map(|tail| tail.entry_hash);
     Ok(entry::sign_entry_from_op_bytes(secret, stream, prev_hash, lamport, row_op::encode(op)))
 }
 
@@ -363,7 +363,7 @@ pub(crate) fn accept_row_entry(
     tx: &Transaction<'_>,
     ctx: &AcceptCtx<'_>,
     signed_bytes: &[u8],
-    advertised_floor: Option<AdvertisedFloor>,
+    advertised_floor: Option<ChainCursor>,
 ) -> anyhow::Result<AcceptOutcome> {
     let AcceptCtx { account_id, expected_stream, expected_tables, pubkey, now_ms } = *ctx;
     anyhow::ensure!(
@@ -439,7 +439,7 @@ pub(crate) fn accept_row_entry(
             advertised_floor.is_some_and(|floor| {
                 verified.lamport == floor.lamport && verified.entry_hash == floor.entry_hash
             }) && chain_tail(tx, expected_stream, verified.device_fingerprint)?
-                .is_none_or(|(tip, _)| verified.lamport > tip);
+                .is_none_or(|tail| verified.lamport > tail.lamport);
         if !adoptable_floor_root {
             return Ok(AcceptOutcome::AlreadyGapped);
         }
@@ -514,13 +514,16 @@ enum ChainFit {
     Conflict,
 }
 
-/// The retained floor a peer advertised for one chain: routing advice that lets a receiver
-/// accept the floor entry as its chain root — a fresh chain, or a RE-ROOT when the receiver's
-/// accepted tip fell below the floor (offline across the churn). Honored only when the entry IS
-/// the advertised floor — the lamport and hash must match exactly, so the advice can never bless
-/// an entry the sender did not itself just produce as the root.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct AdvertisedFloor {
+/// One position in a `(stream, device)` chain: an entry's lamport and hash — what the chain's tail
+/// and its retained witness are read as, and the shape of the floor a peer advertises.
+///
+/// An advertised floor is routing advice that lets a receiver accept the floor entry as its chain
+/// root — a fresh chain, or a RE-ROOT when the receiver's accepted tip fell below the floor
+/// (offline across the churn). Honored only when the entry IS the advertised floor — the lamport
+/// and hash must match exactly, so the advice can never bless an entry the sender did not itself
+/// just produce as the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChainCursor {
     pub lamport: u64,
     pub entry_hash: EntryHash,
 }
@@ -529,10 +532,10 @@ fn classify(
     tx: &Transaction<'_>,
     stream: StreamId,
     verified: &VerifiedEntry,
-    advertised_floor: Option<AdvertisedFloor>,
+    advertised_floor: Option<ChainCursor>,
 ) -> anyhow::Result<ChainFit> {
     let tail = chain_tail(tx, stream, verified.device_fingerprint)?;
-    let tail_lamport = tail.map(|(lamport, _)| lamport);
+    let tail_lamport = tail.map(|tail| tail.lamport);
     let witness =
         if tail.is_none() { chain_witness(tx, stream, verified.device_fingerprint)? } else { None };
     if let Some(floor) = advertised_floor
@@ -549,10 +552,8 @@ fn classify(
             // citing the witness park forever. Adoption is valid only at or past the witness:
             // the floor entry being the witness is the compacted-sender/restored-receiver
             // rendezvous.
-            let regresses_witness = witness.is_some_and(|(witness_lamport, witness_hash)| {
-                !(floor.lamport == witness_lamport && floor.entry_hash == witness_hash)
-                    && floor.lamport <= witness_lamport
-            });
+            let regresses_witness =
+                witness.is_some_and(|witness| floor != witness && floor.lamport <= witness.lamport);
             if !regresses_witness {
                 return Ok(ChainFit::RootAdopt);
             }
@@ -565,15 +566,15 @@ fn classify(
             return Ok(ChainFit::RootAdopt);
         }
     }
-    if let Some((witness_lamport, witness_hash)) = witness {
-        if verified.entry_hash == witness_hash && verified.lamport == witness_lamport {
+    if let Some(witness) = witness {
+        if verified.entry_hash == witness.entry_hash && verified.lamport == witness.lamport {
             return Ok(ChainFit::Restore);
         }
         return Ok(match verified.prev_hash {
-            Some(prev) if prev == witness_hash && verified.lamport > witness_lamport =>
+            Some(prev) if prev == witness.entry_hash && verified.lamport > witness.lamport =>
                 ChainFit::Ok,
             None => ChainFit::Conflict,
-            Some(_) if verified.lamport <= witness_lamport => ChainFit::Conflict,
+            Some(_) if verified.lamport <= witness.lamport => ChainFit::Conflict,
             Some(_) => ChainFit::Gap,
         });
     }
@@ -594,10 +595,10 @@ fn classify(
             } else {
                 ChainFit::Gap
             },
-        (Some(prev), Some((tail_lamport, tail_hash))) =>
-            if prev == tail_hash && verified.lamport > tail_lamport {
+        (Some(prev), Some(tail)) =>
+            if prev == tail.entry_hash && verified.lamport > tail.lamport {
                 ChainFit::Ok
-            } else if verified.lamport <= tail_lamport {
+            } else if verified.lamport <= tail.lamport {
                 ChainFit::Conflict // at/behind the tail — an equivocation.
             } else if entry_exists(tx, &prev)? {
                 // Links PAST the tail to an ALREADY-STORED ancestor: that ancestor already has a
@@ -618,7 +619,7 @@ fn chain_tail(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: DeviceFingerprint,
-) -> anyhow::Result<Option<(u64, EntryHash)>> {
+) -> anyhow::Result<Option<ChainCursor>> {
     let stream_bytes = stream.to_bytes();
     let device_bytes = device.to_bytes();
     let row = tx
@@ -629,15 +630,20 @@ fn chain_tail(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::try_from_sql(hash)?)))
-        .transpose()
+    row.map(|(lamport, hash)| {
+        Ok(ChainCursor {
+            lamport: u64::try_from(lamport)?,
+            entry_hash: EntryHash::try_from_sql(hash)?,
+        })
+    })
+    .transpose()
 }
 
 fn chain_witness(
     tx: &Transaction<'_>,
     stream: StreamId,
     device: DeviceFingerprint,
-) -> anyhow::Result<Option<(u64, EntryHash)>> {
+) -> anyhow::Result<Option<ChainCursor>> {
     let row = tx
         .query_row(
             "SELECT lamport, entry_hash FROM table_sync_chain_tips
@@ -646,8 +652,13 @@ fn chain_witness(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::try_from_sql(hash)?)))
-        .transpose()
+    row.map(|(lamport, hash)| {
+        Ok(ChainCursor {
+            lamport: u64::try_from(lamport)?,
+            entry_hash: EntryHash::try_from_sql(hash)?,
+        })
+    })
+    .transpose()
 }
 
 fn entry_exists(tx: &Transaction<'_>, entry_hash: &EntryHash) -> anyhow::Result<bool> {
@@ -2817,7 +2828,7 @@ mod tests {
                     now_ms: 0
                 },
                 &signed.signed_bytes,
-                Some(AdvertisedFloor {
+                Some(ChainCursor {
                     lamport: signed.entry.lamport,
                     entry_hash: signed.entry.entry_hash,
                 })

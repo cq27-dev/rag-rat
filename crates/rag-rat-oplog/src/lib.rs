@@ -188,10 +188,10 @@ pub use stream::{AccessMode, EntryHash, StreamId};
 // The table-sync forward-compat seam (#1001): replay entries retained but not projected when
 // they arrived. Belongs at store open, before producing — see the module docs.
 pub use table_sync::{
-    LocalWriterMemo, TABLE_SYNC_ENTRY_MAX_BYTES, TableSyncChainEntry, TableSyncChainHead,
-    TableSyncEntryStart, TableSyncFrontier, TableSyncIngestOutcome, TableSyncReceived,
-    TableSyncStream, refold_stale_table_sync_projections, scope_retention_budget,
-    table_sync_author_pending, table_sync_chain_entries, table_sync_chain_frontier,
-    table_sync_chain_page_after, table_sync_compact_overdue, table_sync_ingest,
-    table_sync_supported_streams, table_sync_validate_stream,
+    LocalWriterMemo, TABLE_SYNC_ENTRY_MAX_BYTES, TableSyncChainCursor, TableSyncChainEntry,
+    TableSyncChainHead, TableSyncEntryStart, TableSyncFrontier, TableSyncIngestOutcome,
+    TableSyncReceived, TableSyncStream, refold_stale_table_sync_projections,
+    scope_retention_budget, table_sync_author_pending, table_sync_chain_entries,
+    table_sync_chain_frontier, table_sync_chain_page_after, table_sync_compact_overdue,
+    table_sync_ingest, table_sync_supported_streams, table_sync_validate_stream,
 };
