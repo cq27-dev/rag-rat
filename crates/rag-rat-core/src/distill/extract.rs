@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::distill::candidates::{self, AnchorCaps};
-use crate::distill::thread::{self, ThreadKey};
+use crate::distill::thread::{self, SourceKind, SourcePart, SourceRole, ThreadKey};
 use crate::distill::{prompts, units, validate};
 
 /// Bumped whenever the extraction/prompt contract changes in a way that invalidates existing
@@ -339,81 +339,6 @@ fn stronger_source(current: FixEdgeSource, seen: Option<ClosingEdgeSource>) -> F
 struct WriteOutcome {
     queued: usize,
     mechanical_status: OutcomeStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceRole {
-    Primary,
-    Partner,
-}
-
-impl SourceRole {
-    fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Primary => "primary",
-            Self::Partner => "partner",
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code, reason = "the drain will hydrate persisted snapshots"))]
-    fn from_db_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "primary" => Ok(Self::Primary),
-            "partner" => Ok(Self::Partner),
-            other => anyhow::bail!("unknown distill source role `{other}`"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceKind {
-    Item,
-    Comment,
-}
-
-impl SourceKind {
-    fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Item => "item",
-            Self::Comment => "comment",
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code, reason = "the drain will hydrate persisted snapshots"))]
-    fn from_db_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "item" => Ok(Self::Item),
-            "comment" => Ok(Self::Comment),
-            other => anyhow::bail!("unknown distill source kind `{other}`"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourcePart {
-    Title,
-    Body,
-    Comment,
-}
-
-impl SourcePart {
-    fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Title => "title",
-            Self::Body => "body",
-            Self::Comment => "comment",
-        }
-    }
-
-    #[cfg_attr(not(test), allow(dead_code, reason = "the drain will hydrate persisted snapshots"))]
-    fn from_db_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "title" => Ok(Self::Title),
-            "body" => Ok(Self::Body),
-            "comment" => Ok(Self::Comment),
-            other => anyhow::bail!("unknown distill source part `{other}`"),
-        }
-    }
 }
 
 #[derive(Debug)]
