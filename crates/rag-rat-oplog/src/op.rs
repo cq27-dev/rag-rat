@@ -119,6 +119,11 @@ impl DeviceFingerprint {
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    /// A stored `device_fingerprint` BLOB, or an error naming the column when it is not 32 bytes.
+    pub(crate) fn try_from_sql(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        cbor::sql_fixed(bytes, "device_fingerprint").map(Self)
+    }
 }
 
 impl FromStr for DeviceFingerprint {
