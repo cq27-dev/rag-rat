@@ -86,19 +86,25 @@ impl EntryHash {
 
 /// Whether a per-node override pulls a node INTO the view or drops it OUT — the per-node
 /// refinement on top of the per-kind allow-list defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::EnumString, strum::IntoStaticStr,
+)]
+#[strum(serialize_all = "snake_case")]
 pub enum NodeOverrideAction {
     Include,
     Exclude,
 }
 
 impl NodeOverrideAction {
-    /// The frozen wire token — a rename is a format change.
+    /// The frozen wire token — a rename is a format change. It is hashed into every filtered
+    /// stream id, so the encoder and [`Self::from_wire_str`] must read the same derived token.
     fn as_wire_str(self) -> &'static str {
-        match self {
-            Self::Include => "include",
-            Self::Exclude => "exclude",
-        }
+        self.into()
+    }
+
+    /// The action a wire token names, or `None` for a token this binary does not know.
+    fn from_wire_str(token: &str) -> Option<Self> {
+        token.parse().ok()
     }
 }
 
@@ -370,10 +376,9 @@ fn decode_overrides(dec: &mut Decoder<'_>) -> anyhow::Result<Vec<NodeOverride>> 
     for _ in 0..len {
         anyhow::ensure!(dec.array()? == Some(2), "stream override must be a 2-element array");
         let node_id = dec.str()?.to_string();
-        let action = match dec.str()? {
-            "include" => NodeOverrideAction::Include,
-            "exclude" => NodeOverrideAction::Exclude,
-            other => anyhow::bail!("unknown stream override action `{other}`"),
+        let token = dec.str()?;
+        let Some(action) = NodeOverrideAction::from_wire_str(token) else {
+            anyhow::bail!("unknown stream override action `{token}`");
         };
         overrides.push(NodeOverride { node_id, action });
     }
@@ -500,6 +505,23 @@ mod tests {
         assert_eq!(bytes.len(), 29);
         // And the tuple obeys the module-wide canonical-CBOR floor.
         cbor::require_canonical_cbor(&bytes).expect("spec tuple is canonical CBOR");
+    }
+
+    #[test]
+    fn override_action_wire_tokens_are_frozen_on_both_sides() {
+        // Stream-identity hash input: the encoder and the decoder must agree on exactly these.
+        for (action, token) in
+            [(NodeOverrideAction::Include, "include"), (NodeOverrideAction::Exclude, "exclude")]
+        {
+            assert_eq!(action.as_wire_str(), token);
+            assert_eq!(NodeOverrideAction::from_wire_str(token), Some(action));
+        }
+        assert_eq!(NodeOverrideAction::from_wire_str("Include"), None, "tokens are case-exact");
+        let err = decode_spec_v2(&raw_v2(STREAM_V2_DOMAIN, &owner().to_bytes(), &["repo-a"], &[(
+            "mem-1", "unknown",
+        )]))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "unknown stream override action `unknown`");
     }
 
     #[test]
