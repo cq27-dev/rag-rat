@@ -37,7 +37,8 @@ fn anchor_statement_children(anchor: &RefineMember, lo: usize, hi: usize) -> Vec
         .collect()
 }
 
-/// dropping leaf identity) plus its real source slice.
+/// One member's statement: its structural kind-skeleton (the node kinds joined, leaf identity
+/// dropped) plus its real source slice.
 ///
 /// The skeleton — NOT the struct-hash — is the match key. A struct-hash includes alpha-rename ID
 /// numbering and literal buckets, so two Type-2 variant statements (`a.map(x, y, x)` vs
