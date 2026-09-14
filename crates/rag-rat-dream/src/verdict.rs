@@ -202,13 +202,15 @@ pub(super) fn run_verdict_pass(
             // #767 review: the entry's writes commit under the removal-tombstone guard (the
             // model itself is never called for an uncitable entry, so the whole step is a write).
             super::removal_guarded_write_tx(conn, &scope, |tx| {
-                record_uncitable(tx, Uncitable {
+                record_reality(tx, RecordReality {
                     memory_id: &entry.memory_id,
                     repo_id: &repo_id,
                     title: &entry.title,
                     body: &entry.body,
+                    verdict: None,
                     checked_inputs_hash: &inputs_hash,
                     checked_against_commit: checked_against_commit.as_deref(),
+                    model_id: None,
                     now_ms,
                 })?;
                 failure::clear_failure(tx, &failure_stamp)?;
@@ -238,15 +240,15 @@ pub(super) fn run_verdict_pass(
         // tombstone re-check inside serializes with `rag-rat rm`'s purge, so a removal landing
         // mid-pass cannot leave this repo-scoped `memory_reality` row behind.
         super::removal_guarded_write_tx(conn, &scope, |tx| {
-            record_verdict(tx, RecordVerdict {
+            record_reality(tx, RecordReality {
                 memory_id: &entry.memory_id,
                 repo_id: &repo_id,
                 title: &entry.title,
                 body: &entry.body,
-                accepted: &accepted,
+                verdict: Some(&accepted),
                 checked_inputs_hash: &inputs_hash,
                 checked_against_commit: checked_against_commit.as_deref(),
-                model_id: pass.model.model_id(),
+                model_id: Some(pass.model.model_id()),
                 now_ms,
             })?;
             failure::clear_failure(tx, &failure_stamp)?;
@@ -864,29 +866,38 @@ fn strip_ci<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 // ── memory_reality write + memory_divergence derivation ───────────────────────────────────────
 
 /// Params for the single `memory_reality` UPSERT — one struct so the writer isn't a long positional
-/// train of same-typed strings.
-struct RecordVerdict<'a> {
+/// train of same-typed strings. `verdict` and `model_id` are `None` together for an uncitable
+/// memory the pass checked but could not put to the model (see [`EvidencePack::is_citable`]).
+struct RecordReality<'a> {
     memory_id: &'a str,
     repo_id: &'a str,
     title: &'a str,
     body: &'a str,
-    accepted: &'a AcceptedVerdict,
+    verdict: Option<&'a AcceptedVerdict>,
     checked_inputs_hash: &'a str,
     checked_against_commit: Option<&'a str>,
-    model_id: &'a str,
+    model_id: Option<&'a str>,
     now_ms: i64,
 }
 
-/// UPSERT the accepted verdict into `memory_reality` (PK `(repo_id, memory_id)`), stamping the
+/// UPSERT a checked memory into `memory_reality` (PK `(repo_id, memory_id)`), stamping the
 /// churn-skip comparators (`content_hash`, `checked_inputs_hash`) exactly as the queue reads them
 /// so the next run skips an unchanged memory, plus the verdict, advisory direction, cited evidence,
 /// model id, prompt version, and check timestamp. NEVER writes a `repo_memories` column.
-fn record_verdict(conn: &Connection, r: RecordVerdict<'_>) -> rusqlite::Result<()> {
+///
+/// An uncitable memory records a TERMINAL, verdict-less row: NULL `verdict`/`direction`/`model_id`
+/// and empty `evidence_json`, with the comparators and current `prompt_version` still stamped so it
+/// churn-skips instead of re-queuing every run. A NULL verdict is inert for verdict markers and
+/// divergence findings (both filter on a concrete verdict), and the row is re-evaluated when the
+/// note content, evidence, or `PROMPT_VERSION` change — exactly like a real verdict row.
+fn record_reality(conn: &Connection, r: RecordReality<'_>) -> rusqlite::Result<()> {
     let content_hash = verify::note_content_hash(r.title, r.body);
     // Store the cited pack lines as a JSON array so `divergence_findings` can render a compact,
     // stable evidence string from them.
-    let evidence_json =
-        serde_json::to_string(&r.accepted.evidence).unwrap_or_else(|_| "[]".to_string());
+    let evidence_json = r.verdict.map_or_else(
+        || "[]".to_string(),
+        |accepted| serde_json::to_string(&accepted.evidence).unwrap_or_else(|_| "[]".to_string()),
+    );
     conn.execute(
         "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, direction, \
          checked_against_commit, checked_inputs_hash, evidence_json, model_id, prompt_version, \
@@ -900,54 +911,12 @@ fn record_verdict(conn: &Connection, r: RecordVerdict<'_>) -> rusqlite::Result<(
             r.memory_id,
             r.repo_id,
             content_hash,
-            r.accepted.verdict.as_db_str(),
-            r.accepted.direction.as_db_str(),
+            r.verdict.map(|accepted| accepted.verdict.as_db_str()),
+            r.verdict.map(|accepted| accepted.direction.as_db_str()),
             r.checked_against_commit,
             r.checked_inputs_hash,
             evidence_json,
             r.model_id,
-            PROMPT_VERSION,
-            r.now_ms,
-        ],
-    )?;
-    crate::bump_memory_lens_lanes(conn, r.repo_id)?;
-    Ok(())
-}
-
-/// Params for a terminal, verdict-less `memory_reality` row — an uncitable memory the verdict pass
-/// checked but could not put to the model (see [`EvidencePack::is_citable`]).
-struct Uncitable<'a> {
-    memory_id: &'a str,
-    repo_id: &'a str,
-    title: &'a str,
-    body: &'a str,
-    checked_inputs_hash: &'a str,
-    checked_against_commit: Option<&'a str>,
-    now_ms: i64,
-}
-
-/// Record a TERMINAL, verdict-less `memory_reality` row for an uncitable memory: NULL
-/// `verdict`/`direction`/`model_id`, empty `evidence_json`, but the churn-skip comparators
-/// (`content_hash`, `checked_inputs_hash`) and current `prompt_version` stamped so the memory
-/// churn-skips instead of re-queuing every run. A NULL verdict is inert for verdict markers and
-/// divergence findings (both filter on a concrete verdict). Re-evaluated when the note content,
-/// evidence, or `PROMPT_VERSION` change — exactly like a real verdict row.
-fn record_uncitable(conn: &Connection, r: Uncitable<'_>) -> rusqlite::Result<()> {
-    let content_hash = verify::note_content_hash(r.title, r.body);
-    conn.execute(
-        "INSERT INTO memory_reality(memory_id, repo_id, content_hash, verdict, direction, \
-         checked_against_commit, checked_inputs_hash, evidence_json, model_id, prompt_version, \
-         checked_at_ms) VALUES (?1,?2,?3,NULL,NULL,?4,?5,'[]',NULL,?6,?7) ON CONFLICT(repo_id, \
-         memory_id) DO UPDATE SET content_hash = excluded.content_hash, verdict = NULL, direction \
-         = NULL, checked_against_commit = excluded.checked_against_commit, checked_inputs_hash = \
-         excluded.checked_inputs_hash, evidence_json = '[]', model_id = NULL, prompt_version = \
-         excluded.prompt_version, checked_at_ms = excluded.checked_at_ms",
-        rusqlite::params![
-            r.memory_id,
-            r.repo_id,
-            content_hash,
-            r.checked_against_commit,
-            r.checked_inputs_hash,
             PROMPT_VERSION,
             r.now_ms,
         ],
@@ -2023,6 +1992,97 @@ mod tests {
 
         assert_eq!(err.reason, DreamFailureReason::MalformedVerdict);
         assert_eq!(model.calls(), 1, "malformed completions are discarded without retry");
+    }
+
+    #[test]
+    fn record_reality_overwrites_a_verdict_row_with_a_terminal_uncitable_row() {
+        // Both outcomes share one UPSERT: an uncitable re-check of a memory that previously got a
+        // verdict must NULL the verdict columns and empty the evidence on the conflict path, not
+        // leave the stale verdict behind.
+        let c = mem_db();
+        let row = |c: &Connection| {
+            c.query_row(
+                "SELECT content_hash, verdict, direction, checked_against_commit, \
+                 checked_inputs_hash, evidence_json, model_id, prompt_version, checked_at_ms FROM \
+                 memory_reality WHERE repo_id = 'r' AND memory_id = 'm1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
+                        r.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let content_hash = verify::note_content_hash("t", "b");
+        let accepted = AcceptedVerdict {
+            verdict: Verdict::Diverged,
+            direction: Direction::NoteAhead,
+            evidence: vec!["`gone_thing` -> gone".to_string()],
+        };
+        record_reality(&c, RecordReality {
+            memory_id: "m1",
+            repo_id: "r",
+            title: "t",
+            body: "b",
+            verdict: Some(&accepted),
+            checked_inputs_hash: "inputs-1",
+            checked_against_commit: Some("abc"),
+            model_id: Some("model"),
+            now_ms: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            row(&c),
+            (
+                content_hash.clone(),
+                Some("diverged".to_string()),
+                Some("note_ahead".to_string()),
+                Some("abc".to_string()),
+                Some("inputs-1".to_string()),
+                Some(r#"["`gone_thing` -> gone"]"#.to_string()),
+                Some("model".to_string()),
+                Some(PROMPT_VERSION.to_string()),
+                1,
+            ),
+            "a verdict row stamps every column"
+        );
+
+        record_reality(&c, RecordReality {
+            memory_id: "m1",
+            repo_id: "r",
+            title: "t",
+            body: "b",
+            verdict: None,
+            checked_inputs_hash: "inputs-2",
+            checked_against_commit: None,
+            model_id: None,
+            now_ms: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            row(&c),
+            (
+                content_hash,
+                None,
+                None,
+                None,
+                Some("inputs-2".to_string()),
+                Some("[]".to_string()),
+                None,
+                Some(PROMPT_VERSION.to_string()),
+                2,
+            ),
+            "an uncitable row replaces the verdict with NULLs and empty evidence"
+        );
     }
 
     // ── prompt + pack rendering ──────────────────────────────────────────────────
