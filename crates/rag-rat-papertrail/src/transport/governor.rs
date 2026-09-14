@@ -172,9 +172,12 @@ impl QuotaSnapshot {
     }
 }
 
-/// Why an [`Admission`] came back paused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PauseReason {
+/// Why an [`Admission`] came back paused. Rides `MirrorBindingReport.pause_reason` into the sync
+/// report JSON, so the serialized token is exactly [`Self::as_str`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PauseReason {
     /// A `429`/`Retry-After` hold (or a backoff that would overrun the sync pass's budget).
     RetryAfter,
     /// Header-reported quota is at/below the user reserve; resume when the window resets.
@@ -187,12 +190,7 @@ pub(crate) enum PauseReason {
 
 impl PauseReason {
     pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::RetryAfter => "retry_after",
-            Self::QuotaReserve => "quota_reserve",
-            Self::RequestBudget => "request_budget",
-            Self::PassBudget => "pass_budget",
-        }
+        self.into()
     }
 }
 

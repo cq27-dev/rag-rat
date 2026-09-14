@@ -26,7 +26,7 @@ pub async fn sync_mirror(
         if tracker_synchronization(binding) != TrackerSynchronization::Native {
             errors.push(binding_error(
                 binding,
-                "provider_client_pending",
+                SyncErrorStatus::ProviderClientPending,
                 format!("{} mirror client is not implemented yet", binding.provider.as_db_str()),
             ));
             continue;
@@ -253,7 +253,11 @@ fn prepare_binding_job<'a>(
                 PapertrailErrorClass::Authentication,
                 persisted_detail.as_deref(),
             )?;
-            errors.push(binding_error(binding, "authentication_or_transport", error.to_string()));
+            errors.push(binding_error(
+                binding,
+                SyncErrorStatus::AuthenticationOrTransport,
+                error.to_string(),
+            ));
             Ok(None)
         },
     }
@@ -292,7 +296,7 @@ async fn run_binding_job(conn: &Connection, job: BindingJob<'_>) -> anyhow::Resu
             record_failure(conn, job.binding, class, Some(&error.to_string()))?;
             Ok(BindingOutcome {
                 report: None,
-                error: Some(binding_error(job.binding, "failed", error.to_string())),
+                error: Some(binding_error(job.binding, SyncErrorStatus::Failed, error.to_string())),
             })
         },
     }
@@ -311,15 +315,19 @@ fn attested_walk_error(
     report
         .attested_error
         .as_ref()
-        .map(|detail| binding_error(binding, "attested_walk_failed", detail.clone()))
+        .map(|detail| binding_error(binding, SyncErrorStatus::AttestedWalkFailed, detail.clone()))
 }
 
-fn binding_error(binding: &ResolvedTracker, status: &str, error: String) -> PapertrailSyncError {
+fn binding_error(
+    binding: &ResolvedTracker,
+    status: SyncErrorStatus,
+    error: String,
+) -> PapertrailSyncError {
     PapertrailSyncError {
         tracker: binding.provider,
         project: binding.project.clone(),
         item_key: String::new(),
-        status: status.to_string(),
+        status,
         error,
     }
 }
@@ -936,7 +944,7 @@ mod capability_tests {
             attested_writes: 0,
             attested_error: None,
             paused_until_ms: Some(42),
-            pause_reason: Some("rate_limited".to_string()),
+            pause_reason: Some(transport::PauseReason::RetryAfter),
             completed_full_walk: false,
             probe_not_modified: false,
         };
@@ -1048,7 +1056,7 @@ mod capability_tests {
         };
         let surfaced = attested_walk_error(&binding, &failed)
             .expect("a non-pause attested failure surfaces as a binding error");
-        assert_eq!(surfaced.status, "attested_walk_failed");
+        assert_eq!(surfaced.status, SyncErrorStatus::AttestedWalkFailed);
         assert_eq!(surfaced.project, "o/r");
         assert!(surfaced.error.contains("capability unavailable"));
     }
@@ -1186,10 +1194,11 @@ mod capability_tests {
         let report = block_on(sync_mirror(&conn, Path::new("."), false, &ctx)).unwrap();
         assert_eq!(report.bindings.len(), 0);
         assert_eq!(report.failed_refs, 3);
-        assert_eq!(
-            report.errors.iter().map(|error| error.status.as_str()).collect::<Vec<_>>(),
-            vec!["provider_client_pending", "authentication_or_transport", "failed"]
-        );
+        assert_eq!(report.errors.iter().map(|error| error.status).collect::<Vec<_>>(), vec![
+            SyncErrorStatus::ProviderClientPending,
+            SyncErrorStatus::AuthenticationOrTransport,
+            SyncErrorStatus::Failed,
+        ]);
         assert_eq!(failed_handle.join().unwrap().len(), 1);
         let pending = report
             .status
@@ -1475,7 +1484,7 @@ mod scheduled_tests {
         .unwrap();
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.errors[0].project, "a/one");
-        assert_eq!(report.errors[0].status, "failed");
+        assert_eq!(report.errors[0].status, SyncErrorStatus::Failed);
         assert_eq!(report.bindings.len(), 1, "the sibling binding completes");
         assert_eq!(report.bindings[0].project, "b/two");
         assert!(report.bindings[0].completed_full_walk);

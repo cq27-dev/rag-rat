@@ -334,7 +334,7 @@ fn papertrail_sync_keeps_the_synced_item_and_retries_a_404_ref() {
     assert_eq!(report.failed_refs, 1);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].item_key, "404");
-    assert_eq!(report.errors[0].status, "not_found");
+    assert_eq!(report.errors[0].status, rag_rat_papertrail::SyncErrorStatus::NotFound);
 
     let issue_hits = db.papertrail_issue_search("sqlite", 10).unwrap();
     assert_eq!(issue_hits.len(), 1);
@@ -1035,7 +1035,7 @@ fn papertrail_sync_retries_a_failed_ref_instead_of_caching_a_partial_item() {
     )
     .unwrap();
     assert_eq!(first.failed_refs, 1);
-    assert_eq!(first.errors[0].status, "failed");
+    assert_eq!(first.errors[0].status, rag_rat_papertrail::SyncErrorStatus::Failed);
     assert_eq!(
         first.status.change_requests, 0,
         "a partial sync must cache nothing — a cached item would masquerade as a completed sync \

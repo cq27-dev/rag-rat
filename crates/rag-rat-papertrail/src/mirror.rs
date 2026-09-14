@@ -148,7 +148,7 @@ pub struct MirrorBindingReport {
     pub stored_comments: usize,
     pub pruned_items: usize,
     pub paused_until_ms: Option<i64>,
-    pub pause_reason: Option<String>,
+    pub pause_reason: Option<PauseReason>,
     pub completed_full_walk: bool,
     /// The item freshness probe answered not-modified. Combined with zero stored / pruned work
     /// this classifies the run as a successful PROBE — advancing probe freshness only, never the
@@ -164,6 +164,14 @@ pub struct MirrorBindingReport {
     /// The attested walk's failure, when it had one — EXPLICIT but non-fatal: the mirror data
     /// this run landed is kept, the watermark does not advance, and the next sync retries.
     pub attested_error: Option<String>,
+}
+
+impl MirrorBindingReport {
+    /// Record a rate-governed stop: the run keeps what it landed and resumes at `resume_at_ms`.
+    fn record_pause(&mut self, resume_at_ms: i64, reason: PauseReason) {
+        self.paused_until_ms = Some(resume_at_ms);
+        self.pause_reason = Some(reason);
+    }
 }
 
 pub(crate) async fn mirror_binding<C: PapertrailClient>(
@@ -242,10 +250,7 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
             // the explicit non-fatal `attested_error`.
             if let Err(error) = sync_attested_closers(conn, binding, client, &mut report).await {
                 match pause(&error) {
-                    Some((resume_at_ms, reason)) => {
-                        report.paused_until_ms = Some(resume_at_ms);
-                        report.pause_reason = Some(reason.as_str().to_string());
-                    },
+                    Some((resume_at_ms, reason)) => report.record_pause(resume_at_ms, reason),
                     None => report.attested_error = Some(error.to_string()),
                 }
             }
@@ -264,13 +269,13 @@ pub(crate) async fn mirror_binding<C: PapertrailClient>(
                     || filter_changed);
             Ok(report)
         },
-        Err(error) if pause(&error).is_some() => {
-            let (resume_at_ms, reason) = pause(&error).expect("checked");
-            report.paused_until_ms = Some(resume_at_ms);
-            report.pause_reason = Some(reason.as_str().to_string());
-            Ok(report)
+        Err(error) => match pause(&error) {
+            Some((resume_at_ms, reason)) => {
+                report.record_pause(resume_at_ms, reason);
+                Ok(report)
+            },
+            None => Err(error),
         },
-        Err(error) => Err(error),
     }
 }
 

@@ -90,13 +90,17 @@ pub async fn sync_refs<'a, C: PapertrailClient>(
             },
             Err(err) => {
                 let message = err.to_string();
-                let status = if is_not_found_error(&message) { "not_found" } else { "failed" };
+                let status = if is_not_found_error(&message) {
+                    SyncErrorStatus::NotFound
+                } else {
+                    SyncErrorStatus::Failed
+                };
                 report.failed_refs += 1;
                 report.errors.push(PapertrailSyncError {
                     tracker: reference.tracker,
                     project: reference.project.clone(),
                     item_key: reference.item_key.clone(),
-                    status: status.to_string(),
+                    status,
                     error: message.clone(),
                 });
                 progress(sync_progress(
