@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::auth::{AuthRole, PeerCapability, SessionCapabilities};
+use crate::auth::{self, AuthRole, PeerCapability, SessionCapabilities};
 use crate::session::{DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES};
 use crate::table_codec::{self, TableCodecError};
 use crate::table_wire::{
@@ -556,11 +556,11 @@ async fn send_ack<W: AsyncWrite + Unpin>(
     idle_timeout: Duration,
 ) -> Result<(), TableSessionError> {
     write_before(send, &TableFrame::Ack, idle_timeout).await?;
-    match tokio::time::timeout(idle_timeout, send.shutdown()).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(TableSessionError::Codec(TableCodecError::Io(error))),
-        Err(_) => Err(TableSessionError::Protocol("table session timed out while closing".into())),
-    }
+    auth::within(idle_timeout, send.shutdown(), || {
+        TableSessionError::Protocol("table session timed out while closing".into())
+    })
+    .await?
+    .map_err(|error| TableSessionError::Codec(TableCodecError::Io(error)))
 }
 
 async fn write_before<W: AsyncWrite + Unpin>(
@@ -568,10 +568,11 @@ async fn write_before<W: AsyncWrite + Unpin>(
     frame: &TableFrame,
     idle_timeout: Duration,
 ) -> Result<(), TableSessionError> {
-    match tokio::time::timeout(idle_timeout, table_codec::write_frame(send, frame)).await {
-        Ok(result) => result.map_err(TableSessionError::Codec),
-        Err(_) => Err(TableSessionError::Protocol("table session timed out while writing".into())),
-    }
+    auth::within(idle_timeout, table_codec::write_frame(send, frame), || {
+        TableSessionError::Protocol("table session timed out while writing".into())
+    })
+    .await?
+    .map_err(TableSessionError::Codec)
 }
 
 async fn read_ack<R: AsyncRead + Unpin>(
@@ -591,12 +592,14 @@ async fn read_before<R: AsyncRead + Unpin>(
     recv: &mut R,
     idle_timeout: Duration,
 ) -> Result<TableFrame, TableSessionError> {
-    match tokio::time::timeout(idle_timeout, table_codec::read_frame(recv)).await {
-        Ok(Ok(frame)) => Ok(frame),
-        Ok(Err(TableCodecError::Eof)) =>
+    let read = auth::within(idle_timeout, table_codec::read_frame(recv), || {
+        TableSessionError::Protocol("table session timed out as idle".into())
+    });
+    match read.await? {
+        Ok(frame) => Ok(frame),
+        Err(TableCodecError::Eof) =>
             Err(TableSessionError::Protocol("peer closed before table-session completion".into())),
-        Ok(Err(error)) => Err(TableSessionError::Codec(error)),
-        Err(_) => Err(TableSessionError::Protocol("table session timed out as idle".into())),
+        Err(error) => Err(TableSessionError::Codec(error)),
     }
 }
 

@@ -103,6 +103,17 @@ impl AuthRole {
     }
 }
 
+/// Run `fut` under a `window` deadline, turning an elapsed window into the caller's own error.
+/// Every lane bounds each peer-controlled frame read and write this way; only what a stall
+/// becomes differs per lane.
+pub(crate) async fn within<T, E>(
+    window: Duration,
+    fut: impl Future<Output = T>,
+    on_timeout: impl FnOnce() -> E,
+) -> Result<T, E> {
+    tokio::time::timeout(window, fut).await.map_err(|_elapsed| on_timeout())
+}
+
 /// Whether the authenticated peer may transmit entries in the data phase. This is a transport
 /// capability, not proof that the peer authored those entries: under [`AuthPolicy::Open`], a dialer
 /// permits its explicitly selected server to send the snapshot needed to restore roster state.
@@ -355,11 +366,9 @@ async fn send_grant<W: AsyncWrite + Unpin>(
     timeout: Duration,
 ) -> Result<(), AuthError> {
     let frame = Frame::AuthGrant { can_push: peer.can_push() };
-    match tokio::time::timeout(timeout, codec::write_frame(send, &frame)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(AuthError::Codec(e)),
-        Err(_elapsed) => Err(AuthError::Timeout),
-    }
+    within(timeout, codec::write_frame(send, &frame), || AuthError::Timeout)
+        .await?
+        .map_err(AuthError::Codec)
 }
 
 async fn receive_grant<R: AsyncRead + Unpin>(
@@ -367,11 +376,7 @@ async fn receive_grant<R: AsyncRead + Unpin>(
     timeout: Duration,
 ) -> Result<PeerCapability, AuthError> {
     let read = codec::read_frame_within(recv, MAX_AUTH_FRAME_BYTES);
-    let frame = match tokio::time::timeout(timeout, read).await {
-        Ok(Ok(frame)) => frame,
-        Ok(Err(e)) => return Err(AuthError::Codec(e)),
-        Err(_elapsed) => return Err(AuthError::Timeout),
-    };
+    let frame = within(timeout, read, || AuthError::Timeout).await?.map_err(AuthError::Codec)?;
     match frame {
         Frame::AuthGrant { can_push: true } => Ok(PeerCapability::ReadWrite),
         Frame::AuthGrant { can_push: false } => Ok(PeerCapability::ReadOnly),
@@ -393,11 +398,10 @@ async fn send_ours<W: AsyncWrite + Unpin>(
     // never grants receive credit would otherwise hang this write forever, blocking the acceptor's
     // single-session accept slot — a pre-auth DoS.
     let frame = Frame::Auth { account_id: cfg.account_id, binding: local.binding };
-    match tokio::time::timeout(cfg.pre_auth_timeout, codec::write_frame(send, &frame)).await {
-        Ok(Ok(())) => Ok(local.capability),
-        Ok(Err(e)) => Err(AuthError::Codec(e)),
-        Err(_elapsed) => Err(AuthError::Timeout),
-    }
+    within(cfg.pre_auth_timeout, codec::write_frame(send, &frame), || AuthError::Timeout)
+        .await?
+        .map_err(AuthError::Codec)?;
+    Ok(local.capability)
 }
 
 /// Read the peer's opening `Frame::Auth` off the stream, returning the account it named and the
@@ -409,11 +413,8 @@ async fn read_peer_auth<R: AsyncRead + Unpin>(
     pre_auth_timeout: Duration,
 ) -> Result<([u8; 32], Vec<u8>), AuthError> {
     let read = codec::read_frame_within(recv, MAX_AUTH_FRAME_BYTES);
-    let frame = match tokio::time::timeout(pre_auth_timeout, read).await {
-        Ok(Ok(frame)) => frame,
-        Ok(Err(e)) => return Err(AuthError::Codec(e)),
-        Err(_elapsed) => return Err(AuthError::Timeout),
-    };
+    let frame =
+        within(pre_auth_timeout, read, || AuthError::Timeout).await?.map_err(AuthError::Codec)?;
     let Frame::Auth { account_id, binding } = frame else {
         return Err(AuthError::Protocol("peer did not open with an auth frame".into()));
     };
