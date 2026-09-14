@@ -58,8 +58,7 @@ impl ParserBackend for Go {
 
     /// `const ( A = 1; B = 2 )` and `var x, y int` bind SEVERAL names under one spec node — the
     /// grammar marks `const_spec`/`var_spec`'s `name` field `multiple: true`. `child_by_field_name`
-    /// would return only the first, silently dropping every later binding, so each name is emitted
-    /// as its own symbol the way the Swift backend handles multi-binding properties.
+    /// would return only the first, silently dropping every later binding.
     fn for_each_symbol<'tree>(
         &self,
         node: Node<'tree>,
@@ -78,12 +77,7 @@ impl ParserBackend for Go {
         };
         let mut cursor = node.walk();
         let names = node.children_by_field_name("name", &mut cursor).collect::<Vec<_>>();
-        let multiple_bindings = names.len() > 1;
-        for name in names {
-            // A multi-binding spec needs one symbol/chunk per binding, so use the bound identifier
-            // as its unique span; a single-binding spec keeps the whole declaration span.
-            emit(if multiple_bindings { name } else { node }, (kind, name));
-        }
+        super::emit_bindings(node, kind, names, emit);
     }
 
     /// Import declarations carry no symbol a reader would search for, and Go's convention of a
