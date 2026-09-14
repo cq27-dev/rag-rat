@@ -180,6 +180,25 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn missing_config_hint(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "No rag-rat config found at `{}`.\nRun `rag-rat init` to create one, or pass --config \
+         <path>.",
+        path.display()
+    )
+}
+
+fn global_database_path_or_hint() -> anyhow::Result<PathBuf> {
+    rag_rat_base::data_dir::global_database_path().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No rag-rat config found at `{}`, and this platform has no data directory for a \
+             machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
+             <path>.",
+            rag_rat_base::config::discover_config_path(Path::new(".")).display()
+        )
+    })
+}
+
 /// Load the config, mapping a missing file to a friendly hint instead of a raw IO error.
 /// `init`/`--help`/`--version` never reach here, so this only guards commands that genuinely
 /// need a configured repo. `mcp`/`doctor` deliberately do NOT — they degrade gracefully via
@@ -187,11 +206,8 @@ fn main() -> anyhow::Result<()> {
 pub(crate) fn load_config_or_hint(explicit: Option<&str>) -> anyhow::Result<Config> {
     match discover_config_optional(explicit)? {
         Some(config) => Ok(config),
-        None => anyhow::bail!(
-            "No rag-rat config found at `{}`.\nRun `rag-rat init` to create one, or pass --config \
-             <path>.",
-            rag_rat_base::config::discover_config_path(Path::new(".")).display()
-        ),
+        None =>
+            Err(missing_config_hint(&rag_rat_base::config::discover_config_path(Path::new(".")))),
     }
 }
 
@@ -208,11 +224,7 @@ fn discover_config_optional(explicit: Option<&str>) -> anyhow::Result<Option<Con
         Some(path) => {
             let path = PathBuf::from(path);
             if !path.exists() {
-                anyhow::bail!(
-                    "No rag-rat config found at `{}`.\nRun `rag-rat init` to create one, or pass \
-                     --config <path>.",
-                    path.display()
-                );
+                return Err(missing_config_hint(&path));
             }
             Ok(Some(Config::load(path)?))
         },
@@ -252,15 +264,7 @@ fn run_doctor(args: &DoctorArgs, explicit: Option<&str>) -> anyhow::Result<()> {
         );
     }
     // A plain config-less `doctor` reports the machine-global store instead of erroring.
-    match rag_rat_base::data_dir::global_database_path() {
-        Some(database) => doctor_global_store(&database),
-        None => anyhow::bail!(
-            "No rag-rat config found at `{}`, and this platform has no data directory for a \
-             machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
-             <path>.",
-            rag_rat_base::config::discover_config_path(Path::new(".")).display()
-        ),
-    }
+    doctor_global_store(&global_database_path_or_hint()?)
 }
 
 /// Run `status`, tolerating the ABSENCE of a config. `status` is a cross-repo inventory of the
@@ -272,15 +276,7 @@ fn run_doctor(args: &DoctorArgs, explicit: Option<&str>) -> anyhow::Result<()> {
 fn run_status(explicit: Option<&str>) -> anyhow::Result<()> {
     let database = match discover_config_optional(explicit)? {
         Some(config) => config.database,
-        None => match rag_rat_base::data_dir::global_database_path() {
-            Some(database) => database,
-            None => anyhow::bail!(
-                "No rag-rat config found at `{}`, and this platform has no data directory for a \
-                 machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
-                 <path>.",
-                rag_rat_base::config::discover_config_path(Path::new(".")).display()
-            ),
-        },
+        None => global_database_path_or_hint()?,
     };
     status(&database)
 }
@@ -321,14 +317,7 @@ fn discover_target_config_optional(target: &Path) -> anyhow::Result<Option<Confi
 }
 
 fn configless_rm_config() -> anyhow::Result<Config> {
-    let database = rag_rat_base::data_dir::global_database_path().ok_or_else(|| {
-        anyhow::anyhow!(
-            "No rag-rat config found at `{}`, and this platform has no data directory for a \
-             machine-global store.\nRun `rag-rat init` to create a config, or pass --config \
-             <path>.",
-            rag_rat_base::config::discover_config_path(Path::new(".")).display()
-        )
-    })?;
+    let database = global_database_path_or_hint()?;
     let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     Ok(Config::minimal_for_database(database, root))
 }
@@ -477,5 +466,17 @@ mod tests {
         // natively.
         let root = rag_rat_base::paths::canonicalize(root).unwrap();
         assert_eq!(config.database, root.join("custom").join("index.sqlite"));
+    }
+}
+
+#[cfg(test)]
+mod config_hint_tests {
+    #[test]
+    fn missing_config_hint_keeps_its_text() {
+        assert_eq!(
+            super::missing_config_hint(std::path::Path::new("missing.toml")).to_string(),
+            "No rag-rat config found at `missing.toml`.\nRun `rag-rat init` to create one, or \
+             pass --config <path>."
+        );
     }
 }
