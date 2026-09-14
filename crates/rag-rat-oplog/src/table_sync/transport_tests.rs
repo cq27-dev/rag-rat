@@ -1555,7 +1555,7 @@ fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_p
     source.execute("DELETE FROM t_transport WHERE id = 'deleted'", []).unwrap();
     author(&source, account);
     rewrite(&source, account, "hot", 8);
-    assert!(compact(&source, account, 2) > 0);
+    assert!(compact(&source, account, 3) > 0);
     let route = supported_streams_against(&source, account, &[REPO_SPEC]).unwrap().remove(0);
     let offered = accepted_chain_page(&source, route.stream_id, None, 16).unwrap().remove(0);
     let floor = offered.floor.unwrap();
@@ -1674,11 +1674,30 @@ fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_p
     intermediary.execute("VACUUM INTO ?1", [database.to_str().unwrap()]).unwrap();
     drop(intermediary);
     let intermediary = Connection::open(&database).unwrap();
+    rag_rat_db::schema::apply(&intermediary, &crate::test_hooks()).unwrap();
     assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
     sync_chains(&intermediary, &fresh, account);
     assert!(live_rows(&fresh).iter().any(|(id, _)| id == "deleted"));
     assert!(coverage::stream_pending(&fresh, stream_id).unwrap());
     assert!(!live_rows(&source).iter().any(|(id, _)| id == "deleted"));
+    ingest_received_against(
+        &intermediary,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: offered.device_fingerprint,
+            signed_bytes: &suffix[1].signed_bytes,
+            advertised_floor: None,
+            advertised_tip: Some(TableSyncChainCursor {
+                lamport: offered.lamport,
+                entry_hash: offered.entry_hash,
+            }),
+        },
+        2,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(middle.lamport > floor.lamport && middle.lamport < offered.lamport);
+    assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
     rag_rat_db::schema::purge_repo_rows(&intermediary, "repo-a").unwrap();
     assert!(chain_lamports(&intermediary).is_empty());
     assert_eq!(
@@ -1707,7 +1726,7 @@ fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_p
         &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
         &TableSyncReceived {
             expected_device: offered.device_fingerprint,
-            signed_bytes: &first.signed_bytes,
+            signed_bytes: &suffix[1].signed_bytes,
             advertised_floor: Some(floor),
             advertised_tip: Some(TableSyncChainCursor {
                 lamport: offered.lamport,
@@ -1718,7 +1737,7 @@ fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_p
         &Default::default(),
     )
     .unwrap();
-    assert_eq!(chain_lamports(&intermediary), [floor.lamport as i64]);
+    assert_eq!(chain_lamports(&intermediary), [middle.lamport as i64]);
     assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
     // Reaching the full source is sufficient to repair the stale projection.
     sync_chains(&source, &intermediary, account);
