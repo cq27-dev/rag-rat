@@ -370,12 +370,12 @@ async fn dial_enroll(
     };
     let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, ENROLL_ALPN))
         .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!(dial_timed_out)))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
+        .map_err(|_| InviteError::Transport(dial_timed_out.into()))?
+        .map_err(|error| InviteError::Transport(error.to_string()))?;
     let (send, recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
         .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!(stream_timed_out)))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
+        .map_err(|_| InviteError::Transport(stream_timed_out.into()))?
+        .map_err(|error| InviteError::Transport(error.to_string()))?;
     Ok((conn, send, recv))
 }
 
@@ -436,14 +436,12 @@ pub async fn accept_enrollment(
     database: &Connection,
     now_ms: impl Fn() -> i64,
 ) -> Result<EnrollmentReceipt, InviteError> {
-    let incoming = endpoint
-        .accept()
-        .await
-        .ok_or_else(|| InviteError::Storage(anyhow::anyhow!("endpoint closed")))?;
+    let incoming =
+        endpoint.accept().await.ok_or_else(|| InviteError::Transport("endpoint closed".into()))?;
     let conn = timeout(DEFAULT_IDLE_TIMEOUT, incoming)
         .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!("enrollment handshake timed out")))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
+        .map_err(|_| InviteError::Transport("enrollment handshake timed out".into()))?
+        .map_err(|error| InviteError::Transport(error.to_string()))?;
     if conn.alpn() != ENROLL_ALPN {
         conn.close(0u32.into(), b"wrong-alpn");
         return Err(InviteError::Malformed("connection did not negotiate enrollment ALPN".into()));
@@ -451,8 +449,8 @@ pub async fn accept_enrollment(
     let remote_node = *conn.remote_id().as_bytes();
     let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.accept_bi())
         .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!("peer opened no enrollment stream")))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
+        .map_err(|_| InviteError::Transport("peer opened no enrollment stream".into()))?
+        .map_err(|error| InviteError::Transport(error.to_string()))?;
     let outcome =
         run_enrollment_acceptor(&mut recv, &mut send, database, remote_node, now_ms).await?;
     let served = matches!(
@@ -2567,8 +2565,9 @@ mod tests {
             let conn = dialer
                 .connect(direct_addr(&listener), SYNC_ALPN)
                 .await
-                .map_err(|e| InviteError::Storage(e.into()))?;
-            let (send, _recv) = conn.open_bi().await.map_err(|e| InviteError::Storage(e.into()))?;
+                .map_err(|e| InviteError::Transport(e.to_string()))?;
+            let (send, _recv) =
+                conn.open_bi().await.map_err(|e| InviteError::Transport(e.to_string()))?;
             drop(send);
             conn.closed().await;
             Ok::<(), InviteError>(())
@@ -2576,6 +2575,18 @@ mod tests {
         let (server_r, client_r) = tokio::join!(server, client);
         assert!(matches!(server_r, Err(InviteError::Malformed(_))), "server: {server_r:?}");
         client_r.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_enrollment_accept_on_a_closed_endpoint_is_a_transport_failure() {
+        let (listener, _dialer) = loopback_endpoints().await;
+        listener.close().await;
+        let owner_db = database();
+        let error = accept_enrollment(&listener, &owner_db, || NOW).await.unwrap_err();
+        assert!(
+            matches!(error, InviteError::Transport(ref message) if message == "endpoint closed")
+        );
+        assert_eq!(error.to_string(), "enrollment transport: endpoint closed");
     }
 
     #[test]

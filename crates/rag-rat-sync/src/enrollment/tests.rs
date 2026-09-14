@@ -1139,6 +1139,13 @@ async fn a_writer_invite_redeems_over_the_wire_and_replays_for_the_same_contribu
     assert_eq!(retained, 0, "the replay-expired row is pruned");
 }
 
+#[test]
+fn a_transport_failure_is_never_answered_with_a_refusal_frame() {
+    let error = InviteError::Transport("enrollment dial timed out".into());
+    assert!(super::wire::refusal_code(&error).is_none());
+    assert_eq!(error.to_string(), "enrollment transport: enrollment dial timed out");
+}
+
 #[tokio::test]
 async fn the_writer_dialer_refuses_a_pairing_ticket_by_name() {
     let conn = db();
