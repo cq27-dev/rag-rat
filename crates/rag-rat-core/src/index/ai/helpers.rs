@@ -218,78 +218,60 @@ pub(crate) fn chunk_count(conn: &Connection) -> anyhow::Result<u64> {
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
-pub(crate) fn current_artifact_count(
-    conn: &Connection,
-    capability: &str,
-    model_id: &str,
-) -> anyhow::Result<u64> {
+pub(crate) fn current_artifact_count(conn: &Connection, model_id: &str) -> anyhow::Result<u64> {
     let model_version = active_embedding_model_version(conn, model_id)?;
-    let sql = artifact_table_sql(
-        capability,
-        "
+    let sql = "
         SELECT COUNT(*)
-        FROM {table}
-        JOIN chunks ON chunks.id = {table}.chunk_id
+        FROM chunk_embeddings
+        JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
         JOIN files ON files.id = chunks.file_id
-        JOIN ai_models ON ai_models.model_id = {table}.model_id
-        WHERE {table}.model_id = ?1
-          AND {table}.status = 'Current'
-          AND {table}.source_text_hash = chunks.text_hash
-          AND {table}.model_version = ?2
-          AND {table}.embedding_text_version = ?3
-          AND {table}.input_hash != ''
-          AND {table}.embedding_dim = ai_models.embedding_dim
-    ",
-    );
-    count_query3(conn, &sql, model_id, &model_version, EMBEDDING_TEXT_VERSION)
+        JOIN ai_models ON ai_models.model_id = chunk_embeddings.model_id
+        WHERE chunk_embeddings.model_id = ?1
+          AND chunk_embeddings.status = 'Current'
+          AND chunk_embeddings.source_text_hash = chunks.text_hash
+          AND chunk_embeddings.model_version = ?2
+          AND chunk_embeddings.embedding_text_version = ?3
+          AND chunk_embeddings.input_hash != ''
+          AND chunk_embeddings.embedding_dim = ai_models.embedding_dim
+    ";
+    count_query3(conn, sql, model_id, &model_version, EMBEDDING_TEXT_VERSION)
 }
 
-pub(crate) fn stale_artifact_count(
-    conn: &Connection,
-    capability: &str,
-    model_id: &str,
-) -> anyhow::Result<u64> {
+pub(crate) fn stale_artifact_count(conn: &Connection, model_id: &str) -> anyhow::Result<u64> {
     let model_version = active_embedding_model_version(conn, model_id)?;
-    let sql = artifact_table_sql(
-        capability,
-        "
+    let sql = "
         SELECT COUNT(*)
-        FROM {table}
-        JOIN chunks ON chunks.id = {table}.chunk_id
+        FROM chunk_embeddings
+        JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
         JOIN files ON files.id = chunks.file_id
-        JOIN ai_models ON ai_models.model_id = {table}.model_id
-        WHERE {table}.model_id = ?1
+        JOIN ai_models ON ai_models.model_id = chunk_embeddings.model_id
+        WHERE chunk_embeddings.model_id = ?1
           AND (
-            {table}.source_text_hash != chunks.text_hash
-            OR {table}.model_version != ?2
-            OR {table}.embedding_text_version != ?3
-            OR {table}.input_hash = ''
-            OR {table}.embedding_dim != ai_models.embedding_dim
-            OR {table}.status = 'Stale'
+            chunk_embeddings.source_text_hash != chunks.text_hash
+            OR chunk_embeddings.model_version != ?2
+            OR chunk_embeddings.embedding_text_version != ?3
+            OR chunk_embeddings.input_hash = ''
+            OR chunk_embeddings.embedding_dim != ai_models.embedding_dim
+            OR chunk_embeddings.status = 'Stale'
           )
-    ",
-    );
-    count_query3(conn, &sql, model_id, &model_version, EMBEDDING_TEXT_VERSION)
+    ";
+    count_query3(conn, sql, model_id, &model_version, EMBEDDING_TEXT_VERSION)
 }
 
 pub(crate) fn status_artifact_count(
     conn: &Connection,
-    capability: &str,
     model_id: &str,
     status: ArtifactStatus,
 ) -> anyhow::Result<u64> {
-    let sql = artifact_table_sql(
-        capability,
-        "
+    let sql = "
         SELECT COUNT(*)
-        FROM {table}
-        JOIN chunks ON chunks.id = {table}.chunk_id
+        FROM chunk_embeddings
+        JOIN chunks ON chunks.id = chunk_embeddings.chunk_id
         JOIN files ON files.id = chunks.file_id
-        WHERE {table}.model_id = ?1 AND {table}.status = ?2
-    ",
-    );
+        WHERE chunk_embeddings.model_id = ?1 AND chunk_embeddings.status = ?2
+    ";
     let count =
-        conn.query_row(&sql, params![model_id, status.as_str()], |row| row.get::<_, i64>(0))?;
+        conn.query_row(sql, params![model_id, status.as_str()], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 
@@ -302,11 +284,6 @@ pub(crate) fn count_query3(
 ) -> anyhow::Result<u64> {
     let count = conn.query_row(sql, params![model_id, left, right], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
-}
-
-pub(crate) fn artifact_table_sql(_capability: &str, template: &str) -> String {
-    let table = "chunk_embeddings";
-    template.replace("{table}", table)
 }
 
 /// Delete a GLOBAL meta key from `index_meta` (a no-op when absent) — the `index_meta` counterpart

@@ -181,11 +181,10 @@ pub(crate) fn fastembed_operational_status(
     // same basis it uses for the generic `capability_status` counts); the exact policy-skip +
     // live-drift breakdown is the `reconcile --plan` command's job, where the per-chunk scan
     // belongs.
-    let current = current_artifact_count(conn, "embedding", report_model_id)?;
-    let stale = stale_artifact_count(conn, "embedding", report_model_id)?;
-    let failed = status_artifact_count(conn, "embedding", report_model_id, ArtifactStatus::Failed)?;
-    let blocked =
-        status_artifact_count(conn, "embedding", report_model_id, ArtifactStatus::Blocked)?;
+    let current = current_artifact_count(conn, report_model_id)?;
+    let stale = stale_artifact_count(conn, report_model_id)?;
+    let failed = status_artifact_count(conn, report_model_id, ArtifactStatus::Failed)?;
+    let blocked = status_artifact_count(conn, report_model_id, ArtifactStatus::Blocked)?;
     // Exact `skipped` (embedding input too large) needs the decompressed text per chunk — deferred
     // to `reconcile --plan`. The status treats every chunk as eligible, so the invariant
     // `eligible + skipped == total` holds with `skipped == 0`.
@@ -241,10 +240,10 @@ pub(crate) fn capability_status(
     total_chunks: u64,
 ) -> anyhow::Result<CapabilityStatus> {
     let model = model(conn, model_id)?;
-    let current = current_artifact_count(conn, capability, model_id)?;
-    let stale = stale_artifact_count(conn, capability, model_id)?;
-    let failed = status_artifact_count(conn, capability, model_id, ArtifactStatus::Failed)?;
-    let blocked = status_artifact_count(conn, capability, model_id, ArtifactStatus::Blocked)?;
+    let current = current_artifact_count(conn, model_id)?;
+    let stale = stale_artifact_count(conn, model_id)?;
+    let failed = status_artifact_count(conn, model_id, ArtifactStatus::Failed)?;
+    let blocked = status_artifact_count(conn, model_id, ArtifactStatus::Blocked)?;
     let state = if model.disabled {
         "Disabled"
     } else if total_chunks == 0 {
