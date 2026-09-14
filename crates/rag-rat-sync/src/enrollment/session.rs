@@ -15,11 +15,14 @@ use super::wire::{
     MAX_ENROLL_REQUEST_FRAME, MAX_ENROLL_RESPONSE_FRAME, WriterGrantReceipt, WriterGrantRequest,
     WriterGrantResponse, ensure_frame_len, refusal_code, request_blob_domain,
 };
+use crate::auth;
 
 /// Per-chunk progress window for enrollment frame IO: every 64 KiB slice of a frame body must
-/// arrive (or drain) within this window. Mirrors the session's per-frame idle reset
-/// (`read_frame_before`), so a slow but progressing multi-megabyte receipt never times out while
-/// a stalled peer dies within one window.
+/// arrive (or drain) within this window, so a slow but progressing multi-megabyte receipt never
+/// times out while a stalled peer dies within one window. This is NOT the sync session's idle
+/// timeout, which bounds each whole frame (up to [`crate::codec::MAX_FRAME_BYTES`]) by one window
+/// and so needs roughly frame-size-per-window of throughput; per chunk, enrollment tolerates links
+/// down to about 1 KiB/s.
 pub const ENROLL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Chunk size for progress-tracked frame IO: 64 KiB per window tolerates ~1 KiB/s links, and a
@@ -277,13 +280,13 @@ async fn flush_within<W: AsyncWrite + Unpin>(
     send: &mut W,
     window: Duration,
 ) -> Result<(), InviteError> {
-    tokio::time::timeout(window, send.flush()).await.map_err(|_| {
-        InviteError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "enrollment frame flush stalled",
-        ))
-    })??;
+    auth::within(window, send.flush(), || stalled("enrollment frame flush stalled")).await??;
     Ok(())
+}
+
+/// A progress window that elapsed, as the timed-out stream error enrollment reports.
+fn stalled(what: &'static str) -> InviteError {
+    InviteError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, what))
 }
 
 async fn write_within<W: AsyncWrite + Unpin>(
@@ -291,12 +294,8 @@ async fn write_within<W: AsyncWrite + Unpin>(
     bytes: &[u8],
     window: Duration,
 ) -> Result<(), InviteError> {
-    tokio::time::timeout(window, send.write_all(bytes)).await.map_err(|_| {
-        InviteError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "enrollment frame write stalled",
-        ))
-    })??;
+    auth::within(window, send.write_all(bytes), || stalled("enrollment frame write stalled"))
+        .await??;
     Ok(())
 }
 
@@ -321,11 +320,7 @@ async fn read_within<R: AsyncRead + Unpin>(
     buf: &mut [u8],
     window: Duration,
 ) -> Result<(), InviteError> {
-    tokio::time::timeout(window, recv.read_exact(buf)).await.map_err(|_| {
-        InviteError::Io(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "enrollment frame read stalled",
-        ))
-    })??;
+    auth::within(window, recv.read_exact(buf), || stalled("enrollment frame read stalled"))
+        .await??;
     Ok(())
 }

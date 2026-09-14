@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::auth::{AuthRole, SessionCapabilities};
+use crate::auth::{self, AuthRole, SessionCapabilities};
 use crate::codec::{self, CodecError};
 use crate::wire::{Frame, MAX_ENTRIES_PER_PAGE, MAX_HELLO_HASHES};
 
@@ -369,10 +369,9 @@ async fn send_ack_and_finish<W: AsyncWrite + Unpin>(
     write_frame_before(send, &Frame::Ack, idle_timeout).await?;
     // On iroh this maps to QUIC FIN. The acceptor remains alive until the dialer closes, while the
     // dialer does not close until it has read the acceptor's acknowledgement.
-    match tokio::time::timeout(idle_timeout, send.shutdown()).await {
-        Ok(result) => result.map_err(|e| SessionError::Codec(CodecError::Io(e))),
-        Err(_elapsed) => Err(stalled(idle_timeout)),
-    }
+    auth::within(idle_timeout, send.shutdown(), || stalled(idle_timeout))
+        .await?
+        .map_err(|e| SessionError::Codec(CodecError::Io(e)))
 }
 
 /// Write one frame, failing if the peer takes nothing within `idle_timeout`. The write side waits
@@ -384,10 +383,9 @@ async fn write_frame_before<W: AsyncWrite + Unpin>(
     frame: &Frame,
     idle_timeout: Duration,
 ) -> Result<(), SessionError> {
-    match tokio::time::timeout(idle_timeout, codec::write_frame(send, frame)).await {
-        Ok(result) => result.map_err(SessionError::Codec),
-        Err(_elapsed) => Err(stalled(idle_timeout)),
-    }
+    auth::within(idle_timeout, codec::write_frame(send, frame), || stalled(idle_timeout))
+        .await?
+        .map_err(SessionError::Codec)
 }
 
 fn stalled(idle_timeout: Duration) -> SessionError {
@@ -415,15 +413,17 @@ async fn read_frame_before<R: AsyncRead + Unpin>(
     recv: &mut R,
     idle_timeout: Duration,
 ) -> Result<Frame, SessionError> {
-    match tokio::time::timeout(idle_timeout, codec::read_frame(recv)).await {
-        Ok(Ok(frame)) => Ok(frame),
-        Ok(Err(CodecError::Eof)) => Err(SessionError::Protocol(
+    let read = auth::within(idle_timeout, codec::read_frame(recv), || {
+        SessionError::Protocol(format!(
+            "peer sent no frame within {idle_timeout:?} — session aborted as idle"
+        ))
+    });
+    match read.await? {
+        Ok(frame) => Ok(frame),
+        Err(CodecError::Eof) => Err(SessionError::Protocol(
             "peer closed the stream before session completion — transfer truncated".into(),
         )),
-        Ok(Err(e)) => Err(SessionError::Codec(e)),
-        Err(_elapsed) => Err(SessionError::Protocol(format!(
-            "peer sent no frame within {idle_timeout:?} — session aborted as idle"
-        ))),
+        Err(e) => Err(SessionError::Codec(e)),
     }
 }
 
