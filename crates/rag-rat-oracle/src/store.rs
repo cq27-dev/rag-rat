@@ -1247,24 +1247,37 @@ pub(crate) fn record_oracle_run(
     status: &str,
     stats_json: &str,
 ) -> anyhow::Result<i64> {
-    record_oracle_run_at(conn, tool, tool_version, checkout, now_ms(), status, stats_json)
+    record_oracle_run_at(conn, tool, tool_version, checkout, &OracleRunRecord {
+        started_at_ms: now_ms(),
+        status,
+        stats_json,
+    })
 }
 
-/// Record an oracle run, returning its row id. `stats_json` is an opaque `OracleReport` snapshot.
-/// `checkout.worktree_id` scopes the run to the active checkout so the status read's
-/// `last_run_meta` can distinguish this checkout's run from a sibling worktree's run under the same
-/// `(tool, tool_version, commit_sha)`.
-#[allow(clippy::too_many_arguments)]
+/// What one `oracle_runs` row records about its pass. Named fields, because `status` and
+/// `stats_json` are adjacent text columns: passed positionally, a transposed pair compiled and
+/// wrote the whole JSON report into the operator-facing status.
+pub(crate) struct OracleRunRecord<'a> {
+    /// Unix-epoch ms when the run actually BEGAN — see [`record_oracle_run_at`].
+    pub(crate) started_at_ms: i64,
+    /// The run's [`crate::RunStatus`] token.
+    pub(crate) status: &'a str,
+    /// An opaque report snapshot (`OracleReport` / `LivePassReport` JSON).
+    pub(crate) stats_json: &'a str,
+}
+
+/// Record an oracle run, returning its row id. `checkout.worktree_id` scopes the run to the active
+/// checkout so the status read's `last_run_meta` can distinguish this checkout's run from a
+/// sibling worktree's run under the same `(tool, tool_version, commit_sha)`.
 pub(crate) fn record_oracle_run_at(
     conn: &Connection,
     tool: OracleTool,
     tool_version: &str,
     checkout: CheckoutRef<'_>,
-    started_at_ms: i64,
-    status: &str,
-    stats_json: &str,
+    run: &OracleRunRecord<'_>,
 ) -> anyhow::Result<i64> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
+    let OracleRunRecord { started_at_ms, status, stats_json } = *run;
     // `started_at_ms` is the moment the run actually BEGAN (the pre-spawn snapshot), passed in by
     // the caller — NOT `now_ms()` at completion. The auto-run staleness gate compares this
     // against the index's last-change clock; stamping completion time made a run that

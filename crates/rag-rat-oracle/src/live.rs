@@ -600,9 +600,11 @@ pub fn live_oracle_pass(
             tool,
             session.tool_version(),
             input.checkout,
-            input.started_at_ms,
-            &report.status.as_db_str(),
-            &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
+            &store::OracleRunRecord {
+                started_at_ms: input.started_at_ms,
+                status: &report.status.as_db_str(),
+                stats_json: &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
+            },
         )?;
     }
     tx.commit()?;
