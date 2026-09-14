@@ -77,7 +77,8 @@ pub struct OpenAiEmbedder {
 
 /// Construction params for [`OpenAiEmbedder::from_provisioned`] — groups the handshake outputs
 /// (`endpoint`, `auth_token`) with the model identity + transport knobs so the constructor takes
-/// one struct instead of positional args.
+/// one struct instead of positional args. [`OpenAiEmbedder::from_remote_config`] builds the same
+/// struct (with no `auth_token`), so both constructors share one assembler.
 #[derive(Clone, Copy)]
 pub struct ProvisionedEmbedderParams<'a> {
     /// The serving endpoint from the cookbook handshake (`https://...`).
@@ -135,19 +136,6 @@ impl<'a> ProvisionedEmbedderParams<'a> {
     }
 }
 
-struct BuildParams<'a> {
-    endpoint: &'a str,
-    embed_path: &'a str,
-    auth_header: Option<String>,
-    selected_model_id: &'a str,
-    server_model: &'a str,
-    dim: usize,
-    request_timeout_s: u64,
-    batch_size: u32,
-    concurrency: u32,
-    max_batch_chars: usize,
-}
-
 impl OpenAiEmbedder {
     /// Build the embedder for the SELECTED model served over Ollama. `selected_model_id` + `dim`
     /// come from the model the user picked (`model = "sentence-transformers/all-MiniLM-L6-v2"`,
@@ -176,18 +164,22 @@ impl OpenAiEmbedder {
         let auth_header = crate::http::resolve_auth_header(cfg.auth_env.as_deref(), |var| {
             std::env::var(var).ok()
         })?;
-        Ok(Self::build(BuildParams {
+        let params = ProvisionedEmbedderParams {
             endpoint,
             embed_path: cfg.backend.embed_path(),
-            auth_header,
+            // Connect mode has no handshake token; its header was resolved from `auth_env` above.
+            auth_token: None,
+            server_model: &cfg.model,
             selected_model_id,
-            server_model: cfg.model.trim(),
             dim,
             request_timeout_s: cfg.request_timeout_s,
             batch_size: cfg.batch_size,
+            // The RAW configured value, where `for_remote` passes the already-bounded one: `build`
+            // clamps through `bounded_concurrency_value`, an idempotent clamp, so both land equal.
             concurrency: cfg.concurrency,
             max_batch_chars: cfg.max_batch_chars,
-        }))
+        };
+        Ok(Self::build(params, auth_header))
     }
 
     /// Build the embedder against a freshly PROVISIONED ephemeral box (#318) from
@@ -197,36 +189,27 @@ impl OpenAiEmbedder {
     /// model identity (`selected_model_id` + `dim`) + transport knobs (server `model`, timeout,
     /// batch) come from the config the same way.
     pub fn from_provisioned(params: ProvisionedEmbedderParams<'_>) -> Self {
-        let auth_header = crate::http::bearer_header(params.auth_token);
-        Self::build(BuildParams {
-            endpoint: params.endpoint.trim(),
-            embed_path: params.embed_path,
-            auth_header,
-            selected_model_id: params.selected_model_id,
-            server_model: params.server_model.trim(),
-            dim: params.dim,
-            request_timeout_s: params.request_timeout_s,
-            batch_size: params.batch_size,
-            concurrency: params.concurrency,
-            max_batch_chars: params.max_batch_chars,
-        })
+        Self::build(params, crate::http::bearer_header(params.auth_token))
     }
 
     /// Shared assembler: build the `ureq::Agent` (with the loopback proxy bypass) + the struct.
-    /// `endpoint` is already trimmed/validated by the caller.
-    fn build(params: BuildParams<'_>) -> Self {
-        let BuildParams {
+    /// `endpoint` and `server_model` are trimmed here; `params.auth_token` is NOT read — each
+    /// constructor resolves its own `auth_header` (a handshake token or an `auth_env` lookup).
+    fn build(params: ProvisionedEmbedderParams<'_>, auth_header: Option<String>) -> Self {
+        let ProvisionedEmbedderParams {
             endpoint,
             embed_path,
-            auth_header,
-            selected_model_id,
+            auth_token: _,
             server_model,
+            selected_model_id,
             dim,
             request_timeout_s,
             batch_size,
             concurrency,
             max_batch_chars,
         } = params;
+        let endpoint = endpoint.trim();
+        let server_model = server_model.trim();
         let embed_url = format!("{}{}", endpoint.trim_end_matches('/'), embed_path);
         let agent = crate::http::build_agent(
             endpoint,
