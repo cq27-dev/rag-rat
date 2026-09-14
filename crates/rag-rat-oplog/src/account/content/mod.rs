@@ -10,10 +10,9 @@ mod storage;
 // onto it (#664).
 #[allow(unused_imports, reason = "C3.1 freezes the pure evaluator before C3.2 storage wiring")]
 pub use acceptance::{
-    AncestryRelation, CitedFreshness, CitedGrantAuthority, CitedOwnership, CitedRosterAuthority,
-    ContentAcceptance, ContentAcceptanceInput, ContentAcceptanceInputError, ContentCondemnReason,
-    ContentParkReason, ContentRejectReason, SubjectAuthorityHold, UnknownAncestry,
-    evaluate_content_acceptance,
+    CitedGrantAuthority, CitedOwnership, CitedRosterAuthority, ContentAcceptance,
+    ContentAcceptanceInput, ContentAcceptanceInputError, ContentCondemnReason, ContentParkReason,
+    ContentRejectReason, SubjectAuthorityHold, evaluate_content_acceptance,
 };
 // The C5 sealed-authoring seam (#608): policy-aware preparation plus caller-owned-txn and
 // convenience authoring, the sealed-op size predicate, downgrade-ratchet reader, and seal

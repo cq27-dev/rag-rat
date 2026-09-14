@@ -5,9 +5,11 @@
 //! self-contained [`super::cut::beyond`] handles). They are pure functions of a [`HeaderView`] —
 //! the fold implements it over its candidate map; tests implement it over a small `HashMap`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 use super::AccountId;
+use super::branch::{self, AncestryRelation, UnknownAncestry, WalkEnd};
 use super::cut::Cut;
 use super::envelope::AccountEntryHeader;
 use crate::op::DeviceFingerprint;
@@ -24,78 +26,34 @@ impl HeaderView for HashMap<[u8; 32], AccountEntryHeader> {
     }
 }
 
-/// Why an ancestry walk could not be decided yet (a WITHHELD watermark parks, never flips a verdict
-/// — I11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum UnknownCause {
-    /// The cut's watermark entry itself is not held.
-    UnknownCutTarget,
-    /// A link on the walk from the watermark toward the target is missing.
-    IncompleteCutAncestry,
-}
-
-/// The result of walking `prev_hash` from a cut's watermark toward a target entry (§11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Ancestry {
-    /// The target is an ancestor of (or equal to) the watermark — within the cut's accepted branch.
-    OnBranch,
-    /// The watermark's branch reaches genesis without passing the target — a different branch (L2).
-    OffBranch,
-    /// Undecidable until more entries arrive.
-    Unknown(UnknownCause),
-}
-
 /// Walk `prev_hash` from `cut`'s watermark and decide whether `target` lies on that branch (§11). A
 /// withheld watermark / missing link parks (`Unknown`); it NEVER flips an on/off verdict. `Empty`
 /// has no branch, so ancestry is `OffBranch` (callers test [`super::cut::beyond`] first).
-pub(super) fn ancestry(target: &[u8; 32], cut: &Cut, view: &dyn HeaderView) -> Ancestry {
+pub(super) fn ancestry(target: &[u8; 32], cut: &Cut, view: &dyn HeaderView) -> AncestryRelation {
     let Some(watermark) = cut.hash() else {
-        return Ancestry::OffBranch;
+        return AncestryRelation::OffBranch;
     };
-    let Some(wm) = view.header(&watermark) else {
-        return Ancestry::Unknown(UnknownCause::UnknownCutTarget);
-    };
-    // The cut bounds ONE device's log: every link on the walk must stay on the watermark's
-    // `(account, log, device)` coordinate and step down EXACTLY one seq slot. A signed header only
-    // pins `prev_hash` NULLITY, not that `prev` is a valid contiguous parent, so a forged link
-    // (jumping coordinate, or skipping seq slots) is not a real predecessor — `OffBranch` there.
-    let (account, log, device) = (wm.account_id, wm.log_id, wm.device_fingerprint);
-    // Hash chains cannot cycle (a cycle needs a sha256 collision), but guard a corrupt input
-    // against an infinite loop by refusing to revisit a hash.
-    let mut visited: HashSet<[u8; 32]> = HashSet::new();
-    let mut current = watermark;
-    loop {
-        let Some(header) = view.header(&current) else {
-            return Ancestry::Unknown(UnknownCause::IncompleteCutAncestry);
-        };
-        // Validate the node is on the bounded chain BEFORE counting it as the target — a forged
-        // link straight to a foreign / off-coordinate entry is not a real on-branch
-        // predecessor.
-        if header.account_id != account
-            || header.log_id != log
-            || header.device_fingerprint != device
-        {
-            return Ancestry::OffBranch;
-        }
-        if &current == target {
-            return Ancestry::OnBranch;
-        }
-        if !visited.insert(current) {
-            return Ancestry::OffBranch;
-        }
-        let Some(prev) = header.prev_hash else {
-            return Ancestry::OffBranch; // reached the chain origin without hitting the target
-        };
-        // If the predecessor is held, it must be the EXACTLY-preceding slot (`seq - 1`) — a chain
-        // is contiguous, so a link that skips slots (e.g. 5 → 3) is forged, not a real parent.
-        // `seq` is peer-supplied, so guard the `+ 1` against a `u64::MAX` header rather than panic
-        // on a checked build (the content-side walk uses the same `checked_add`).
-        if let Some(prev_header) = view.header(&prev)
-            && prev_header.seq.checked_add(1) != Some(header.seq)
-        {
-            return Ancestry::OffBranch;
-        }
-        current = prev;
+    if view.header(&watermark).is_none() {
+        return AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget);
+    }
+    let mut found = false;
+    let end = branch::walk_back(
+        &watermark,
+        |hash| view.header(hash),
+        |hash, _| {
+            if hash == target {
+                found = true;
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        },
+    );
+    if found {
+        return AncestryRelation::OnBranch;
+    }
+    match end {
+        WalkEnd::Stopped | WalkEnd::Origin | WalkEnd::ForgedLink => AncestryRelation::OffBranch,
+        WalkEnd::MissingLink => AncestryRelation::Unknown(UnknownAncestry::IncompleteCutAncestry),
     }
 }
 
@@ -174,9 +132,9 @@ pub(super) fn join_cuts(a: &Cut, b: &Cut, view: &dyn HeaderView) -> JoinResult {
             // lower's watermark.
             let lower_hash = lower.hash().expect("At cut has a hash");
             match ancestry(&lower_hash, higher, view) {
-                Ancestry::OnBranch => JoinResult::Extended(higher.clone()),
-                Ancestry::OffBranch => JoinResult::Incomparable,
-                Ancestry::Unknown(_) => JoinResult::Unknown,
+                AncestryRelation::OnBranch => JoinResult::Extended(higher.clone()),
+                AncestryRelation::OffBranch => JoinResult::Incomparable,
+                AncestryRelation::Unknown(_) => JoinResult::Unknown,
             }
         },
     }
@@ -184,6 +142,7 @@ pub(super) fn join_cuts(a: &Cut, b: &Cut, view: &dyn HeaderView) -> JoinResult {
 
 #[cfg(test)]
 mod tests {
+    use super::super::branch::{AncestryRelation as Ancestry, UnknownAncestry as UnknownCause};
     use super::*;
 
     /// Build a header at `(account 0xaa, log 0, device 0xbb, seq)` with `prev_hash`, keyed in

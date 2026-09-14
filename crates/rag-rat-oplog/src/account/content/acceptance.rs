@@ -11,6 +11,7 @@
 //! (a `CutExtend` we have not folded re-blesses it, §11.4), so while we are behind the author that
 //! parks as `auth_len_ahead` instead of hardening into a rejection.
 
+use super::super::branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
 use super::ContentEntryHeader;
 use crate::account::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery,
@@ -19,34 +20,6 @@ use crate::account::{
 use crate::stream::StreamId;
 
 type AccountEntryHash = [u8; 32];
-
-/// Why an ancestry walk against a cut watermark could not be decided (mirrors the account fold's
-/// `UnknownCause`: a withheld watermark parks, and never flips a verdict — I11).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UnknownAncestry {
-    /// The cut's watermark entry itself is not held.
-    UnknownCutTarget,
-    /// A link on the walk from the watermark toward the entry is missing.
-    IncompleteCutAncestry,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AncestryRelation {
-    /// The entry is the watermark itself or an ancestor reached walking backward from it.
-    OnBranch,
-    OffBranch,
-    Unknown(UnknownAncestry),
-}
-
-/// One freshness observation, bound to the exact query it answers. The pair (account, asserted
-/// length) is carried so a result computed for the owner cannot be read as the author's, and a
-/// result computed for a shorter assertion cannot stand in for the header's.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CitedFreshness {
-    pub account_id: AccountId,
-    pub asserted_auth_len: u64,
-    pub state: AuthorityFreshness,
-}
 
 /// A whole-coordinate authority hold that fails content closed regardless of the revocation
 /// registers. A withheld cut watermark is NOT one of these: it is bound at the register (the cut

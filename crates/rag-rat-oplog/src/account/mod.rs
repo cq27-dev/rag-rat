@@ -62,6 +62,7 @@ pub use bootstrap::{
     read_local_account_genesis, release_account_candidate_reservation_in_tx,
     upsert_account_candidate_reservation_in_tx,
 };
+pub use branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, ContentRefoldBudget,

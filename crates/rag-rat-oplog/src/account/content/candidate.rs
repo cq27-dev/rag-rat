@@ -14,7 +14,6 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use super::super::branch::{self, BranchSelection, Candidate, ChainLink, WalkEnd};
-use super::acceptance::{AncestryRelation, UnknownAncestry};
 use super::envelope::ContentEntryHeader;
 use crate::account::AccountId;
 use crate::op::DeviceFingerprint;
@@ -510,3 +509,5 @@ mod tests {
         assert_eq!(select_accepted_branch(&rows, &all(&view), &[pin], &view).accepted.len(), 2000);
     }
 }
+
+use super::super::branch::{AncestryRelation, UnknownAncestry};

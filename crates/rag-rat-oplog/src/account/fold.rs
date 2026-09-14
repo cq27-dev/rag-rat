@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use super::AccountId;
-use super::candidate::{self, Ancestry, CutCoordinate, HeaderView, JoinResult, UnknownCause};
+use super::branch::{AncestryRelation, UnknownAncestry};
+use super::candidate::{self, CutCoordinate, HeaderView, JoinResult};
 use super::cut::{Cut, beyond};
 use super::envelope::{AccountEntryHeader, VerifiedAccountEntry};
 use super::id::account_id_from_genesis_payload;
@@ -905,10 +906,13 @@ fn register_verdict(
             continue;
         }
         match candidate::ancestry(&c.hash(), cut, view) {
-            Ancestry::OnBranch => {}, // within-cut on the accepted branch: this register admits it
-            Ancestry::OffBranch => off_branch = true,
-            Ancestry::Unknown(UnknownCause::UnknownCutTarget) => park_unknown_target = true,
-            Ancestry::Unknown(UnknownCause::IncompleteCutAncestry) => park_incomplete = true,
+            AncestryRelation::OnBranch => {}, /* within-cut on the accepted branch: this */
+            // register admits it
+            AncestryRelation::OffBranch => off_branch = true,
+            AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget) =>
+                park_unknown_target = true,
+            AncestryRelation::Unknown(UnknownAncestry::IncompleteCutAncestry) =>
+                park_incomplete = true,
         }
     }
     // Precedence: off-branch/beyond (condemned) > a missing watermark entry > a missing mid-chain
@@ -944,7 +948,7 @@ fn has_condemn_cycle(admitted: &[AdmittedCut<'_>], view: &dyn HeaderView) -> boo
         x.registers.iter().any(|(key, cut)| {
             key.scopes(y.op.header())
                 && (beyond(y.op.header().seq, cut)
-                    || candidate::ancestry(&y.op.hash(), cut, view) == Ancestry::OffBranch)
+                    || candidate::ancestry(&y.op.hash(), cut, view) == AncestryRelation::OffBranch)
         })
     };
     let adj: Vec<Vec<usize>> = (0..n)

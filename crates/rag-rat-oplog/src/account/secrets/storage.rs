@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::super::branch::BranchSelection;
-use super::super::candidate::{self as account_candidate, Ancestry, HeaderView, UnknownCause};
+use super::super::candidate::{self as account_candidate, HeaderView};
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader};
 use super::super::fold::{EntryStatus, SECRETS_LOG, SUPPORTED_OP_VERSION};
@@ -27,10 +27,7 @@ use super::super::id::fixed;
 use super::super::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityQuery, OwnerChainAuthority, storage,
 };
-use super::acceptance::{
-    self, AncestryRelation, CitedFreshness, SecretsAcceptance, SecretsAcceptanceInput,
-    SecretsParkReason, UnknownAncestry,
-};
+use super::acceptance::{self, SecretsAcceptance, SecretsAcceptanceInput, SecretsParkReason};
 use super::candidate::{self, BranchPin, SecretsCandidate, SecretsCoordinate};
 use super::ops::{self, DecodedSecretsOp};
 
@@ -571,8 +568,7 @@ fn write_secrets_verdict(
     Ok(())
 }
 
-/// Map the account-log ancestry verdict into the evaluator's `AncestryRelation` (both name a
-/// withheld watermark and a missing mid-chain link apart — I11).
+/// Evaluate a secrets watermark through the shared account-log ancestry walk.
 fn ancestry_relation(
     target: AccountEntryHash,
     watermark: AccountEntryHash,
@@ -580,14 +576,7 @@ fn ancestry_relation(
 ) -> AncestryRelation {
     // The seq is unused by the ancestry walk (it follows `prev_hash` from the watermark hash), so a
     // placeholder 0 is correct here.
-    match account_candidate::ancestry(&target, &Cut::At { seq: 0, hash: watermark }, view) {
-        Ancestry::OnBranch => AncestryRelation::OnBranch,
-        Ancestry::OffBranch => AncestryRelation::OffBranch,
-        Ancestry::Unknown(UnknownCause::UnknownCutTarget) =>
-            AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget),
-        Ancestry::Unknown(UnknownCause::IncompleteCutAncestry) =>
-            AncestryRelation::Unknown(UnknownAncestry::IncompleteCutAncestry),
-    }
+    account_candidate::ancestry(&target, &Cut::At { seq: 0, hash: watermark }, view)
 }
 
 #[cfg(test)]
@@ -1413,3 +1402,5 @@ mod tests {
         .unwrap()
     }
 }
+
+use super::super::branch::{AncestryRelation, CitedFreshness};

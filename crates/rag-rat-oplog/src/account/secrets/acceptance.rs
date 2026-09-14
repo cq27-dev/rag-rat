@@ -20,32 +20,7 @@ use super::super::{
 
 type AccountEntryHash = [u8; 32];
 
-/// Why an ancestry walk against a cut watermark could not be decided (mirrors the account fold's
-/// `UnknownCause`: a withheld watermark parks, and never flips a verdict — I11).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::account) enum UnknownAncestry {
-    /// The cut's watermark entry itself is not held.
-    UnknownCutTarget,
-    /// A link on the walk from the watermark toward the entry is missing.
-    IncompleteCutAncestry,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::account) enum AncestryRelation {
-    OnBranch,
-    OffBranch,
-    Unknown(UnknownAncestry),
-}
-
-/// One freshness observation, bound to the exact query it answers. The pair (account, asserted
-/// length) is carried so a result computed for another account, or for a shorter assertion than the
-/// header makes, decides nothing about THIS entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::account) struct CitedFreshness {
-    pub(in crate::account) account_id: AccountId,
-    pub(in crate::account) asserted_auth_len: u64,
-    pub(in crate::account) state: AuthorityFreshness,
-}
+use super::super::branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::account) enum SecretsParkReason {

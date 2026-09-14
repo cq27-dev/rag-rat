@@ -13,8 +13,8 @@ use super::super::ops::{self, AccountOp, DecodedAccountOp};
 use super::super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
 use super::super::{envelope as account_envelope, storage as account_storage};
 use super::acceptance::{
-    self, CitedFreshness, CitedGrantAuthority, CitedOwnership, CitedRosterAuthority,
-    ContentAcceptance, ContentParkReason, SubjectAuthorityHold,
+    self, CitedGrantAuthority, CitedOwnership, CitedRosterAuthority, ContentAcceptance,
+    ContentParkReason, SubjectAuthorityHold,
 };
 use super::candidate::{
     self, BranchPin, ChainCoordinate, ContentCandidate, CutBinding, HeaderView,
@@ -7646,3 +7646,5 @@ mod tests {
         );
     }
 }
+
+use super::super::branch::CitedFreshness;

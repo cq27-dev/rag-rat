@@ -18,6 +18,37 @@ use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::ControlFlow;
 
+use super::fold::AuthorityFreshness;
+use super::id::AccountId;
+
+/// Why an ancestry walk against a cut watermark could not be decided (a withheld watermark parks,
+/// and never flips a verdict — I11).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnknownAncestry {
+    /// The cut's watermark entry itself is not held.
+    UnknownCutTarget,
+    /// A link on the walk from the watermark toward the entry is missing.
+    IncompleteCutAncestry,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AncestryRelation {
+    /// The entry is the watermark itself or an ancestor reached walking backward from it.
+    OnBranch,
+    OffBranch,
+    Unknown(UnknownAncestry),
+}
+
+/// One freshness observation, bound to the exact query it answers. The pair (account, asserted
+/// length) is carried so a result computed for the owner cannot be read as the author's, and a
+/// result computed for a shorter assertion cannot stand in for the header's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CitedFreshness {
+    pub account_id: AccountId,
+    pub asserted_auth_len: u64,
+    pub state: AuthorityFreshness,
+}
+
 type AccountEntryHash = [u8; 32];
 
 /// The header fields the branch walks read: which dense chain an entry extends, its slot on that
