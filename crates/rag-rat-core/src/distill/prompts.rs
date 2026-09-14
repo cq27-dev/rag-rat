@@ -9,9 +9,8 @@
 //! text. The unit ids in the prompt are the units' ORIGINAL indices, so a citation stays valid even
 //! after tail-aware budgeting drops middle units.
 //!
-//! Consumed by the drain pass (a later #704 slice); exercised now by the golden tests so the
-//! contract ships verified before its consumer exists.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Consumed by `drain::drain`, which renders the prompt and schema it sends, and by
+//! `output::run_output_ladder`, which validates the model's reply against that schema.
 
 use rag_rat_papertrail::OutcomeStatus;
 use strum::VariantArray;
@@ -27,14 +26,14 @@ use super::units::BudgetPlan;
 /// plain-prose gate rejects, and re-attempts failed identically (a live-run precision fix).
 pub(crate) const PROMPT_VERSION: u32 = 4;
 
-// Output bounds are shared contract constants so the later strict/fallback parser can enforce the
-// same limits as guided decoding rather than trusting the backend alone.
-pub(crate) const MAX_EVIDENCE_UNITS: usize = 64;
-pub(crate) const MAX_NARRATIVE_CHARS: usize = 1_000;
-pub(crate) const MAX_CAUSE_CLASS_CHARS: usize = 100;
-pub(crate) const MAX_REJECTED_ALTERNATIVES: usize = 20;
-pub(crate) const MAX_ALTERNATIVE_CHARS: usize = 500;
-pub(crate) const MAX_ANCHOR_INDICES: usize = 40;
+// Guided decoding and output validation use the same bounds through the record schema,
+// rather than trusting the backend alone.
+const MAX_EVIDENCE_UNITS: usize = 64;
+const MAX_NARRATIVE_CHARS: usize = 1_000;
+const MAX_CAUSE_CLASS_CHARS: usize = 100;
+const MAX_REJECTED_ALTERNATIVES: usize = 20;
+const MAX_ALTERNATIVE_CHARS: usize = 500;
+const MAX_ANCHOR_INDICES: usize = 40;
 
 /// Max chars of a cross-referenced item's title and opening the prompt renders. The extraction
 /// snapshot caps the STORED (and hashed) text to this same width, so a referenced item's edit
