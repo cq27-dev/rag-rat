@@ -559,13 +559,7 @@ fn day_before(timestamp: &str) -> anyhow::Result<String> {
     let (year, month, day) = parse_date(date)
         .filter(|(_, month, day)| (1..=12).contains(month) && (1..=31).contains(day))
         .ok_or_else(|| anyhow::anyhow!("timestamp `{timestamp}` has no leading YYYY-MM-DD date"))?;
-    let (year, month, day) = if day > 1 {
-        (year, month, day - 1)
-    } else if month > 1 {
-        (year, month - 1, days_in_month(year, month - 1))
-    } else {
-        (year - 1, 12, 31)
-    };
+    let (year, month, day) = previous_civil_day(year, month, day);
     Ok(format!("{year:04}-{month:02}-{day:02}"))
 }
 
