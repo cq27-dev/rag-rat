@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rag_rat_base::locks::WriteLock;
 use rag_rat_llm::chat::ChatModel;
-use rag_rat_papertrail::FixEdgeSource;
+use rag_rat_papertrail::{AnchorKind, FixEdgeSource};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -15,7 +15,7 @@ use super::prompts::{
     self, AnchorContext, FixCommit, PartnerThread, PromptBudget, PromptInput, PromptUnit,
     SymbolContext,
 };
-use super::thread::{self, ThreadKey};
+use super::thread::{self, SourceKind, SourcePart, SourceRole, ThreadKey};
 use super::{run_stats, validate};
 
 const MAX_STORED_ERROR_CHARS: usize = 2_000;
@@ -72,12 +72,12 @@ struct PreparedIdentity {
 #[derive(Debug, Clone)]
 struct SourceSnapshot {
     ordinal: usize,
-    role: String,
+    role: SourceRole,
     partner_ordinal: Option<usize>,
     item_kind: String,
     item_key: String,
-    source_kind: String,
-    source_part: String,
+    source_kind: SourceKind,
+    source_part: SourcePart,
     source_id: String,
     exact_text: String,
     author: Option<String>,
@@ -330,15 +330,15 @@ fn load_sources(
         |row| {
             Ok(SourceSnapshot {
                 ordinal: usize_from_sql(row.get::<_, i64>(0)?, 0)?,
-                role: row.get(1)?,
+                role: token_from_sql(row, 1, SourceRole::from_db_str)?,
                 partner_ordinal: row
                     .get::<_, Option<i64>>(2)?
                     .map(|value| usize_from_sql(value, 2))
                     .transpose()?,
                 item_kind: row.get(3)?,
                 item_key: row.get(4)?,
-                source_kind: row.get(5)?,
-                source_part: row.get(6)?,
+                source_kind: token_from_sql(row, 5, SourceKind::from_db_str)?,
+                source_part: token_from_sql(row, 6, SourcePart::from_db_str)?,
                 source_id: row.get(7)?,
                 exact_text: row.get(8)?,
                 author: row.get(9)?,
@@ -529,11 +529,18 @@ fn build_prompt_input(
 ) -> anyhow::Result<PromptInput> {
     let primary_title = sources
         .iter()
-        .find(|source| source.role == "primary" && source.source_part == "title")
+        .find(|source| {
+            source.role == SourceRole::Primary && source.source_part == SourcePart::Title
+        })
         .ok_or_else(|| anyhow::anyhow!("prepared distill snapshot has no primary title"))?;
-    let primary_units: Vec<PromptUnit> =
-        units.iter().filter(|unit| unit.source.role == "primary").map(prompt_unit).collect();
-    for (expected, unit) in units.iter().filter(|unit| unit.source.role == "primary").enumerate() {
+    let primary_units: Vec<PromptUnit> = units
+        .iter()
+        .filter(|unit| unit.source.role == SourceRole::Primary)
+        .map(prompt_unit)
+        .collect();
+    for (expected, unit) in
+        units.iter().filter(|unit| unit.source.role == SourceRole::Primary).enumerate()
+    {
         anyhow::ensure!(unit.ordinal == expected, "primary distill unit ids are not a prefix");
     }
 
@@ -550,7 +557,7 @@ fn build_prompt_input(
                 .collect();
             let title = partner_sources
                 .iter()
-                .find(|source| source.source_part == "title")
+                .find(|source| source.source_part == SourcePart::Title)
                 .map_or("", |source| source.exact_text.as_str());
             let identity = partner_sources.first().copied();
             PartnerThread {
@@ -579,7 +586,7 @@ fn build_prompt_input(
         .collect();
     let symbols = anchors
         .iter()
-        .filter(|anchor| anchor.kind == "symbol" && anchor.resolved)
+        .filter(|anchor| anchor.kind == AnchorKind::Symbol.as_db_str() && anchor.resolved)
         .map(|anchor| SymbolContext {
             name: anchor.name.clone(),
             kind: anchor.kind.clone(),
@@ -605,12 +612,14 @@ fn build_prompt_input(
 fn prompt_unit(unit: &UnitSnapshot) -> PromptUnit {
     PromptUnit {
         text: unit.source.exact_text[unit.byte_start..unit.byte_end].to_string(),
-        source: if unit.source.source_kind == "comment" {
+        source: if unit.source.source_kind == SourceKind::Comment {
             format!("comment {}", unit.source.source_id)
         } else {
             format!(
                 "{} #{} {}",
-                unit.source.item_kind, unit.source.item_key, unit.source.source_part
+                unit.source.item_kind,
+                unit.source.item_key,
+                unit.source.source_part.as_db_str()
             )
         },
     }
@@ -867,7 +876,10 @@ fn collect_evidence<'a>(
                 .units
                 .get(citation.get())
                 .ok_or_else(|| anyhow::anyhow!("validated citation has no snapshot unit"))?;
-            anyhow::ensure!(unit.source.role == "primary", "partner unit cannot be evidence");
+            anyhow::ensure!(
+                unit.source.role == SourceRole::Primary,
+                "partner unit cannot be evidence"
+            );
             evidence.push(EvidenceRow { field, unit, source: &unit.source });
         }
     }
@@ -895,10 +907,10 @@ fn insert_evidence(
             key.item_key,
             i64::try_from(ordinal)?,
             evidence.field,
-            evidence.source.source_kind,
+            evidence.source.source_kind.as_db_str(),
             // source_part (#801) distinguishes a title citation from a body citation on the same
             // item — both carry the item key as source_id, so this is the only discriminator.
-            evidence.source.source_part,
+            evidence.source.source_part.as_db_str(),
             evidence.source.source_id,
             i64::try_from(evidence.unit.byte_start)?,
             i64::try_from(evidence.unit.byte_end)?,
@@ -920,6 +932,20 @@ fn usize_from_sql(value: i64, column: usize) -> rusqlite::Result<usize> {
             rusqlite::types::Type::Integer,
             Box::new(error),
         )
+    })
+}
+
+/// Parse a closed-vocabulary snapshot column. The snapshot tables are local-only, written by
+/// extraction through the same tokens and CHECK-constrained to them, so an unknown one is
+/// corruption: it fails the load rather than silently dropping the row out of a filter.
+fn token_from_sql<T>(
+    row: &rusqlite::Row<'_>,
+    column: usize,
+    parse: fn(&str) -> anyhow::Result<T>,
+) -> rusqlite::Result<T> {
+    let value: String = row.get(column)?;
+    parse(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, error.into())
     })
 }
 
@@ -1477,6 +1503,25 @@ mod tests {
             prompt.contains("[] #9 (reference): Kindless target"),
             "a NULL target kind renders as an empty kind label: {prompt}",
         );
+    }
+
+    #[test]
+    fn an_unknown_source_token_fails_the_load_instead_of_dropping_out_of_a_filter() {
+        // The column's CHECK admits only the enum's tokens, so an unknown one means the constraint
+        // was bypassed. Read as a bare string it would render as an item source and slip past
+        // every `comment` check; hydrated as a closed enum it fails the load.
+        let conn = fixture();
+        seed(&conn, "first", 10);
+        conn.execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE papertrail_distill_sources SET source_kind = 'commnt' WHERE source_ordinal = 1;
+             PRAGMA ignore_check_constraints = OFF;",
+        )
+        .unwrap();
+
+        let error = load_prepared_jobs(&conn, "repo", 1, &PromptBudget::default())
+            .expect_err("an unknown source kind must fail the snapshot load");
+        assert!(format!("{error:#}").contains("unknown distill source kind `commnt`"), "{error:#}");
     }
 
     #[test]
