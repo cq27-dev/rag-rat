@@ -569,61 +569,7 @@ impl IndexDatabase {
             // re-resolves so a carried caller's edge re-points at re-derived rowids
             // (#502).
             if effects.any_rows_written() || effects.roots_changed {
-                // #820: a batch whose EVERY change was a key-stable file replacement keeps the
-                // grouped table correct by re-linking members inside this same transaction —
-                // the wholesale rebuild is owed only when a key set changed, or when the pass
-                // mutated grouping-relevant state OUTSIDE the per-file plan (an overlay heal
-                // moves symbols across scopes; a carry re-stamps scope rows; a package-map
-                // change keeps today's rebuild coupling). A pre-existing #819 obligation is
-                // untouched either way — the pass's tail settle below still consumes it.
-                let key_stable_relinks = match logical {
-                    graph_index::LogicalGroupingUpkeep::RelinkMembers(relinks)
-                        if effects.base_files_only() =>
-                        Some(relinks),
-                    _ => None,
-                };
-                match key_stable_relinks {
-                    Some(relinks) => self.apply_logical_member_relinks(&relinks)?,
-                    None => {
-                        progress(IndexProgress::RebuildingLogicalSymbols);
-                        // #826: re-derive ONLY the changed paths' logical groups (staged in
-                        // `temp.logical_rederive_paths`) instead of the whole repo, UNLESS a #493
-                        // drift heal (key-version lag) or a #819 deferred whole-repo rebuild is
-                        // owed — both of which the scoped path cannot
-                        // serve, so they keep the full rebuild.
-                        // A carry / roots-change reaches here (their guard above excludes the
-                        // relink) but does not move any grouping, so its
-                        // captured set is empty and the scoped re-derive is
-                        // a correct no-op; a heal's removed paths ARE captured (via
-                        // `remove_file_in_scope`), so they regroup. Defer: a partial pass must not
-                        // stamp the logical-key version — untouched files' drift is still future.
-                        if self.can_scope_logical_rederive()? {
-                            self.rederive_changed_logical_symbols()?;
-                        } else {
-                            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
-                        }
-                    },
-                }
-                progress(IndexProgress::ResolvingGraph);
-                // #827: narrow the re-resolve to this pass's staged changed files + the source
-                // files of the in-edges its removals NULLed
-                // (`temp.edge_rewrite_files`) — but ONLY when the pass's mutations
-                // are purely per-file symbol/edge changes. A package-map change
-                // (`roots_changed`), a carried scope (`carried`), or an overlay heal (`healed`) can
-                // shift how edges in UNCHANGED files resolve (import scope / row visibility), which
-                // a narrowed write set would silently under-resolve — those keep
-                // the full active-scope pass. The narrowed set re-points every
-                // existing edge (no `find_callers` loss); only a purely NEW binding
-                // from an unchanged source is deferred to the next full pass.
-                let scoped_resolve = indexed > 0 && effects.base_files_only();
-                if scoped_resolve {
-                    self.resolve_changed_edges()?;
-                } else {
-                    self.resolve_edges()?;
-                }
-                self.mark_graph_index_current()?;
-                progress(IndexProgress::SyncingFts);
-                self.sync_fts()?;
+                self.rederive_after_pass(&effects, logical, progress)?;
             }
             // #827: disarm capture for this connection (the staged rows are consumed by the resolve
             // above; the next pass's `begin_scoped_edge_rewrite` clears them). Runs whether or not
@@ -648,6 +594,76 @@ impl IndexDatabase {
             let _ = self.storage.execute_batch("ROLLBACK");
         }
         result
+    }
+
+    /// The incremental pass's re-derive tail, inside [`Self::apply_pass`]'s transaction: regroup
+    /// logical symbols (relink, scoped re-derive or rebuild), re-resolve edges (narrowed or full),
+    /// mark the graph current and sync FTS. Each gate reads what the pass mutated (`effects`) and
+    /// the batch's grouping verdict (`logical`); statement order is the transaction's contract.
+    fn rederive_after_pass<F>(
+        &self,
+        effects: &PassEffects,
+        logical: graph_index::LogicalGroupingUpkeep,
+        progress: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(IndexProgress),
+    {
+        // #820: a batch whose EVERY change was a key-stable file replacement keeps the
+        // grouped table correct by re-linking members inside this same transaction —
+        // the wholesale rebuild is owed only when a key set changed, or when the pass
+        // mutated grouping-relevant state OUTSIDE the per-file plan (an overlay heal
+        // moves symbols across scopes; a carry re-stamps scope rows; a package-map
+        // change keeps today's rebuild coupling). A pre-existing #819 obligation is
+        // untouched either way — the pass's tail settle still consumes it.
+        let key_stable_relinks = match logical {
+            graph_index::LogicalGroupingUpkeep::RelinkMembers(relinks)
+                if effects.base_files_only() =>
+                Some(relinks),
+            _ => None,
+        };
+        match key_stable_relinks {
+            Some(relinks) => self.apply_logical_member_relinks(&relinks)?,
+            None => {
+                progress(IndexProgress::RebuildingLogicalSymbols);
+                // #826: re-derive ONLY the changed paths' logical groups (staged in
+                // `temp.logical_rederive_paths`) instead of the whole repo, UNLESS a #493
+                // drift heal (key-version lag) or a #819 deferred whole-repo rebuild is
+                // owed — both of which the scoped path cannot
+                // serve, so they keep the full rebuild.
+                // A carry / roots-change reaches here (their guard above excludes the
+                // relink) but does not move any grouping, so its
+                // captured set is empty and the scoped re-derive is
+                // a correct no-op; a heal's removed paths ARE captured (via
+                // `remove_file_in_scope`), so they regroup. Defer: a partial pass must not
+                // stamp the logical-key version — untouched files' drift is still future.
+                if self.can_scope_logical_rederive()? {
+                    self.rederive_changed_logical_symbols()?;
+                } else {
+                    self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                }
+            },
+        }
+        progress(IndexProgress::ResolvingGraph);
+        // #827: narrow the re-resolve to this pass's staged changed files + the source
+        // files of the in-edges its removals NULLed
+        // (`temp.edge_rewrite_files`) — but ONLY when the pass's mutations
+        // are purely per-file symbol/edge changes. A package-map change
+        // (`roots_changed`), a carried scope (`carried`), or an overlay heal (`healed`) can
+        // shift how edges in UNCHANGED files resolve (import scope / row visibility), which
+        // a narrowed write set would silently under-resolve — those keep
+        // the full active-scope pass. The narrowed set re-points every
+        // existing edge (no `find_callers` loss); only a purely NEW binding
+        // from an unchanged source is deferred to the next full pass.
+        let scoped_resolve = effects.indexed > 0 && effects.base_files_only();
+        if scoped_resolve {
+            self.resolve_changed_edges()?;
+        } else {
+            self.resolve_edges()?;
+        }
+        self.mark_graph_index_current()?;
+        progress(IndexProgress::SyncingFts);
+        self.sync_fts()
     }
 
     /// Standalone full-corpus indexing into the CURRENT context — no generation staging, no
