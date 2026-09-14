@@ -430,16 +430,15 @@ pub(crate) fn graph_tool(
         SymbolAnswer::Selected(symbol) => {
             options.symbol_id = Some(symbol.symbol_id);
             let tool = graph_tool_name(direction);
-            let mut value =
-                json!(db.graph_traversal_report(tool, &symbol, direction, limit, &options)?);
-            compact_graph_coverage(&mut value, include_coverage);
+            let mut report =
+                db.graph_traversal_report(tool, &symbol, direction, limit, &options)?;
+            escalate_risk_when_coverage_degraded(&mut report);
+            let mut value = json!(report);
+            if !include_coverage {
+                compact_graph_coverage(&mut value, &report.coverage);
+            }
             if include_memories {
-                let edge_ids = value["results"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|hop| hop.get("edge_id").and_then(Value::as_i64))
-                    .collect::<Vec<_>>();
+                let edge_ids = report.results.iter().map(|hop| hop.edge_id).collect::<Vec<_>>();
                 // find_callers crosses caller edges (X -> symbol); trace_callees crosses callee
                 // edges (symbol -> X). Pass the correct side so call-path hashes line up (#38).
                 let (caller_edge_ids, callee_edge_ids): (&[i64], &[i64]) = match direction {
@@ -542,7 +541,8 @@ pub(crate) fn keep_literal_tracker_refs_if_present(value: &mut Value) {
     let literal_items = items
         .iter()
         .filter(|item| {
-            item.get("evidence_kind").and_then(Value::as_str) == Some("literal_tracker_ref")
+            item.get("evidence_kind").and_then(Value::as_str)
+                == Some(rag_rat_papertrail::LITERAL_TRACKER_REF)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -551,38 +551,29 @@ pub(crate) fn keep_literal_tracker_refs_if_present(value: &mut Value) {
     }
 }
 
-pub(crate) fn compact_graph_coverage(value: &mut Value, include_coverage: bool) {
+/// A stale or partially-parsed index can hide caller/callee edges entirely, so a 0-result must not
+/// read as confident. Never report `low` completeness when coverage is degraded (issue #47: a stale
+/// index produced "0 callers, completeness_risk: low"). Applied to the typed report, so a renamed
+/// field is a compile error rather than a silently skipped guard.
+pub(crate) fn escalate_risk_when_coverage_degraded(report: &mut GraphTraversalReport) {
+    let coverage = &report.coverage;
+    let degraded = coverage.stale_files > 0
+        || coverage.parser_failures > 0
+        || !coverage.known_index_gaps.is_empty();
+    if degraded && report.summary.completeness_risk == "low" {
+        report.summary.completeness_risk = "medium".to_string();
+    }
+}
+
+/// Swap the serialized report's full `coverage` block for one-line `coverage_warnings` (omitted
+/// when coverage is clean) — the compact default when the caller did not ask for coverage.
+pub(crate) fn compact_graph_coverage(value: &mut Value, coverage: &GraphCoverage) {
     let Some(report) = value.as_object_mut() else {
         return;
     };
-    let (parser_failures, stale_files, known_gaps) = report
-        .get("coverage")
-        .and_then(Value::as_object)
-        .map(|coverage| {
-            (
-                coverage.get("parser_failures").and_then(Value::as_u64).unwrap_or_default(),
-                coverage.get("stale_files").and_then(Value::as_u64).unwrap_or_default(),
-                coverage.get("known_index_gaps").and_then(Value::as_array).map_or(0, Vec::len),
-            )
-        })
-        .unwrap_or_default();
-
-    // A stale or partially-parsed index can hide caller/callee edges entirely, so a 0-result
-    // must not read as confident. Never report `low` completeness when coverage is degraded
-    // (issue #47: a stale index produced "0 callers, completeness_risk: low").
-    if (stale_files > 0 || parser_failures > 0 || known_gaps > 0)
-        && let Some(risk) = report
-            .get_mut("summary")
-            .and_then(Value::as_object_mut)
-            .and_then(|summary| summary.get_mut("completeness_risk"))
-        && risk.as_str() == Some("low")
-    {
-        *risk = Value::String("medium".to_string());
-    }
-
-    if include_coverage {
-        return;
-    }
+    let parser_failures = coverage.parser_failures;
+    let stale_files = coverage.stale_files;
+    let known_gaps = coverage.known_index_gaps.len();
     if report.remove("coverage").is_none() {
         return;
     }
