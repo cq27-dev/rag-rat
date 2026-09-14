@@ -53,6 +53,7 @@ impl CellBudget {
 
     /// A budget at `budget` that has already charged `spent` — exhausted when `spent` is past the
     /// cap, exactly as if the charges had gone through this instance.
+    #[cfg(test)]
     pub(crate) fn resumed(budget: u64, spent: u64) -> Self {
         CellBudget { spent, budget }
     }
@@ -71,6 +72,7 @@ impl CellBudget {
         *remaining = remaining.saturating_sub(self.spent);
     }
 
+    #[cfg(test)]
     pub(crate) fn spent(&self) -> u64 {
         self.spent
     }

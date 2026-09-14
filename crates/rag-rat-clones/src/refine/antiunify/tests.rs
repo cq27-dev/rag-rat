@@ -2460,11 +2460,12 @@ fn under_budget_class_is_byte_identical_to_unbudgeted() {
         ])
     };
 
-    // Production path (fresh budget at the lane const — never tripped for this small class).
+    // Production path: the real entry, drawing from an allowance at the lane cap (never tripped
+    // for this small class).
     let prod = mk();
     let prod_anchor = resolve_anchor_idx(&prod, None);
-    let prod_align = align_to_anchor(&prod, prod_anchor);
-    let prod_tpl = anti_unify(&prod, &prod_align);
+    let mut allowance = ALIGN_AGGREGATE_CELLS_BUDGET;
+    let (prod_align, prod_tpl) = anti_unify_global(&prod, prod_anchor, &mut allowance);
 
     // Explicit huge-budget path (a budget so large it can never trip) — must produce the SAME
     // output, proving the budget machinery does not perturb the under-budget result.
@@ -2486,6 +2487,17 @@ fn under_budget_class_is_byte_identical_to_unbudgeted() {
     // Neither is sampled — the under-budget common case.
     assert!(!prod_align.sampled && !prod_tpl.sampled, "under-budget class must not be sampled");
     assert!(!huge_align.sampled && !huge_tpl.sampled, "huge-budget class must not be sampled");
+
+    // The tests' unbudgeted entry pair matches the real entry too.
+    let pair = mk();
+    let pair_align = align_to_anchor(&pair, prod_anchor);
+    let pair_tpl = anti_unify(&pair, &pair_align);
+    assert_eq!(prod_tpl.text, pair_tpl.text, "the test entry pair must match the real entry");
+    assert_eq!(
+        prod_vps,
+        serde_json::to_string(&pair_tpl.variation_points).unwrap(),
+        "the test entry pair must match the real entry's variation points"
+    );
 }
 
 // ─────────────────────── kk adversarial probes (round-6 callee reopen) ──────────────────────

@@ -19,19 +19,11 @@ use super::widen::{
     annotation_type_context, widen_generic_type_head_run, widen_string_content_run,
 };
 
-/// Anti-unify the class via a recursive descent of the anchor AST (§1.2–§1.10).
-///
-/// Rather than coalescing raw LCS variation columns (which straddle when LCS spuriously matches
-/// repeated internal-node kinds across structurally-different subtrees), we descend the anchor's
-/// pre-order subtree spans and emit one metavar at the tightest subtree where members genuinely
-/// diverge. This snaps a differing subtree to ONE metavar (not one per differing leaf), surfaces an
-/// indel (a member that gaps a whole subtree) as a `gapped` metavar, and keeps a clean leaf swap as
-/// a single-column `value_param`/`type_param`. See the module-level "Simplifications" note.
+/// [`anti_unify_with_budget`] resuming the per-class budget the star align already charged
+/// (`alignment.spent_cells`), so the matched-statement re-descent continues it rather than
+/// restarting fresh — the tests' entry point.
+#[cfg(test)]
 pub(crate) fn anti_unify(members: &[RefineMember], alignment: &ClassAlignment) -> Template {
-    // Production entry: a budget at the lane const, SEEDED with the cells the parent star-align
-    // already charged (`alignment.spent_cells`) so the matched-statement re-descent CONTINUES the
-    // same per-class budget rather than restarting fresh. The whole per-class anti-unify (parent
-    // star-align + every re-descent) is therefore bounded by ONE [`ALIGN_AGGREGATE_CELLS_BUDGET`].
     let mut budget = CellBudget::resumed(ALIGN_AGGREGATE_CELLS_BUDGET, alignment.spent_cells);
     anti_unify_with_budget(members, alignment, &mut budget)
 }
@@ -64,13 +56,22 @@ pub(crate) fn anti_unify_global(
     (alignment, template)
 }
 
-/// [`anti_unify`] drawing from a CALLER-OWNED [`CellBudget`]. The budget bounds the exact
-/// `lcs_align` work the matched-statement re-descent ([`emit_matched_statement_redescent`]) adds:
-/// once it is exhausted, remaining matched statements are left whole-fixed (no further exact DP)
-/// and the returned [`Template::sampled`] is set. The re-descent recursion passes the SAME budget
-/// down to its `align_to_anchor_with_budget` + `anti_unify_with_budget` calls (the sub-alignment's
-/// cells are already charged to it — no re-seed), so a matched statement nested inside another
-/// matched statement still draws from the one per-class budget.
+/// Anti-unify the class via a recursive descent of the anchor AST (§1.2–§1.10).
+///
+/// Rather than coalescing raw LCS variation columns (which straddle when LCS spuriously matches
+/// repeated internal-node kinds across structurally-different subtrees), we descend the anchor's
+/// pre-order subtree spans and emit one metavar at the tightest subtree where members genuinely
+/// diverge. This snaps a differing subtree to ONE metavar (not one per differing leaf), surfaces an
+/// indel (a member that gaps a whole subtree) as a `gapped` metavar, and keeps a clean leaf swap as
+/// a single-column `value_param`/`type_param`. See the module-level "Simplifications" note.
+///
+/// The CALLER-OWNED [`CellBudget`] bounds the exact `lcs_align` work the matched-statement
+/// re-descent ([`emit_matched_statement_redescent`]) adds: once it is exhausted, remaining matched
+/// statements are left whole-fixed (no further exact DP) and the returned [`Template::sampled`] is
+/// set. The re-descent recursion passes the SAME budget down to its `align_to_anchor_with_budget` +
+/// `anti_unify_with_budget` calls (the sub-alignment's cells are already charged to it — no
+/// re-seed), so a matched statement nested inside another matched statement still draws from the
+/// one per-class budget.
 pub(super) fn anti_unify_with_budget(
     members: &[RefineMember],
     alignment: &ClassAlignment,

@@ -58,9 +58,13 @@ mod widen;
 use std::collections::BTreeMap;
 
 #[cfg(test)]
+pub(crate) use alignment::align_to_anchor;
+#[cfg(test)]
 use alignment::align_to_anchor_with_budget;
-pub(crate) use alignment::{align_to_anchor, resolve_anchor_idx};
-pub(crate) use build::{anti_unify, anti_unify_global};
+pub(crate) use alignment::resolve_anchor_idx;
+#[cfg(test)]
+pub(crate) use build::anti_unify;
+pub(crate) use build::anti_unify_global;
 #[cfg(test)]
 use build::{anti_unify_with_budget, collapse_recurring};
 #[cfg(test)]
