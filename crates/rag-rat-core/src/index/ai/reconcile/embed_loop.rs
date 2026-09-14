@@ -1,3 +1,5 @@
+use std::ops::ControlFlow;
+
 use rag_rat_base::config::RemoteEmbeddingConfig;
 
 use super::super::*;
@@ -89,86 +91,24 @@ pub(crate) fn reconcile_with_options_progress(
     // waste. Only the Ready path (which actually walks the candidates) runs the policy summary.
     let acquired = acquire_chunk_embedder(conn, options.intra_threads, &scan, &options);
 
-    // SkipEphemeral and NoEphemeralWork are the ONLY paths that return BEFORE the policy scan, and
-    // both embed nothing:
-    //  - SkipEphemeral: an ephemeral active model on a watcher/maintenance pass
-    //    (`provision_remote=false`) whose local `query_endpoint` is absent or UNREACHABLE — defer
-    //    incremental embedding to an explicit reconcile. (WITH a REACHABLE `query_endpoint`, that
-    //    pass takes the light local-embed path → `Ready`, not here.) Returning here avoids paying
-    //    the repo-wide `embedding_policy_skip_summary` scan just to report a deferral.
-    //  - NoEphemeralWork: an explicit provisioning reconcile on an already-current ephemeral model
-    //    (never cold-start a paid box for zero work, #330-6). `acquire_chunk_embedder` confirmed
-    //    ZERO candidates, so the policy scan would likewise be wasted work.
-    // Both carry an empty `skipped_by_policy` (no policy counts on these early-return paths). The
-    // NotReady path below DOES report policy skips
-    // (`blocked_fastembed_reconcile_still_reports_policy_skips` pins that), so it runs the scan
-    // like the Ready path.
-    // `_provisioned` MUST outlive the embed loop: its `Drop` is the box teardown. Bound at function
-    // scope here (not inside the match) so it lives until the function returns.
-    let (embedder, _provisioned, remote_config, acquired_estimated_jobs, mut report) =
-        match acquired {
-            ChunkEmbedder::Ready { embedder, provisioned, remote, estimated_jobs } => {
-                let report = heal_policy_and_report_skips(conn, &mut scan, &options, batch_size)?;
-                (embedder, provisioned, remote, estimated_jobs, report)
-            },
-            ChunkEmbedder::NotReady(err) => {
-                // Surface the cause (e.g. a cookbook provisioning failure with its captured
-                // stderr) so a remote outage isn't swallowed; the report keeps the actionable
-                // "install" hint AND the policy-skip counts.
-                let mut report =
-                    heal_policy_and_report_skips(conn, &mut scan, &options, batch_size)?;
-                eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
-                report.status = ReconcileStatus::Blocked;
-                report.message = Some(format!(
-                    "{active_model_id} model is not ready; run `rag-rat models install \
-                     {active_model_id}`"
-                ));
-                return finish_attempt_without_embedding(conn, attempt_id, report, &mut progress);
-            },
-            skip @ (ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork) => {
-                // NoEphemeralWork is an EXPLICIT `rag-rat reconcile` with nothing to embed — still
-                // a good moment to certify the policy column after a version bump so later
-                // plans take the fast path. SkipEphemeral is a FREQUENT watcher/maintenance
-                // deferral and must stay cheap: no heal scan. (The heal itself no-ops
-                // unless the stamp is stale at the DEFAULT cap.)
-                if matches!(skip, ChunkEmbedder::NoEphemeralWork) {
-                    policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
-                }
-                let (status, message) = match skip {
-                    ChunkEmbedder::SkipEphemeral => (
-                        ReconcileStatus::Blocked,
-                        Some(
-                            "ephemeral remote embedding needs an explicit `rag-rat reconcile`, or \
-                             a REACHABLE local `[remote] query_endpoint` server to embed \
-                             incremental edits against (the watcher does not provision a GPU box)"
-                                .to_string(),
-                        ),
-                    ),
-                    // Already current → nothing to embed; no paid box was provisioned.
-                    _ => (ReconcileStatus::Current, None),
-                };
-                let report = ReconcileReport {
-                    status,
-                    message,
-                    ..batch_write::empty_current_reconcile_report(
-                        active_model_id.clone(),
-                        model_version.clone(),
-                        embedding_dim,
-                        batch_size,
-                        max_embedding_chars,
-                        &options,
-                    )
-                };
-                return finish_attempt_without_embedding(conn, attempt_id, report, &mut progress);
-            },
-        };
-    let selection_batch_size = remote_config
+    let mut pass = match begin_embed_pass(
+        conn,
+        &mut scan,
+        acquired,
+        EmbedPassStart { options: &options, attempt_id, batch_size },
+        &mut progress,
+    )? {
+        ControlFlow::Break(report) => return Ok(report),
+        ControlFlow::Continue(pass) => pass,
+    };
+    let selection_batch_size = pass
+        .remote
         .as_deref()
         .map(|remote| {
             batch_write::remote_reconcile_batch_size(remote, batch_size, options.max_seconds)
         })
         .unwrap_or(batch_size);
-    let progress_total_chunks = match preflight_estimated_jobs.or(acquired_estimated_jobs) {
+    let progress_total_chunks = match preflight_estimated_jobs.or(pass.estimated_jobs) {
         Some(jobs) => jobs,
         None => estimated_reconcile_jobs(conn, &scan, &options)?,
     };
@@ -181,47 +121,47 @@ pub(crate) fn reconcile_with_options_progress(
         conn,
         scan: &scan,
         options: &options,
-        embedder: embedder.as_ref(),
-        remote: remote_config.as_deref(),
+        embedder: pass.embedder.as_ref(),
+        remote: pass.remote.as_deref(),
         selection_batch_size,
         timer,
     }
-    .drain_candidate_windows(&mut report, progress_total_chunks, &mut progress)?;
-    if report.failed_chunks > 0 {
-        report.status = ReconcileStatus::Failed;
-        report.message =
-            Some(format!("{} chunks failed; retry after backoff", report.failed_chunks));
+    .drain_candidate_windows(&mut pass.report, progress_total_chunks, &mut progress)?;
+    if pass.report.failed_chunks > 0 {
+        pass.report.status = ReconcileStatus::Failed;
+        pass.report.message =
+            Some(format!("{} chunks failed; retry after backoff", pass.report.failed_chunks));
     }
     // Embeddings committed under the active model CONFIRM it as the working choice — clear the
     // provisional flag so a later config-model edit no longer reseeds away from it (that would
     // strand these vectors). The active model is what `embed_and_write_jobs` wrote under (#394).
-    if report.embeddings_written > 0 {
+    if pass.report.embeddings_written > 0 {
         clear_active_embedding_model_provisional(conn)?;
     }
-    finalize_reconcile_throughput(&mut report, timer.elapsed().as_millis());
+    finalize_reconcile_throughput(&mut pass.report, timer.elapsed().as_millis());
 
-    finish_reconcile_attempt(conn, attempt_id, &report)?;
+    finish_reconcile_attempt(conn, attempt_id, &pass.report)?;
     progress(ReconcileProgress::Finished {
-        processed_chunks: report.processed_chunks,
-        embeddings_written: report.embeddings_written,
-        failed_chunks: report.failed_chunks,
-        blocked_chunks: report.blocked_chunks,
+        processed_chunks: pass.report.processed_chunks,
+        embeddings_written: pass.report.embeddings_written,
+        failed_chunks: pass.report.failed_chunks,
+        blocked_chunks: pass.report.blocked_chunks,
     });
-    // `report.status` is the stop-reason reaching here (Current | Partial | Failed — the Blocked /
-    // NotReady acquire outcomes returned earlier); `remote` shows whether an offload backend was
-    // configured (a local light/incremental pass has none). The
+    // `pass.report.status` is the stop-reason reaching here (Current | Partial | Failed — the
+    // Blocked / NotReady acquire outcomes returned earlier); `remote` shows whether an offload
+    // backend was configured (a local light/incremental pass has none). The
     // active-scope proof for #360 (commit/worktree/view-installed, raw-vs-scoped counts) is a
     // deferred follow-up — it needs a conn-level scope introspection helper.
     tracing::info!(
         target: "rag_rat_core::index::ai::reconcile",
-        status = %report.status.as_db_str(),
-        embedded = report.embeddings_written,
-        processed = report.processed_chunks,
-        failed = report.failed_chunks,
-        remote = remote_config.is_some(),
+        status = %pass.report.status.as_db_str(),
+        embedded = pass.report.embeddings_written,
+        processed = pass.report.processed_chunks,
+        failed = pass.report.failed_chunks,
+        remote = pass.remote.is_some(),
         "reconcile complete"
     );
-    Ok(report)
+    Ok(pass.report)
 }
 
 /// Record the run-start meta and insert this reconcile's `Running` attempt row, returning its id
@@ -525,6 +465,115 @@ pub(crate) fn finalize_reconcile_throughput(report: &mut ReconcileReport, elapse
         0.0
     };
 }
+
+struct AcquiredEmbedPass {
+    embedder: Box<dyn Embedder>,
+    // Keep the provisioned box alive through the orchestrator's embed loop and final reporting.
+    _provisioned: Option<ProvisionedBox>,
+    remote: Option<Box<RemoteEmbeddingConfig>>,
+    estimated_jobs: Option<u64>,
+    report: ReconcileReport,
+}
+
+struct EmbedPassStart<'a> {
+    options: &'a ReconcileOptions,
+    attempt_id: i64,
+    batch_size: usize,
+}
+
+fn begin_embed_pass(
+    conn: &Connection,
+    scan: &mut EmbeddingScan<'_>,
+    acquired: ChunkEmbedder,
+    start: EmbedPassStart<'_>,
+    progress: &mut impl FnMut(ReconcileProgress),
+) -> anyhow::Result<ControlFlow<ReconcileReport, AcquiredEmbedPass>> {
+    let EmbedPassStart { options, attempt_id, batch_size } = start;
+    let active_model_id = scan.model_id;
+    let model_version = scan.model_version;
+    let embedding_dim = scan.dim;
+    let max_embedding_chars = scan.max_embedding_chars;
+    // SkipEphemeral and NoEphemeralWork are the ONLY paths that return BEFORE the policy scan, and
+    // both embed nothing:
+    //  - SkipEphemeral: an ephemeral active model on a watcher/maintenance pass
+    //    (`provision_remote=false`) whose local `query_endpoint` is absent or UNREACHABLE — defer
+    //    incremental embedding to an explicit reconcile. (WITH a REACHABLE `query_endpoint`, that
+    //    pass takes the light local-embed path → `Ready`, not here.) Returning here avoids paying
+    //    the repo-wide `embedding_policy_skip_summary` scan just to report a deferral.
+    //  - NoEphemeralWork: an explicit provisioning reconcile on an already-current ephemeral model
+    //    (never cold-start a paid box for zero work, #330-6). `acquire_chunk_embedder` confirmed
+    //    ZERO candidates, so the policy scan would likewise be wasted work.
+    // Both carry an empty `skipped_by_policy` (no policy counts on these early-return paths). The
+    // NotReady path below DOES report policy skips
+    // (`blocked_fastembed_reconcile_still_reports_policy_skips` pins that), so it runs the scan
+    // like the Ready path.
+    // The returned pass owns `_provisioned` through the orchestrator scope; its Drop tears down the
+    // box.
+    match acquired {
+        ChunkEmbedder::Ready { embedder, provisioned, remote, estimated_jobs } => {
+            let report = heal_policy_and_report_skips(conn, scan, options, batch_size)?;
+            Ok(ControlFlow::Continue(AcquiredEmbedPass {
+                embedder,
+                _provisioned: provisioned,
+                remote,
+                estimated_jobs,
+                report,
+            }))
+        },
+        ChunkEmbedder::NotReady(err) => {
+            // Surface the cause (e.g. a cookbook provisioning failure with its captured
+            // stderr) so a remote outage isn't swallowed; the report keeps the actionable
+            // "install" hint AND the policy-skip counts.
+            let mut report = heal_policy_and_report_skips(conn, scan, options, batch_size)?;
+            eprintln!("rag-rat: chunk embedder unavailable: {err:#}");
+            report.status = ReconcileStatus::Blocked;
+            report.message = Some(format!(
+                "{active_model_id} model is not ready; run `rag-rat models install \
+                 {active_model_id}`"
+            ));
+            finish_attempt_without_embedding(conn, attempt_id, report, progress)
+                .map(ControlFlow::Break)
+        },
+        skip @ (ChunkEmbedder::SkipEphemeral | ChunkEmbedder::NoEphemeralWork) => {
+            // NoEphemeralWork is an EXPLICIT `rag-rat reconcile` with nothing to embed — still
+            // a good moment to certify the policy column after a version bump so later
+            // plans take the fast path. SkipEphemeral is a FREQUENT watcher/maintenance
+            // deferral and must stay cheap: no heal scan. (The heal itself no-ops
+            // unless the stamp is stale at the DEFAULT cap.)
+            if matches!(skip, ChunkEmbedder::NoEphemeralWork) {
+                policy_scan::maybe_heal_embedding_policy(conn, max_embedding_chars);
+            }
+            let (status, message) = match skip {
+                ChunkEmbedder::SkipEphemeral => (
+                    ReconcileStatus::Blocked,
+                    Some(
+                        "ephemeral remote embedding needs an explicit `rag-rat reconcile`, or a \
+                         REACHABLE local `[remote] query_endpoint` server to embed incremental \
+                         edits against (the watcher does not provision a GPU box)"
+                            .to_string(),
+                    ),
+                ),
+                // Already current → nothing to embed; no paid box was provisioned.
+                _ => (ReconcileStatus::Current, None),
+            };
+            let report = ReconcileReport {
+                status,
+                message,
+                ..batch_write::empty_current_reconcile_report(
+                    active_model_id.to_string(),
+                    model_version.to_string(),
+                    embedding_dim,
+                    batch_size,
+                    max_embedding_chars,
+                    options,
+                )
+            };
+            finish_attempt_without_embedding(conn, attempt_id, report, progress)
+                .map(ControlFlow::Break)
+        },
+    }
+}
+
 #[cfg(test)]
 mod freshness_version_tests {
     use std::io::{Read, Write};
