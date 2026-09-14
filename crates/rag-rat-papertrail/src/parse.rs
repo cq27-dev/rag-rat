@@ -32,7 +32,7 @@ pub(crate) fn parse_refs(text: &str, default_repo: Option<&str>) -> Vec<ParsedRe
 /// The legacy GitHub-only parser retained for the manual single-item API and compatibility tests.
 /// Production discovery and rationale lookup consume [`parse_tracker_refs`] directly.
 pub(crate) fn parse_issue_ref(token: &str, default_repo: Option<&str>) -> Option<ParsedRef> {
-    let parsed = github_token_ref(token, default_repo, "https://github.com", true)?;
+    let parsed = github_token_ref(token, default_repo, "https://github.com")?;
     // The GitHub grammar only ever emits two-segment `owner/repo` projects.
     split_repo(&parsed.project)?;
     Some(ParsedRef {
@@ -69,16 +69,39 @@ impl TokenShape {
             Self::LocalNumber => RefKind::LocalNumber,
         }
     }
+
+    /// The provider-neutral routing shape of this token syntax.
+    fn matched_shape(self) -> MatchedShape {
+        match self {
+            Self::Url => MatchedShape::Url,
+            Self::CrossRepo => MatchedShape::Qualified,
+            Self::GhDash | Self::LocalNumber => MatchedShape::Shorthand,
+        }
+    }
+}
+/// Which kind of ref syntax a token matched — the one provider-neutral fact
+/// [`GrammarScope::admits`] routes on. Each provider arm reports it where it builds the ref.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchedShape {
+    /// Shorthand every code host shares (`#N`, GitHub's `GH-N`): only the designated code-host
+    /// binding may own it.
+    Shorthand,
+    /// Shorthand whose syntax names its provider (GitLab's `!N`): any binding of that provider may
+    /// own it.
+    ProviderShorthand,
+    /// A project-qualified token (`owner/repo#N`, `group/sub/proj!N`, a Jira key).
+    Qualified,
+    /// A full item URL.
+    Url,
 }
 /// The GitHub token grammar — `<base>/owner/repo/{issues|pull}/N` URLs, `owner/repo#N`, `GH-N`,
 /// bare `#N` — shared by the legacy lane and the provider-keyed grammar so the two can never
-/// drift. `local_number` gates the bare-`#N` arm: bare refs resolve against the code-host
-/// binding only.
+/// drift. It matches every shape and reports which one; whether a routing pass may claim it is
+/// [`GrammarScope::admits`]'s call.
 fn github_token_ref(
     token: &str,
     default_project: Option<&str>,
     url_base: &str,
-    local_number: bool,
 ) -> Option<GithubTokenRef> {
     if let Some(rest) = token.strip_prefix(url_base).and_then(|rest| rest.strip_prefix('/')) {
         let parts = rest.split('/').collect::<Vec<_>>();
@@ -103,8 +126,8 @@ fn github_token_ref(
         }
     }
     // `GH-N` resolves against the binding's OWN project — a local shorthand exactly like bare
-    // `#N`, gated the same way (the two-pass source router owns it, never config order).
-    if local_number && let Some(number) = token.strip_prefix("GH-") {
+    // `#N`, routed the same way (the two-pass source router owns it, never config order).
+    if let Some(number) = token.strip_prefix("GH-") {
         return Some(GithubTokenRef {
             project: default_project?.to_string(),
             number: ref_number(number)?,
@@ -112,7 +135,7 @@ fn github_token_ref(
             shape: TokenShape::GhDash,
         });
     }
-    if local_number && let Some(number) = token.strip_prefix('#') {
+    if let Some(number) = token.strip_prefix('#') {
         return Some(GithubTokenRef {
             project: default_project?.to_string(),
             number: ref_number(number)?,
@@ -264,20 +287,15 @@ enum GrammarScope {
 }
 
 impl GrammarScope {
-    fn is_code_host(self) -> bool {
+    /// Whether this pass may claim a token of `shape` — the routing rule, stated once for every
+    /// provider.
+    fn admits(self, shape: MatchedShape) -> bool {
         match self {
-            Self::SourceLocal => true,
-            Self::QualifiedOnly => false,
-            Self::Configured { is_code_host } => is_code_host,
+            Self::SourceLocal =>
+                matches!(shape, MatchedShape::Shorthand | MatchedShape::ProviderShorthand),
+            Self::QualifiedOnly => matches!(shape, MatchedShape::Qualified | MatchedShape::Url),
+            Self::Configured { is_code_host } => is_code_host || shape != MatchedShape::Shorthand,
         }
-    }
-
-    fn allows_bare(self) -> bool {
-        !matches!(self, Self::QualifiedOnly)
-    }
-
-    fn bare_only(self) -> bool {
-        matches!(self, Self::SourceLocal)
     }
 }
 
@@ -286,42 +304,26 @@ fn tracker_token_ref(
     tracker: &ResolvedTracker,
     scope: GrammarScope,
 ) -> Option<TrackerParsedRef> {
-    let (is_code_host, allow_bare, bare_only) =
-        (scope.is_code_host(), scope.allows_bare(), scope.bare_only());
-    match tracker.provider {
+    let (parsed, shape) = match tracker.provider {
         Tracker::Github => {
             let base = url_base(tracker, "https://github.com");
-            let parsed =
-                github_token_ref(token, Some(&tracker.project), base, is_code_host && allow_bare)?;
-            if bare_only && !matches!(parsed.shape, TokenShape::LocalNumber | TokenShape::GhDash) {
-                return None;
-            }
-            Some(tracker_ref(tracker, parsed.project, parsed.number.to_string(), parsed.item_kind))
+            let parsed = github_token_ref(token, Some(&tracker.project), base)?;
+            let shape = parsed.shape.matched_shape();
+            (
+                tracker_ref(tracker, parsed.project, parsed.number.to_string(), parsed.item_kind),
+                shape,
+            )
         },
-        Tracker::Gitlab => {
-            let parsed = gitlab_token_ref(token, tracker, is_code_host, allow_bare)?;
-            // GitLab's bare shapes resolve to the binding's own project with no `/` in the
-            // token; a qualified `a/b#N` or URL match is never bare.
-            if bare_only && (token.contains('/') || parsed.project != tracker.project) {
-                return None;
-            }
-            Some(parsed)
+        Tracker::Gitlab => gitlab_token_ref(token, tracker)?,
+        Tracker::Bitbucket => bitbucket_token_ref(token, tracker)?,
+        Tracker::Jira => {
+            let key = jira_token_ref(token, &tracker.project)?;
+            // A Jira key names its project, so it routes like any qualified ref.
+            let parsed = tracker_ref(tracker, tracker.project.clone(), key, Some(ItemKind::Issue));
+            (parsed, MatchedShape::Qualified)
         },
-        Tracker::Bitbucket => {
-            let parsed = bitbucket_token_ref(token, tracker, is_code_host && allow_bare)?;
-            if bare_only && (token.contains('/') || parsed.project != tracker.project) {
-                return None;
-            }
-            Some(parsed)
-        },
-        Tracker::Jira => (!bare_only)
-            .then(|| {
-                jira_token_ref(token, &tracker.project).map(|key| {
-                    tracker_ref(tracker, tracker.project.clone(), key, Some(ItemKind::Issue))
-                })
-            })
-            .flatten(),
-    }
+    };
+    scope.admits(shape).then_some(parsed)
 }
 fn tracker_ref(
     tracker: &ResolvedTracker,
@@ -350,9 +352,7 @@ fn url_base<'a>(tracker: &'a ResolvedTracker, cloud: &'a str) -> &'a str {
 fn gitlab_token_ref(
     token: &str,
     tracker: &ResolvedTracker,
-    is_code_host: bool,
-    allow_bare: bool,
-) -> Option<TrackerParsedRef> {
+) -> Option<(TrackerParsedRef, MatchedShape)> {
     let base = url_base(tracker, "https://gitlab.com");
     if let Some(rest) = token.strip_prefix(base).and_then(|rest| rest.strip_prefix('/')) {
         let (project, tail) = rest.split_once("/-/")?;
@@ -366,12 +366,8 @@ fn gitlab_token_ref(
             _ => return None,
         };
         let number: i64 = ref_number(parts[1])?;
-        return Some(tracker_ref(
-            tracker,
-            project.to_string(),
-            number.to_string(),
-            Some(item_kind),
-        ));
+        let parsed = tracker_ref(tracker, project.to_string(), number.to_string(), Some(item_kind));
+        return Some((parsed, MatchedShape::Url));
     }
     for (separator, item_kind) in [('!', ItemKind::ChangeRequest), ('#', ItemKind::Issue)] {
         let Some((path, number)) = token.split_once(separator) else {
@@ -381,29 +377,25 @@ fn gitlab_token_ref(
             continue;
         };
         if path.is_empty() {
-            // Bare shorthand → the binding's own project. In the legacy single-pass form `#N`
-            // needs the designated code-host owner while `!N` (GitLab-specific syntax) resolves
-            // against the first GitLab binding; the two-pass source form disables BOTH here
-            // (`allow_bare = false`) and routes them to the SOURCE binding instead — with
-            // several GitLab bindings, `!5` must not belong to whichever is configured first.
-            if !allow_bare || (separator == '#' && !is_code_host) {
-                continue;
-            }
-            return Some(tracker_ref(
-                tracker,
-                tracker.project.clone(),
-                number.to_string(),
-                Some(item_kind),
-            ));
+            // Bare shorthand → the binding's own project. `!N` names GitLab, so any GitLab
+            // binding may own it; `#N` is the shorthand every code host shares. The routing pass
+            // decides (`GrammarScope::admits`) — the two-pass source form hands both to the
+            // SOURCE binding, so with several GitLab bindings `!5` never belongs to whichever is
+            // configured first.
+            let shape = if separator == '!' {
+                MatchedShape::ProviderShorthand
+            } else {
+                MatchedShape::Shorthand
+            };
+            let parsed =
+                tracker_ref(tracker, tracker.project.clone(), number.to_string(), Some(item_kind));
+            return Some((parsed, shape));
         }
         let segments = path.split('/').collect::<Vec<_>>();
         if segments.len() >= 2 && segments.iter().all(|segment| !segment.is_empty()) {
-            return Some(tracker_ref(
-                tracker,
-                path.to_string(),
-                number.to_string(),
-                Some(item_kind),
-            ));
+            let parsed =
+                tracker_ref(tracker, path.to_string(), number.to_string(), Some(item_kind));
+            return Some((parsed, MatchedShape::Qualified));
         }
     }
     None
@@ -413,20 +405,20 @@ fn gitlab_token_ref(
 fn bitbucket_token_ref(
     token: &str,
     tracker: &ResolvedTracker,
-    is_code_host: bool,
-) -> Option<TrackerParsedRef> {
+) -> Option<(TrackerParsedRef, MatchedShape)> {
     let base = url_base(tracker, "https://bitbucket.org");
     if let Some(rest) = token.strip_prefix(base).and_then(|rest| rest.strip_prefix('/')) {
         let parts = rest.split('/').collect::<Vec<_>>();
         if let ["projects", project, "repos", repo, "pull-requests", number, ..] = parts.as_slice()
         {
             let number: i64 = ref_number(number)?;
-            return Some(tracker_ref(
+            let parsed = tracker_ref(
                 tracker,
                 format!("{project}/{repo}"),
                 number.to_string(),
                 Some(ItemKind::ChangeRequest),
-            ));
+            );
+            return Some((parsed, MatchedShape::Url));
         }
         if parts.len() < 4 {
             return None;
@@ -437,25 +429,18 @@ fn bitbucket_token_ref(
             _ => return None,
         };
         let number: i64 = ref_number(parts[3])?;
-        return Some(tracker_ref(
+        let parsed = tracker_ref(
             tracker,
             format!("{}/{}", parts[0], parts[1]),
             number.to_string(),
             Some(item_kind),
-        ));
+        );
+        return Some((parsed, MatchedShape::Url));
     }
-    if is_code_host
-        && let Some(number) = token.strip_prefix('#')
-        && let Some(number) = ref_number(number)
-    {
-        return Some(tracker_ref(
-            tracker,
-            tracker.project.clone(),
-            number.to_string(),
-            Some(ItemKind::Issue),
-        ));
-    }
-    None
+    let number = ref_number(token.strip_prefix('#')?)?;
+    let parsed =
+        tracker_ref(tracker, tracker.project.clone(), number.to_string(), Some(ItemKind::Issue));
+    Some((parsed, MatchedShape::Shorthand))
 }
 /// Jira bare keys: `[A-Z][A-Z0-9]+-\d+`, WHOLE-token anchored (the tokenizer split is the word
 /// boundary, so `XPROJ-12` never matches a `PROJ` binding) and ONLY for the bound project key —
