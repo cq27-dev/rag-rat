@@ -16,6 +16,7 @@ use std::time::Instant;
 // selection, no tune-cache write — those stay on the reconcile path.
 pub(crate) use embedder_select::{ChunkEmbedder, acquire_chunk_embedder, active_embedder};
 pub(crate) use helpers::*;
+pub use policy::EmbeddingPolicy;
 pub(crate) use policy::*;
 use rag_rat_base::language::Language;
 use rag_rat_base::time::now_ms;
@@ -83,7 +84,7 @@ const LEGACY_MODEL_IDS: &[&str] = &[
 #[cfg(feature = "fastembed")]
 const FASTEMBED_HF_CACHE_REPO_DIR: &str = "models--Qdrant--all-MiniLM-L6-v2-onnx";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
 pub enum ArtifactStatus {
     Current,
     Missing,
@@ -94,15 +95,11 @@ pub enum ArtifactStatus {
 }
 
 impl ArtifactStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Current => "Current",
-            Self::Missing => "Missing",
-            Self::Stale => "Stale",
-            Self::Failed => "Failed",
-            Self::Blocked => "Blocked",
-            Self::Disabled => "Disabled",
-        }
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+    pub fn from_db_str(token: &str) -> Option<Self> {
+        token.parse().ok()
     }
 }
 
@@ -197,7 +194,11 @@ pub struct LastReconcileStatus {
     pub input_chars: u64,
     pub chunks_per_sec: f64,
     pub chars_per_sec: f64,
-    pub status: String,
+    #[serde(skip)]
+    pub status: Option<ReconcileStatus>,
+    /// Preserve in-progress and unknown persisted tokens on the wire.
+    #[serde(rename = "status")]
+    pub raw_status: String,
     pub message: Option<String>,
 }
 
@@ -340,7 +341,7 @@ impl Default for ReconcileOptions {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbeddingPolicyDecision {
-    pub policy: String,
+    pub policy: EmbeddingPolicy,
     pub priority: i64,
     pub eligible: bool,
 }
@@ -377,7 +378,8 @@ pub(crate) struct CurrentChunk {
     symbol_path: Option<String>,
     text: String,
     text_hash: String,
-    embedding_status: Option<String>,
+    embedding_status: Option<ArtifactStatus>,
+    embedding_status_present: bool,
     source_text_hash: Option<String>,
     model_version: Option<String>,
     embedding_dim: Option<i64>,
@@ -387,7 +389,7 @@ pub(crate) struct CurrentChunk {
     /// The stamped index-time policy columns (`chunks.embedding_policy` / `embedding_priority`),
     /// trusted as the policy source only under `EmbeddingScan::stamped_policy` (#530
     /// certification).
-    embedding_policy: String,
+    embedding_policy: EmbeddingPolicy,
     embedding_priority: i64,
     reason: ReconcileReason,
 }
@@ -400,7 +402,7 @@ pub(crate) struct PreparedEmbeddingJob {
     input_hash: String,
     input_chars: usize,
     input_truncated: bool,
-    policy: String,
+    policy: EmbeddingPolicy,
     priority: i64,
     reason: ReconcileReason,
 }
@@ -420,7 +422,7 @@ impl CurrentChunk {
         if self.reason == ReconcileReason::Forced {
             return ReconcileReason::Forced;
         }
-        if self.embedding_status.is_none() {
+        if !self.embedding_status_present {
             return ReconcileReason::Missing;
         }
         if self.source_text_hash.as_deref() != Some(self.text_hash.as_str()) {
@@ -437,7 +439,7 @@ impl CurrentChunk {
         if self.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX)) {
             return ReconcileReason::DimChanged;
         }
-        if self.embedding_status.as_deref() == Some(ArtifactStatus::Failed.as_str())
+        if self.embedding_status == Some(ArtifactStatus::Failed)
             && self.next_retry_after_ms.unwrap_or(0) <= now_ms
         {
             return ReconcileReason::RetryAfterFailure;

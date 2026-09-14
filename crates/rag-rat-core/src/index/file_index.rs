@@ -68,9 +68,7 @@ impl IndexDatabase {
         // heal deliberately stays LOCKLESS at the flock level — it must run alongside a
         // mid-flight rebuild (`a_lockless_heal_mid_rebuild_does_not_remove_the_staged_row`).
         self.in_immediate_txn(|| {
-            let conn = self.storage.connection();
-            let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-            super::remove::assert_repo_not_removed(conn, &active_repo_id)?;
+            self.assert_active_repo_not_removed()?;
 
             let Some(text) = text else {
                 // File deleted on disk since indexing — drop it from the index rather than
@@ -110,9 +108,7 @@ impl IndexDatabase {
     /// serializes with rm's purge on the SQLite write lock — see `heal_file`).
     pub(crate) fn mark_file_deleted_if_not_removed(&self, path: &Path) -> anyhow::Result<()> {
         self.in_immediate_txn(|| {
-            let conn = self.storage.connection();
-            let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-            super::remove::assert_repo_not_removed(conn, &active_repo_id)?;
+            self.assert_active_repo_not_removed()?;
             self.mark_file_deleted(path)
         })
     }
@@ -457,7 +453,7 @@ impl IndexDatabase {
                 anchor.start_context_hash,
                 anchor.end_context_hash,
                 anchor.context_radius,
-                prepared.embedding.policy,
+                prepared.embedding.policy.as_db_str(),
                 prepared.embedding.priority,
             ])?;
             let chunk_id = conn.last_insert_rowid();

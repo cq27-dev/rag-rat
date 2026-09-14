@@ -76,12 +76,14 @@ pub(crate) fn prepare_chunks(
                 None => ai::LowSignalCheck::FromText,
             };
             let embedding = ai::embedding_policy_for_chunk(
-                path,
-                language,
-                file_kind,
-                chunk.kind.as_db_str(),
-                chunk.symbol_path.as_deref(),
-                &chunk.text,
+                &ai::ChunkPolicyInput {
+                    path,
+                    language,
+                    file_kind,
+                    chunk_kind: chunk.kind.as_db_str(),
+                    symbol_path: chunk.symbol_path.as_deref(),
+                    text: &chunk.text,
+                },
                 ai::DEFAULT_MAX_EMBEDDING_CHARS,
                 low_signal,
             );
@@ -667,12 +669,12 @@ mod low_signal_wiring_tests {
 
         assert_eq!(decisions(&with_tree), decisions(&text_only), "span vs text policy parity");
         assert!(
-            with_tree.iter().any(|pc| pc.embedding.policy == "SkipLowSignal"),
+            with_tree.iter().any(|pc| pc.embedding.policy == ai::EmbeddingPolicy::SkipLowSignal),
             "fixture must exercise the low-signal outcome: {:?}",
             decisions(&with_tree),
         );
         assert!(
-            with_tree.iter().any(|pc| pc.embedding.policy == "Embed"),
+            with_tree.iter().any(|pc| pc.embedding.policy == ai::EmbeddingPolicy::Embed),
             "fixture must exercise the embed outcome: {:?}",
             decisions(&with_tree),
         );

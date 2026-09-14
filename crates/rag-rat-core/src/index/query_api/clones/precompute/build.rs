@@ -35,7 +35,7 @@ impl IndexDatabase {
             && live.delta_files_applied < CLONE_GRAPH_DRIFT_REBUILD_FILES
         {
             return Ok(CloneEdgeReport {
-                status: "Current".to_string(),
+                status: CloneEdgeStatus::Current,
                 generation: live.generation,
                 symbols_total: 0,
                 symbols_processed: 0,
@@ -198,15 +198,15 @@ impl IndexDatabase {
         )?;
 
         let status = if budget_tripped {
-            "Partial"
+            CloneEdgeStatus::Partial
         } else {
             // The walk reached the last symbol: publish this generation as live, GC the rest.
             self.complete_generation(building.generation, edges_written)?;
-            "Complete"
+            CloneEdgeStatus::Complete
         };
 
         Ok(CloneEdgeReport {
-            status: status.to_string(),
+            status,
             generation: building.generation,
             symbols_total,
             symbols_processed: processed,

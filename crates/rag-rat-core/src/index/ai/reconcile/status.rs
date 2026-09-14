@@ -47,18 +47,10 @@ pub(crate) fn pending_embedding_jobs_with_options(
     conn: &Connection,
     options: &ReconcileOptions,
 ) -> anyhow::Result<u64> {
-    let Some((model_id, model_version, dim, max_embedding_chars)) =
-        ready_embedding_scan_parts(conn, options)?
-    else {
+    let Some(model) = ActiveEmbeddingModel::ready(conn)? else {
         return Ok(0);
     };
-    let scan = EmbeddingScan {
-        model_id: &model_id,
-        model_version: &model_version,
-        dim,
-        max_embedding_chars,
-        stamped_policy: super::policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
-    };
+    let scan = model.scan(conn, options.max_embedding_chars.max(MIN_EMBEDDING_CHARS))?;
     estimated_reconcile_jobs(conn, &scan, options)
 }
 
@@ -75,18 +67,10 @@ pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
     if !remote.is_ephemeral() {
         return pending_embedding_jobs_with_options(conn, options);
     }
-    let Some((model_id, model_version, dim, max_embedding_chars)) =
-        ready_embedding_scan_parts(conn, options)?
-    else {
+    let Some(model) = ActiveEmbeddingModel::ready(conn)? else {
         return Ok(0);
     };
-    let scan = EmbeddingScan {
-        model_id: &model_id,
-        model_version: &model_version,
-        dim,
-        max_embedding_chars,
-        stamped_policy: super::policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
-    };
+    let scan = model.scan(conn, options.max_embedding_chars.max(MIN_EMBEDDING_CHARS))?;
     let mut light_options = options.clone();
     light_options.provision_remote = false;
     match acquire_chunk_embedder(conn, light_options.intra_threads, &scan, &light_options) {
@@ -97,31 +81,61 @@ pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
     }
 }
 
-fn ready_embedding_scan_parts(
-    conn: &Connection,
-    options: &ReconcileOptions,
-) -> anyhow::Result<Option<(String, String, usize, usize)>> {
-    ensure_model_manifest(conn)?;
-    let model_id = active_embedding_model_id(conn)?;
-    let model = model(conn, &model_id)?;
-    if validate_ready_model(&model).is_err() {
-        return Ok(None);
+pub(super) struct ActiveEmbeddingModel {
+    pub model: ModelInfo,
+    pub model_version: String,
+    pub dim: usize,
+}
+
+impl ActiveEmbeddingModel {
+    fn load_model(conn: &Connection) -> anyhow::Result<ModelInfo> {
+        ensure_model_manifest(conn)?;
+        let model_id = active_embedding_model_id(conn)?;
+        model(conn, &model_id)
     }
-    let model_version = active_embedding_model_version(conn, &model_id)?;
-    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
-    let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
-    Ok(Some((model_id, model_version, dim, max_embedding_chars)))
+
+    fn with_version(conn: &Connection, model: ModelInfo) -> anyhow::Result<Self> {
+        let model_version = active_embedding_model_version(conn, &model.model_id)?;
+        let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+        Ok(Self { model, model_version, dim })
+    }
+
+    pub(super) fn resolve(conn: &Connection) -> anyhow::Result<Self> {
+        Self::with_version(conn, Self::load_model(conn)?)
+    }
+
+    fn ready(conn: &Connection) -> anyhow::Result<Option<Self>> {
+        let model = Self::load_model(conn)?;
+        // Preserve the readiness gate before reading version metadata for unavailable models.
+        if validate_ready_model(&model).is_err() {
+            return Ok(None);
+        }
+        Self::with_version(conn, model).map(Some)
+    }
+
+    pub(super) fn scan(
+        &self,
+        conn: &Connection,
+        max_embedding_chars: usize,
+    ) -> anyhow::Result<EmbeddingScan<'_>> {
+        Ok(EmbeddingScan {
+            model_id: &self.model.model_id,
+            model_version: &self.model_version,
+            dim: self.dim,
+            max_embedding_chars,
+            stamped_policy: super::policy_scan::stamped_policy_certified(
+                conn,
+                max_embedding_chars,
+            )?,
+        })
+    }
 }
 
 pub(crate) fn reconcile_plan(
     conn: &Connection,
     max_embedding_chars: usize,
 ) -> anyhow::Result<ReconcilePlan> {
-    ensure_model_manifest(conn)?;
-    let model_id = active_embedding_model_id(conn)?;
-    let model = model(conn, &model_id)?;
-    let model_version = active_embedding_model_version(conn, &model_id)?;
-    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+    let ActiveEmbeddingModel { model, model_version, dim } = ActiveEmbeddingModel::resolve(conn)?;
     let available = validate_ready_model(&model).is_ok();
     let message = (!available).then(|| model_not_ready_reason(&model));
     // The plan must classify against the SAME cap the reconcile it previews will use
@@ -187,7 +201,7 @@ pub(crate) fn embedding_reconcile_plan(
         }
         let metadata_current = {
             let job = &candidate.chunk;
-            job.embedding_status.as_deref() == Some(ArtifactStatus::Current.as_str())
+            job.embedding_status == Some(ArtifactStatus::Current)
                 && job.source_text_hash.as_deref() == Some(job.text_hash.as_str())
                 && job.model_version.as_deref() == Some(model_version)
                 && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
@@ -219,12 +233,12 @@ pub(crate) fn embedding_reconcile_plan(
             ReconcileReason::Forced => missing += 1,
         }
         *missing_by_priority.entry(priority_label(policy.priority).to_string()).or_default() += 1;
-        if job.embedding_status.as_deref() == Some(ArtifactStatus::Failed.as_str())
+        if job.embedding_status == Some(ArtifactStatus::Failed)
             && job.next_retry_after_ms.unwrap_or(0) > now_ms()
         {
             failed_waiting += 1;
         }
-        if job.embedding_status.as_deref() == Some(ArtifactStatus::Blocked.as_str()) {
+        if job.embedding_status == Some(ArtifactStatus::Blocked) {
             blocked += 1;
         }
         Ok(())
@@ -294,11 +308,54 @@ pub(crate) fn last_reconcile_status(
                 input_chars,
                 chunks_per_sec: embeddings_written as f64 / elapsed_secs,
                 chars_per_sec: input_chars as f64 / elapsed_secs,
-                status: row.get(8)?,
+                status: ReconcileStatus::from_db_str(&row.get::<_, String>(8)?),
+                raw_status: row.get(8)?,
                 message: row.get(9)?,
             })
         },
     )
     .optional()
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod status_token_tests {
+    use super::*;
+
+    #[test]
+    fn last_reconcile_wire_retains_running_and_unknown_tokens() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        for token in ["Current", "Blocked", "Partial", "Failed", "Running", "FutureStatus"] {
+            conn.execute("DELETE FROM reconcile_attempts", []).unwrap();
+            conn.execute(
+                "INSERT INTO reconcile_attempts(started_at_ms, status, batch_size) VALUES (1, ?1, \
+                 8)",
+                [token],
+            )
+            .unwrap();
+            let status = last_reconcile_status(&conn).unwrap().unwrap();
+            assert_eq!(status.status, ReconcileStatus::from_db_str(token));
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire["status"], token);
+            assert!(wire.get("raw_status").is_none());
+        }
+    }
+
+    #[test]
+    fn artifact_tokens_match_wire() {
+        for (status, token) in [
+            (ArtifactStatus::Current, "Current"),
+            (ArtifactStatus::Missing, "Missing"),
+            (ArtifactStatus::Stale, "Stale"),
+            (ArtifactStatus::Failed, "Failed"),
+            (ArtifactStatus::Blocked, "Blocked"),
+            (ArtifactStatus::Disabled, "Disabled"),
+        ] {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(ArtifactStatus::from_db_str(token), Some(status));
+            assert_eq!(serde_json::to_value(status).unwrap(), token);
+        }
+        assert_eq!(ArtifactStatus::from_db_str("future"), None);
+    }
 }

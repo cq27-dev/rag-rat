@@ -1186,17 +1186,19 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
             .resolve(&mut decoder)
             .unwrap();
             let decision = embedding_policy_for_chunk(
-                Path::new(&path),
-                &language,
-                &file_kind,
-                &chunk_kind,
-                symbol_path.as_deref(),
-                &text,
+                &crate::index::ai::ChunkPolicyInput {
+                    path: Path::new(&path),
+                    language: &language,
+                    file_kind: &file_kind,
+                    chunk_kind: &chunk_kind,
+                    symbol_path: symbol_path.as_deref(),
+                    text: &text,
+                },
                 ai::DEFAULT_MAX_EMBEDDING_CHARS,
                 LowSignalCheck::FromText,
             );
             if !decision.eligible {
-                *out.entry(decision.policy).or_default() += 1;
+                *out.entry(decision.policy.as_db_str().to_string()).or_default() += 1;
             }
         }
         out

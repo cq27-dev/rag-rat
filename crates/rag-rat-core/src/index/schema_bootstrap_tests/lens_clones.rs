@@ -24,7 +24,10 @@ fn several_symbols_from_one_file_in_one_class_each_get_their_own_partners() {
     .unwrap();
     let config = source_config(root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).unwrap();
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
 
     let res = db.lens_file_clones("src/pair.rs", 0.7, 0).unwrap();
     assert_eq!(res.clone_regions.len(), 2, "both in-file members anchor a region: {res:?}");
@@ -52,7 +55,7 @@ fn lens_file_clones_carries_the_cached_refinement_payload() {
     let db = write_four_renamed_clones(&root);
     assert_eq!(
         db.precompute_clone_graph(None).unwrap().status,
-        "Complete",
+        crate::index::CloneEdgeStatus::Complete,
         "the lens reads the persisted graph — it must build Complete"
     );
 
@@ -120,7 +123,7 @@ fn lens_file_clones_serves_coherent_class_with_partners() {
     );
     assert_eq!(
         db.precompute_clone_graph(None).unwrap().status,
-        "Complete",
+        crate::index::CloneEdgeStatus::Complete,
         "the lens reads the persisted graph — it must build Complete"
     );
 
