@@ -3101,10 +3101,12 @@ pub(crate) fn create_papertrail_tables(conn: &Connection) -> rusqlite::Result<()
 ///     behind `review_state` / `anchor_path`; refs copy verbatim. `repo_id` copies VERBATIM
 ///     (placeholder rows stay placeholder for `register_repo` to adopt; the V044/V045 per-repo-copy
 ///     semantics carry over unchanged). The `papertrail_fts` mirror is re-derived from the
-///     freshly-backfilled base tables (the V045 in-migration posture) via the standing
-///     [`crate::index::papertrail::rebuild_fts`], which recomputes `classification` with the
-///     current classifier. The seven github_* tables + `github_fts` are then DROPPED — the gate can
-///     never fire again, so the backfill is structurally first-apply-only.
+///     freshly-backfilled base tables (the V045 in-migration posture) via rag-rat-papertrail's
+///     standing `rebuild_fts` (reached through the
+///     [`rebuild_papertrail_fts`](crate::hooks::MigrationHooks::rebuild_papertrail_fts) hook),
+///     which recomputes `classification` with the current classifier. The seven github_* tables +
+///     `github_fts` are then DROPPED — the gate can never fire again, so the backfill is
+///     structurally first-apply-only.
 ///  3. Memory bindings: gated on the legacy `github_owner` column existing — `binding_kind =
 ///     'github'` rows become `binding_kind = 'tracker'` with `binding_id = 'github:' || owner ||
 ///     '/' || repo || '#' || number` and the new `tracker` / `project` / `item_key` columns
