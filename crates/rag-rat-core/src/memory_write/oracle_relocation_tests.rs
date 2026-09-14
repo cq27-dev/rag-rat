@@ -823,7 +823,10 @@ fn a_moniker_relocation_answers_a_retarget_mark() {
         .execute(
             "UPDATE repo_memory_bindings SET relocation_reason = ?2
               WHERE memory_id = ?1 AND binding_kind = 'symbol'",
-            rusqlite::params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
+            rusqlite::params![
+                memory_id,
+                rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()
+            ],
         )
         .unwrap();
 

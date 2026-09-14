@@ -673,7 +673,7 @@ fn a_set_change_re_resolves_a_row_anchors1_already_moved() {
         .unwrap();
     assert_eq!(
         reason.as_deref(),
-        Some(rag_rat_query::memory::RETARGETED_REASON),
+        Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()),
         "judged against the struct the last set named, not the row `anchors/1` moved",
     );
     assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
@@ -723,7 +723,7 @@ fn a_republish_is_compared_with_the_last_applied_set_not_the_row() {
     drain_worker(&conn, stream, 3_000);
     assert_eq!(
         reason().as_deref(),
-        Some(rag_rat_query::memory::RETARGETED_REASON),
+        Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()),
         "a changed signature is"
     );
 }
@@ -787,7 +787,7 @@ fn a_changed_published_scope_marks_a_retarget_and_a_missing_one_never_does() {
     drain_worker(&conn, stream, 3_000);
     assert_eq!(
         reason().as_deref(),
-        Some(rag_rat_query::memory::RETARGETED_REASON),
+        Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()),
         "a changed scope under an unchanged kind and signature is a retarget",
     );
     assert_eq!(recorded_scope().as_deref(), Some(beta.as_str()));
@@ -825,7 +825,7 @@ fn a_changed_published_scope_marks_a_retarget_and_a_missing_one_never_does() {
     drain_worker(&conn, stream, 8_000);
     assert_eq!(
         reason().as_deref(),
-        Some(rag_rat_query::memory::RETARGETED_REASON),
+        Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()),
         "and the rebind that follows is a retarget",
     );
 
@@ -930,7 +930,10 @@ fn a_set_recorded_over_foreign_rows_is_no_baseline_for_them() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(reason.as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
+    assert_eq!(
+        reason.as_deref(),
+        Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str())
+    );
 }
 
 /// An author cannot publish an unbinding, so a memory whose rows another device removed
@@ -1073,7 +1076,7 @@ fn a_kept_binding_whose_target_moved_converges_and_takes_the_published_hash() {
         binding_of(&conn, "mem_peer"),
         Some((
             Some("impl".to_string()),
-            Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str().to_string())
         )),
     );
     assert_eq!(source_hash_of(&conn, "mem_peer"), Some(HASH_A.to_string()));
@@ -1129,7 +1132,7 @@ fn a_returning_memory_with_rows_held_and_nothing_parked_converges_on_its_rebind(
         binding_of(&conn, "mem_peer"),
         Some((
             Some("impl".to_string()),
-            Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str().to_string())
         )),
         "the held struct row is an older image and converges on the impl",
     );
@@ -2176,7 +2179,10 @@ fn a_local_memory_records_its_own_sets_as_the_baseline() {
 
     publish(&foreign, "struct", "s1", HASH_A);
     drain_worker(&conn, stream, 3_000);
-    assert_eq!(reason().as_deref(), Some(rag_rat_query::memory::RETARGETED_REASON));
+    assert_eq!(
+        reason().as_deref(),
+        Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str())
+    );
 }
 
 /// The published hash crosses the same untrusted boundary as the content and lands in a column
@@ -2701,7 +2707,7 @@ fn a_condemned_memory_keeps_its_bindings_and_takes_a_rebind_published_while_away
         binding_of(&conn, "mem_peer"),
         Some((
             Some("impl".to_string()),
-            Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str().to_string())
         )),
         "the rebind published while it was away lands as a retarget",
     );
@@ -2861,7 +2867,7 @@ fn a_memory_returning_ahead_of_its_anchors_converges_when_they_arrive() {
         binding_of(&conn, "mem_peer"),
         Some((
             Some("impl".to_string()),
-            Some(rag_rat_query::memory::RETARGETED_REASON.to_string())
+            Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str().to_string())
         )),
         "the rebind lands on the pass that carries the anchors",
     );

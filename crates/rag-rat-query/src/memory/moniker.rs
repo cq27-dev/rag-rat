@@ -17,17 +17,6 @@
 
 use super::*;
 
-/// Why a moniker relocation succeeded — persisted on `repo_memory_bindings.relocation_reason` so
-/// `doctor`/MCP output can distinguish a semantic-identity relocate from the default
-/// qualified-name/content paths.
-pub(crate) const MONIKER_MATCH_REASON: &str = "moniker-match";
-
-/// Why a `scip_moniker` binding's own anchor string was rewritten: its live logical symbol got a
-/// NEW moniker from the latest run (rust-analyzer monikers embed the Cargo package version, so a
-/// routine version bump changes every string without changing any symbol identity). The rebind is
-/// keyed off our own content-derived logical id, not fuzzy matching.
-pub(crate) const MONIKER_REFRESH_REASON: &str = "moniker-refresh";
-
 /// One `logical_symbol_monikers` row, as read for auto-binding.
 #[derive(Debug, Clone)]
 pub(crate) struct MonikerRow {
@@ -397,7 +386,8 @@ pub(crate) fn validate_moniker_binding(
         if drifted {
             binding.set_resolved_binding_id(row.moniker);
             binding.moniker_tool_version = Some(row.tool_version);
-            binding.relocation_reason = Some(MONIKER_REFRESH_REASON.to_string());
+            binding.relocation_reason =
+                Some(RelocationReason::MonikerRefresh.as_db_str().to_string());
             return Ok(AnchorStatus::Relocated);
         }
         return Ok(AnchorStatus::Current);
@@ -414,7 +404,8 @@ pub(crate) fn validate_moniker_binding(
             };
             apply_relocate_match(binding, &matched);
             if moved {
-                binding.relocation_reason = Some(MONIKER_MATCH_REASON.to_string());
+                binding.relocation_reason =
+                    Some(RelocationReason::MonikerMatch.as_db_str().to_string());
                 Ok(AnchorStatus::Relocated)
             } else {
                 Ok(AnchorStatus::Current)

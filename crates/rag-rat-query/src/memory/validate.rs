@@ -74,8 +74,8 @@ pub(crate) fn validate_logical_symbol_binding(
     binding: &mut RepoMemoryBinding,
 ) -> anyhow::Result<AnchorStatus> {
     // A live handle is trusted — unless its writer marked the row retargeted and the handle's
-    // target contradicts the recorded kind or signature (see `RETARGETED_REASON`); then it is held
-    // back and the twins below are searched with the author's evidence first.
+    // target contradicts the recorded kind or signature (see `RelocationReason::Retargeted`); then
+    // it is held back and the twins below are searched with the author's evidence first.
     let retargeted = is_retargeted(binding);
     let published_scope = if retargeted { published_scope_for(conn, binding)? } else { None };
     let mut held_back = None;
@@ -209,39 +209,18 @@ fn logical_twins_named(
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
-/// The `relocation_reason` the synced-memory drain stamps on a symbol binding it moved IN PLACE to
-/// a target another store published, when the published kind or signature differs from the row's.
-/// Its cached ids may still name the target it left: a rebind between two impls of one type keeps
-/// the binding's identity and kind, so only the signature says it moved.
-///
-/// The validator weighs a recorded kind or signature against a live handle ONLY on a row so marked.
-/// Any other row can disagree with its handle for reasons that name no other target — a sibling
-/// device's `anchors/1` update carrying its own checkout's view, or values recorded before the
-/// target's kind or signature changed here — and following them there would hand the memory to any
-/// same-named sibling that has the old kind or signature.
-///
-/// The mark stands until a validation lands on a target agreeing with the recorded kind and
-/// signature. The row is shared by every checkout of the repo, and the one validating first may not
-/// hold the author's target: on the raw-id arm, whose candidates are the validating checkout's own,
-/// a linked worktree that edited the target leaves the mark for the checkout that has it (the
-/// logical arm's candidates are repo-wide, so any checkout can answer there). That works because
-/// relocation does not refresh a marked row's recorded kind or signature until the mark is
-/// answered. An identity match answers it outright: the content-hash fallback clears it and
-/// restates the kind and signature, and a moniker relocation replaces the reason with its own. (An
-/// `anchors/1` row update also moves a binding in place, but marks nothing.)
-pub const RETARGETED_REASON: &str = "retargeted";
 
-/// Whether the binding carries [`RETARGETED_REASON`].
+/// Whether the binding carries [`RelocationReason::Retargeted`].
 fn is_retargeted(binding: &RepoMemoryBinding) -> bool {
-    binding.relocation_reason.as_deref() == Some(RETARGETED_REASON)
+    binding.relocation_reason.as_deref() == Some(RelocationReason::Retargeted.as_db_str())
 }
 
 /// What a published anchor set said a symbol anchor's target is: the kind, the signature hash and
 /// the scope hash its author recorded. The drain records these per anchor identity as the memory's
 /// `anchors_applied_targets` — the baseline a later set is compared against to tell a retarget from
 /// a republish of the same target — and the validator reads the scope back on a
-/// [`RETARGETED_REASON`] row, where it is the author's evidence of which same-named twin the row
-/// moved to.
+/// [`RelocationReason::Retargeted`] row, where it is the author's evidence of which same-named twin
+/// the row moved to.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppliedTarget {
     pub symbol_kind: Option<String>,
@@ -298,8 +277,8 @@ pub fn decode_applied_targets(json: Option<&str>) -> Option<AppliedTargets> {
     )
 }
 
-/// The scope the author published for a [`RETARGETED_REASON`] row's target, from the memory's
-/// applied targets; `None` when none was recorded for this anchor.
+/// The scope the author published for a [`RelocationReason::Retargeted`] row's target, from the
+/// memory's applied targets; `None` when none was recorded for this anchor.
 fn published_scope_for(
     conn: &Connection,
     binding: &RepoMemoryBinding,
@@ -353,7 +332,8 @@ fn logical_symbol_scope(conn: &Connection, id: i64) -> anyhow::Result<Option<Str
         .flatten())
 }
 
-/// Clear [`RETARGETED_REASON`]: validation found a target agreeing with the author's evidence.
+/// Clear [`RelocationReason::Retargeted`]: validation found a target agreeing with the author's
+/// evidence.
 fn answer_retarget_mark(binding: &mut RepoMemoryBinding) {
     if is_retargeted(binding) {
         binding.relocation_reason = None;
@@ -421,13 +401,14 @@ struct RelocationTwin {
 /// it can't speak to, and the id tiebreak decides, matching the behavior for bindings that predate
 /// the V014 discriminators.
 ///
-/// On a row its writer marked [`RETARGETED_REASON`] the recorded kind and signature outrank the
-/// handle instead: the writer set them, while the handle can be the one it left (a rebind from a
-/// struct to its impl keeps the struct's handle beside the impl's kind). The author's published
-/// scope (`published_scope`) ranks next, below both: it separates twins that agree on kind and
-/// signature — two impls of different traits for one type — and never overrides the evidence those
-/// already give. The handle still decides where all three tie — including evidence no candidate
-/// matches, which names nothing here — so a held-back handle keeps its row over an equal twin.
+/// On a row its writer marked [`RelocationReason::Retargeted`] the recorded kind and signature
+/// outrank the handle instead: the writer set them, while the handle can be the one it left (a
+/// rebind from a struct to its impl keeps the struct's handle beside the impl's kind). The author's
+/// published scope (`published_scope`) ranks next, below both: it separates twins that agree on
+/// kind and signature — two impls of different traits for one type — and never overrides the
+/// evidence those already give. The handle still decides where all three tie — including evidence
+/// no candidate matches, which names nothing here — so a held-back handle keeps its row over an
+/// equal twin.
 fn pick_relocation_twin(
     candidates: Vec<RelocationTwin>,
     binding: &RepoMemoryBinding,
@@ -635,7 +616,7 @@ fn relocate_by_moniker(conn: &Connection, binding: &mut RepoMemoryBinding) -> an
         binding.end_line = m.end_line;
         binding.symbol_kind = m.symbol_kind;
         binding.signature_hash = m.signature_hash;
-        binding.relocation_reason = Some(MONIKER_MATCH_REASON.to_string());
+        binding.relocation_reason = Some(RelocationReason::MonikerMatch.as_db_str().to_string());
         return Ok(true);
     }
     Ok(false)
@@ -1147,35 +1128,12 @@ pub(crate) fn source_hash_for_memory(
     .map_err(Into::into)
 }
 pub fn validate_kind(kind: &str) -> anyhow::Result<()> {
-    match kind {
-        "Invariant"
-        | "Decision"
-        | "RejectedAlternative"
-        | "Risk"
-        | "BugPattern"
-        | "TestExpectation"
-        | "PerformanceNote"
-        | "SecurityNote"
-        | "FFIBoundary"
-        | "PlatformQuirk"
-        | "FollowUp"
-        | "OpenQuestion"
-        | "Obsolete"
-        // Polymorphic graph-node kinds (#465): legitimately unanchored (a Concept / standalone
-        // Task lives as a graph node with no code binding — see resolve_binding / #463).
-        | "Task"
-        | "Concept" => Ok(()),
-        _ => anyhow::bail!("invalid memory kind `{kind}`"),
-    }
+    MemoryKind::from_db_str(kind).map(|_| ())
 }
-/// The polymorphic graph-node kinds — `Task` and `Concept` (#463/#465). They ALONE may be created
-/// UNANCHORED (no code binding) AND may carry a structured `payload_json`; every other kind is a
-/// plain note (anchors to code, no payload). The SINGLE source of truth for the unanchored-create
-/// gate (`create`/`update_memory`), the payload-kind gate (`validate_payload`), and the dream
-/// verifier's `memory_unverifiable` exemption — they must never drift, or a create the gate allows
-/// becomes self-inflicted dream noise, or an off-contract payload/anchor slips through.
+/// [`MemoryKind::is_polymorphic_node`] for a kind token as stored or submitted; a token outside the
+/// closed set is not a node kind.
 pub fn is_polymorphic_node_kind(kind: &str) -> bool {
-    matches!(kind, "Task" | "Concept")
+    MemoryKind::from_db_str(kind).is_ok_and(MemoryKind::is_polymorphic_node)
 }
 
 /// Validate a memory's `payload_json` for its `kind`. Only the polymorphic graph-node kinds
@@ -1229,22 +1187,13 @@ pub fn validate_payload(kind: &str, payload_json: Option<&str>) -> anyhow::Resul
 }
 
 pub fn validate_confidence(confidence: &str) -> anyhow::Result<()> {
-    match confidence {
-        "high" | "medium" | "low" => Ok(()),
-        _ => anyhow::bail!("invalid memory confidence `{confidence}`"),
-    }
+    MemoryConfidence::from_db_str(confidence).map(|_| ())
 }
 pub fn validate_status(status: &str) -> anyhow::Result<()> {
-    match status {
-        "active" | "stale" | "obsolete" | "rejected" => Ok(()),
-        _ => anyhow::bail!("invalid memory status `{status}`"),
-    }
+    MemoryStatus::from_db_str(status).map(|_| ())
 }
 pub fn validate_source(source: &str) -> anyhow::Result<()> {
-    match source {
-        "agent" | "human" | "imported" | "generated" => Ok(()),
-        _ => anyhow::bail!("invalid memory source `{source}`"),
-    }
+    MemorySource::from_db_str(source).map(|_| ())
 }
 pub fn validate_len(field: &str, value: &str, max: usize) -> anyhow::Result<()> {
     let len = value.trim().chars().count();
