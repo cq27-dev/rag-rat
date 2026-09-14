@@ -4,7 +4,6 @@
 //! local git state — the old `gh repo view` network shell-out is gone.
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::path::Path;
 
 use rag_rat_base::config::{Tracker, TrackerAuth, TrackerConfig};
@@ -64,11 +63,7 @@ impl ResolvedTracker {
             // NUL after TOML parsing + trimming, unlike `\n` or `,`).
             hasher.update([0u8]);
         }
-        let mut out = String::with_capacity(64);
-        for byte in hasher.finalize() {
-            let _ = write!(out, "{byte:02x}");
-        }
-        out
+        rag_rat_base::hash::hex_lower(&hasher.finalize())
     }
 }
 
