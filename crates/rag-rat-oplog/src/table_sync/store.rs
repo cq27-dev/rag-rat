@@ -27,7 +27,6 @@ use anyhow::Context;
 use rusqlite::{OptionalExtension, Transaction, params};
 
 use super::row_op::{self, DecodedRowOp, RowOp};
-use crate::AccountId;
 use crate::account::device_is_effective_writer;
 use crate::device::{DevicePublic, DeviceSecret};
 // The lamport ceiling + bounded-advance constants live in `crate::entry` — shared with the
@@ -36,6 +35,7 @@ use crate::device::{DevicePublic, DeviceSecret};
 use crate::entry::{self, MAX_ENTRY_LAMPORT, MAX_LAMPORT_ADVANCE, SignedEntry, VerifiedEntry};
 use crate::op::{DeviceFingerprint, OpMeta};
 use crate::stream::{EntryHash, StreamId};
+use crate::{AccountId, cbor};
 
 /// Why a retained entry is NOT projected into its table — persisted per entry so a later binary
 /// that understands the payload replays exactly the outstanding set (#1001). Without a durable
@@ -629,7 +629,7 @@ fn chain_tail(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::from_bytes(fixed32(hash)?))))
+    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::try_from_sql(hash)?)))
         .transpose()
 }
 
@@ -646,7 +646,7 @@ fn chain_witness(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::from_bytes(fixed32(hash)?))))
+    row.map(|(lamport, hash)| Ok((u64::try_from(lamport)?, EntryHash::try_from_sql(hash)?)))
         .transpose()
 }
 
@@ -807,7 +807,7 @@ pub(crate) fn discard_gapped_descendants(
             tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
                 child
             ])?;
-            worklist.push(EntryHash::from_bytes(fixed32(child)?));
+            worklist.push(EntryHash::try_from_sql(child)?);
             discarded += 1;
         }
     }
@@ -864,8 +864,7 @@ pub(crate) fn discard_foreign_chain_citations(
         ])?;
         discarded += 1;
         // Everything queued behind it is orphaned by the same argument.
-        discarded +=
-            discard_gapped_descendants(tx, stream, &EntryHash::from_bytes(fixed32(entry_hash)?))?;
+        discarded += discard_gapped_descendants(tx, stream, &EntryHash::try_from_sql(entry_hash)?)?;
     }
     Ok(discarded)
 }
@@ -912,8 +911,8 @@ pub(crate) fn take_gapped_child(
         entry_hash.as_slice()
     ])?;
     Ok(Some(GappedEntry {
-        entry_hash: EntryHash::from_bytes(fixed32(entry_hash)?),
-        prev_hash: EntryHash::from_bytes(fixed32(prev)?),
+        entry_hash: EntryHash::try_from_sql(entry_hash)?,
+        prev_hash: EntryHash::try_from_sql(prev)?,
         signed_bytes,
     }))
 }
@@ -1113,8 +1112,8 @@ pub(crate) fn pending_entries(
     rows.into_iter()
         .map(|(hash, stream, signed_bytes, reason, projector_version)| {
             Ok(PendingEntry {
-                entry_hash: EntryHash::from_bytes(fixed32(hash)?),
-                stream_id: StreamId::from_bytes(fixed32(stream)?),
+                entry_hash: EntryHash::try_from_sql(hash)?,
+                stream_id: StreamId::try_from_sql(stream)?,
                 signed_bytes,
                 reason: reason.as_deref().and_then(PendingReason::from_db_str),
                 projector_version,
@@ -1258,9 +1257,9 @@ fn enqueue_precontext_readoption_work(
         enqueue_readoption_work(
             tx,
             account_id,
-            DeviceFingerprint::from_bytes(fixed32(device)?),
+            DeviceFingerprint::try_from_sql(device)?,
             stream,
-            fixed32(roster_ref)?,
+            cbor::sql_fixed(roster_ref, "roster_ref")?,
             u64::try_from(epoch)?,
             enqueued_at_ms,
         )?;
@@ -1293,8 +1292,8 @@ pub(crate) fn readoption_work_for_stream(
         .optional()?;
     row.map(|(device, roster_ref, epoch)| -> anyhow::Result<_> {
         Ok(ReadoptionWork {
-            device_fingerprint: DeviceFingerprint::from_bytes(fixed32(device)?),
-            roster_ref: fixed32(roster_ref)?,
+            device_fingerprint: DeviceFingerprint::try_from_sql(device)?,
+            roster_ref: cbor::sql_fixed(roster_ref, "roster_ref")?,
             removed_at_epoch: u64::try_from(epoch)?,
         })
     })
@@ -1391,7 +1390,7 @@ pub(crate) fn readoption_candidates(
             table_name,
             row_pk,
             original_lamport: u64::try_from(lamport)?,
-            entry_hash: entry_hash.map(fixed32).transpose()?.map(EntryHash::from_bytes),
+            entry_hash: entry_hash.map(EntryHash::try_from_sql).transpose()?,
         });
     }
     Ok(candidates)
@@ -1571,12 +1570,7 @@ pub(crate) fn stream_account_id(
         [stream.to_bytes().as_slice()],
         |row| row.get(0),
     )?;
-    Ok(AccountId::from_bytes(fixed32(bytes)?))
-}
-
-fn fixed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
-    <[u8; 32]>::try_from(bytes)
-        .map_err(|got| anyhow::anyhow!("stored entry_hash must be 32 bytes, got {}", got.len()))
+    Ok(AccountId::from_bytes(cbor::sql_fixed(bytes, "account_id")?))
 }
 
 #[cfg(test)]

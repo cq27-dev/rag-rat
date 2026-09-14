@@ -411,7 +411,7 @@ pub fn chain_tail(
     row.map(|(lamport, hash)| {
         Ok(ChainTail {
             lamport: u64::try_from(lamport).context("stored lamport is negative")?,
-            entry_hash: EntryHash::from_bytes(hash_from_vec(hash)?),
+            entry_hash: EntryHash::try_from_sql(hash)?,
         })
     })
     .transpose()
@@ -465,10 +465,7 @@ fn conflicting_entry(
             .optional()?,
     };
     row.map(|(signed_bytes, entry_hash)| {
-        Ok(ConflictingEntry {
-            signed_bytes,
-            entry_hash: EntryHash::from_bytes(hash_from_vec(entry_hash)?),
-        })
+        Ok(ConflictingEntry { signed_bytes, entry_hash: EntryHash::try_from_sql(entry_hash)? })
     })
     .transpose()
 }
@@ -537,7 +534,7 @@ fn streams_present(conn: &Connection) -> anyhow::Result<Vec<StreamId>> {
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut streams = Vec::new();
     for row in rows {
-        streams.push(StreamId::from_bytes(hash_from_vec(row?)?));
+        streams.push(StreamId::try_from_sql(row?)?);
     }
     Ok(streams)
 }
@@ -636,7 +633,7 @@ fn load_known_entries(tx: &Transaction<'_>, stream: StreamId) -> anyhow::Result<
     let mut entries = Vec::new();
     for row in rows {
         let (device_bytes, lamport, signed_bytes) = row?;
-        let device = DeviceFingerprint::from_bytes(hash_from_vec(device_bytes)?);
+        let device = DeviceFingerprint::try_from_sql(device_bytes)?;
         let lamport = u64::try_from(lamport).context("stored lamport is negative")?;
         // `decode_signed` is structure-only (no crypto) — recovers the opaque op bytes without
         // re-verifying the signature. `signed_bytes` is the single source of truth.
@@ -736,11 +733,6 @@ fn stored_projector_version(conn: &Connection) -> anyhow::Result<Option<i64>> {
     .optional()?
     .map(|value| value.parse::<i64>().context("oplog projector_version is not an integer"))
     .transpose()
-}
-
-fn hash_from_vec(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
-    let len = bytes.len();
-    bytes.try_into().map_err(|_| anyhow::anyhow!("expected a 32-byte value, got {len} bytes"))
 }
 
 // The shadow-table serialization DTOs. serde lives HERE, never on the frozen op-wire types (whose

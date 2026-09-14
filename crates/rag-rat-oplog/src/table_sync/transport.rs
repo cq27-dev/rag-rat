@@ -13,10 +13,10 @@ use super::engine::{self, IngestOutcome, SyncCtx};
 use super::registry::{SYNCABLE_TABLES, TableSpec, scope_lens_metas};
 use super::scope_stream::{ScopeId, scope_stream_id};
 use super::{retention, store};
-use crate::AccountId;
 use crate::account::{self, RepoIncarnationState};
 use crate::device::DevicePublic;
 use crate::stream::{EntryHash, StreamId};
+use crate::{AccountId, cbor};
 
 /// One locally-supported repo-scoped table stream.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -117,7 +117,7 @@ pub(crate) fn table_sync_sweep_expired_gapped(
     };
     let mut swept = 0;
     for (stream_id, hash) in expired {
-        let hash = EntryHash::from_bytes(fixed32(hash)?);
+        let hash = EntryHash::try_from_sql(hash)?;
         // The descendant sweep below may have already reclaimed this row behind an earlier root;
         // only a real deletion counts (and only a real root needs its subtree walked).
         if tx.execute("DELETE FROM table_sync_gapped_entries WHERE entry_hash = ?1", params![
@@ -127,11 +127,7 @@ pub(crate) fn table_sync_sweep_expired_gapped(
             continue;
         }
         swept += 1;
-        swept += store::discard_gapped_descendants(
-            &tx,
-            StreamId::from_bytes(fixed32(stream_id)?),
-            &hash,
-        )?;
+        swept += store::discard_gapped_descendants(&tx, StreamId::try_from_sql(stream_id)?, &hash)?;
     }
     tx.commit()?;
     Ok(swept)
@@ -325,7 +321,7 @@ fn compact_overdue_against(
             if count <= keep {
                 continue;
             }
-            let chain = crate::op::DeviceFingerprint::from_bytes(fixed32(device_bytes)?);
+            let chain = crate::op::DeviceFingerprint::try_from_sql(device_bytes)?;
             // The budget floor is the oldest RECLAIMABLE entry to retain: the one at offset
             // (count - keep) in lamport order. compact_chain_prefix drops strictly below it.
             let target: i64 = tx.query_row(
@@ -620,9 +616,7 @@ fn supported_streams_against(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut streams = Vec::with_capacity(rows.len().saturating_mul(scopes.len()));
     for (repo_id, incarnation) in rows {
-        let incarnation_ref: [u8; 32] = incarnation.try_into().map_err(|got: Vec<u8>| {
-            anyhow::anyhow!("stored repository incarnation must be 32 bytes, got {}", got.len())
-        })?;
+        let incarnation_ref = cbor::sql_fixed(incarnation, "repository incarnation")?;
         for &scope_id in &scopes {
             streams.push(TableSyncStream {
                 stream_id: scope_stream_id(&repo_id, account_id, incarnation_ref, scope_id)
@@ -715,14 +709,17 @@ fn accepted_chain_page(
             .map(|l| -> anyhow::Result<_> {
                 Ok((
                     u64::try_from(l)?,
-                    fixed32(floor_hash.expect("floor row carries its entry hash"))?,
+                    cbor::sql_fixed(
+                        floor_hash.expect("floor row carries its entry hash"),
+                        "entry_hash",
+                    )?,
                 ))
             })
             .transpose()?;
         Ok(TableSyncChainHead {
-            device_fingerprint: fixed32(device)?,
+            device_fingerprint: cbor::sql_fixed(device, "device_fingerprint")?,
             lamport: u64::try_from(lamport)?,
-            entry_hash: fixed32(hash)?,
+            entry_hash: cbor::sql_fixed(hash, "entry_hash")?,
             floor,
         })
     })
@@ -744,7 +741,7 @@ fn chain_frontier(
         )
         .optional()?
         .map(|(lamport, hash)| -> anyhow::Result<_> {
-            Ok((u64::try_from(lamport)?, fixed32(hash)?))
+            Ok((u64::try_from(lamport)?, cbor::sql_fixed(hash, "entry_hash")?))
         })
         .transpose()?;
     match (accepted, witness) {
@@ -776,7 +773,9 @@ fn accepted_chain_tail(
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
     )
     .optional()?
-    .map(|(lamport, hash)| -> anyhow::Result<_> { Ok((u64::try_from(lamport)?, fixed32(hash)?)) })
+    .map(|(lamport, hash)| -> anyhow::Result<_> {
+        Ok((u64::try_from(lamport)?, cbor::sql_fixed(hash, "entry_hash")?))
+    })
     .transpose()
 }
 
@@ -837,7 +836,7 @@ fn accepted_chain_entries(
         let (lamport, hash, signed_bytes) = row?;
         Ok(TableSyncChainEntry {
             lamport: u64::try_from(lamport)?,
-            entry_hash: fixed32(hash)?,
+            entry_hash: cbor::sql_fixed(hash, "entry_hash")?,
             signed_bytes,
         })
     })
@@ -886,16 +885,10 @@ fn cursor_matches(
         .optional()?;
     let Some(stored) = stored else { return Ok(false) };
     anyhow::ensure!(
-        fixed32(stored)? == entry_hash,
+        cbor::sql_fixed(stored, "entry_hash")? == entry_hash,
         "table-sync chain cursor hash conflicts at lamport {lamport}"
     );
     Ok(true)
-}
-
-fn fixed32(bytes: Vec<u8>) -> anyhow::Result<[u8; 32]> {
-    bytes.try_into().map_err(|bytes: Vec<u8>| {
-        anyhow::anyhow!("stored table-sync hash must be 32 bytes, got {}", bytes.len())
-    })
 }
 
 /// The route one ingest is validated against: the account, the stream it arrived on, and the
@@ -1002,6 +995,32 @@ mod tests {
     use crate::table_sync::registry::{ColumnSpec, ValueType};
     use crate::table_sync::row_op::DecodedRowOp;
     use crate::table_sync::{Cell, RowOp, TypedValue};
+
+    #[test]
+    fn malformed_chain_tail_hash_names_the_stored_field() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE table_sync_entries(
+                stream_id BLOB, device_fingerprint BLOB, lamport INTEGER, entry_hash BLOB
+            )",
+        )
+        .unwrap();
+        let stream = [1_u8; 32];
+        let device = [2_u8; 32];
+        for len in [0, 31, 33] {
+            conn.execute("DELETE FROM table_sync_entries", []).unwrap();
+            conn.execute("INSERT INTO table_sync_entries VALUES (?1, ?2, 1, ?3)", params![
+                stream.as_slice(),
+                device.as_slice(),
+                vec![0_u8; len]
+            ])
+            .unwrap();
+            assert_eq!(
+                accepted_chain_tail(&conn, stream, device).unwrap_err().to_string(),
+                format!("stored entry_hash must be 32 bytes, got {len}"),
+            );
+        }
+    }
 
     const INCARNATION: [u8; 32] = [0x24; 32];
 
@@ -2138,7 +2157,7 @@ mod tests {
                 StreamId::from_bytes(route.stream_id),
                 writer,
                 4,
-                EntryHash::from_bytes(fixed32(floor_hash).unwrap()),
+                EntryHash::try_from_sql(floor_hash).unwrap(),
                 0,
             )
             .unwrap();
@@ -2349,7 +2368,7 @@ mod tests {
                 StreamId::from_bytes(route.stream_id),
                 local,
                 8,
-                EntryHash::from_bytes(fixed32(floor_hash).unwrap()),
+                EntryHash::try_from_sql(floor_hash).unwrap(),
                 0,
             )
             .unwrap();
@@ -2449,7 +2468,7 @@ mod tests {
                 StreamId::from_bytes(route.stream_id),
                 local,
                 8,
-                EntryHash::from_bytes(fixed32(floor_hash).unwrap()),
+                EntryHash::try_from_sql(floor_hash).unwrap(),
                 0,
             )
             .unwrap();

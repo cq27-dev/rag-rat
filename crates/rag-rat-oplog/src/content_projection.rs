@@ -28,6 +28,7 @@ use super::account::{
     AccountId, KeyId, content_projected_tables_exist, content_stream_has_pending_refold,
     decode_content_signed, historical_content_keyring, open_sealed_payload, stream_owner_account,
 };
+use super::cbor;
 use super::identity::load_local_device;
 use super::op::{
     self, DecodedOp, DeviceFingerprint, EdgeSpec, Entry, NodeContent, NodeStatus, OpMeta,
@@ -178,10 +179,7 @@ fn accepted_or_projected_content_streams(conn: &Connection) -> anyhow::Result<Ve
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut streams = Vec::new();
     for row in rows {
-        let bytes = row?;
-        let hash: [u8; 32] =
-            bytes.try_into().map_err(|_| anyhow::anyhow!("stored /3 stream_id is not 32 bytes"))?;
-        streams.push(StreamId::from_bytes(hash));
+        streams.push(StreamId::try_from_sql(row?)?);
     }
     Ok(streams)
 }
@@ -509,12 +507,8 @@ fn load_accepted_entries(
     let mut entries = Vec::new();
     for row in rows {
         let (stored_entry_hash, stored_stream_id, signed_bytes) = row?;
-        let stored_entry_hash: [u8; 32] = stored_entry_hash
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("stored accepted /3 entry_hash is not 32 bytes"))?;
-        let stored_stream_id: [u8; 32] = stored_stream_id
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("stored accepted /3 stream_id is not 32 bytes"))?;
+        let stored_entry_hash: [u8; 32] = cbor::sql_fixed(stored_entry_hash, "entry_hash")?;
+        let stored_stream_id = StreamId::try_from_sql(stored_stream_id)?;
         // The signed ENVELOPE decoded at ingest to become a candidate, so a failure here is
         // corruption at rest — surface it loudly.
         let signed = decode_content_signed(&signed_bytes)
@@ -524,8 +518,7 @@ fn load_accepted_entries(
             "stored accepted /3 signed envelope does not match its entry_hash row"
         );
         anyhow::ensure!(
-            signed.header.stream_id.to_bytes() == stored_stream_id
-                && signed.header.stream_id == stream_id,
+            signed.header.stream_id == stored_stream_id && signed.header.stream_id == stream_id,
             "stored accepted /3 signed envelope does not match its stream_id row"
         );
         // Payload/key failures are LOCAL projection failures, not acceptance failures. Unknown
