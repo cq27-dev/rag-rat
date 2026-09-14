@@ -28,7 +28,9 @@ pub fn store_ref(conn: &Connection, reference: &PapertrailRef) -> anyhow::Result
     // `idx_papertrail_refs_unique` leads with `repo_id`, so a conflict is always THIS repo
     // re-discovering its OWN ref. The upsert PROMOTES `ref_kind` to the strongest claim (see the
     // SQL comment) and preserves the first-sighting `discovered_at_ms`; a sibling repo
-    // referencing the same item gets its own distinct row rather than conflicting.
+    // referencing the same item gets its own distinct row rather than conflicting. The rank
+    // ladder keeps its token literals: it ranks STORED rows, so it mirrors `RefKind::claim_rank`
+    // rather than calling it, and a pairwise test keeps the two equal.
     conn.execute(
         "
         INSERT INTO papertrail_refs(
@@ -145,13 +147,14 @@ pub fn store_item(
     conn.execute(
         "DELETE FROM papertrail_fts
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND item_kind = ?4
-           AND item_key = ?5 AND doc_kind = 'item'",
+           AND item_key = ?5 AND doc_kind = ?6",
         params![
             repo_id,
             tracker.as_db_str(),
             item.project,
             item.item_kind.as_db_str(),
-            item.item_key
+            item.item_key,
+            DocKind::Item.as_db_str(),
         ],
     )?;
     insert_fts(conn, FtsRow {
@@ -215,8 +218,14 @@ pub fn store_comment(
     conn.execute(
         "DELETE FROM papertrail_fts
          WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND comment_id = ?4
-           AND doc_kind = 'comment'",
-        params![repo_id, tracker.as_db_str(), comment.project, comment.comment_id],
+           AND doc_kind = ?5",
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            comment.project,
+            comment.comment_id,
+            DocKind::Comment.as_db_str(),
+        ],
     )?;
     insert_fts(conn, FtsRow {
         tracker: tracker.as_db_str(),
@@ -258,11 +267,11 @@ pub fn store_closing_edge(
             -- may replace an existing sha — a text re-mine must never overwrite attested data.
             closer_commit = CASE
                 WHEN closer_commit IS NULL THEN excluded.closer_commit
-                WHEN excluded.source = 'provider' THEN COALESCE(excluded.closer_commit, \
-         closer_commit)
+                WHEN excluded.source = ?11 THEN COALESCE(excluded.closer_commit, closer_commit)
                 ELSE closer_commit
             END,
-            source = CASE WHEN source = 'provider' THEN 'provider' ELSE excluded.source END,
+            -- The provider tier is sticky: ?11 is the `provider` token on both sides.
+            source = CASE WHEN source = ?11 THEN ?11 ELSE excluded.source END,
             synced_at_ms = excluded.synced_at_ms
         ",
         params![
@@ -276,6 +285,7 @@ pub fn store_closing_edge(
             edge.source.as_db_str(),
             now_ms(),
             repo_id,
+            ClosingEdgeSource::Provider.as_db_str(),
         ],
     )?;
     Ok(())
@@ -297,11 +307,18 @@ pub fn closing_edges_for_item(
         SELECT issue_kind, issue_key, closer_kind, closer_key, closer_commit, source
         FROM papertrail_closing_edges
         WHERE repo_id = ?1 AND tracker = ?2 AND project = ?3 AND issue_kind = ?4 AND issue_key = ?5
-        ORDER BY CASE source WHEN 'provider' THEN 0 ELSE 1 END, closer_kind, closer_key
+        ORDER BY CASE source WHEN ?6 THEN 0 ELSE 1 END, closer_kind, closer_key
         ",
     )?;
     let rows = stmt.query_map(
-        params![repo_id, tracker.as_db_str(), project, issue_kind.as_db_str(), issue_key],
+        params![
+            repo_id,
+            tracker.as_db_str(),
+            project,
+            issue_kind.as_db_str(),
+            issue_key,
+            ClosingEdgeSource::Provider.as_db_str(),
+        ],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,

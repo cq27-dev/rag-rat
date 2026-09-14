@@ -416,9 +416,8 @@ pub(crate) fn mine_item_refs(
     // Keyed by the SOURCE identity alone (no tracker predicate — one source can reference
     // several configured trackers).
     conn.execute(
-        "DELETE FROM papertrail_refs WHERE repo_id = ?1 AND source_kind = 'item' AND source_text \
-         = ?2",
-        params![repo_id, identity],
+        "DELETE FROM papertrail_refs WHERE repo_id = ?1 AND source_kind = ?3 AND source_text = ?2",
+        params![repo_id, identity, RefSourceKind::Item.as_db_str()],
     )?;
     let source = source_binding(provider, &item.project, trackers);
     for text in [item.title.as_str(), item.body.as_str()] {
@@ -452,9 +451,8 @@ pub(crate) fn mine_comment_refs(
     // REPLACE-on-remine, same contract as item bodies: comment text is editable, and one
     // comment can reference several configured trackers (no tracker predicate).
     conn.execute(
-        "DELETE FROM papertrail_refs WHERE repo_id = ?1 AND source_kind = 'comment' AND \
-         source_text = ?2",
-        params![repo_id, identity],
+        "DELETE FROM papertrail_refs WHERE repo_id = ?1 AND source_kind = ?3 AND source_text = ?2",
+        params![repo_id, identity, RefSourceKind::Comment.as_db_str()],
     )?;
     let source = source_binding(provider, &comment.project, trackers);
     for parsed in parse_tracker_refs_with_source(&comment.body, trackers, &source) {
@@ -554,11 +552,12 @@ pub(crate) fn current_commit_closing_refs(conn: &Connection) -> anyhow::Result<V
     // longer in `git_commits`).
     let mut stmt = conn.prepare(
         "SELECT r.tracker, r.project, r.item_key, r.item_kind, r.ref_kind, r.source_commit, \
-         r.source_text FROM papertrail_refs r WHERE r.repo_id = ?1 AND r.source_kind = 'commit' \
-         AND r.ref_kind = 'closing' AND EXISTS (SELECT 1 FROM git_commits g WHERE g.repo_id = \
-         r.repo_id AND g.hash = r.source_commit)",
+         r.source_text FROM papertrail_refs r WHERE r.repo_id = ?1 AND r.source_kind = ?2 AND \
+         r.ref_kind = ?3 AND EXISTS (SELECT 1 FROM git_commits g WHERE g.repo_id = r.repo_id AND \
+         g.hash = r.source_commit)",
     )?;
-    let rows = stmt.query_map([&repo_id], |row| {
+    let args = params![repo_id, RefSourceKind::Commit.as_db_str(), RefKind::Closing.as_db_str()];
+    let rows = stmt.query_map(args, |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
