@@ -87,7 +87,7 @@ pub mod serving {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             return PathBuf::from(local).join("rag-rat").join("models");
         }
-        PathBuf::from(".rag-rat").join("models")
+        PathBuf::from(rag_rat_base::data_dir::WORKSPACE_DIR).join("models")
     }
 
     pub fn hash_embed_text(text: &str, dim: usize) -> Vec<f32> {

@@ -3,7 +3,32 @@
 //! state) rather than the *cache* dir (disposable, re-derivable) — memories and the op log live
 //! here and must survive `git clean -fdx` of any checkout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The per-checkout workspace directory rag-rat keeps beside a repo: the legacy per-repo index,
+/// the default log dir, the lens discovery sockets.
+pub const WORKSPACE_DIR: &str = ".rag-rat";
+
+/// The legacy per-repo index file's name inside [`WORKSPACE_DIR`].
+pub const LEGACY_DATABASE_FILE: &str = "index.sqlite";
+
+/// The suffix `rag-rat consolidate` appends to a database file's name once it has been imported;
+/// the marker's presence is the stay-global latch keyless database resolution reads.
+pub const IMPORTED_MARKER_SUFFIX: &str = ".imported";
+
+/// The legacy per-repo index under `base` (the main worktree top): `<base>/.rag-rat/index.sqlite`.
+/// Spelled with a `/` inside the joined component on every platform, exactly as the path has
+/// always been rendered.
+pub fn legacy_database_path(base: &Path) -> PathBuf {
+    base.join(format!("{WORKSPACE_DIR}/{LEGACY_DATABASE_FILE}"))
+}
+
+/// `<database>.imported` — the name the legacy file is renamed to after a successful import.
+pub fn imported_marker_path(database: &Path) -> PathBuf {
+    let mut name = database.as_os_str().to_os_string();
+    name.push(IMPORTED_MARKER_SUFFIX);
+    PathBuf::from(name)
+}
 
 /// The rag-rat data directory, resolved by env cascade. An env var set to the empty string is
 /// treated as unset (XDG semantics), so the cascade falls through:
@@ -91,6 +116,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// These name files on users' disks — a respelling strands an existing index or its marker.
+    #[test]
+    fn workspace_file_names_are_pinned() {
+        // Compared as the rendered `OsStr`, against a single `join` of the literal tokens: that is
+        // the historical spelling on every platform, including the `/` inside the joined
+        // component on Windows (where `join` itself inserts a `\` before it).
+        let base = Path::new("/repo");
+        let legacy = legacy_database_path(base);
+        assert_eq!(legacy.as_os_str(), base.join(".rag-rat/index.sqlite").as_os_str());
+        assert_eq!(
+            imported_marker_path(&legacy).as_os_str(),
+            base.join(".rag-rat/index.sqlite.imported").as_os_str()
+        );
     }
 
     #[test]

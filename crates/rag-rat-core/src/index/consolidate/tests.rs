@@ -1733,7 +1733,7 @@ fn readiness_carry_restores_missing_model_but_respects_disabled() {
 #[test]
 fn imported_marker_appends_the_suffix() {
     assert_eq!(
-        imported_marker(Path::new("/repo/.rag-rat/index.sqlite")),
+        rag_rat_base::data_dir::imported_marker_path(Path::new("/repo/.rag-rat/index.sqlite")),
         PathBuf::from("/repo/.rag-rat/index.sqlite.imported"),
     );
 }
@@ -1747,7 +1747,7 @@ fn imported_marker_appends_the_suffix() {
 fn wal_sidecars_travel_with_the_imported_archive() {
     let dir = rag_rat_base::test_scratch::ScratchDir::new("sidecars");
     let source = dir.join("index.sqlite");
-    let imported = imported_marker(&source);
+    let imported = rag_rat_base::data_dir::imported_marker_path(&source);
     // Simulate the post-rename state with LEFTOVER sidecars (incl. an un-checkpointed wal).
     fs::write(&source, b"db").unwrap();
     fs::write(path_with_suffix(&source, "-wal"), b"frames").unwrap();

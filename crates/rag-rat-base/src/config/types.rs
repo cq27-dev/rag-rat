@@ -477,7 +477,7 @@ impl Default for LogConfig {
             enabled: false,
             level: LogLevel::Info,
             filter: None,
-            dir: PathBuf::from(".rag-rat/logs"),
+            dir: PathBuf::from(format!("{}/logs", crate::data_dir::WORKSPACE_DIR)),
             format: LogFormat::Text,
             max_file_bytes: 50 * 1024 * 1024,
             retention_days: 7,

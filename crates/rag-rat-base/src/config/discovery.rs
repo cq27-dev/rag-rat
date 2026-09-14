@@ -182,11 +182,11 @@ fn default_database_with_disposition(
     identity_root: &Path,
     repo_id_override: Option<&str>,
 ) -> (PathBuf, DefaultDatabaseDisposition) {
-    let legacy = db_base.join(".rag-rat/index.sqlite");
+    let legacy = crate::data_dir::legacy_database_path(db_base);
     if !crate::repo_identity::identity_is_resolvable(identity_root, repo_id_override) {
         return (legacy, DefaultDatabaseDisposition::IdentityLess);
     }
-    let marker = db_base.join(".rag-rat/index.sqlite.imported");
+    let marker = crate::data_dir::imported_marker_path(&legacy);
     let global = crate::data_dir::global_database_path();
     if marker.exists()
         && let Some(global) = global
@@ -240,7 +240,9 @@ pub(crate) fn resolve_default_database(
 /// removed, while a CUSTOM pin must also move its file here first (keyless resolution never looks
 /// anywhere else, so removing the key alone would strand the custom file unimported).
 pub fn default_legacy_database_path(root: &Path) -> PathBuf {
-    main_worktree_root(root).unwrap_or_else(|| root.to_path_buf()).join(".rag-rat/index.sqlite")
+    crate::data_dir::legacy_database_path(
+        &main_worktree_root(root).unwrap_or_else(|| root.to_path_buf()),
+    )
 }
 
 /// `path` as an absolute, canonical directory — the ONE production of `config.root`.
