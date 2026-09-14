@@ -61,6 +61,11 @@ impl StreamId {
     pub fn to_bytes(self) -> [u8; 32] {
         self.0
     }
+
+    /// A stored `stream_id` BLOB, or an error naming the column when it is not 32 bytes.
+    pub(crate) fn try_from_sql(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        cbor::sql_fixed(bytes, "stream_id").map(Self)
+    }
 }
 
 /// An op-log entry's content address: `sha256(body_bytes)` — what a signature covers, what the next
@@ -81,6 +86,11 @@ impl EntryHash {
 
     pub fn as_slice(&self) -> &[u8] {
         &self.0
+    }
+
+    /// A stored `entry_hash` BLOB, or an error naming the column when it is not 32 bytes.
+    pub(crate) fn try_from_sql(bytes: Vec<u8>) -> anyhow::Result<Self> {
+        cbor::sql_fixed(bytes, "entry_hash").map(Self)
     }
 }
 
