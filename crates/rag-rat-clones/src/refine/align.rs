@@ -259,7 +259,7 @@ pub(crate) fn class_fidelity(seqs: &[Vec<String>], cells: &mut CellBudget) -> Cl
             let denom = (a.len() + b.len()) as f64;
             let ratio = if denom == 0.0 {
                 1.0
-            } else if cells.exhausted || a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
+            } else if cells.is_exhausted() || a.len().max(b.len()) > LCS_MAX_SEQ_TOKENS {
                 // Per-pair length cap OR aggregate budget exhausted: use the Dice proxy instead of
                 // the O(n·m) DP. Dice ignores token order so it is an UPPER BOUND on the true LCS
                 // ratio — clamp to [`DICE_PROXY_CEILING`] (< the High-confidence threshold) so an
@@ -271,7 +271,7 @@ pub(crate) fn class_fidelity(seqs: &[Vec<String>], cells: &mut CellBudget) -> Cl
                 // exact DP. Once the running sum exceeds the budget, the NEXT pairs
                 // take the proxy branch above — but this pair, already accounted,
                 // still computes exactly.
-                cells.charge((a.len() as u64) * (b.len() as u64));
+                cells.charge_and_run((a.len() as u64) * (b.len() as u64));
                 exact_dp_pairs += 1;
                 let lcs = lcs_align(a, b).lcs_len;
                 2.0 * lcs as f64 / denom

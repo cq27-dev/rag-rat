@@ -104,7 +104,8 @@ pub(super) fn align_to_anchor_with_budget(
         // the per-member length skip, so the rest of the pipeline (fixedness / indel /
         // recover) excludes them. A member already charged still runs exactly
         // (check-after-charge → bound is "budget + one pair").
-        if budget.charge((spine_len as u64) * (member.seq.len() as u64)) {
+        budget.charge_and_run((spine_len as u64) * (member.seq.len() as u64));
+        if budget.is_exhausted() {
             col_map.push(vec![None; spine_len]);
             member_inserts.push(BTreeMap::new());
             sampled = true;
@@ -195,7 +196,7 @@ pub(super) fn align_to_anchor_with_budget(
         aligned,
         col_map,
         member_inserts,
-        spent_cells: budget.spent,
+        spent_cells: budget.spent(),
     }
 }
 

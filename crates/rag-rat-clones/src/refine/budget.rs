@@ -27,8 +27,8 @@ pub(crate) const ALIGN_AGGREGATE_CELLS_BUDGET: u64 = 100_000_000;
 /// re-descent). Threaded by `&mut` so the parent [`align_to_anchor`] and each
 /// [`emit_matched_statement_redescent`] recursion draw from the SAME budget.
 ///
-/// `charge` is called with `|anchor.seq| · |member.seq|` BEFORE an exact `lcs_align`; once the
-/// cumulative charge exceeds the budget, `exhausted` latches and every subsequent member /
+/// Each lane charges `|anchor.seq| · |member.seq|` BEFORE an exact `lcs_align`; once the cumulative
+/// charge exceeds the budget, [`Self::is_exhausted`] latches and every subsequent member /
 /// statement takes the skip-and-sample path instead of running exact DP. The cutover is consumed in
 /// the existing deterministic member/statement order, so the truncation point — and therefore the
 /// whole degraded output — is byte-identical for a given class.
@@ -37,16 +37,20 @@ pub(crate) const ALIGN_AGGREGATE_CELLS_BUDGET: u64 = 100_000_000;
 /// LCS lanes share one check-after-charge discipline.
 pub(crate) struct CellBudget {
     /// Cumulative `Σ |a|·|b|` charged over the exact `lcs_align` calls run so far.
-    pub(crate) spent: u64,
-    /// The cap; `spent > budget` latches `exhausted`.
-    pub(crate) budget: u64,
-    /// `true` once `spent` has exceeded `budget`. Latches — never resets within a class.
-    pub(crate) exhausted: bool,
+    spent: u64,
+    /// The cap; `spent > budget` means exhausted.
+    budget: u64,
 }
 
 impl CellBudget {
     pub(crate) fn new(budget: u64) -> Self {
-        CellBudget { spent: 0, budget, exhausted: false }
+        CellBudget { spent: 0, budget }
+    }
+
+    /// A budget at `budget` that has already charged `spent` — exhausted when `spent` is past the
+    /// cap, exactly as if the charges had gone through this instance.
+    pub(crate) fn resumed(budget: u64, spent: u64) -> Self {
+        CellBudget { spent, budget }
     }
 
     /// A per-class budget drawn from a SHARED CROSS-CLASS allowance: the lane's per-class `cap`,
@@ -63,14 +67,18 @@ impl CellBudget {
         *remaining = remaining.saturating_sub(self.spent);
     }
 
-    /// Charge `cells` against the budget BEFORE running the exact DP, then return whether the
-    /// budget is now exhausted. A pair already charged still runs exactly (the bound is "budget
-    /// + one pair").
-    pub(crate) fn charge(&mut self, cells: u64) -> bool {
+    pub(crate) fn spent(&self) -> u64 {
+        self.spent
+    }
+
+    /// `true` once `spent` has exceeded the cap. Latches: `spent` only grows.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.spent > self.budget
+    }
+
+    /// Charge `cells` against the budget BEFORE running the exact DP. A pair already charged still
+    /// runs exactly (the bound is "budget + one pair").
+    pub(crate) fn charge_and_run(&mut self, cells: u64) {
         self.spent = self.spent.saturating_add(cells);
-        if self.spent > self.budget {
-            self.exhausted = true;
-        }
-        self.exhausted
     }
 }

@@ -32,9 +32,7 @@ pub(crate) fn anti_unify(members: &[RefineMember], alignment: &ClassAlignment) -
     // already charged (`alignment.spent_cells`) so the matched-statement re-descent CONTINUES the
     // same per-class budget rather than restarting fresh. The whole per-class anti-unify (parent
     // star-align + every re-descent) is therefore bounded by ONE [`ALIGN_AGGREGATE_CELLS_BUDGET`].
-    let mut budget = CellBudget::new(ALIGN_AGGREGATE_CELLS_BUDGET);
-    budget.spent = alignment.spent_cells;
-    budget.exhausted = budget.spent > budget.budget;
+    let mut budget = CellBudget::resumed(ALIGN_AGGREGATE_CELLS_BUDGET, alignment.spent_cells);
     anti_unify_with_budget(members, alignment, &mut budget)
 }
 
