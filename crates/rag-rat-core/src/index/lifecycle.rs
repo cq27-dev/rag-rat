@@ -961,7 +961,7 @@ fn write_scope_view_inner(
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
          '{CONNECTION_CONTEXT_GENERATION_KEY}')
               AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-         '{CONNECTION_CONTEXT_WORKTREE_KEY}') AND worktree_id != '' AND kind != 'deleted'
+         '{CONNECTION_CONTEXT_WORKTREE_KEY}') AND worktree_id != '' AND kind != '{}'
             UNION ALL
             SELECT {SCOPED_FILES_COLUMNS}
             FROM main.files
@@ -982,7 +982,8 @@ fn write_scope_view_inner(
          '{CONNECTION_CONTEXT_WORKTREE_KEY}')
                     AND worktree_id != ''
               );
-        "
+        ",
+        schema::TOMBSTONE_FILE_KIND
     ))?;
 
     Ok(())

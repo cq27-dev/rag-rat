@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::time::now_ms;
+use rag_rat_db::schema::TOMBSTONE_FILE_KIND;
 use rusqlite::{Connection, params};
 
 use super::{OracleResolutionKind, OracleTool};
@@ -371,7 +372,8 @@ pub(crate) fn indexed_file_sha_for_path(
     use rusqlite::OptionalExtension as _;
     conn.query_row(
         &format!(
-            "SELECT sha256 FROM files WHERE path = ?1 AND kind != 'deleted' AND {scope}",
+            "SELECT sha256 FROM files WHERE path = ?1 AND kind != '{TOMBSTONE_FILE_KIND}' AND \
+             {scope}",
             scope = active_checkout_file_predicate("?2", "?3"),
         ),
         params![path, commit_sha, worktree_id],
@@ -852,7 +854,7 @@ pub(crate) fn indexed_paths_in_scope(
     // candidate (`edge_join_candidates` won't emit one) — counting it would falsely inflate the
     // recall gap. The deleted row must NOT count as "indexed in scope".
     let mut stmt = conn.prepare(&format!(
-        "SELECT path FROM files WHERE {scope} AND kind != 'deleted'",
+        "SELECT path FROM files WHERE {scope} AND kind != '{TOMBSTONE_FILE_KIND}'",
         scope = active_checkout_file_predicate("?1", "?2"),
     ))?;
     let rows = stmt.query_map(params![commit_sha, worktree_id], |row| row.get::<_, String>(0))?;
@@ -870,7 +872,7 @@ pub(crate) fn indexed_file_shas_in_scope(
 ) -> anyhow::Result<HashMap<String, String>> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     let mut stmt = conn.prepare(&format!(
-        "SELECT path, sha256 FROM files WHERE {scope} AND kind != 'deleted'",
+        "SELECT path, sha256 FROM files WHERE {scope} AND kind != '{TOMBSTONE_FILE_KIND}'",
         scope = active_checkout_file_predicate("?1", "?2"),
     ))?;
     let rows = stmt.query_map(params![commit_sha, worktree_id], |row| {

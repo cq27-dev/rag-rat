@@ -1,6 +1,8 @@
 //! Graph-index freshness: edge resolution entry points, per-row graph/scope provenance, the
 //! on-open heal, and graph coverage.
 
+use rag_rat_db::schema::TOMBSTONE_FILE_KIND;
+
 use super::logical_key::KeyVersionStamp;
 use super::references::resolve_synced_symbol_anchors;
 use crate::index::*;
@@ -320,17 +322,19 @@ impl IndexDatabase {
 
     pub(in crate::index) fn active_derivation_rows_owed(&self) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(
+            &format!(
+                "SELECT EXISTS(
                  SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND graph_version < CAST(?3 AS INTEGER)
                    AND id IN (SELECT id FROM files)
              ) OR EXISTS(
                  SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND scope_version < CAST(?4 AS INTEGER)
                    AND id IN (SELECT id FROM files)
-             )",
+             )"
+            ),
             params![
                 self.active_repo_id,
                 self.active_generation,
@@ -343,12 +347,14 @@ impl IndexDatabase {
 
     fn active_graph_rows_owed(&self) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(
+            &format!(
+                "SELECT EXISTS(
                  SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND graph_version < CAST(?3 AS INTEGER)
                    AND id IN (SELECT id FROM files)
-             )",
+             )"
+            ),
             params![self.active_repo_id, self.active_generation, GRAPH_INDEX_VERSION],
             |row| row.get::<_, i64>(0),
         )? == 1)
@@ -356,11 +362,13 @@ impl IndexDatabase {
 
     fn graph_rows_owed(&self) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(
+            &format!(
+                "SELECT EXISTS(
                  SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND graph_version < CAST(?3 AS INTEGER)
-             )",
+             )"
+            ),
             params![self.active_repo_id, self.active_generation, GRAPH_INDEX_VERSION],
             |row| row.get::<_, i64>(0),
         )? == 1)
@@ -368,11 +376,13 @@ impl IndexDatabase {
 
     fn scope_rows_owed(&self) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(
+            &format!(
+                "SELECT EXISTS(
                  SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND scope_version < CAST(?3 AS INTEGER)
-             )",
+             )"
+            ),
             params![self.active_repo_id, self.active_generation, LOGICAL_KEY_VERSION],
             |row| row.get::<_, i64>(0),
         )? == 1)
@@ -380,11 +390,13 @@ impl IndexDatabase {
 
     fn scope_rows_newer(&self) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(
+            &format!(
+                "SELECT EXISTS(
                  SELECT 1 FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND scope_version > CAST(?3 AS INTEGER)
-             )",
+             )"
+            ),
             params![self.active_repo_id, self.active_generation, LOGICAL_KEY_VERSION],
             |row| row.get::<_, i64>(0),
         )? == 1)
@@ -541,17 +553,17 @@ impl IndexDatabase {
         // `kind != 'deleted'` guards the bare-open view, which does not filter tombstones:
         // `mark_file_deleted` leaves `language='unknown', kind='deleted'`, and neither parses, so
         // letting one through would turn every open into a hard error.
-        let mut stmt = self.storage.connection().prepare(
+        let mut stmt = self.storage.connection().prepare(&format!(
             "SELECT id, path, language, kind, sha256,
                     graph_version < CAST(?3 AS INTEGER),
                     scope_version < CAST(?4 AS INTEGER)
                  FROM main.files
-                 WHERE repo_id = ?1 AND generation = ?2 AND kind != 'deleted'
+                 WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND id IN (SELECT id FROM files)
                    AND (graph_version < CAST(?3 AS INTEGER)
                         OR scope_version < CAST(?4 AS INTEGER))
                  ORDER BY path",
-        )?;
+        ))?;
         let rows = stmt.query_map(
             params![
                 self.active_repo_id,

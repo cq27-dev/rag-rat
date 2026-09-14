@@ -190,15 +190,16 @@ fn retained_committed_file_map(
     if active_commit.is_empty() {
         return Ok(files);
     }
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT path, id, sha256, language, kind FROM main.files
          WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
            AND generation = (SELECT value FROM temp.connection_context WHERE key = \
          'files_generation')
-           AND worktree_id = '' AND kind != 'deleted'
+           AND worktree_id = '' AND kind != '{}'
            AND commit_sha != '' AND commit_sha != ?1
          ORDER BY id",
-    )?;
+        rag_rat_db::schema::TOMBSTONE_FILE_KIND
+    ))?;
     let rows = stmt.query_map([&active_commit], |row| {
         Ok((row.get::<_, String>(0)?, RetainedFileRow {
             file_id: row.get(1)?,

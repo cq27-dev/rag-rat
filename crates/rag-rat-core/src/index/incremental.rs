@@ -1096,7 +1096,9 @@ impl IndexDatabase {
         // holding one would run a `git status` inside `BEGIN IMMEDIATE`, forever, which is the
         // idle-pass cost #63 exists to keep at zero. Filtering here also keeps the rule in ONE
         // place: below, a surviving tombstone is healable by construction.
-        overlays.retain(|(_, path, _, kind)| kind != "deleted" || reindexed.contains(path));
+        overlays.retain(|(_, path, _, kind)| {
+            kind != schema::TOMBSTONE_FILE_KIND || reindexed.contains(path)
+        });
         // No overlay candidates → nothing to heal and NO walk under the lock (the common clean-tree
         // / idle pass pays nothing).
         if overlays.is_empty() {
@@ -1134,7 +1136,7 @@ impl IndexDatabase {
             // to hand the path back to; with none, the tombstone shadows nothing. It is never
             // re-stamped into the commit scope below: that would publish a deletion marker as the
             // file's committed row.
-            if kind == "deleted" {
+            if kind == schema::TOMBSTONE_FILE_KIND {
                 if self.committed_row_exists(&path)? {
                     self.remove_file_in_scope(
                         Path::new(&path),

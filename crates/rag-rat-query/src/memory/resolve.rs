@@ -1,3 +1,5 @@
+use rag_rat_db::schema::TOMBSTONE_FILE_KIND;
+
 use super::*;
 
 /// Resolve the ONE binding target a bind request names, or `Ok(None)` when the request names none
@@ -503,7 +505,8 @@ pub(crate) fn edge_id_matches_fingerprint_in_linked_worktree(
     .unwrap_or_default();
     let edge = conn
         .query_row(
-            "SELECT edges.id AS edge_id,
+            &format!(
+                "SELECT edges.id AS edge_id,
                     main.files.path AS path,
                     COALESCE(NULLIF(edges.source_start_line, 0), 1) AS start_line,
                     COALESCE(NULLIF(edges.source_end_line, 0),
@@ -522,14 +525,15 @@ pub(crate) fn edge_id_matches_fingerprint_in_linked_worktree(
                       ON members.symbol_id = edges.to_symbol_id
               WHERE edges.id = ?1
                 AND main.files.repo_id = ?2
-                AND main.files.kind != 'deleted'
+                AND main.files.kind != '{TOMBSTONE_FILE_KIND}'
                 AND main.files.worktree_id != ''
                 AND main.files.worktree_id != ?3
                 AND main.files.generation = COALESCE(
                     (SELECT CAST(value AS INTEGER) FROM repo_meta
                       WHERE repo_id = ?2 AND key = 'live_files_generation'),
                     0
-                )",
+                )"
+            ),
             params![edge_id, repo_id, active_worktree],
             |row| read_edge_anchor(row, LegacyShadow::Skip),
         )
@@ -1330,7 +1334,7 @@ fn remapped_edge_fingerprint(
     old_callee: i64,
     new_callee: Option<i64>,
 ) -> rusqlite::Result<Option<String>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT main.files.path AS path,
                 COALESCE(NULLIF(edges.source_start_line, 0), 1) AS start_line,
                 COALESCE(NULLIF(edges.source_end_line, 0), NULLIF(edges.source_start_line, 0), 1)
@@ -1343,7 +1347,7 @@ fn remapped_edge_fingerprint(
            FROM edges
            JOIN main.files ON main.files.id = edges.source_file_id
            LEFT JOIN main.logical_symbol_members members ON members.symbol_id = edges.to_symbol_id
-          WHERE main.files.kind != 'deleted'
+          WHERE main.files.kind != '{TOMBSTONE_FILE_KIND}'
             AND main.files.generation = COALESCE(
                 (SELECT CAST(value AS INTEGER) FROM repo_meta
                   WHERE repo_id = main.files.repo_id AND key = 'live_files_generation'),
@@ -1352,7 +1356,7 @@ fn remapped_edge_fingerprint(
             AND (members.logical_symbol_id = ?1
               OR members.logical_symbol_id = ?2
               OR (?2 IS NULL AND members.logical_symbol_id IS NULL))",
-    )?;
+    ))?;
     let mut rows = stmt.query(params![old_callee, new_callee])?;
     while let Some(row) = rows.next()? {
         let path: String = row.get("path")?;

@@ -287,10 +287,11 @@ fn list_repo_worktree_overlays(
     repo_id: &str,
     live_generation: i64,
 ) -> anyhow::Result<Vec<WorktreeOverlay>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT worktree_id, COUNT(*) FROM main.files WHERE repo_id = ?1 AND generation = ?2 AND \
-         worktree_id != '' AND kind != 'deleted' GROUP BY worktree_id ORDER BY worktree_id",
-    )?;
+         worktree_id != '' AND kind != '{}' GROUP BY worktree_id ORDER BY worktree_id",
+        schema::TOMBSTONE_FILE_KIND
+    ))?;
     let overlays = stmt
         .query_map(params![repo_id, live_generation], |row| {
             Ok(WorktreeOverlay {
@@ -408,8 +409,11 @@ fn count_repo_content(
     Ok(RepoContent {
         files: count_live_files(
             conn,
-            "SELECT COUNT(*) FROM main.files WHERE repo_id = ?1 AND generation = ?2 AND kind != \
-             'deleted'",
+            &format!(
+                "SELECT COUNT(*) FROM main.files WHERE repo_id = ?1 AND generation = ?2 AND kind \
+                 != '{}'",
+                schema::TOMBSTONE_FILE_KIND
+            ),
             repo_id,
             live_generation,
         )?,

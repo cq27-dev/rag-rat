@@ -4,6 +4,7 @@
 use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::paths::path_string;
 use rag_rat_base::time::now_ms;
+use rag_rat_db::schema::{TOMBSTONE_FILE_KIND, TOMBSTONE_FILE_LANGUAGE};
 
 use super::*;
 
@@ -169,14 +170,17 @@ impl IndexDatabase {
         let path = path_string(path);
         self.remove_file_in_scope(Path::new(&path), CheckoutRef::worktree(worktree_id))?;
         self.storage.connection().execute(
-            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id, generation)
-             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3, ?4, ?5)
+            &format!(
+                "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
+                 indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id, generation)
+             VALUES (?1, '{TOMBSTONE_FILE_LANGUAGE}', '{TOMBSTONE_FILE_KIND}', '', 0, 0, ?2, '', \
+                 '', ?3, ?4, ?5)
              ON CONFLICT(repo_id, path, commit_sha, worktree_id, generation) DO UPDATE SET
-                kind = 'deleted',
+                kind = '{TOMBSTONE_FILE_KIND}',
                 sha256 = '',
                 modified_at_ms = 0,
-                indexed_at_ms = excluded.indexed_at_ms",
+                indexed_at_ms = excluded.indexed_at_ms"
+            ),
             // A6: the tombstone lands on the connection's live generation, and the ON CONFLICT
             // target matches the V043 UNIQUE (repo_id, path, commit_sha, worktree_id,
             // generation).
@@ -523,21 +527,23 @@ impl IndexDatabase {
         include_retained_commit_fallback: bool,
     ) -> anyhow::Result<usize> {
         let count = self.storage.connection().query_row(
-            "SELECT COUNT(*) FROM (
+            &format!(
+                "SELECT COUNT(*) FROM (
                  SELECT path FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2
-                   AND worktree_id = ?3 AND worktree_id != '' AND kind != 'deleted'
+                   AND worktree_id = ?3 AND worktree_id != '' AND kind != '{TOMBSTONE_FILE_KIND}'
                  UNION
                  SELECT path FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2
-                   AND worktree_id = '' AND kind != 'deleted'
+                   AND worktree_id = '' AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND (
                        commit_sha = ?4
                        OR (
                            ?5 AND ?4 != '' AND commit_sha != '' AND NOT EXISTS (
                                SELECT 1 FROM main.files
                                WHERE repo_id = ?1 AND generation = ?2
-                                 AND worktree_id = '' AND commit_sha = ?4 AND kind != 'deleted'
+                                 AND worktree_id = '' AND commit_sha = ?4 AND kind != \
+                 '{TOMBSTONE_FILE_KIND}'
                            )
                        )
                    )
@@ -546,7 +552,8 @@ impl IndexDatabase {
                        WHERE repo_id = ?1 AND generation = ?2
                          AND worktree_id = ?3 AND worktree_id != ''
                    )
-             )",
+             )"
+            ),
             params![
                 self.active_repo_id,
                 self.active_generation,

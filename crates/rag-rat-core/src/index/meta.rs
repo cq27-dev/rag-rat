@@ -219,8 +219,10 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let mut state = [0u64; 4];
         let mut rows_folded = 0i64;
-        let mut stmt =
-            conn.prepare("SELECT path, sha256 FROM main.files WHERE kind != 'deleted'")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT path, sha256 FROM main.files WHERE kind != '{}'",
+            rag_rat_db::schema::TOMBSTONE_FILE_KIND
+        ))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;

@@ -29,6 +29,8 @@ use rusqlite::Connection;
 use rusqlite::functions::FunctionFlags;
 use sha2::{Digest, Sha256};
 
+use crate::schema::TOMBSTONE_FILE_KIND;
+
 /// Domain tag versioning the per-row hash function itself. Bumping it is a digest-algorithm change
 /// (a new migration that reseeds and re-stamps), which is exactly what the rendered `ms1-` prefix
 /// announces in stored stamps.
@@ -38,10 +40,6 @@ const ROW_HASH_DOMAIN: &[u8] = b"rag-rat/content-revision/1";
 /// guaranteed disjoint from the legacy 64-hex SHA digest, so a stale legacy stamp never
 /// accidentally equals a new one.
 pub const CONTENT_REVISION_PREFIX: &str = "ms1-";
-
-/// The `files.kind` value excluded from the multiset (a tombstone). The trigger fold no-ops each
-/// side whose kind is this, matching the current digest's `kind != 'deleted'` inclusion predicate.
-const TOMBSTONE_KIND: &str = "deleted";
 
 /// Four little-endian `u64` lanes — the 256-bit additive multiset-hash state. All-zero is the
 /// empty multiset.
@@ -152,7 +150,7 @@ pub fn register_content_digest_fold(conn: &Connection) -> rusqlite::Result<()> {
             // predicate lives in ONE place and the triggers stay simple (the UPDATE trigger folds
             // both OLD and NEW unconditionally, and this no-ops each tombstone side).
             let kind: String = ctx.get(3)?;
-            if kind == TOMBSTONE_KIND {
+            if kind == TOMBSTONE_FILE_KIND {
                 return Ok(state_hex);
             }
             // Decode AFTER the tombstone check would still be correct, but decoding first keeps the
@@ -176,13 +174,15 @@ pub fn register_content_digest_fold(conn: &Connection) -> rusqlite::Result<()> {
 /// insert the state row — the caller seeds it with a from-scratch fold, so no write can slip
 /// between trigger creation and the seed inside the migration transaction.
 pub fn ensure_content_digest(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(CONTENT_DIGEST_SCHEMA_SQL)
+    conn.execute_batch(&content_digest_schema_sql())
 }
 
-/// The state table + fold triggers. Kept as one const so trigger bodies and the invariant comment
+/// The state table + fold triggers. Kept as one batch so trigger bodies and the invariant comment
 /// travel together; every statement is `IF NOT EXISTS`, so re-running is a no-op.
-const CONTENT_DIGEST_SCHEMA_SQL: &str = "
--- Invariant: state == fold over {(path, sha256) : main.files, kind != 'deleted'} at every
+fn content_digest_schema_sql() -> String {
+    format!(
+        "
+-- Invariant: state == fold over {{(path, sha256) : main.files, kind != 'deleted'}} at every
 -- transaction boundary, maintained exclusively by the files_content_digest_* triggers below.
 -- Exactly one row (id = 1), seeded by the migration; rows_folded is the multiset cardinality
 -- (diagnostic only — never part of the rendered digest).
@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS content_digest_state(
 
 -- Inserted rows join the multiset unless they are tombstones.
 CREATE TRIGGER IF NOT EXISTS files_content_digest_ai
-AFTER INSERT ON files WHEN NEW.kind != 'deleted'
+AFTER INSERT ON files WHEN NEW.kind != '{TOMBSTONE_FILE_KIND}'
 BEGIN
     UPDATE content_digest_state
        SET state = rr_content_digest_fold(state, NEW.path, NEW.sha256, NEW.kind, 1),
@@ -204,7 +204,7 @@ END;
 
 -- Deleted rows leave the multiset unless they were tombstones.
 CREATE TRIGGER IF NOT EXISTS files_content_digest_ad
-AFTER DELETE ON files WHEN OLD.kind != 'deleted'
+AFTER DELETE ON files WHEN OLD.kind != '{TOMBSTONE_FILE_KIND}'
 BEGIN
     UPDATE content_digest_state
        SET state = rr_content_digest_fold(state, OLD.path, OLD.sha256, OLD.kind, -1),
@@ -224,10 +224,13 @@ BEGIN
                        rr_content_digest_fold(state, OLD.path, OLD.sha256, OLD.kind, -1),
                        NEW.path, NEW.sha256, NEW.kind, 1),
            rows_folded = rows_folded
-                         + (NEW.kind != 'deleted') - (OLD.kind != 'deleted')
+                         + (NEW.kind != '{TOMBSTONE_FILE_KIND}') - (OLD.kind != \
+         '{TOMBSTONE_FILE_KIND}')
      WHERE id = 1;
 END;
-";
+"
+    )
+}
 
 #[cfg(test)]
 mod tests {

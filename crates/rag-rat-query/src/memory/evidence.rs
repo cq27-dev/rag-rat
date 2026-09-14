@@ -1335,7 +1335,10 @@ fn bound_path_gives_absence_authority(conn: &Connection, path: &str) -> rusqlite
         return Ok(false);
     }
     conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND kind != 'deleted')",
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND kind != '{}')",
+            schema::TOMBSTONE_FILE_KIND
+        ),
         [path],
         |r| r.get(0),
     )

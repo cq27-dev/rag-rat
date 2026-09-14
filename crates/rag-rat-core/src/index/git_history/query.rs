@@ -62,7 +62,10 @@ pub fn replay_commit_cases(
 /// it as missing gold would make recall@k track the file mix of recent commits rather than search
 /// quality (#315).
 pub fn indexed_path_set(conn: &Connection) -> anyhow::Result<BTreeSet<String>> {
-    let mut stmt = conn.prepare("SELECT path FROM files WHERE kind != 'deleted'")?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT path FROM files WHERE kind != '{}'",
+        schema::TOMBSTONE_FILE_KIND
+    ))?;
     let paths = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<String>>>()?;
