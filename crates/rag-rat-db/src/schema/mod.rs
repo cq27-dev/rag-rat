@@ -109,17 +109,27 @@ const MIGRATION_001_DESCRIPTION: &str =
 /// `MIGRATION_NNN_{ID,CHECKSUM,DESCRIPTION}` consts and its [`ADDITIVE_MIGRATIONS`] row, so a
 /// migration's strings and its ladder position cannot drift apart. Entries MUST stay in ascending
 /// id order — the array order is the order the ladder applies them.
+///
+/// Markers after the apply fn set how the ladder runs the step: `ledger_atomic`
+/// ([`Migration::ledger_atomic`]) and `refold_accounts` ([`Migration::refold_accounts`]).
 macro_rules! additive_migrations {
     ($($id:ident, $checksum:ident, $description:ident = (
         $id_str:expr, $checksum_str:expr, $description_str:expr $(,)?
-    ) => $apply:expr;)*) => {
+    ) => $apply:expr $(, $flag:ident)*;)*) => {
         $(
             const $id: &str = $id_str;
             const $checksum: &str = $checksum_str;
             const $description: &str = $description_str;
         )*
         const ADDITIVE_MIGRATIONS: &[Migration] = &[
-            $(Migration { id: $id, checksum: $checksum, description: $description, apply: $apply },)*
+            $(Migration {
+                id: $id,
+                checksum: $checksum,
+                description: $description,
+                apply: $apply,
+                ledger_atomic: false,
+                refold_accounts: false,
+            }$(.$flag())*,)*
         ];
     };
 }
@@ -567,12 +577,14 @@ additive_migrations! {
          stream ownership, exact grant incarnations, and revoke device cuts. refold_account rewrites \
          these shadow tables in the same IMMEDIATE transaction as accepted/status, so /3 authority \
          checks never rescan the bounded candidate DAG",
-    ) => MigrationFn::Plain(migrations::apply_account_authority_projection);
+    ) => MigrationFn::Plain(migrations::apply_account_authority_projection),
+        ledger_atomic, refold_accounts;
     MIGRATION_065_ID, MIGRATION_065_CHECKSUM, MIGRATION_065_DESCRIPTION = (
         "065_account_authority_boundaries",
         "sha256:rag-rat-account-authority-boundaries-v65a",
         "Persist closed roster and owner chain boundaries for bounded historical citations",
-    ) => MigrationFn::Plain(migrations::apply_account_authority_boundaries);
+    ) => MigrationFn::Plain(migrations::apply_account_authority_boundaries),
+        ledger_atomic, refold_accounts;
     MIGRATION_066_ID, MIGRATION_066_CHECKSUM, MIGRATION_066_DESCRIPTION = (
         "066_content_candidate_dag",
         "sha256:rag-rat-content-candidate-dag-v66a",
@@ -864,7 +876,8 @@ additive_migrations! {
          does, so a verbatim path that is still load-bearing (UNC, >MAX_PATH, reserved DOS names) is \
          kept. Runs on every host: which spellings a store carries is a property of the store, not of \
          the binary that opens it",
-    ) => MigrationFn::Plain(migrations::apply_windows_verbatim_path_rekey);
+    ) => MigrationFn::Plain(migrations::apply_windows_verbatim_path_rekey),
+        ledger_atomic;
     MIGRATION_098_ID, MIGRATION_098_CHECKSUM, MIGRATION_098_DESCRIPTION = (
         "098_reindex_after_unix_backslash_rendering",
         "sha256:rag-rat-reindex-after-unix-backslash-rendering-v98",
@@ -881,7 +894,8 @@ additive_migrations! {
          parser_failures, the one path-keyed derived table a file re-walk does not cascade. Runs on \
          every host: which spellings a store carries is a property of the store, not of the binary \
          that opens it",
-    ) => MigrationFn::Plain(migrations::apply_reindex_after_unix_backslash_rendering);
+    ) => MigrationFn::Plain(migrations::apply_reindex_after_unix_backslash_rendering),
+        ledger_atomic;
     MIGRATION_099_ID, MIGRATION_099_CHECKSUM, MIGRATION_099_DESCRIPTION = (
         "099_table_sync_repo_incarnations",
         "sha256:rag-rat-table-sync-repo-incarnations-v99",
@@ -889,7 +903,8 @@ additive_migrations! {
          incarnation-bound stream contexts, stream-isolated row clocks/publication/tombstones, and \
          retained per-device chain-tip witnesses that survive local repository purge. Pre-transport \
          /4 table-sync state is cleared because it has no account-authorized incarnation identity",
-    ) => MigrationFn::Plain(migrations::apply_table_sync_repo_incarnations);
+    ) => MigrationFn::Plain(migrations::apply_table_sync_repo_incarnations),
+        ledger_atomic, refold_accounts;
     MIGRATION_100_ID, MIGRATION_100_CHECKSUM, MIGRATION_100_DESCRIPTION = (
         "100_receiver_type_hint_interning",
         "sha256:rag-rat-receiver-type-hint-and-callee-aware-edge-identity-v100",
@@ -919,7 +934,8 @@ additive_migrations! {
         "Rebuild memory bindings as a strict, repository-keyed, \
          dependency-free table suitable for deterministic \
          anchors/1 whole-row replication",
-    ) => MigrationFn::Plain(migrations::apply_syncable_memory_bindings);
+    ) => MigrationFn::Plain(migrations::apply_syncable_memory_bindings),
+        ledger_atomic;
     MIGRATION_104_ID, MIGRATION_104_CHECKSUM, MIGRATION_104_DESCRIPTION = (
         "104_table_sync_readoption",
         "sha256:rag-rat-table-sync-readoption-v104",
@@ -942,7 +958,8 @@ additive_migrations! {
          nullable (#1127): a winner reclaimed by accepted-entry \
          compaction before re-adoption ran has no hash to record; \
          the slot stays named by (stream, device, lamport)",
-    ) => MigrationFn::Plain(migrations::apply_readoption_audit_nullable_winner);
+    ) => MigrationFn::Plain(migrations::apply_readoption_audit_nullable_winner),
+        ledger_atomic;
     MIGRATION_107_ID, MIGRATION_107_CHECKSUM, MIGRATION_107_DESCRIPTION = (
         "107_syncable_overlay_tables",
         "sha256:rag-rat-syncable-overlay-tables-v107",
@@ -958,28 +975,32 @@ additive_migrations! {
          device-local AUTOINCREMENT id, so the distill/1 table-sync scope can replicate distilled \
          records under whole-row LWW (#1135); also drops its Lens revision triggers (the sync apply \
          advances the papertrail lane explicitly)",
-    ) => MigrationFn::Plain(migrations::apply_syncable_distill_records);
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_records),
+        ledger_atomic;
     MIGRATION_109_ID, MIGRATION_109_CHECKSUM, MIGRATION_109_DESCRIPTION = (
         "109_syncable_distill_edges_and_alternatives",
         "sha256:rag-rat-syncable-distill-edges-and-alternatives-v109",
         "Rebuild papertrail_distill_edges and papertrail_distill_alternatives onto their thread \
          natural keys (repo_id first), dropping the device-local AUTOINCREMENT id, so these distill \
          enrichment children replicate on the distill/1 table-sync scope under whole-row LWW (#1137)",
-    ) => MigrationFn::Plain(migrations::apply_syncable_distill_edges_and_alternatives);
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_edges_and_alternatives),
+        ledger_atomic;
     MIGRATION_110_ID, MIGRATION_110_CHECKSUM, MIGRATION_110_DESCRIPTION = (
         "110_syncable_distill_record_commits",
         "sha256:rag-rat-syncable-distill-record-commits-v110",
         "Rebuild papertrail_distill_record_commits onto its natural key (repo_id first), dropping the \
          device-local AUTOINCREMENT id and adding a created_at_ms non-key column so the key-only \
          table can replicate on the distill/1 table-sync scope under whole-row LWW (#1139)",
-    ) => MigrationFn::Plain(migrations::apply_syncable_distill_record_commits);
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_record_commits),
+        ledger_atomic;
     MIGRATION_111_ID, MIGRATION_111_CHECKSUM, MIGRATION_111_DESCRIPTION = (
         "111_syncable_distill_evidence",
         "sha256:rag-rat-syncable-distill-evidence-v111",
         "Rebuild papertrail_distill_evidence onto its natural key (repo_id first) with a per-thread \
          ordinal, dropping the device-local AUTOINCREMENT id, so the distill evidence child \
          replicates on the distill/1 table-sync scope under whole-row LWW (#1139)",
-    ) => MigrationFn::Plain(migrations::apply_syncable_distill_evidence);
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_evidence),
+        ledger_atomic;
     MIGRATION_112_ID, MIGRATION_112_CHECKSUM, MIGRATION_112_DESCRIPTION = (
         "112_syncable_distill_anchors",
         "sha256:rag-rat-syncable-distill-anchors-v112",
@@ -987,7 +1008,8 @@ additive_migrations! {
          device-local AUTOINCREMENT id and its Lens revision triggers, so the distill anchors child \
          replicates on the distill/1 table-sync scope under whole-row LWW; logical_symbol_id and \
          resolved stay checkout-local and never replicate (#1139)",
-    ) => MigrationFn::Plain(migrations::apply_syncable_distill_anchors);
+    ) => MigrationFn::Plain(migrations::apply_syncable_distill_anchors),
+        ledger_atomic;
     MIGRATION_113_ID, MIGRATION_113_CHECKSUM, MIGRATION_113_DESCRIPTION = (
         "113_refold_content_streams_for_lamport_clamp",
         "sha256:rag-rat-refold-content-streams-for-lamport-clamp-v113",
@@ -995,7 +1017,8 @@ additive_migrations! {
          lamport clamp existed are re-judged under it; a stale accepted near-ceiling lamport would \
          otherwise keep dominating LWW and blocking authoring on an upgraded store while a fresh \
          replica parks the same entry and diverges (#1176)",
-    ) => MigrationFn::WithHooks(migrations::apply_refold_content_streams_for_lamport_clamp);
+    ) => MigrationFn::WithHooks(migrations::apply_refold_content_streams_for_lamport_clamp),
+        ledger_atomic;
     MIGRATION_114_ID, MIGRATION_114_CHECKSUM, MIGRATION_114_DESCRIPTION = (
         "114_content_entries_lamport_column",
         "sha256:rag-rat-content-entries-lamport-column-v114",
@@ -1003,7 +1026,8 @@ additive_migrations! {
          envelopes) with a partial (stream_id, lamport) accepted-rows index, so the accepted stream \
          clock is an indexed MAX instead of a per-read decode of every accepted envelope — the \
          ingest-time bounded-advance gate and the authoring mint both read it (#1176)",
-    ) => MigrationFn::WithHooks(migrations::apply_content_entries_lamport_column);
+    ) => MigrationFn::WithHooks(migrations::apply_content_entries_lamport_column),
+        ledger_atomic;
     MIGRATION_115_ID, MIGRATION_115_CHECKSUM, MIGRATION_115_DESCRIPTION = (
         "115_refold_account_authority_projections",
         "sha256:rag-rat-refold-account-authority-projections-v115",
@@ -1012,7 +1036,8 @@ additive_migrations! {
          grants-require-PublicRead rule at upgrade time — the projected account_stream_grants row \
          would otherwise keep answering Effective until some unrelated ingest happened to refold that \
          account (#1178)",
-    ) => MigrationFn::Plain(migrations::apply_refold_account_authority_projections);
+    ) => MigrationFn::Plain(migrations::apply_refold_account_authority_projections),
+        ledger_atomic, refold_accounts;
     MIGRATION_116_ID, MIGRATION_116_CHECKSUM, MIGRATION_116_DESCRIPTION = (
         "116_writer_invites",
         "sha256:rag-rat-writer-invites-v116",
@@ -1062,7 +1087,8 @@ additive_migrations! {
         "Queue every /3 content stream for an acceptance refold and refold every account, so content \
          and secrets-log wraps parked auth_len_ahead after a cut lowered the cited account's \
          effective count are re-judged against the held control log (#1282)",
-    ) => MigrationFn::Plain(migrations::apply_refold_for_held_control_log_freshness);
+    ) => MigrationFn::Plain(migrations::apply_refold_for_held_control_log_freshness),
+        ledger_atomic, refold_accounts;
     MIGRATION_122_ID, MIGRATION_122_CHECKSUM, MIGRATION_122_DESCRIPTION = (
         "122_memory_parked_anchor_baselines",
         "sha256:rag-rat-memory-parked-anchor-baselines-v122",
@@ -1094,7 +1120,8 @@ additive_migrations! {
         "Refold every account and queue every /3 content stream for an acceptance refold, so control \
          ops authored concurrently with a revoking cut and parked auth_len_ahead behind the ops it \
          condemned are re-judged with the cut vouching for them (#1301)",
-    ) => MigrationFn::Plain(migrations::apply_refold_for_concurrent_cut_vouch);
+    ) => MigrationFn::Plain(migrations::apply_refold_for_concurrent_cut_vouch),
+        ledger_atomic, refold_accounts;
     MIGRATION_126_ID, MIGRATION_126_CHECKSUM, MIGRATION_126_DESCRIPTION = (
         "126_memory_note_summaries",
         "sha256:rag-rat-memory-note-summaries-v126",
@@ -1294,22 +1321,73 @@ fn apply_ladder(conn: &Connection, hooks: &MigrationHooks) -> rusqlite::Result<(
     Ok(())
 }
 
-/// One additive migration layered on the baseline (001): its identity + the function that applies
-/// it. Single source of truth for both `apply` (fresh DB, runs all) and `migrate_forward` (existing
-/// DB, runs only the unapplied ones).
+/// One additive migration layered on the baseline (001): its identity, the function that applies
+/// it, and how the ladder runs it. Single source of truth for both `apply` (fresh DB, runs all) and
+/// `migrate_forward` (existing DB, runs only the unapplied ones).
 struct Migration {
     id: &'static str,
     checksum: &'static str,
     description: &'static str,
     apply: MigrationFn,
+    /// The step's ledger row MUST commit in the SAME transaction as its body.
+    ///
+    /// The default is body-then-stamp, in two commits. That is safe for a migration that only ADDS
+    /// structure: in the window between the two, an older binary reads a store carrying tables it
+    /// does not know but DATA it still interprets correctly. It is NOT safe for a migration that
+    /// CONVERTS data an older binary reads and acts on, because `schema_version` is the entire
+    /// coexistence fence — an unrecognized migration id is what makes [`status`] answer `Newer`,
+    /// and every refusal (`ensure_compatible_or_migrate`, `migrate_schema_only`, the read-only
+    /// config open) is downstream of that answer. A converted-but-unstamped store answers
+    /// `Compatible` to exactly the binary the conversion locks out, and nothing else serializes
+    /// the two: the migrating process holds only the global schema lock, which an old binary
+    /// opening a `Compatible` store never takes. The window is normally sub-millisecond but it
+    /// is not bounded — the stamp can block on another writer up to the busy timeout, and a
+    /// crash between the two commits leaves the store durably converted with an old roster
+    /// until some newer binary happens to re-open it.
+    ///
+    /// * V064/V065 project existing grow-only account history: DDL, source snapshot, and the
+    ///   all-account refold must land with the stamp so an older writer cannot slip an unprojected
+    ///   candidate into a migration race.
+    /// * V097 rewrites the persisted checkout-path spellings. An older binary derives its live
+    ///   worktree set from the OLD spelling, so inside the window its GC reads every rekeyed row
+    ///   as a dead checkout and prunes a registered, live worktree's overlay.
+    ///
+    /// A flagged migration's body must NOT open a transaction of its own — the ladder owns one,
+    /// and `BEGIN` inside a transaction fails. `blocking_the_ledger_stamp_rolls_the_body_back`
+    /// drives every flagged step and pins the atomicity behaviorally.
+    ledger_atomic: bool,
+    /// After the body, and inside the same ledger-atomic transaction, the ladder rebuilds every
+    /// account's authority projection through [`MigrationHooks::backfill_authority_projection`].
+    /// It rebuilds what V064 creates/V065 bounds and projects V099's newly-known secrets
+    /// artifact, off a domain builder this crate cannot link. Only honoured on a
+    /// `ledger_atomic` step.
+    refold_accounts: bool,
+}
+
+impl Migration {
+    /// Set [`Self::ledger_atomic`]; the `ledger_atomic` marker in [`additive_migrations!`].
+    const fn ledger_atomic(mut self) -> Self {
+        self.ledger_atomic = true;
+        self
+    }
+
+    /// Set [`Self::refold_accounts`]; the `refold_accounts` marker in [`additive_migrations!`].
+    const fn refold_accounts(mut self) -> Self {
+        self.refold_accounts = true;
+        self
+    }
 }
 
 /// A migration body. Almost every migration is `Plain` SQL; the few that rebuild DERIVED data
 /// mid-transaction (papertrail FTS, dream finding ids, logical-symbol realignment) take the
 /// domain-supplied [`MigrationHooks`] so the rebuild runs the shipped builder without this crate
-/// linking domain code. The hook call stays INSIDE the migration body on purpose — those bodies
+/// linking domain code. That hook call stays INSIDE the migration body on purpose — those bodies
 /// wrap the rebuild and their sentinel/drop steps in one transaction, and hoisting the hook out
 /// would break that atomicity.
+///
+/// The one hook the ladder calls OUTSIDE a body is the account refold: a step flagged
+/// [`Migration::refold_accounts`] has it run by [`apply_and_record_migration`], after the body and
+/// inside the step's ledger-atomic transaction, so the refold commits with the body and the stamp.
 #[derive(Clone, Copy)]
 enum MigrationFn {
     Plain(fn(&Connection) -> rusqlite::Result<()>),
@@ -1325,77 +1403,22 @@ impl MigrationFn {
     }
 }
 
-/// Every migration whose ledger row MUST commit in the SAME transaction as its body.
-///
-/// The default is body-then-stamp, in two commits. That is safe for a migration that only ADDS
-/// structure: in the window between the two, an older binary reads a store carrying tables it does
-/// not know but DATA it still interprets correctly. It is NOT safe for a migration that CONVERTS
-/// data an older binary reads and acts on, because `schema_version` is the entire coexistence
-/// fence — an unrecognized migration id is what makes [`status`] answer `Newer`, and every refusal
-/// (`ensure_compatible_or_migrate`, `migrate_schema_only`, the read-only config open) is downstream
-/// of that answer. A converted-but-unstamped store answers `Compatible` to exactly the binary the
-/// conversion locks out, and nothing else serializes the two: the migrating process holds only the
-/// global schema lock, which an old binary opening a `Compatible` store never takes. The window is
-/// normally sub-millisecond but it is not bounded — the stamp can block on another writer up to the
-/// busy timeout, and a crash between the two commits leaves the store durably converted with an old
-/// roster until some newer binary happens to re-open it.
-///
-/// * V064/V065 project existing grow-only account history: DDL, source snapshot, and the
-///   all-account refold must land with the stamp so an older writer cannot slip an unprojected
-///   candidate into a migration race.
-/// * V097 rewrites the persisted checkout-path spellings. An older binary derives its live worktree
-///   set from the OLD spelling, so inside the window its GC reads every rekeyed row as a dead
-///   checkout and prunes a registered, live worktree's overlay.
-///
-/// A listed migration's body must NOT open a transaction of its own — the ladder owns one here, and
-/// `BEGIN` inside a transaction fails. `blocking_the_ledger_stamp_rolls_the_body_back` drives every
-/// entry and pins the atomicity behaviorally.
-const LEDGER_ATOMIC_MIGRATIONS: &[&str] = &[
-    MIGRATION_064_ID,
-    MIGRATION_065_ID,
-    MIGRATION_097_ID,
-    MIGRATION_098_ID,
-    MIGRATION_099_ID,
-    MIGRATION_103_ID,
-    MIGRATION_106_ID,
-    MIGRATION_108_ID,
-    MIGRATION_109_ID,
-    MIGRATION_110_ID,
-    MIGRATION_111_ID,
-    MIGRATION_112_ID,
-    MIGRATION_113_ID,
-    MIGRATION_114_ID,
-    MIGRATION_115_ID,
-    MIGRATION_121_ID,
-    MIGRATION_125_ID,
-];
-
 /// Apply one migration and stamp its ledger row, atomically when the migration converts data an
-/// older binary can still act on (see [`LEDGER_ATOMIC_MIGRATIONS`]).
+/// older binary can still act on (see [`Migration::ledger_atomic`]).
 fn apply_and_record_migration(
     conn: &Connection,
     step: &Migration,
     hooks: &MigrationHooks,
 ) -> rusqlite::Result<()> {
-    if !LEDGER_ATOMIC_MIGRATIONS.contains(&step.id) {
+    if !step.ledger_atomic {
         step.apply.run(conn, hooks)?;
         return migrations::record_migration(conn, step.id, step.checksum, step.description);
     }
 
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     step.apply.run(&tx, hooks)?;
-    // The account refold is the projection migrations' own requirement, not the ledger's: it
-    // rebuilds what V064 creates/V065 bounds and projects V099's newly-known secrets artifact, off
-    // a domain builder this crate cannot link.
-    if matches!(
-        step.id,
-        MIGRATION_064_ID
-            | MIGRATION_065_ID
-            | MIGRATION_099_ID
-            | MIGRATION_115_ID
-            | MIGRATION_121_ID
-            | MIGRATION_125_ID
-    ) {
+    // The account refold is the projection migrations' own requirement, not the ledger's.
+    if step.refold_accounts {
         // The hook runs the CURRENT fold, so it writes whatever columns today's projector writes —
         // not the ones that existed when the migration was written. A refold step therefore depends
         // on the projection's final shape even though its own body says nothing about it, and a
@@ -1597,7 +1620,7 @@ pub fn ensure_compatible_or_migrate(
 }
 
 /// The coexistence fence for a data-CONVERTING migration: its rewrite and its `schema_version` row
-/// are one commit, never two (see [`LEDGER_ATOMIC_MIGRATIONS`]).
+/// are one commit, never two (see [`Migration::ledger_atomic`]).
 ///
 /// A converted-but-unstamped store is the failure these tests exist for, and it is invisible by
 /// construction: on a healthy run the two commits are microseconds apart, and every gate downstream
@@ -1615,10 +1638,10 @@ mod ledger_atomicity {
     const POISONED_SOURCE_ROOT: &str = r"\\?\C:\repo";
 
     /// The migrations known to CONVERT data an older binary reads and acts on — restated here
-    /// rather than read from [`LEDGER_ATOMIC_MIGRATIONS`] on purpose. Driving the behavioral test
-    /// off the production list alone would let a migration dropped from that list drop out of the
-    /// test with it, so the regression that reintroduces the two-commit window would pass. These
-    /// tests range over the UNION, so removing an id from production fails here instead.
+    /// rather than read from the roster's `ledger_atomic` markers on purpose. Driving the
+    /// behavioral test off the production flags alone would let a migration whose marker was
+    /// dropped drop out of the test with it, so the regression that reintroduces the two-commit
+    /// window would pass. These tests range over the UNION, so unflagging an id fails here instead.
     const DATA_CONVERTING_MIGRATIONS: &[&str] = &[
         MIGRATION_064_ID,
         MIGRATION_065_ID,
@@ -1639,10 +1662,32 @@ mod ledger_atomicity {
         MIGRATION_125_ID,
     ];
 
+    /// The migrations whose ledger step must refold every account's authority projection —
+    /// restated here rather than read from the roster's `refold_accounts` markers, for the same
+    /// reason as [`DATA_CONVERTING_MIGRATIONS`]: a dropped marker silently skips the rebuild, and
+    /// the forward-only ladder never revisits the step.
+    const ACCOUNT_REFOLDING_MIGRATIONS: &[&str] = &[
+        MIGRATION_064_ID,
+        MIGRATION_065_ID,
+        MIGRATION_099_ID,
+        MIGRATION_115_ID,
+        MIGRATION_121_ID,
+        MIGRATION_125_ID,
+    ];
+
+    /// The shipped roster entry for `id`, if any.
+    fn shipped_step(id: &str) -> Option<&'static Migration> {
+        ADDITIVE_MIGRATIONS.iter().find(|step| step.id == id)
+    }
+
     /// Every migration whose ledger stamp must be atomic, from both statements of the set.
     fn ledger_atomic_under_test() -> Vec<&'static str> {
-        let mut ids: Vec<&'static str> =
-            LEDGER_ATOMIC_MIGRATIONS.iter().chain(DATA_CONVERTING_MIGRATIONS).copied().collect();
+        let mut ids: Vec<&'static str> = ADDITIVE_MIGRATIONS
+            .iter()
+            .filter(|step| step.ledger_atomic)
+            .map(|step| step.id)
+            .chain(DATA_CONVERTING_MIGRATIONS.iter().copied())
+            .collect();
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -1735,9 +1780,11 @@ mod ledger_atomicity {
 
     #[test]
     fn every_ledger_atomic_migration_is_in_the_ladder() {
-        for id in ledger_atomic_under_test() {
+        for id in
+            ledger_atomic_under_test().into_iter().chain(ACCOUNT_REFOLDING_MIGRATIONS.to_vec())
+        {
             assert!(
-                ADDITIVE_MIGRATIONS.iter().any(|step| step.id == id),
+                shipped_step(id).is_some(),
                 "{id} is listed as ledger-atomic but is not a shipped migration, so the arm that \
                  stamps it atomically never runs",
             );
@@ -1748,10 +1795,34 @@ mod ledger_atomicity {
     fn every_data_converting_migration_is_ledger_atomic() {
         for id in DATA_CONVERTING_MIGRATIONS {
             assert!(
-                LEDGER_ATOMIC_MIGRATIONS.contains(id),
-                "{id} converts data an older binary acts on but is not in \
-                 `LEDGER_ATOMIC_MIGRATIONS`, so its rewrite commits before its `schema_version` \
-                 row and the store reads as `Compatible` while already converted",
+                shipped_step(id).is_some_and(|step| step.ledger_atomic),
+                "{id} converts data an older binary acts on but is not marked `ledger_atomic`, so \
+                 its rewrite commits before its `schema_version` row and the store reads as \
+                 `Compatible` while already converted",
+            );
+        }
+    }
+
+    #[test]
+    fn every_account_refolding_migration_refolds() {
+        for id in ACCOUNT_REFOLDING_MIGRATIONS {
+            assert!(
+                shipped_step(id).is_some_and(|step| step.refold_accounts),
+                "{id} must refold every account's authority projection but is not marked \
+                 `refold_accounts`, so the ladder stamps it without the rebuild",
+            );
+        }
+    }
+
+    /// The refold runs only inside the ledger-atomic arm, so a refold marker without
+    /// `ledger_atomic` would be silently ignored.
+    #[test]
+    fn every_refolding_migration_is_ledger_atomic() {
+        for step in ADDITIVE_MIGRATIONS.iter().filter(|step| step.refold_accounts) {
+            assert!(
+                step.ledger_atomic,
+                "{} is marked `refold_accounts` but not `ledger_atomic`, so its refold never runs",
+                step.id,
             );
         }
     }
