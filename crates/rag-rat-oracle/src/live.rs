@@ -58,6 +58,7 @@ use url::Url;
 use super::backend::{self, CheckoutScope, LiveBackend, ProjectLayout};
 use super::lsp::client::LspClient;
 use super::lsp::position::LineIndex;
+use super::lsp::resolve::LspRange;
 use super::store::{self, EdgeOracleRow};
 use super::{OracleResolutionKind, OracleTool, RunStatus, ToolAvailability, ToolManifest, join};
 
@@ -706,9 +707,8 @@ fn resolve_one_file(
     path: &str,
     callees: &[&store::EdgeJoinCandidate],
 ) -> anyhow::Result<FileOutcome> {
-    let PassCtx { conn, input, tool, moniker_source } = *ctx;
-    let PassProgress { report, caches, refinements_stale } = progress;
-    let PassCaches { def_bytes, def_indexed_sha, def_spans, logical_cache, moniker_cache } = caches;
+    let PassCtx { conn, input, tool, .. } = *ctx;
+    let report = &mut progress.report;
     // The session may be unable to CONFIGURE this file even though its language qualifies:
     // with several compilation databases in a checkout, clangd is pointed at none, and a file
     // whose database it cannot find on its own gets heuristic flags. Measured, that resolves a
@@ -818,149 +818,18 @@ fn resolve_one_file(
     // two source files' LSP requests would otherwise be hashed + position-converted from a
     // stale snapshot, defeating the definition-side drift gate. (The indexed sha + symbol
     // spans stay cached: the write lock pins the index for the whole pass.)
-    def_bytes.clear();
+    progress.caches.def_bytes.clear();
 
     for (candidate, definition) in to_resolve.iter().zip(resolved.iter()) {
-        let Some((target_uri, target_range)) = definition else {
-            report.unresolved += 1;
-            continue;
-        };
-        // The definition must land inside this checkout: an external target (a dependency
-        // source outside the root) has no indexed symbol and no batch-interchangeable
-        // moniker, so live writes nothing for it.
-        let Some(def_path) = path_from_uri(&session.root_uri, target_uri) else {
-            report.skipped_external += 1;
-            continue;
-        };
-        // Definition-side drift gate: the LSP range converts against the def file's CURRENT
-        // disk bytes, so those must still be the indexed bytes the symbol spans came from.
-        let def_disk = def_bytes
-            .entry(def_path.clone())
-            .or_insert_with(|| std::fs::read(input.scope.root().join(&def_path)).ok())
-            .clone();
-        let Some(def_disk) = def_disk else {
-            report.skipped_drifted += 1;
+        let outcome = write_verdict_for_definition(ctx, session, progress, candidate, definition)?;
+        if matches!(outcome, DefOutcome::RequeueFile) {
             retry_file = true;
-            continue;
-        };
-        let indexed_sha = match def_indexed_sha.entry(def_path.clone()) {
-            Entry::Occupied(entry) => entry.get().clone(),
-            Entry::Vacant(entry) => entry
-                .insert(store::indexed_file_sha_for_path(conn, &def_path, input.checkout)?)
-                .clone(),
-        };
-        match indexed_sha {
-            // Not indexed in this checkout — nothing live can map to it.
-            None => {
-                report.skipped_external += 1;
-                continue;
-            },
-            Some(sha) if sha == hex_sha256(&def_disk) => {},
-            Some(_) => {
-                report.skipped_drifted += 1;
-                retry_file = true;
-                continue;
-            },
-        }
-        let index = LineIndex::new(&def_disk, session.client.encoding());
-        let (Some(def_start), Some(def_end)) =
-            (index.byte_at_position(target_range.start), index.byte_at_position(target_range.end))
-        else {
-            report.skipped_drifted += 1;
-            retry_file = true;
-            continue;
-        };
-        let spans = match def_spans.entry(def_path.clone()) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) =>
-                entry.insert(store::symbol_spans_for_path(conn, &def_path, input.checkout)?),
-        };
-        let Some(symbol_id) = join::map_definition_to_symbol(spans, def_start, def_end) else {
-            // The def is in an indexed file but under no indexed symbol (macro-generated
-            // code, a symbol kind without a row): nothing trustworthy to write.
-            report.skipped_external += 1;
-            continue;
-        };
-
-        // Resolve the logical ids of the heuristic + compiler targets up front, propagating
-        // a DB failure instead of swallowing it to `None` — a swallowed error would degrade
-        // a real Confirm (same logical symbol) into a Contradict and corrupt precision while
-        // later writes still succeed (#534 review). The closure then reads the warmed cache.
-        let warm_logical = |id: i64| -> anyhow::Result<()> {
-            if !logical_cache.borrow().contains_key(&id) {
-                let logical = store::logical_symbol_id_for_member(conn, id)?;
-                logical_cache.borrow_mut().insert(id, logical);
-            }
-            Ok(())
-        };
-        warm_logical(symbol_id)?;
-        if let Some(heuristic_id) = candidate.to_symbol_id {
-            warm_logical(heuristic_id)?;
-        }
-        let logical_symbol_of =
-            |id: i64| -> Option<i64> { logical_cache.borrow().get(&id).copied().flatten() };
-        let kind = join::classify_in_corpus(
-            candidate.confidence,
-            candidate.to_symbol_id,
-            symbol_id,
-            &logical_symbol_of,
-        );
-
-        // Moniker: the target's batch moniker verbatim, else the content-stable local
-        // sentinel (module docs — NEVER the LSP moniker string). A DB failure propagates.
-        if let std::collections::hash_map::Entry::Vacant(slot) = moniker_cache.entry(symbol_id) {
-            slot.insert(store::batch_moniker_for_symbol(conn, symbol_id, moniker_source)?);
-        }
-        let scip_symbol = moniker_cache
-            .get(&symbol_id)
-            .and_then(Clone::clone)
-            .unwrap_or_else(|| live_local_sentinel(tool, &candidate.source_path, candidate));
-
-        let row = EdgeOracleRow {
-            source_path: &candidate.source_path,
-            source_start_byte: candidate.source_start_byte,
-            source_end_byte: candidate.source_end_byte,
-            callee_start_byte: candidate.callee_start_byte,
-            callee_end_byte: candidate.callee_end_byte,
-            edge_kind: &candidate.edge_kind,
-            file_sha: &candidate.file_sha,
-            resolved_symbol_id: Some(symbol_id),
-            scip_symbol: &scip_symbol,
-            kind,
-        };
-        let existing =
-            store::existing_verdict_scip_symbol(conn, tool, session.tool_version(), &row)?;
-        // The content-key PK excludes file_sha. Preserve a different-SHA row while any sibling
-        // checkout still joins to it; overwriting would make that sibling lose live evidence.
-        if let Some((old_sha, _)) = &existing
-            && old_sha != &candidate.file_sha
-            && store::verdict_content_is_current_anywhere(conn, &row, old_sha)?
-        {
-            report.skipped_content_collisions += 1;
-            continue;
-        }
-        // Refine-cache interplay: CHANGED evidence under the same bytes, OR newly inserted
-        // NON-LOCAL moniker evidence, moves data absent from the refinement key. Local
-        // sentinels are filtered by the consumer and are refine-neutral.
-        if existing.as_ref().is_some_and(|(old_sha, old_symbol)| {
-            old_sha == &candidate.file_sha && old_symbol != &scip_symbol
-        }) || (existing.is_none() && !super::scip::is_local_symbol(&scip_symbol))
-        {
-            *refinements_stale = true;
-        }
-        store::write_edge_oracle(conn, tool, session.tool_version(), &row)?;
-        report.rows_written += 1;
-        match kind {
-            OracleResolutionKind::Upgrade => report.upgraded += 1,
-            OracleResolutionKind::Confirm => report.confirmed += 1,
-            OracleResolutionKind::Contradict => report.contradicted += 1,
-            // Live never emits ResolvedExternal (out-of-corpus defs are skipped above).
-            OracleResolutionKind::ResolvedExternal => {},
         }
     }
     // Fully resolved only when nothing was budget- or drift-deferred. A definition that changed
     // during this caller's batch requeues the CALLER because the definition's own watcher event
     // does not enumerate every caller that resolved into it.
+    let report = &mut progress.report;
     if retry_file {
         if !report.unfinished_paths.iter().any(|queued| queued == path) {
             report.unfinished_paths.push(path.to_string());
@@ -969,6 +838,165 @@ fn resolve_one_file(
         report.files_resolved += 1;
     }
     Ok(FileOutcome::Next)
+}
+
+/// How one definition answer left the pass.
+enum DefOutcome {
+    /// A verdict row was written and tallied.
+    Wrote,
+    /// Nothing to write — unresolved, external, under no indexed symbol, or a sibling checkout's
+    /// content collision — and nothing a retry of this file could change.
+    Skipped,
+    /// The definition document drifted under the batch: requeue the CALLER, because the
+    /// definition's own watcher event does not enumerate every caller that resolved into it.
+    RequeueFile,
+}
+
+/// Turn one definition answer for `candidate` into at most one verdict row: map the target URI to
+/// an indexed path, gate its document on drift, convert the range to bytes, map it onto an indexed
+/// symbol, classify, pick the moniker, check for a sibling's content collision, write, and tally.
+fn write_verdict_for_definition(
+    ctx: &PassCtx<'_>,
+    session: &LiveOracleSession,
+    progress: &mut PassProgress,
+    candidate: &store::EdgeJoinCandidate,
+    definition: &Option<(String, LspRange)>,
+) -> anyhow::Result<DefOutcome> {
+    let PassCtx { conn, input, tool, moniker_source } = *ctx;
+    let PassProgress { report, caches, refinements_stale } = progress;
+    let PassCaches { def_bytes, def_indexed_sha, def_spans, logical_cache, moniker_cache } = caches;
+    let Some((target_uri, target_range)) = definition else {
+        report.unresolved += 1;
+        return Ok(DefOutcome::Skipped);
+    };
+    // The definition must land inside this checkout: an external target (a dependency
+    // source outside the root) has no indexed symbol and no batch-interchangeable
+    // moniker, so live writes nothing for it.
+    let Some(def_path) = path_from_uri(&session.root_uri, target_uri) else {
+        report.skipped_external += 1;
+        return Ok(DefOutcome::Skipped);
+    };
+    // Definition-side drift gate: the LSP range converts against the def file's CURRENT
+    // disk bytes, so those must still be the indexed bytes the symbol spans came from.
+    let def_disk = def_bytes
+        .entry(def_path.clone())
+        .or_insert_with(|| std::fs::read(input.scope.root().join(&def_path)).ok())
+        .clone();
+    let Some(def_disk) = def_disk else {
+        report.skipped_drifted += 1;
+        return Ok(DefOutcome::RequeueFile);
+    };
+    let indexed_sha = match def_indexed_sha.entry(def_path.clone()) {
+        Entry::Occupied(entry) => entry.get().clone(),
+        Entry::Vacant(entry) =>
+            entry.insert(store::indexed_file_sha_for_path(conn, &def_path, input.checkout)?).clone(),
+    };
+    match indexed_sha {
+        // Not indexed in this checkout — nothing live can map to it.
+        None => {
+            report.skipped_external += 1;
+            return Ok(DefOutcome::Skipped);
+        },
+        Some(sha) if sha == hex_sha256(&def_disk) => {},
+        Some(_) => {
+            report.skipped_drifted += 1;
+            return Ok(DefOutcome::RequeueFile);
+        },
+    }
+    let index = LineIndex::new(&def_disk, session.client.encoding());
+    let (Some(def_start), Some(def_end)) =
+        (index.byte_at_position(target_range.start), index.byte_at_position(target_range.end))
+    else {
+        report.skipped_drifted += 1;
+        return Ok(DefOutcome::RequeueFile);
+    };
+    let spans = match def_spans.entry(def_path.clone()) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) =>
+            entry.insert(store::symbol_spans_for_path(conn, &def_path, input.checkout)?),
+    };
+    let Some(symbol_id) = join::map_definition_to_symbol(spans, def_start, def_end) else {
+        // The def is in an indexed file but under no indexed symbol (macro-generated
+        // code, a symbol kind without a row): nothing trustworthy to write.
+        report.skipped_external += 1;
+        return Ok(DefOutcome::Skipped);
+    };
+
+    // Resolve the logical ids of the heuristic + compiler targets up front, propagating
+    // a DB failure instead of swallowing it to `None` — a swallowed error would degrade
+    // a real Confirm (same logical symbol) into a Contradict and corrupt precision while
+    // later writes still succeed (#534 review). The closure then reads the warmed cache.
+    let warm_logical = |id: i64| -> anyhow::Result<()> {
+        if !logical_cache.borrow().contains_key(&id) {
+            let logical = store::logical_symbol_id_for_member(conn, id)?;
+            logical_cache.borrow_mut().insert(id, logical);
+        }
+        Ok(())
+    };
+    warm_logical(symbol_id)?;
+    if let Some(heuristic_id) = candidate.to_symbol_id {
+        warm_logical(heuristic_id)?;
+    }
+    let logical_symbol_of =
+        |id: i64| -> Option<i64> { logical_cache.borrow().get(&id).copied().flatten() };
+    let kind = join::classify_in_corpus(
+        candidate.confidence,
+        candidate.to_symbol_id,
+        symbol_id,
+        &logical_symbol_of,
+    );
+
+    // Moniker: the target's batch moniker verbatim, else the content-stable local
+    // sentinel (module docs — NEVER the LSP moniker string). A DB failure propagates.
+    if let std::collections::hash_map::Entry::Vacant(slot) = moniker_cache.entry(symbol_id) {
+        slot.insert(store::batch_moniker_for_symbol(conn, symbol_id, moniker_source)?);
+    }
+    let scip_symbol = moniker_cache
+        .get(&symbol_id)
+        .and_then(Clone::clone)
+        .unwrap_or_else(|| live_local_sentinel(tool, &candidate.source_path, candidate));
+
+    let row = EdgeOracleRow {
+        source_path: &candidate.source_path,
+        source_start_byte: candidate.source_start_byte,
+        source_end_byte: candidate.source_end_byte,
+        callee_start_byte: candidate.callee_start_byte,
+        callee_end_byte: candidate.callee_end_byte,
+        edge_kind: &candidate.edge_kind,
+        file_sha: &candidate.file_sha,
+        resolved_symbol_id: Some(symbol_id),
+        scip_symbol: &scip_symbol,
+        kind,
+    };
+    let existing = store::existing_verdict_scip_symbol(conn, tool, session.tool_version(), &row)?;
+    // The content-key PK excludes file_sha. Preserve a different-SHA row while any sibling
+    // checkout still joins to it; overwriting would make that sibling lose live evidence.
+    if let Some((old_sha, _)) = &existing
+        && old_sha != &candidate.file_sha
+        && store::verdict_content_is_current_anywhere(conn, &row, old_sha)?
+    {
+        report.skipped_content_collisions += 1;
+        return Ok(DefOutcome::Skipped);
+    }
+    // Refine-cache interplay: CHANGED evidence under the same bytes, OR newly inserted
+    // NON-LOCAL moniker evidence, moves data absent from the refinement key. Local
+    // sentinels are filtered by the consumer and are refine-neutral.
+    if existing.as_ref().is_some_and(|(old_sha, old_symbol)| {
+        old_sha == &candidate.file_sha && old_symbol != &scip_symbol
+    }) || (existing.is_none() && !super::scip::is_local_symbol(&scip_symbol))
+    {
+        *refinements_stale = true;
+    }
+    store::write_edge_oracle(conn, tool, session.tool_version(), &row)?;
+    report.rows_written += 1;
+    match kind {
+        OracleResolutionKind::Upgrade => report.upgraded += 1,
+        OracleResolutionKind::Confirm => report.confirmed += 1,
+        OracleResolutionKind::Contradict => report.contradicted += 1,
+        // Live never emits ResolvedExternal (out-of-corpus defs are skipped above).
+        OracleResolutionKind::ResolvedExternal => {},
+    }
+    Ok(DefOutcome::Wrote)
 }
 
 /// The status for a pass that ended with `stop` — the one place a live status is derived, early
