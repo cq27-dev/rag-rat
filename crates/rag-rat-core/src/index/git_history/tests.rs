@@ -60,8 +60,8 @@ fn current_history_cursor_guard_rejects_empty_incomplete_or_wrong_scope() {
 
     set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_HEAD_META, "existing-head").unwrap();
     set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_ROOT_META, "other-root").unwrap();
-    set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META, "0").unwrap();
-    set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, "1").unwrap();
+    set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META.key, "0").unwrap();
+    set_repo_meta(&conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META.key, "1").unwrap();
     assert!(
         current_history_cursors_at_or_after_prepared(&conn, repo_id, &root, &repo)
             .unwrap()

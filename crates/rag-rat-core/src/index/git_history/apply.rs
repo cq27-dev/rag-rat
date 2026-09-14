@@ -29,14 +29,8 @@ pub(crate) fn record_history_cursors(
     let repo_id = schema::active_repo_id(conn)?;
     set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_HEAD_META, &cursors.head)?;
     set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_ROOT_META, &cursors.root_key)?;
-    set_repo_meta(
-        conn,
-        &repo_id,
-        GIT_HISTORY_INDEXED_SHALLOW_META,
-        if cursors.shallow { "1" } else { "0" },
-    )?;
-    let complete = if cursors.complete { "1" } else { "0" };
-    set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, complete)?;
+    set_repo_meta_bool(conn, &repo_id, GIT_HISTORY_INDEXED_SHALLOW_META, cursors.shallow)?;
+    set_repo_meta_bool(conn, &repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, cursors.complete)?;
     // Coupling's stamp includes the complete cursor snapshot, so materialize only after all four
     // cursor keys are published. Production callers own the surrounding history transaction.
     crate::index::change_coupling::ensure_coupling_fresh(conn, rag_rat_base::time::now_ms())?;
@@ -258,21 +252,11 @@ fn raw_history_cursors(conn: &Connection, repo_id: &str) -> anyhow::Result<Optio
     let Some(root_key) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_ROOT_META)? else {
         return Ok(None);
     };
-    let Some(shallow) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META)? else {
+    let Some(shallow) = repo_meta_bool(conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META)? else {
         return Ok(None);
     };
-    let shallow = match shallow.as_str() {
-        "0" => false,
-        "1" => true,
-        _ => return Ok(None),
-    };
-    let Some(complete) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META)? else {
+    let Some(complete) = repo_meta_bool(conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META)? else {
         return Ok(None);
-    };
-    let complete = match complete.as_str() {
-        "0" => false,
-        "1" => true,
-        _ => return Ok(None),
     };
     Ok(Some(HistoryCursors { head, root_key, shallow, complete }))
 }
@@ -369,8 +353,8 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
     for key in [
         GIT_HISTORY_INDEXED_HEAD_META,
         GIT_HISTORY_INDEXED_ROOT_META,
-        GIT_HISTORY_INDEXED_SHALLOW_META,
-        GIT_HISTORY_INDEXED_COMPLETE_META,
+        GIT_HISTORY_INDEXED_SHALLOW_META.key,
+        GIT_HISTORY_INDEXED_COMPLETE_META.key,
     ] {
         delete_repo_meta(conn, &repo_id, key)?;
     }

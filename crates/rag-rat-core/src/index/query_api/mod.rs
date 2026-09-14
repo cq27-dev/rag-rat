@@ -96,7 +96,7 @@ impl IndexDatabase {
             exists: database.exists(),
             schema: schema::status(self.storage.connection())?,
             git_commit: self.repo_meta("git_commit")?,
-            git_dirty: self.repo_meta("git_dirty")?.map(|value| value == "true"),
+            git_dirty: self.repo_meta_bool(rag_rat_db::meta::GIT_DIRTY_META)?,
             indexed_at_ms: self
                 .repo_meta("indexed_at_ms")?
                 .and_then(|value| value.parse::<i64>().ok()),

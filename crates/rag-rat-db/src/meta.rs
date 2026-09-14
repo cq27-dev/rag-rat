@@ -8,7 +8,53 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 pub mod watch_placement;
 
-pub const WATCH_SHUTDOWN_RECONCILE_PENDING_META: &str = "watch_shutdown_reconcile_pending";
+/// How a persisted boolean meta value is spelled. Deployed indexes carry two spellings and each key
+/// keeps the one it has always been written with — respelling a key would misread every existing
+/// index — so the spelling travels with the key ([`BoolMetaKey`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolSpelling {
+    /// `"true"` / `"false"`. Read as `value == "true"`, so any other stored text reads `false`.
+    Word,
+    /// `"1"` / `"0"`. Read strictly: any other stored text is no value at all (the git-history
+    /// cursors treat that as "no snapshot").
+    Digit,
+}
+
+impl BoolSpelling {
+    pub fn encode(self, value: bool) -> &'static str {
+        match (self, value) {
+            (Self::Word, true) => "true",
+            (Self::Word, false) => "false",
+            (Self::Digit, true) => "1",
+            (Self::Digit, false) => "0",
+        }
+    }
+
+    pub fn decode(self, stored: &str) -> Option<bool> {
+        match (self, stored) {
+            (Self::Word, stored) => Some(stored == "true"),
+            (Self::Digit, "1") => Some(true),
+            (Self::Digit, "0") => Some(false),
+            (Self::Digit, _) => None,
+        }
+    }
+}
+
+/// A boolean `index_meta` / `repo_meta` key and the spelling its values are stored in.
+#[derive(Debug, Clone, Copy)]
+pub struct BoolMetaKey {
+    pub key: &'static str,
+    pub spelling: BoolSpelling,
+}
+
+/// Whether the working tree was dirty when the repo was last indexed (`repo_meta`).
+pub const GIT_DIRTY_META: BoolMetaKey =
+    BoolMetaKey { key: "git_dirty", spelling: BoolSpelling::Word };
+/// Whether the global `chunk_fts` mirror is known stale (`index_meta`).
+pub const FTS_DIRTY_META: BoolMetaKey =
+    BoolMetaKey { key: "fts_dirty", spelling: BoolSpelling::Word };
+pub const WATCH_SHUTDOWN_RECONCILE_PENDING_META: BoolMetaKey =
+    BoolMetaKey { key: "watch_shutdown_reconcile_pending", spelling: BoolSpelling::Digit };
 /// Watch-placement failure HIGH-WATER MARK the resident watcher has seen (see `watch::placement`).
 /// Persisted per pass, never lowered, so `index_status` can surface silent inotify degradation
 /// without one watcher process masking another's (see `record_watch_placement_failures`).
@@ -170,6 +216,36 @@ pub fn set_repo_meta_if_changed(
     Ok(true)
 }
 
+/// Read a boolean per-repo meta value in its key's spelling; `None` when unset (or, for a
+/// [`BoolSpelling::Digit`] key, unrecognized).
+pub fn repo_meta_bool(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: BoolMetaKey,
+) -> rusqlite::Result<Option<bool>> {
+    Ok(repo_meta(conn, repo_id, key.key)?.and_then(|stored| key.spelling.decode(&stored)))
+}
+
+/// Upsert a boolean per-repo meta value in its key's spelling.
+pub fn set_repo_meta_bool(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: BoolMetaKey,
+    value: bool,
+) -> rusqlite::Result<()> {
+    set_repo_meta(conn, repo_id, key.key, key.spelling.encode(value))
+}
+
+/// [`set_repo_meta_if_changed`] for a boolean key — returns whether a write happened.
+pub fn set_repo_meta_bool_if_changed(
+    conn: &rusqlite::Connection,
+    repo_id: &str,
+    key: BoolMetaKey,
+    value: bool,
+) -> rusqlite::Result<bool> {
+    set_repo_meta_if_changed(conn, repo_id, key.key, key.spelling.encode(value))
+}
+
 /// Delete a per-repo meta key (a no-op when absent) — needed by the clear paths of the relocated
 /// model / reencode-cursor keys.
 pub fn delete_repo_meta(
@@ -225,6 +301,11 @@ pub fn set_meta_i64(conn: &Connection, key: &str, value: i64) -> rusqlite::Resul
     set_meta(conn, key, &value.to_string())
 }
 
+/// Read a boolean `index_meta` value in its key's spelling (see [`repo_meta_bool`]).
+pub fn read_meta_bool(conn: &Connection, key: BoolMetaKey) -> rusqlite::Result<Option<bool>> {
+    Ok(read_meta(conn, key.key)?.and_then(|stored| key.spelling.decode(&stored)))
+}
+
 /// Remove an `index_meta` key (the global-scope companion to [`delete_repo_meta`]). Idempotent:
 /// deleting an absent key is a no-op.
 pub fn delete_meta(conn: &Connection, key: &str) -> rusqlite::Result<()> {
@@ -239,4 +320,25 @@ pub fn meta_values_with_prefix(conn: &Connection, prefix: &str) -> rusqlite::Res
         conn.prepare("SELECT value FROM index_meta WHERE key GLOB ?1 || '*' ORDER BY key")?;
     let rows = stmt.query_map([prefix], |row| row.get::<_, String>(0))?;
     rows.collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BoolSpelling;
+
+    /// Both spellings are persisted in deployed indexes, so their tokens and read tolerance are
+    /// fixed: a Word key reads anything but `"true"` as false, a Digit key reads only `"0"`/`"1"`.
+    #[test]
+    fn bool_spellings_are_pinned() {
+        for (spelling, yes, no) in
+            [(BoolSpelling::Word, "true", "false"), (BoolSpelling::Digit, "1", "0")]
+        {
+            assert_eq!(spelling.encode(true), yes);
+            assert_eq!(spelling.encode(false), no);
+            assert_eq!(spelling.decode(yes), Some(true));
+            assert_eq!(spelling.decode(no), Some(false));
+        }
+        assert_eq!(BoolSpelling::Word.decode("garbage"), Some(false));
+        assert_eq!(BoolSpelling::Digit.decode("true"), None);
+    }
 }

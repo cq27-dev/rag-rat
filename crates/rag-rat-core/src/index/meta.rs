@@ -49,12 +49,32 @@ impl IndexDatabase {
         Ok(set_repo_meta_if_changed(self.storage.connection(), &self.active_repo_id, key, value)?)
     }
 
+    /// Read a boolean per-repo meta value for the repo owning this connection.
+    pub(super) fn repo_meta_bool(&self, key: BoolMetaKey) -> anyhow::Result<Option<bool>> {
+        Ok(repo_meta_bool(self.storage.connection(), &self.active_repo_id, key)?)
+    }
+
+    /// Upsert a boolean per-repo meta value only when it changes — returns whether a write
+    /// happened (issue #63).
+    pub(super) fn set_repo_meta_bool_if_changed(
+        &self,
+        key: BoolMetaKey,
+        value: bool,
+    ) -> anyhow::Result<bool> {
+        Ok(set_repo_meta_bool_if_changed(
+            self.storage.connection(),
+            &self.active_repo_id,
+            key,
+            value,
+        )?)
+    }
+
     pub(crate) fn mark_watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
-        self.set_repo_meta_if_changed(WATCH_SHUTDOWN_RECONCILE_PENDING_META, "1")
+        self.set_repo_meta_bool_if_changed(WATCH_SHUTDOWN_RECONCILE_PENDING_META, true)
     }
 
     pub(crate) fn watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
-        Ok(self.repo_meta(WATCH_SHUTDOWN_RECONCILE_PENDING_META)?.as_deref() == Some("1"))
+        Ok(self.repo_meta_bool(WATCH_SHUTDOWN_RECONCILE_PENDING_META)? == Some(true))
     }
 
     pub(crate) fn clear_watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
@@ -62,7 +82,7 @@ impl IndexDatabase {
             return Ok(false);
         }
         let conn = self.storage.connection();
-        delete_repo_meta(conn, &self.active_repo_id, WATCH_SHUTDOWN_RECONCILE_PENDING_META)?;
+        delete_repo_meta(conn, &self.active_repo_id, WATCH_SHUTDOWN_RECONCILE_PENDING_META.key)?;
         Ok(true)
     }
 
@@ -166,6 +186,16 @@ impl IndexDatabase {
 
     pub(super) fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
         Ok(read_meta(self.storage.connection(), key)?)
+    }
+
+    /// Upsert a boolean `index_meta` value in its key's spelling.
+    pub(super) fn set_meta_bool(&self, key: BoolMetaKey, value: bool) -> anyhow::Result<()> {
+        self.set_meta(key.key, key.spelling.encode(value))
+    }
+
+    /// Read a boolean `index_meta` value in its key's spelling.
+    pub(super) fn meta_bool(&self, key: BoolMetaKey) -> anyhow::Result<Option<bool>> {
+        Ok(read_meta_bool(self.storage.connection(), key)?)
     }
 
     /// The content digest over EVERY indexed file row — an O(1) read of the incrementally

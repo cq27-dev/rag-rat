@@ -10,6 +10,7 @@
 //! back through `self.repo_meta` / `self.set_repo_meta`.
 
 use rag_rat_base::time::now_ms;
+use rag_rat_db::meta::FTS_DIRTY_META;
 use rag_rat_db::schema;
 
 use super::*;
@@ -29,7 +30,7 @@ impl IndexDatabase {
             schema::rebuild_commit_fts(self.storage.connection())?;
             self.record_content_revision()?;
             self.record_fts_current()?;
-            self.set_meta("fts_dirty", "false")?;
+            self.set_meta_bool(FTS_DIRTY_META, false)?;
             Ok(())
         })
     }
@@ -41,7 +42,7 @@ impl IndexDatabase {
         schema::rebuild_commit_fts(self.storage.connection())?;
         self.record_content_revision()?;
         self.record_fts_current()?;
-        self.set_meta("fts_dirty", "false")?;
+        self.set_meta_bool(FTS_DIRTY_META, false)?;
         Ok(())
     }
 
@@ -97,7 +98,7 @@ impl IndexDatabase {
         let revision = self.content_revision()?;
         self.record_content_revision_value(&revision)?;
         self.record_fts_current_value(&revision)?;
-        self.set_meta("fts_dirty", "false")?;
+        self.set_meta_bool(FTS_DIRTY_META, false)?;
         Ok(())
     }
 
@@ -115,7 +116,7 @@ impl IndexDatabase {
     }
 
     pub(super) fn mark_fts_dirty(&self) -> anyhow::Result<()> {
-        self.set_meta("fts_dirty", "true")
+        self.set_meta_bool(FTS_DIRTY_META, true)
     }
 
     pub(super) fn ensure_fts_fresh(&self) -> anyhow::Result<()> {
@@ -185,7 +186,7 @@ impl IndexDatabase {
     }
 
     pub(super) fn fts_dirty(&self) -> anyhow::Result<bool> {
-        Ok(self.meta("fts_dirty")?.as_deref() == Some("true"))
+        Ok(self.meta_bool(FTS_DIRTY_META)? == Some(true))
     }
 }
 
