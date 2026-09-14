@@ -597,7 +597,7 @@ fn adopt_in_transaction(conn: &Connection, adoption: Adoption<'_>) -> rusqlite::
             // absent table keeps adoption correct on the full schema while staying
             // robust to those partial fixtures — a table that does not exist has no
             // source rows to re-point.
-            if !adoption_table_present(&tx, table)? {
+            if !super::migrations::sqlite_object_exists(&tx, "table", table)? {
                 continue;
             }
             // `main.`-qualified: adoption can run on a connection that already carries the
@@ -855,7 +855,7 @@ fn merge_local_incumbent_into_registered(
         identity.repo_id,
         owner
     ])?;
-    if adoption_table_present(&tx, "repo_memory_fts")? {
+    if super::migrations::sqlite_object_exists(&tx, "table", "repo_memory_fts")? {
         tx.execute("UPDATE main.repo_memory_fts SET repo_id = ?1 WHERE repo_id = ?2", params![
             identity.repo_id,
             owner
@@ -864,7 +864,7 @@ fn merge_local_incumbent_into_registered(
     // The baselines the drain parked for removed synced memories (#1298) move with the memories
     // they belong to. The key is `(repo_id, memory_id)`, so a memory parked under BOTH ids keeps
     // the owner's. Guarded for a partial-schema fixture.
-    if adoption_table_present(&tx, "repo_memory_parked_baselines")? {
+    if super::migrations::sqlite_object_exists(&tx, "table", "repo_memory_parked_baselines")? {
         tx.execute(
             "INSERT OR REPLACE INTO main.repo_memory_parked_baselines(
                  repo_id, memory_id, anchors_applied_digest, anchors_applied_targets,
@@ -893,7 +893,7 @@ fn merge_local_incumbent_into_registered(
     }
     // DERIVED data drops (cascades take the transitive children).
     for table in DIRECT_SCOPED_ADOPTION_TABLES {
-        if adoption_table_present(&tx, table)? {
+        if super::migrations::sqlite_object_exists(&tx, "table", table)? {
             tx.execute(&format!("DELETE FROM main.{table} WHERE repo_id = ?1"), [owner])?;
         }
     }
@@ -921,20 +921,6 @@ fn merge_local_incumbent_into_registered(
          over; its derived index rows were dropped and will re-derive on the next index pass."
     );
     Ok(())
-}
-
-/// Whether `table` exists in the schema (a plain or FTS5-virtual table both register in
-/// `sqlite_master` as `type = 'table'`) — the adoption loop's guard so a partial isolation
-/// fixture's absent direct-scoped table is skipped rather than tripping a `no such table` failure.
-fn adoption_table_present(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [table],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
 }
 
 /// A `SQLITE_CONSTRAINT` failure carrying `msg` — the registry's refusal shape. These are

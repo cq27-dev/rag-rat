@@ -1245,17 +1245,9 @@ fn provision_baseline(conn: &Connection) -> rusqlite::Result<()> {
     // `ensure_edges_view` then sees `name_strings`. Fresh / already-merged DBs have no
     // `edge_strings` → no-op. A pre-merge DB is `Older` (< V028), so it reaches this migrate path;
     // a `Compatible` open skips migration and is already `name_strings`.
-    let pre_merge_pool: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'edge_strings'",
-        [],
-        |row| row.get(0),
-    )?;
-    let merged_pool: i64 = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'name_strings'",
-        [],
-        |row| row.get(0),
-    )?;
-    if pre_merge_pool > 0 && merged_pool == 0 {
+    if migrations::sqlite_object_exists(conn, "table", "edge_strings")?
+        && !migrations::sqlite_object_exists(conn, "table", "name_strings")?
+    {
         conn.execute_batch("ALTER TABLE edge_strings RENAME TO name_strings;")?;
     }
     let result = apply_baseline(conn);
