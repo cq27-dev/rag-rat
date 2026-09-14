@@ -66,7 +66,7 @@ pub(crate) fn produce_row_ops(
             // Published under THIS binary's column set: a differing hash is a real local
             // change.
             Some((published, version)) if version == spec.spec_version => {
-                diagnostics::clear(tx, &key)?;
+                diagnostics::clear_observed(tx, &key, false)?;
                 published != hash
             },
             // Published under a DIFFERENT column set: the two hashes cover different cell
@@ -107,7 +107,7 @@ pub(crate) fn produce_row_ops(
                 },
             // Never published: a genuinely new local row.
             None => {
-                diagnostics::clear(tx, &key)?;
+                diagnostics::clear_observed(tx, &key, false)?;
                 true
             },
         };

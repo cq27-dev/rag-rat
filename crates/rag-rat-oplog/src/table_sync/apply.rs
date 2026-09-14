@@ -1028,7 +1028,8 @@ pub(crate) fn stale_row_disposition(
     let key = RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk };
     match outcome {
         StaleRow::Unknown(cause) => diagnostics::record(tx, &key, cause)?,
-        StaleRow::Unchanged | StaleRow::LocallyChanged => diagnostics::clear(tx, &key)?,
+        StaleRow::Unchanged | StaleRow::LocallyChanged =>
+            diagnostics::clear_observed(tx, &key, true)?,
     }
     Ok(outcome)
 }
@@ -1235,7 +1236,11 @@ fn unsent_work_on_row(
     let current_cells = match read_synced_cells(tx, spec, pk_vals)? {
         SyncedRow::Cells(cells) => cells,
         SyncedRow::Absent => {
-            diagnostics::clear(tx, &RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk })?;
+            diagnostics::clear_observed(
+                tx,
+                &RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk },
+                false,
+            )?;
             // No row — but a surviving published identity means the row was DELETED locally and not
             // yet authored. That is precisely what the producer's `Remove` branch keys on, so
             // replaying an upsert here would recreate the row and discard the unsent deletion for
@@ -1282,12 +1287,11 @@ fn unsent_work_on_row(
         })? {
             // Comparable: a differing hash is a demonstrably unsent local change.
             Some((published, version)) if version == spec.spec_version => {
-                diagnostics::clear(tx, &RowKey {
-                    stream,
-                    repo_id,
-                    table: spec.name,
-                    row_pk: &row_pk,
-                })?;
+                diagnostics::clear_observed(
+                    tx,
+                    &RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk },
+                    false,
+                )?;
                 (published != current).then_some(PendingReason::DeferredUnsentEdit)
             },
             // Published under a different column set, so the hashes cannot be compared — but the
@@ -1305,12 +1309,11 @@ fn unsent_work_on_row(
             // A live row no apply ever published is purely local: the only content there came from
             // this device, and no peer has seen it.
             None => {
-                diagnostics::clear(tx, &RowKey {
-                    stream,
-                    repo_id,
-                    table: spec.name,
-                    row_pk: &row_pk,
-                })?;
+                diagnostics::clear_observed(
+                    tx,
+                    &RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk },
+                    false,
+                )?;
                 Some(PendingReason::DeferredUnsentEdit)
             },
         },

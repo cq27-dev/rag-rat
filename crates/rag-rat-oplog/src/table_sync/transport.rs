@@ -192,6 +192,25 @@ pub fn table_sync_author_pending(
 /// Own the rollback boundary so failed authoring cannot discard its diagnostic explanation.
 pub(super) fn author_repo_pending(conn: &Connection, ctx: &SyncCtx<'_>) -> anyhow::Result<usize> {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    match author_repo_in_tx(&tx, ctx) {
+        Ok(authored) => {
+            tx.commit()?;
+            Ok(authored)
+        },
+        Err(error) => {
+            tx.rollback()?;
+            let observations = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+            diagnostics::refresh_after_rollback(&observations, ctx)?;
+            if let Some(conflict) = error.downcast_ref::<diagnostics::SelfApplyConflict>() {
+                conflict.record_if_unexplained(&observations)?;
+            }
+            observations.commit()?;
+            Err(error)
+        },
+    }
+}
+
+fn author_repo_in_tx(tx: &Transaction<'_>, ctx: &SyncCtx<'_>) -> anyhow::Result<usize> {
     let mut authored = 0;
     // INVARIANT: the account fold enqueues re-adoption work for EVERY stream in
     // table_sync_streams, while this drain only walks repo-scoped specs' streams. The two
@@ -205,19 +224,7 @@ pub(super) fn author_repo_pending(conn: &Connection, ctx: &SyncCtx<'_>) -> anyho
             scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, spec.scope_id)
         })
         .collect();
-    let produced = match engine::produce_and_author(&tx, ctx) {
-        Ok(produced) => produced,
-        Err(error) => {
-            tx.rollback()?;
-            let observations = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-            diagnostics::refresh_after_rollback(&observations, ctx)?;
-            if let Some(conflict) = error.downcast_ref::<diagnostics::SelfApplyConflict>() {
-                conflict.record_if_unexplained(&observations)?;
-            }
-            observations.commit()?;
-            return Err(error);
-        },
-    };
+    let produced = engine::produce_and_author(tx, ctx)?;
     authored += produced.len();
     streams.sort_unstable();
     streams.dedup();
@@ -228,15 +235,14 @@ pub(super) fn author_repo_pending(conn: &Connection, ctx: &SyncCtx<'_>) -> anyho
         // column is unreadable today (retried once the cell is repaired), or a stream with no
         // recorded apply context. `None` is that case: stop rather than spin on a work item
         // this pass cannot finish.
-        while store::has_pending_readoption_work(&tx, ctx.account_id, stream)? {
-            let Some(reauthored) = engine::process_readoption_work_for_stream(&tx, ctx, stream)?
+        while store::has_pending_readoption_work(tx, ctx.account_id, stream)? {
+            let Some(reauthored) = engine::process_readoption_work_for_stream(tx, ctx, stream)?
             else {
                 break;
             };
             authored += reauthored;
         }
     }
-    tx.commit()?;
     Ok(authored)
 }
 

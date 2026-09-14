@@ -2185,6 +2185,7 @@ CREATE TABLE table_sync_row_diagnostics(
              table_name TEXT NOT NULL,
              row_pk TEXT NOT NULL,
              cause TEXT NOT NULL,
+             self_apply_failed INTEGER NOT NULL DEFAULT 0 CHECK(self_apply_failed IN (0,1)),
              PRIMARY KEY(stream_id, repo_id, table_name, row_pk)
          ) STRICT;
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('001_sqlite_storage_baseline',1789374675829,'sha256:rag-rat-sqlite-baseline-v1','SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata');

@@ -284,7 +284,7 @@ fn opaque_and_malformed_winner_payloads_have_separate_causes() {
 
 #[test]
 fn superseded_self_apply_is_reported_when_the_winner_itself_resolves() {
-    let d = published();
+    let mut d = published();
     d.conn
         .execute(
             "INSERT INTO \
@@ -313,5 +313,117 @@ fn superseded_self_apply_is_reported_when_the_winner_itself_resolves() {
             .query_row("SELECT COUNT(*) FROM table_sync_entries", [], |r| r.get::<_, i64>(0))
             .unwrap(),
         1
+    );
+    let peer = Device::new();
+    d.enroll(peer.local.fingerprint());
+    let incoming = RowOp::Upsert {
+        table: "t_demo".into(),
+        spec_version: 1,
+        pk: vec![TypedValue::Text("r1".into())],
+        cells: vec![Cell { column: "title".into(), value: TypedValue::Text("incoming".into()) }],
+    };
+    let signed = crate::entry::sign_entry_from_op_bytes(
+        peer.local.secret(),
+        stream(),
+        None,
+        10_000,
+        row_op::encode(&incoming),
+    );
+    assert_eq!(d.ingest(OLD_REGISTRY, "repo", &[signed.signed_bytes], &peer.pubkey()), [
+        IngestOutcome::Retained(PendingReason::DeferredUnsentEdit)
+    ]);
+    assert_eq!(
+        causes(&d.conn),
+        ["self_apply_superseded"],
+        "comparable-hash deferral proves no repair"
+    );
+    let tx = d.conn.transaction().unwrap();
+    assert_eq!(
+        apply::unsent_work_blocking_replay(&tx, &NEW, "repo", stream(), &incoming).unwrap(),
+        Some(PendingReason::DeferredUnsentEdit)
+    );
+    tx.commit().unwrap();
+    assert_eq!(
+        causes(&d.conn),
+        ["self_apply_superseded"],
+        "resolving the winning entry does not resolve the blocking tombstone"
+    );
+}
+
+#[test]
+fn readoption_failure_rolls_back_entries_and_retains_scan_only_diagnostics() {
+    const SCOPED: TableSpec = TableSpec {
+        name: "t_scoped",
+        scope_id: OLD.scope_id,
+        spec_version: 1,
+        pk: &[
+            ColumnSpec::required("repo_id", ValueType::Text),
+            ColumnSpec::required("id", ValueType::Text),
+        ],
+        columns: &[ColumnSpec::required("title", ValueType::Text)],
+        local_columns: &[],
+        repo_column: Some("repo_id"),
+    };
+    const FLAG: TableSpec = TableSpec {
+        name: "t_flag",
+        columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+        ..SCOPED
+    };
+    const REGISTRY: &[TableSpec] = &[SCOPED, FLAG];
+    let mut a = Device::new();
+    let mut b = Device::new();
+    for d in [&a, &b] {
+        d.conn
+            .execute_batch(
+                "CREATE TABLE t_scoped(repo_id TEXT NOT NULL,id TEXT NOT NULL,title TEXT,PRIMARY \
+                 KEY(repo_id,id)) STRICT; CREATE TABLE t_flag(repo_id TEXT NOT NULL,id TEXT NOT \
+                 NULL,flag INTEGER,PRIMARY KEY(repo_id,id)) STRICT;",
+            )
+            .unwrap();
+    }
+    a.conn.execute("INSERT INTO t_scoped VALUES ('repo','r1','unchanged')", []).unwrap();
+    let entries = a.produce(REGISTRY, "repo");
+    b.enroll(a.local.fingerprint());
+    b.ingest(REGISTRY, "repo", &entries, &a.pubkey());
+    b.conn
+        .execute("UPDATE account_roster_history SET closed_at = 1 WHERE device_fingerprint = ?1", [
+            a.local.fingerprint().to_bytes().as_slice(),
+        ])
+        .unwrap();
+    b.conn
+        .execute(
+            "INSERT INTO \
+             sync_row_tombstones(stream_id,repo_id,table_name,row_pk,lamport,device_fingerprint) \
+             SELECT stream_id,repo_id,table_name,row_pk,9999,device_fingerprint FROM \
+             sync_row_clocks",
+            [],
+        )
+        .unwrap();
+    b.conn.execute("INSERT INTO t_flag VALUES ('repo','bad',2)", []).unwrap();
+    let tx = b.conn.transaction().unwrap();
+    store::enqueue_readoption_work(&tx, account(), a.local.fingerprint(), stream(), [7; 32], 9, 10)
+        .unwrap();
+    tx.commit().unwrap();
+    let ctx = SyncCtx {
+        repo_id: "repo",
+        account_id: account(),
+        incarnation_ref: [0x44; 32],
+        device: &b.local,
+        registry: REGISTRY,
+        now_ms: 11,
+        local_writer: Default::default(),
+    };
+    let error = transport::author_repo_pending(&b.conn, &ctx).unwrap_err();
+    assert!(error.to_string().contains("lost its own self-apply"));
+    assert_eq!(causes(&b.conn), ["unreadable_row", "self_apply_superseded"]);
+    assert_eq!(
+        b.conn
+            .query_row("SELECT COUNT(*) FROM table_sync_entries", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        entries.len() as i64
+    );
+    assert_eq!(
+        b.conn.query_row("SELECT title FROM t_scoped", [], |r| r.get::<_, String>(0)).unwrap(),
+        "unchanged"
     );
 }

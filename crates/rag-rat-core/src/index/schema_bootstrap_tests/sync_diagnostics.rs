@@ -7,6 +7,7 @@ fn sync_diagnostics_share_main_and_linked_scope_without_exposing_siblings() {
     run_git(&root, &["worktree", "add", "-b", "diagnostic-linked", linked.to_str().unwrap()]);
     let mut linked_config = config.clone();
     linked_config.root = linked.to_path_buf();
+    IndexDatabase::migrate(&config.database).unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     let sibling_db = IndexDatabase::open_config(&linked_config).unwrap();
     assert_eq!(db.active_repo_id, sibling_db.active_repo_id);
@@ -30,14 +31,14 @@ fn sync_diagnostics_share_main_and_linked_scope_without_exposing_siblings() {
     let streams = rag_rat_oplog::table_sync_supported_streams(conn, account).unwrap();
     for stream in &streams {
         conn.execute(
-            "INSERT INTO table_sync_row_diagnostics VALUES \
-             (?1,?2,'repo_memories','r1','missing_entry')",
+            "INSERT INTO table_sync_row_diagnostics(stream_id,repo_id,table_name,row_pk,cause) \
+             VALUES (?1,?2,'repo_memories','r1','missing_entry')",
             rusqlite::params![stream.stream_id.as_slice(), stream.repo_id],
         )
         .unwrap();
     }
     conn.execute(
-        "INSERT INTO table_sync_row_diagnostics VALUES \
+        "INSERT INTO table_sync_row_diagnostics(stream_id,repo_id,table_name,row_pk,cause) VALUES \
          (?1,?2,'repo_memories','old-incarnation','missing_entry')",
         rusqlite::params![[99_u8; 32].as_slice(), db.active_repo_id],
     )

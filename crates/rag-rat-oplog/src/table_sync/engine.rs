@@ -501,11 +501,13 @@ fn author_repair(
         // MAX(lamport)+1, so losing its own self-apply means the row's clock carries a lamport
         // from ANOTHER stream — the shape a scope or account move leaves behind. Swallowing it
         // would record the repair done with the row unrepaired and no retry left.
-        ApplyOutcome::Superseded => anyhow::bail!(
-            "table-sync: a {what} op lost its own self-apply on `{}` — the row's write clock \
-             carries a lamport from another stream",
-            spec.name
-        ),
+        ApplyOutcome::Superseded => Err(super::diagnostics::SelfApplyConflict {
+            stream,
+            repo_id: ctx.repo_id.to_owned(),
+            table: spec.name.to_owned(),
+            row_pk: row_op::row_pk_string(op.pks().next().expect("repair names at least one row")),
+        }
+        .into()),
         outcome @ (ApplyOutcome::Quarantined { .. } | ApplyOutcome::Unprojectable(_)) => {
             anyhow::bail!(
                 "table-sync: a {what} op did not self-apply on `{}`: {outcome:?}",

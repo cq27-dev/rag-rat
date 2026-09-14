@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Connection, Transaction, params};
 
-use super::apply::{self, RowKey, StaleRow};
+use super::apply::{self, RowKey};
 use super::engine::SyncCtx;
 use super::row_op;
 use super::scope_stream::scope_stream_id;
@@ -48,6 +48,8 @@ pub struct TableSyncRowDiagnostic {
     pub row_pk: String,
     /// Raw stable token, preserving observations written by newer binaries.
     pub cause: String,
+    /// A failed self-apply remains unresolved until a successful publication or deletion.
+    pub self_apply_failed: bool,
 }
 
 /// One stream/repository, ordered by `(table_name, row_pk)`. Continue after the last returned row.
@@ -64,7 +66,7 @@ pub fn table_sync_row_diagnostics(
     query: &TableSyncDiagnosticQuery<'_>,
 ) -> anyhow::Result<Vec<TableSyncRowDiagnostic>> {
     let mut stmt = conn.prepare(
-        "SELECT table_name, row_pk, cause FROM table_sync_row_diagnostics
+        "SELECT table_name, row_pk, cause, self_apply_failed FROM table_sync_row_diagnostics
          WHERE stream_id = ?1 AND repo_id = ?2
            AND (?3 IS NULL OR (table_name, row_pk) > (?3, ?4))
          ORDER BY table_name, row_pk LIMIT ?5",
@@ -83,6 +85,7 @@ pub fn table_sync_row_diagnostics(
                 table_name: r.get(0)?,
                 row_pk: r.get(1)?,
                 cause: r.get(2)?,
+                self_apply_failed: r.get(3)?,
             })
         },
     )?;
@@ -119,6 +122,30 @@ pub(super) fn clear(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()
     Ok(())
 }
 
+pub(super) fn clear_observed(
+    tx: &Transaction<'_>,
+    key: &RowKey<'_>,
+    winner_resolved: bool,
+) -> anyhow::Result<()> {
+    let stream_bytes = key.stream.to_bytes();
+    let args =
+        params![stream_bytes.as_slice(), key.repo_id, key.table, key.row_pk, winner_resolved];
+    tx.execute(
+        "UPDATE table_sync_row_diagnostics SET cause = 'self_apply_superseded'
+        WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4
+          AND self_apply_failed = 1 AND (?5 OR cause = 'unreadable_row') AND cause != \
+         'self_apply_superseded'",
+        args,
+    )?;
+    tx.execute(
+        "DELETE FROM table_sync_row_diagnostics
+        WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4
+          AND self_apply_failed = 0 AND (?5 OR cause = 'unreadable_row')",
+        args,
+    )?;
+    Ok(())
+}
+
 pub(super) fn clear_absent(
     tx: &Transaction<'_>,
     stream: StreamId,
@@ -135,7 +162,12 @@ pub(super) fn clear_absent(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for row_pk in keys {
         if !live.contains(&row_pk) {
-            clear(tx, &RowKey { stream, repo_id: repo, table, row_pk: &row_pk })?;
+            let key = RowKey { stream, repo_id: repo, table, row_pk: &row_pk };
+            if apply::published_hash_on_stream(tx, &key)?.is_none() {
+                clear(tx, &key)?;
+            } else {
+                clear_observed(tx, &key, false)?;
+            }
         }
     }
     Ok(())
@@ -166,14 +198,10 @@ pub(super) fn refresh_after_rollback(
                 Some(cells) if apply::published_hash_on_stream(tx, &key)?.is_some() => {
                     // Also inspect current-spec clocks: a corrupt clock can prevent self-apply
                     // even when the anti-echo hash itself is comparable.
-                    if !matches!(
-                        apply::stale_row_disposition(tx, spec, ctx.repo_id, stream, &pk, &cells)?,
-                        StaleRow::Unknown(_)
-                    ) {
-                        clear(tx, &key)?;
-                    }
+                    let _ =
+                        apply::stale_row_disposition(tx, spec, ctx.repo_id, stream, &pk, &cells)?;
                 },
-                Some(_) => clear(tx, &key)?,
+                Some(_) => clear_observed(tx, &key, false)?,
             }
         }
         clear_absent(tx, stream, ctx.repo_id, spec.name, &live)?;
@@ -206,8 +234,11 @@ impl SelfApplyConflict {
     pub(super) fn record_if_unexplained(&self, tx: &Transaction<'_>) -> anyhow::Result<()> {
         // Keep a more specific winner-resolution cause from the rolled-back view if available.
         tx.execute(
-            "INSERT OR IGNORE INTO table_sync_row_diagnostics(stream_id, repo_id, table_name, \
-             row_pk, cause) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO table_sync_row_diagnostics(stream_id, repo_id, table_name, row_pk, \
+             cause, self_apply_failed)
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)
+             ON CONFLICT(stream_id, repo_id, table_name, row_pk) DO UPDATE SET self_apply_failed = \
+             1",
             params![
                 self.stream.to_bytes().as_slice(),
                 self.repo_id,

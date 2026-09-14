@@ -319,7 +319,10 @@ The limit is 1–1000 rows across current table streams. `limit_reached` means t
 have more rows; the library's `table_sync_row_diagnostics` API also supports keyset pagination.
 
 These observations are local diagnostics, not replicated authority or a reason to delete a row.
-They survive restart and failed authoring rollback. Successful publication or deletion clears them;
+They survive restart and failed authoring rollback, including re-adoption failures. The
+`self_apply_failed` flag keeps a failed authoring attempt visible even after its winner can be
+resolved: a readable row alone does not prove a blocking clock or tombstone was repaired.
+Successful publication or deletion clears that flag and the diagnostic;
 a raw local repair becomes visible on the next producer scan or replay. A row with an unreadable
 primary key has no addressable row identity and is not included in this per-row report. The command
 reads existing observations; it does not trigger a scan or author entries. An empty report therefore

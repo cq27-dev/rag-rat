@@ -881,6 +881,7 @@ pub fn apply_table_sync_row_diagnostics(conn: &Connection) -> rusqlite::Result<(
              table_name TEXT NOT NULL,
              row_pk TEXT NOT NULL,
              cause TEXT NOT NULL,
+             self_apply_failed INTEGER NOT NULL DEFAULT 0 CHECK(self_apply_failed IN (0,1)),
              PRIMARY KEY(stream_id, repo_id, table_name, row_pk)
          ) STRICT;",
     )
@@ -902,8 +903,9 @@ mod diagnostic_tests {
         crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
         for repo in ["main-checkout", "linked-sibling"] {
             conn.execute(
-                "INSERT INTO table_sync_row_diagnostics VALUES (?1, ?2, 't_demo', 'r1', \
-                 'future_cause')",
+                "INSERT INTO \
+                 table_sync_row_diagnostics(stream_id,repo_id,table_name,row_pk,cause) VALUES \
+                 (?1, ?2, 't_demo', 'r1', 'future_cause')",
                 rusqlite::params![[1_u8; 32].as_slice(), repo],
             )
             .unwrap();
