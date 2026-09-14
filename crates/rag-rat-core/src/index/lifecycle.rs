@@ -835,10 +835,6 @@ pub fn install_scope_view(
     write_scope_view(conn, &ScopeContext { repo_id: &repo_id, checkout, generation })
 }
 
-/// Installs the per-connection repo/commit/worktree scoping view; callers query `files` afterward
-/// and see only the active context. The `files` view filters on `repo_id` FIRST (A3) so a
-/// consolidated DB never leaks another repo's rows through the view — every read path that goes
-/// through `temp.files` is repo-scoped for free.
 /// Install the connection's scope, ALL-OR-NOTHING.
 ///
 /// The view body reads `temp.connection_context` through sub-selects at query time, so writing
@@ -860,6 +856,10 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext<'_>) -> rusq
     }
 }
 
+/// Installs the per-connection repo/commit/worktree scoping view; callers query `files` afterward
+/// and see only the active context. The `files` view filters on `repo_id` FIRST (A3) so a
+/// consolidated DB never leaks another repo's rows through the view — every read path that goes
+/// through `temp.files` is repo-scoped for free.
 fn write_scope_view_inner(
     conn: &rusqlite::Connection,
     ctx: &ScopeContext<'_>,
