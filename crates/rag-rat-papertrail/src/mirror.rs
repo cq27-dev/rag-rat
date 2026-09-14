@@ -1455,6 +1455,9 @@ fn common_comment_high_mark(streams: &BTreeMap<String, CommentStreamCursor>) -> 
         .min()
 }
 
+/// One second before `timestamp`. Malformed input comes back UNCHANGED (a zero overlap) rather
+/// than erroring — unlike GitLab's `day_before`, which shares the calendar rule but rejects bad
+/// dates; see [`parse_time`] for why that fallback must stay out of the common path.
 fn overlap_timestamp(timestamp: &str) -> String {
     let Some(core) = timestamp.strip_suffix('Z') else { return timestamp.to_string() };
     let Some((date, time)) = core.split_once('T') else { return timestamp.to_string() };
@@ -1475,17 +1478,7 @@ fn overlap_timestamp(timestamp: &str) -> String {
                 hour -= 1;
             } else {
                 hour = 23;
-                if day > 1 {
-                    day -= 1;
-                } else {
-                    if month > 1 {
-                        month -= 1;
-                    } else {
-                        year -= 1;
-                        month = 12;
-                    }
-                    day = days_in_month(year, month);
-                }
+                (year, month, day) = previous_civil_day(year, month, day);
             }
         }
     }
@@ -1514,12 +1507,26 @@ fn parse_time(value: &str) -> Option<(u32, u32, u32)> {
     parts.next().is_none().then_some(parsed)
 }
 
-pub(crate) fn days_in_month(year: i32, month: u32) -> u32 {
+fn days_in_month(year: i32, month: u32) -> u32 {
     match month {
         4 | 6 | 9 | 11 => 30,
         2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
         2 => 28,
         _ => 31,
+    }
+}
+
+/// The civil day before `(year, month, day)`: January 1 rolls back to December 31 of the prior
+/// year, day 1 of any other month to that previous month's last day (leap years via
+/// [`days_in_month`]), anything else to `day - 1`. Callers validate the input; the rule is shared,
+/// each caller's malformed-input policy is not.
+pub(crate) fn previous_civil_day(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
+    if day > 1 {
+        (year, month, day - 1)
+    } else if month > 1 {
+        (year, month - 1, days_in_month(year, month - 1))
+    } else {
+        (year - 1, 12, 31)
     }
 }
 
@@ -1836,6 +1843,21 @@ mod tests {
         assert_eq!(overlap_timestamp("2026-01-01T00:00:00.001Z"), "2025-12-31T23:59:59Z");
         // Non-fractional stamps keep their existing behavior.
         assert_eq!(overlap_timestamp("2026-07-15T13:15:56Z"), "2026-07-15T13:15:55Z");
+    }
+
+    #[test]
+    fn previous_civil_day_rolls_back_through_month_year_and_leap_boundaries() {
+        for ((year, month, day), expected) in [
+            ((2026, 7, 15), (2026, 7, 14)),
+            ((2026, 3, 1), (2026, 2, 28)),
+            ((2024, 3, 1), (2024, 2, 29)),
+            ((2000, 3, 1), (2000, 2, 29)),
+            ((1900, 3, 1), (1900, 2, 28)),
+            ((2026, 5, 1), (2026, 4, 30)),
+            ((2026, 1, 1), (2025, 12, 31)),
+        ] {
+            assert_eq!(previous_civil_day(year, month, day), expected, "{year}-{month}-{day}");
+        }
     }
 
     /// A quiet probe must not starve an OWED boundary replay: providers without a probe

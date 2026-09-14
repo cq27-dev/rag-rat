@@ -38,8 +38,8 @@ pub(crate) use gitlab::*;
 pub use http::*;
 pub use mirror::MirrorBindingReport;
 pub(crate) use mirror::{
-    MirrorContinuation, days_in_month, load_mirror_continuation, max_timestamp, mirror_binding,
-    parse_date,
+    MirrorContinuation, load_mirror_continuation, max_timestamp, mirror_binding, parse_date,
+    previous_civil_day,
 };
 pub use parse::{TrackerParsedRef, parse_tracker_refs, *};
 pub use rag_rat_base::config::Tracker;
