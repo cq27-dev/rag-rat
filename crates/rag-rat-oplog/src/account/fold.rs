@@ -1550,8 +1550,8 @@ impl<'a> DepthPass<'a> {
     /// condemnation cycle: this is what makes a SOLE owner's equivocating self-removals
     /// fold `Live` (each rejected `LastOwner`) instead of manufacturing a contested cut
     /// (incomparable variant) or a same-device 2-cycle (same-cut variant, which
-    /// `has_condemn_cycle` WOULD flag). Keyed on the SAME `closes` predicate the I2 sim
-    /// uses, against the prior-depth `state.owners` (empty at stratum 0, so genesis / a
+    /// `has_condemn_cycle` WOULD flag). Keyed on [`closes_open_incarnation`], as in the I2
+    /// simulation, against the prior-depth `state.owners` (empty at stratum 0, so genesis / a
     /// founder self-remove is never intrinsic here) — NEVER on "is a self-removal". The
     /// multi-owner mutual-removal case (owner set > 1) is untouched and still
     /// reaches `has_condemn_cycle` before I2, so it folds contested (§12).
@@ -1560,13 +1560,7 @@ impl<'a> DepthPass<'a> {
             return;
         }
         admitted.retain(|a| {
-            let closes_sole_owner = match &a.op.op {
-                AccountOp::DeviceRemove { device_fingerprint, .. } =>
-                    self.state.owners.contains_key(device_fingerprint),
-                AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } =>
-                    self.state.owners.get(device_fingerprint) == Some(owner_id),
-                _ => false,
-            };
+            let closes_sole_owner = closes_open_incarnation(&a.op.op, &self.state.owners).is_some();
             if closes_sole_owner {
                 self.cut_verdicts.insert(a.op.hash(), Outcome::Rejected(RejectReason::LastOwner));
                 return false;
@@ -1626,14 +1620,7 @@ impl<'a> DepthPass<'a> {
     fn reserve_surviving_owner(&mut self, admitted: &mut Vec<AdmittedCut<'a>>) {
         let mut surviving = self.state.owners.clone();
         admitted.retain(|a| {
-            let closes = match &a.op.op {
-                AccountOp::DeviceRemove { device_fingerprint, .. } =>
-                    surviving.contains_key(device_fingerprint).then_some(*device_fingerprint),
-                AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } =>
-                    (surviving.get(device_fingerprint) == Some(owner_id))
-                        .then_some(*device_fingerprint),
-                _ => None,
-            };
+            let closes = closes_open_incarnation(&a.op.op, &surviving);
             if let Some(dev) = closes {
                 if surviving.len() == 1 {
                     self.cut_verdicts
@@ -2296,7 +2283,7 @@ fn derive_authority_facts(
                 }
             },
             AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } => {
-                if owners.get(device_fingerprint) == Some(owner_id) {
+                if closes_open_incarnation(&candidate.op, &owners).is_some() {
                     owners.remove(device_fingerprint);
                     let account = candidate.header().account_id;
                     let roster_ref = roster
@@ -2442,6 +2429,19 @@ enum AuthorityStatus {
     /// held). The dependent parks on the same reason, never permanently stale — it heals when
     /// the mint does (I11).
     ParkedAuthorizer(ParkReason),
+}
+
+fn closes_open_incarnation(
+    op: &AccountOp,
+    owners: &HashMap<DeviceFingerprint, [u8; 32]>,
+) -> Option<DeviceFingerprint> {
+    match op {
+        AccountOp::DeviceRemove { device_fingerprint, .. } =>
+            owners.contains_key(device_fingerprint).then_some(*device_fingerprint),
+        AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } =>
+            (owners.get(device_fingerprint) == Some(owner_id)).then_some(*device_fingerprint),
+        _ => None,
+    }
 }
 
 /// The §"authority rule" (clauses 1 + 3): `c`'s cited incarnation must (1) resolve to a mint whose
@@ -2664,8 +2664,8 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
         },
         // A demotion closes ONLY the named incarnation: if the device has since reopened a fresh
         // one (a later OwnerPromote), a stale demote naming the old `owner_id` is a no-op.
-        AccountOp::OwnerDemote { device_fingerprint, owner_id, .. }
-            if state.owners.get(device_fingerprint) == Some(owner_id) =>
+        AccountOp::OwnerDemote { device_fingerprint, .. }
+            if closes_open_incarnation(&c.op, &state.owners).is_some() =>
         {
             state.owners.remove(device_fingerprint);
         },
