@@ -38,7 +38,8 @@ use crate::auth::{
 };
 use crate::enrollment::{
     ENROLL_ALPN, EnrollmentAcceptorOutcome, EnrollmentReceipt, EnrollmentRequest, InviteError,
-    RESPONSE_ACK, RESPONSE_ACK_TIMEOUT, run_enrollment_acceptor, run_enrollment_dialer,
+    InviteTicketKind, RESPONSE_ACK, RESPONSE_ACK_TIMEOUT, run_enrollment_acceptor,
+    run_enrollment_dialer,
 };
 use crate::session::{
     DEFAULT_IDLE_TIMEOUT, ServeScope, SessionError, SessionLimits, SessionReport, SyncStore,
@@ -299,14 +300,7 @@ pub async fn connect_and_enroll(
     request.held_entry_hashes =
         rag_rat_oplog::held_account_entry_hashes(database, expected_account)?;
     validate_enrollment_request_identity(database, expected_account, &request, now_ms)?;
-    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, ENROLL_ALPN))
-        .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!("enrollment dial timed out")))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
-    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
-        .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!("opening enrollment stream timed out")))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
+    let (conn, mut send, mut recv) = dial_enroll(endpoint, peer, InviteTicketKind::Pairing).await?;
     let receipt = run_enrollment_dialer(&mut recv, &mut send, expected_account, &request).await?;
     let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
         &receipt.account_entries,
@@ -349,14 +343,7 @@ pub async fn connect_and_redeem_writer(
     ticket: &crate::InviteTicket,
     contributor_account: AccountId,
 ) -> Result<crate::WriterGrantReceipt, InviteError> {
-    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, ENROLL_ALPN))
-        .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!("writer invite dial timed out")))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
-    let (mut send, mut recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
-        .await
-        .map_err(|_| InviteError::Storage(anyhow::anyhow!("opening invite stream timed out")))?
-        .map_err(|error| InviteError::Storage(error.into()))?;
+    let (conn, mut send, mut recv) = dial_enroll(endpoint, peer, InviteTicketKind::Writer).await?;
     let receipt = crate::enrollment::run_writer_grant_dialer(
         &mut recv,
         &mut send,
@@ -366,6 +353,30 @@ pub async fn connect_and_redeem_writer(
     .await?;
     conn.close(0u32.into(), b"done");
     Ok(receipt)
+}
+
+/// Dial `peer` on [`ENROLL_ALPN`] and open the exchange stream for a `kind` redemption. Both waits
+/// are peer-controlled, so each is bounded by [`DEFAULT_IDLE_TIMEOUT`] like every other dial here.
+async fn dial_enroll(
+    endpoint: &Endpoint,
+    peer: impl Into<EndpointAddr>,
+    kind: InviteTicketKind,
+) -> Result<(IrohConnection, iroh::endpoint::SendStream, iroh::endpoint::RecvStream), InviteError> {
+    let (dial_timed_out, stream_timed_out) = match kind {
+        InviteTicketKind::Pairing =>
+            ("enrollment dial timed out", "opening enrollment stream timed out"),
+        InviteTicketKind::Writer =>
+            ("writer invite dial timed out", "opening invite stream timed out"),
+    };
+    let conn = timeout(DEFAULT_IDLE_TIMEOUT, endpoint.connect(peer, ENROLL_ALPN))
+        .await
+        .map_err(|_| InviteError::Storage(anyhow::anyhow!(dial_timed_out)))?
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    let (send, recv) = timeout(DEFAULT_IDLE_TIMEOUT, conn.open_bi())
+        .await
+        .map_err(|_| InviteError::Storage(anyhow::anyhow!(stream_timed_out)))?
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    Ok((conn, send, recv))
 }
 
 /// Refuse a request assembled for a different store before making network contact: redemption is
