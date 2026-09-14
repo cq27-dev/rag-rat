@@ -313,6 +313,8 @@ pub(crate) fn item_numbering_is_shared(tracker: Tracker) -> bool {
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Serialize,
     Deserialize,
     strum::EnumString,
