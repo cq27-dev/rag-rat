@@ -307,6 +307,32 @@ impl AnchorScope {
     }
 }
 
+/// A row in a wire set is keyed by binding identity, never by its payload.
+trait IdentifiedRow {
+    fn identity(&self) -> (&str, &str);
+}
+
+impl IdentifiedRow for PortableAnchor {
+    fn identity(&self) -> (&str, &str) {
+        self.identity()
+    }
+}
+
+impl IdentifiedRow for AnchorScope {
+    fn identity(&self) -> (&str, &str) {
+        self.identity()
+    }
+}
+
+fn identities_unique<T: IdentifiedRow>(items: &[T]) -> bool {
+    if items.len() > MAX_ANCHORS_PER_OP {
+        return false;
+    }
+    let mut identities: Vec<_> = items.iter().map(IdentifiedRow::identity).collect();
+    identities.sort_unstable();
+    identities.windows(2).all(|pair| pair[0] != pair[1])
+}
+
 /// The most anchors one `node_anchors` op may carry. A memory holds a handful of bindings in
 /// practice (its own, plus an auto-moniker), so this is a generous structural bound rather than a
 /// budget.
@@ -347,24 +373,8 @@ pub(crate) const PORTABLE_ANCHOR_FIELDS: &[&str] = &[
 /// permanent entries whose anchors every peer silently drops at projection.
 pub fn within_wire_limits(op: &MemoryOp) -> bool {
     match op {
-        MemoryOp::NodeAnchors { anchors, .. } => {
-            if anchors.len() > MAX_ANCHORS_PER_OP {
-                return false;
-            }
-            let mut identities: Vec<(&str, &str)> =
-                anchors.iter().map(PortableAnchor::identity).collect();
-            identities.sort_unstable();
-            identities.windows(2).all(|pair| pair[0] != pair[1])
-        },
-        MemoryOp::NodeAnchorScopes { scopes, .. } => {
-            if scopes.len() > MAX_ANCHORS_PER_OP {
-                return false;
-            }
-            let mut identities: Vec<(&str, &str)> =
-                scopes.iter().map(AnchorScope::identity).collect();
-            identities.sort_unstable();
-            identities.windows(2).all(|pair| pair[0] != pair[1])
-        },
+        MemoryOp::NodeAnchors { anchors, .. } => identities_unique(anchors),
+        MemoryOp::NodeAnchorScopes { scopes, .. } => identities_unique(scopes),
         // Listed rather than wildcarded ON PURPOSE: this seam's contract is "reject exactly what
         // `decode` rejects", so the next op kind that grows a count cap or an ordering rule must
         // fail to compile here instead of silently answering `true` — the same under-approximation
@@ -570,27 +580,32 @@ fn encode_resolved(enc: &mut VecEncoder<'_>, resolved: &ResolvedAnchor) {
 /// and must not be mistaken for one. It is unreachable (decode errors first), and it would pass
 /// anyway: this sort is stable, so a duplicate-carrying payload re-encodes to the bytes it came
 /// from. Relaxing the `>=` to `>` would let duplicates straight through.
-fn encode_anchors(enc: &mut VecEncoder<'_>, anchors: &[PortableAnchor]) {
-    let mut ordered: Vec<&PortableAnchor> = anchors.iter().collect();
+fn encode_identity_set<T: IdentifiedRow>(
+    enc: &mut VecEncoder<'_>,
+    items: &[T],
+    write: impl Fn(&mut VecEncoder<'_>, &T),
+) {
+    let mut ordered: Vec<&T> = items.iter().collect();
     ordered.sort_by(|a, b| a.identity().cmp(&b.identity()));
     enc.put_array(ordered.len() as u64);
-    for anchor in ordered {
-        encode_anchor(enc, anchor);
+    for item in ordered {
+        write(enc, item);
     }
 }
 
-/// Encode the scope SET in identity order, under the same rules as [`encode_anchors`]: the sort
-/// canonicalizes, and `decode`'s strictly-increasing check is what rejects a duplicated identity.
+fn encode_anchors(enc: &mut VecEncoder<'_>, anchors: &[PortableAnchor]) {
+    encode_identity_set(enc, anchors, encode_anchor);
+}
+
 fn encode_anchor_scopes(enc: &mut VecEncoder<'_>, scopes: &[AnchorScope]) {
-    let mut ordered: Vec<&AnchorScope> = scopes.iter().collect();
-    ordered.sort_by(|a, b| a.identity().cmp(&b.identity()));
-    enc.put_array(ordered.len() as u64);
-    for scope in ordered {
-        enc.put_array(3);
-        enc.put_str(&scope.binding_kind);
-        enc.put_str(&scope.binding_id);
-        enc.put_str(&scope.scope_hash);
-    }
+    encode_identity_set(enc, scopes, encode_anchor_scope);
+}
+
+fn encode_anchor_scope(enc: &mut VecEncoder<'_>, scope: &AnchorScope) {
+    enc.put_array(3);
+    enc.put_str(&scope.binding_kind);
+    enc.put_str(&scope.binding_id);
+    enc.put_str(&scope.scope_hash);
 }
 
 fn encode_anchor(enc: &mut VecEncoder<'_>, anchor: &PortableAnchor) {
@@ -779,61 +794,50 @@ fn decode_node_anchors(d: &mut Decoder<'_>) -> Result<(NodeId, Vec<PortableAncho
     Ok((node_id, anchors))
 }
 
-fn decode_anchors(d: &mut Decoder<'_>) -> Result<Vec<PortableAnchor>, CborError> {
+fn decode_identity_set<T: IdentifiedRow>(
+    d: &mut Decoder<'_>,
+    op: &str,
+    noun: &str,
+    read: impl Fn(&mut Decoder<'_>) -> Result<T, CborError>,
+) -> Result<Vec<T>, CborError> {
     let len = cbor::expect_definite_len(d)?;
-    // Judge the COUNT from the header before decoding a single element. The length is
-    // attacker-controlled, so this both bounds the work and stays clear of trusting it enough to
-    // preallocate — the `cbor::decode_str_array` rule.
+    // Judge the attacker-controlled count before reading or preallocating any elements.
     if len > MAX_ANCHORS_PER_OP as u64 {
         return Err(CborError::message(format!(
-            "node_anchors carries {len} anchors, over the {MAX_ANCHORS_PER_OP} limit"
+            "{op} carries {len} {noun}, over the {MAX_ANCHORS_PER_OP} limit"
         )));
     }
-    let mut out: Vec<PortableAnchor> = Vec::new();
+    let mut out: Vec<T> = Vec::new();
     for _ in 0..len {
-        let anchor = decode_anchor(d)?;
-        // Canonical SET order: strictly increasing by identity. One comparison rejects both an
-        // unsorted payload and a duplicated row identity — the latter names one row twice, and
-        // nothing in the op says which of the two should win.
+        let item = read(d)?;
+        // One strict comparison rejects both unsorted payloads and duplicated identities.
         if let Some(previous) = out.last()
-            && previous.identity() >= anchor.identity()
+            && previous.identity() >= item.identity()
         {
-            return Err(CborError::message(
-                "node_anchors must be strictly increasing by (binding_kind, binding_id)",
-            ));
+            return Err(CborError::message(format!(
+                "{op} must be strictly increasing by (binding_kind, binding_id)"
+            )));
         }
-        out.push(anchor);
+        out.push(item);
     }
     Ok(out)
 }
 
-/// The scope-set twin of [`decode_anchors`]: the count is judged from the header, and the set must
-/// be strictly increasing by identity, which rejects both an unsorted payload and a duplicate.
+fn decode_anchors(d: &mut Decoder<'_>) -> Result<Vec<PortableAnchor>, CborError> {
+    decode_identity_set(d, "node_anchors", "anchors", decode_anchor)
+}
+
 fn decode_anchor_scopes(d: &mut Decoder<'_>) -> Result<Vec<AnchorScope>, CborError> {
-    let len = cbor::expect_definite_len(d)?;
-    if len > MAX_ANCHORS_PER_OP as u64 {
-        return Err(CborError::message(format!(
-            "node_anchor_scopes carries {len} scopes, over the {MAX_ANCHORS_PER_OP} limit"
-        )));
-    }
-    let mut out: Vec<AnchorScope> = Vec::new();
-    for _ in 0..len {
-        cbor::expect_array(d, 3)?;
-        let scope = AnchorScope {
-            binding_kind: d.str()?.to_string(),
-            binding_id: d.str()?.to_string(),
-            scope_hash: d.str()?.to_string(),
-        };
-        if let Some(previous) = out.last()
-            && previous.identity() >= scope.identity()
-        {
-            return Err(CborError::message(
-                "node_anchor_scopes must be strictly increasing by (binding_kind, binding_id)",
-            ));
-        }
-        out.push(scope);
-    }
-    Ok(out)
+    decode_identity_set(d, "node_anchor_scopes", "scopes", decode_anchor_scope)
+}
+
+fn decode_anchor_scope(d: &mut Decoder<'_>) -> Result<AnchorScope, CborError> {
+    cbor::expect_array(d, 3)?;
+    Ok(AnchorScope {
+        binding_kind: d.str()?.to_string(),
+        binding_id: d.str()?.to_string(),
+        scope_hash: d.str()?.to_string(),
+    })
 }
 
 fn decode_anchor(d: &mut Decoder<'_>) -> Result<PortableAnchor, CborError> {
