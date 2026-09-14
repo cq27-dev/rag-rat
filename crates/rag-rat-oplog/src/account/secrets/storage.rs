@@ -43,6 +43,8 @@ pub fn repo_incarnation_state(
     account_id: AccountId,
     repo_id: &str,
 ) -> anyhow::Result<RepoIncarnationState> {
+    let _snapshot = super::super::control_policy::read_snapshot(conn)?;
+    super::super::control_policy::require_supported_account_control(conn, account_id)?;
     let row: Option<Option<Vec<u8>>> = conn
         .query_row(
             "SELECT incarnation_ref FROM account_repo_incarnation_current

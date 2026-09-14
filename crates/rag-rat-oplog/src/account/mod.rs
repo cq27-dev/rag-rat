@@ -21,6 +21,7 @@ mod branch;
 mod candidate;
 mod checkpoint;
 mod content;
+pub(crate) mod control_policy;
 // Isolated grammar and evidence planning only; production control dispatch remains v1.
 #[allow(dead_code, reason = "control v2 execution awaits frozen legacy fold policy (#1311)")]
 mod control_v2;
@@ -111,6 +112,11 @@ pub use content::{
 pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
 #[allow(unused_imports, reason = "envelope tests consume these crate-internal signing seams")]
 pub(in crate::account) use content::{seal_and_sign_content_entry, sign_sealed_content_entry};
+pub use control_policy::{
+    AccountControlPolicy, PinInstallOutcome, UnsupportedAccountControlVersion,
+    account_control_policy, export_account_checkpoint, pin_checkpoint_in_tx,
+    require_supported_account_control,
+};
 pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, EntryStatus,
     GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,

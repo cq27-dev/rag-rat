@@ -522,6 +522,8 @@ fn list_accepted_stream_key_wraps_with_mode(
     stream_id: StreamId,
     mode: AcceptedWrapDecodeMode,
 ) -> anyhow::Result<Vec<AcceptedStreamWrap>> {
+    let _snapshot = super::super::control_policy::read_snapshot(conn)?;
+    super::super::control_policy::require_supported_account_control(conn, account_id)?;
     let mut stmt = conn.prepare(
         "SELECT entry_hash, signed_bytes FROM account_entries
          WHERE account_id = ?1 AND log_id = ?2 AND accepted = 1

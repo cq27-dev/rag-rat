@@ -211,6 +211,8 @@ fn author_batch_in_tx(
         owner_auth_len,
         author_auth_len,
     } = *authoring;
+    crate::account::require_supported_account_control(tx, account_id)?;
+    super::super::control_policy::require_supported_stream_control(tx, stream_id)?;
     let fingerprint = device.fingerprint();
 
     // Stream-global LWW clock (#1164): the next lamport is `max(accepted stream lamports) + 1`, so
@@ -415,6 +417,8 @@ pub fn author_prepared_content_batch_in_tx(
     prepared: &PreparedContentAuthoring,
     now_ms: i64,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
+    crate::account::require_supported_account_control(tx, prepared.account_id)?;
+    super::super::control_policy::require_supported_stream_control(tx, stream_id)?;
     if ops.is_empty() {
         return Ok(Vec::new());
     }

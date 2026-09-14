@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 129;
+pub const LATEST_SCHEMA_VERSION: u32 = 130;
 
 /// The `files.kind` token of a deletion tombstone — the row `mark_file_deleted` /
 /// `write_tombstone_in_scope` leave for a path the checkout no longer serves. It is outside
@@ -1161,6 +1161,11 @@ additive_migrations! {
         "sha256:rag-rat-table-sync-suffix-coverage-v129",
         "Retain promised suffix tips across interrupted table floor adoption (#892)",
     ) => MigrationFn::Plain(migrations::apply_table_sync_suffix_coverage);
+    MIGRATION_130_ID, MIGRATION_130_CHECKSUM, MIGRATION_130_DESCRIPTION = (
+        "130_account_control_pins",
+        "sha256:rag-rat-account-control-pins-v130",
+        "Retain permanent external account checkpoint pins and signed evidence (#1311)",
+    ) => MigrationFn::Plain(migrations::apply_account_control_pins);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

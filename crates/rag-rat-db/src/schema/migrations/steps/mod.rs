@@ -15,3 +15,5 @@ pub(super) mod repo_scoping;
 pub(super) mod sync_substrate;
 pub(super) mod syncable_tables;
 pub(super) mod table_sync;
+
+pub(super) mod account_checkpoint;

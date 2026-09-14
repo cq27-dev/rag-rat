@@ -103,6 +103,8 @@ pub fn table_sync_supported_streams(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<TableSyncStream>> {
+    let _snapshot = crate::account::control_policy::read_snapshot(conn)?;
+    crate::account::require_supported_account_control(conn, account_id)?;
     supported_streams_against(conn, account_id, SYNCABLE_TABLES)
 }
 
@@ -212,6 +214,7 @@ pub(super) fn author_repo_pending(conn: &Connection, ctx: &SyncCtx<'_>) -> anyho
 }
 
 fn author_repo_in_tx(tx: &Transaction<'_>, ctx: &SyncCtx<'_>) -> anyhow::Result<usize> {
+    crate::account::require_supported_account_control(tx, ctx.account_id)?;
     let mut authored = 0;
     // INVARIANT: the account fold enqueues re-adoption work for EVERY stream in
     // table_sync_streams, while this drain only walks repo-scoped specs' streams. The two
@@ -326,6 +329,7 @@ fn compact_overdue_against(
         anyhow::ensure!(keep >= 1, "a retention budget of zero keeps no chain tail to build on");
         let stream_id = StreamId::from_bytes(stream.stream_id);
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        crate::account::require_supported_account_control(&tx, account_id)?;
         if coverage::stream_pending(&tx, stream_id)? {
             continue;
         }
@@ -564,6 +568,8 @@ pub fn table_sync_validate_stream(
     account_id: AccountId,
     stream: &TableSyncStream,
 ) -> anyhow::Result<bool> {
+    let _snapshot = crate::account::control_policy::read_snapshot(conn)?;
+    crate::account::require_supported_account_control(conn, account_id)?;
     validate_stream_against(conn, account_id, stream, SYNCABLE_TABLES)
 }
 
@@ -575,6 +581,8 @@ pub fn table_sync_chain_page_after(
     after_device: Option<[u8; 32]>,
     limit: usize,
 ) -> anyhow::Result<Vec<TableSyncChainHead>> {
+    let _snapshot = crate::account::control_policy::read_snapshot(conn)?;
+    crate::account::require_supported_account_control(conn, account_id)?;
     if limit == 0 || !table_sync_validate_stream(conn, account_id, stream)? {
         return Ok(Vec::new());
     }
@@ -588,6 +596,8 @@ pub fn table_sync_chain_frontier(
     stream: &TableSyncStream,
     device_fingerprint: [u8; 32],
 ) -> anyhow::Result<TableSyncFrontier> {
+    let _snapshot = crate::account::control_policy::read_snapshot(conn)?;
+    crate::account::require_supported_account_control(conn, account_id)?;
     if !table_sync_validate_stream(conn, account_id, stream)? {
         return Ok(TableSyncFrontier::Empty);
     }
@@ -603,6 +613,8 @@ pub fn table_sync_chain_entries(
     start: TableSyncEntryStart,
     limit: usize,
 ) -> anyhow::Result<Vec<TableSyncChainEntry>> {
+    let _snapshot = crate::account::control_policy::read_snapshot(conn)?;
+    crate::account::require_supported_account_control(conn, account_id)?;
     if limit == 0 || !table_sync_validate_stream(conn, account_id, stream)? {
         return Ok(Vec::new());
     }
@@ -616,6 +628,8 @@ pub fn table_sync_has_pending_coverage(
     account_id: AccountId,
     stream: &TableSyncStream,
 ) -> anyhow::Result<bool> {
+    let _snapshot = crate::account::control_policy::read_snapshot(conn)?;
+    crate::account::require_supported_account_control(conn, account_id)?;
     Ok(table_sync_validate_stream(conn, account_id, stream)?
         && coverage::stream_pending(conn, StreamId::from_bytes(stream.stream_id))?)
 }
@@ -1044,6 +1058,7 @@ fn ingest_received_against(
         .context("table sync requires an existing local device identity")?;
     let registry = repo_registry(registry);
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    crate::account::require_supported_account_control(&tx, account_id)?;
     let ctx = SyncCtx {
         repo_id: &stream.repo_id,
         account_id,

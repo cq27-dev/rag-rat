@@ -388,8 +388,8 @@ pub fn roster_ref_effective(
     roster_ref: RosterRef,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    roster_ref_effective_in_snapshot(&read_tx, account_id, roster_ref, device_fingerprint)
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    roster_ref_effective_in_snapshot(conn, account_id, roster_ref, device_fingerprint)
 }
 
 fn roster_ref_effective_in_snapshot(
@@ -416,6 +416,8 @@ fn load_roster_fact(
     account_id: AccountId,
     roster_ref: &RosterRef,
 ) -> anyhow::Result<Option<(fold::RosterAuthority, i64, Option<i64>)>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, role, effective_at, closed_at
@@ -441,9 +443,9 @@ pub fn roster_content_authority(
     device_fingerprint: DeviceFingerprint,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterContentAuthority>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
     roster_content_authority_in_snapshot(
-        &read_tx,
+        conn,
         account_id,
         roster_ref,
         device_fingerprint,
@@ -563,8 +565,8 @@ fn owner_chain_authority(
     device_fingerprint: DeviceFingerprint,
     chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    owner_chain_authority_in_snapshot(&read_tx, account_id, owner_id, device_fingerprint, chain)
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    owner_chain_authority_in_snapshot(conn, account_id, owner_id, device_fingerprint, chain)
 }
 
 /// The body of [`owner_chain_authority`], reading whatever snapshot `conn` is already in.
@@ -575,6 +577,8 @@ fn owner_chain_authority_in_snapshot(
     device_fingerprint: DeviceFingerprint,
     chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let chain = chain.column_prefix();
     let sql = format!(
         "SELECT o.device_fingerprint, o.effective_at, o.closed_at,
@@ -727,6 +731,8 @@ pub(in crate::account) fn usable_snapshots(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<UsableSnapshot>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let rows = load_candidates(conn, account_id)?;
     let held: Vec<envelope::VerifiedAccountEntry> =
         rows.iter().map(|row| row.verified.clone()).collect();
@@ -794,8 +800,8 @@ pub fn owner_incarnation_effective(
     owner_id: OwnerId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerAuthority>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn: &Connection = &read_tx;
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, effective_at, closed_at
@@ -825,8 +831,8 @@ pub fn grant_effective(
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    grant_effective_in_snapshot(&read_tx, owner_account_id, grant_id, stream_id, grantee_account_id)
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    grant_effective_in_snapshot(conn, owner_account_id, grant_id, stream_id, grantee_account_id)
 }
 
 /// The body of [`grant_effective`], reading whatever snapshot `conn` is already in — so an
@@ -839,6 +845,9 @@ pub fn grant_effective_in_snapshot(
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
     let row: Option<StoredGrantRow> = conn
         .query_row(
             "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
@@ -873,6 +882,9 @@ pub fn effective_writer_grant(
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<Option<GrantId>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
     let grant_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT grant_id FROM account_stream_grants
@@ -903,6 +915,9 @@ pub fn open_writer_grants(
     stream_id: StreamId,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<Vec<GrantId>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT grant_id FROM account_stream_grants
          WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
@@ -943,6 +958,8 @@ pub fn stream_grants_for_owner(
     owner_account_id: AccountId,
     stream_id: StreamId,
 ) -> anyhow::Result<Vec<StreamGrantListing>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT grant_id, grantee_account_id, role, closed_at IS NULL
          FROM account_stream_grants
@@ -983,6 +1000,8 @@ pub fn effective_writer_grantees(
     conn: &Connection,
     owner_account_id: AccountId,
 ) -> anyhow::Result<Vec<AccountId>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT DISTINCT grantee_account_id FROM account_stream_grants
          WHERE owner_account_id = ?1 AND role = ?2 AND closed_at IS NULL
@@ -1060,6 +1079,8 @@ pub fn account_holds_effective_public_writer_grant(
     conn: &Connection,
     grantee_account_id: AccountId,
 ) -> anyhow::Result<bool> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT owner_account_id, stream_id FROM account_stream_grants
          WHERE grantee_account_id = ?1 AND role = ?2 AND closed_at IS NULL",
@@ -1091,9 +1112,9 @@ pub fn grant_effective_for_device(
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantDeviceAuthority>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
     grant_effective_for_device_in_snapshot(
-        &read_tx,
+        conn,
         owner_account_id,
         grant_id,
         stream_id,
@@ -1112,6 +1133,9 @@ pub fn grant_effective_for_device_in_snapshot(
     grantee_account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantDeviceAuthority>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
     let row: Option<StoredGrantRow> = conn
         .query_row(
             "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
@@ -1149,8 +1173,8 @@ pub fn stream_owner_effective(
     account_id: AccountId,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<AccountEntryHash>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    stream_owner_effective_in_snapshot(&read_tx, account_id, stream_id)
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    stream_owner_effective_in_snapshot(conn, account_id, stream_id)
 }
 
 /// The body of [`stream_owner_effective`], reading whatever snapshot `conn` is already in — see
@@ -1160,6 +1184,8 @@ pub fn stream_owner_effective_in_snapshot(
     account_id: AccountId,
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<AccountEntryHash>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT own_id, effective_at FROM account_stream_ownership
@@ -1182,8 +1208,8 @@ pub(super) fn grant_device_cut(
     grant_id: GrantId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<Option<DeviceCut>>> {
-    let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn: &Connection = &read_tx;
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
     let grant_exists: bool = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM account_stream_grants
@@ -1238,6 +1264,8 @@ pub fn stream_owner_account(
     conn: &Connection,
     stream_id: StreamId,
 ) -> anyhow::Result<Option<AccountId>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_stream_control(conn, stream_id)?;
     let owner: Option<Vec<u8>> = conn
         .query_row(
             "SELECT account_id FROM account_stream_ownership WHERE stream_id = ?1",
@@ -1262,6 +1290,8 @@ pub fn stream_access_mode(
     owner_account_id: AccountId,
     stream_id: StreamId,
 ) -> anyhow::Result<AccessMode> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
     let own_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT own_id FROM account_stream_ownership
@@ -1311,6 +1341,8 @@ pub fn stream_access_mode(
 /// `PublicOnly` content gates on this so a mis-flagged account leaks nothing, independent of how
 /// its policy was selected.
 pub fn account_is_fully_public(conn: &Connection, account_id: AccountId) -> anyhow::Result<bool> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let mut stmt = conn.prepare(
         "SELECT signed_bytes FROM account_entries
          WHERE account_id = ?1 AND entry_type = ?2 AND log_id = ?3",
@@ -1348,6 +1380,8 @@ pub fn account_is_fully_public(conn: &Connection, account_id: AccountId) -> anyh
 /// event (§12), which HALTS authority mutation. Content authorized by a contested account is
 /// fail-closed: parked (quota-bounded), never accepted, and reclassified if the account recovers.
 pub fn account_is_contested(conn: &Connection, account_id: AccountId) -> anyhow::Result<bool> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let classification: Option<String> = conn
         .query_row(
             "SELECT classification FROM account_auth_state WHERE account_id = ?1",
@@ -1403,6 +1437,8 @@ pub fn held_control_log_len(conn: &Connection, account_id: AccountId) -> anyhow:
 /// straddle two folds. Zero for an account we hold nothing for (its facts resolve `Unknown` long
 /// before freshness).
 pub fn account_effective_count(conn: &Connection, account_id: AccountId) -> anyhow::Result<u64> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let effective_count: Option<i64> = conn
         .query_row(
             "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
@@ -1429,6 +1465,8 @@ pub(in crate::account) fn effective_owner_incarnation_for_device(
     account_id: AccountId,
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<OwnerId>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let owner_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT owner_id FROM account_owner_incarnations
@@ -1591,6 +1629,17 @@ fn fold_account_state_in_tx(
     now_ms: i64,
     promotion: PreVerifyPromotion,
 ) -> anyhow::Result<AccountStateFold> {
+    if matches!(
+        super::control_policy::account_control_policy(tx, account_id)?,
+        super::control_policy::AccountControlPolicy::UnsupportedVersion(_)
+    ) {
+        clear_unsupported_authority_in_tx(tx, account_id)?;
+        return Ok(AccountStateFold {
+            statuses: HashMap::new(),
+            affected_streams: Vec::new(),
+            rejected_content_promotions: Default::default(),
+        });
+    }
     let rows = load_candidates(tx, account_id)?;
     let projection = derive_account_projection(&rows);
 
@@ -1662,6 +1711,8 @@ pub fn owned_streams_for_account(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<StreamId>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     owned_stream_bytes(conn, account_id)
         .map(|streams| streams.into_iter().map(StreamId::from_bytes).collect())
 }
@@ -1679,6 +1730,46 @@ fn owned_stream_bytes(conn: &Connection, account_id: AccountId) -> anyhow::Resul
 
 /// Replace every query-ready authority fact for this account. The caller's IMMEDIATE refold txn
 /// also owns accepted/status, so readers can never observe authority from a different fold round.
+pub(super) fn clear_unsupported_authority_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+) -> anyhow::Result<()> {
+    tx.execute(
+        "UPDATE content_entries SET accepted=0 WHERE author_account_id=?1 OR stream_id IN (SELECT \
+         stream_id FROM account_control_pin_streams WHERE account_id=?1)",
+        [account_id.to_bytes().as_slice()],
+    )?;
+    tx.execute("UPDATE account_entries SET accepted=0 WHERE account_id=?1", [account_id
+        .to_bytes()
+        .as_slice()])?;
+    tx.execute(
+        "UPDATE account_entry_status SET status='retained_unfolded', detail='unsupported_version' \
+         WHERE entry_hash IN (SELECT entry_hash FROM account_entries WHERE account_id=?1)",
+        [account_id.to_bytes().as_slice()],
+    )?;
+    let account = account_id.to_bytes();
+    for table in [
+        "account_roster_content_boundaries",
+        "account_roster_history",
+        "account_owner_incarnations",
+        "account_stream_ownership",
+        "account_stream_grants",
+        "account_stream_grant_cuts",
+        "account_auth_state",
+        "account_repo_incarnation_current",
+    ] {
+        let account_column = match table {
+            "account_stream_grants" | "account_stream_grant_cuts" => "owner_account_id",
+            _ => "account_id",
+        };
+        tx.execute(&format!("DELETE FROM {table} WHERE {account_column} = ?1"), [
+            account.as_slice()
+        ])?;
+    }
+
+    Ok(())
+}
+
 fn rewrite_authority_projection(
     tx: &Transaction<'_>,
     account_id: AccountId,
@@ -2723,6 +2814,8 @@ pub(super) fn list_effective_roster_x25519_pubkeys(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<(DeviceFingerprint, DeviceX25519Public)>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     // The effective set + the enrolling entry each device's key must come from. DISTINCT because
     // one device can (in principle) key more than one `roster_ref` row.
     let mut stmt = conn.prepare(
@@ -2753,6 +2846,8 @@ pub(super) fn effective_roster_x25519_pubkey(
     account_id: AccountId,
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<DeviceX25519Public>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let roster_ref: Option<Vec<u8>> = conn
         .query_row(
             "SELECT roster_ref FROM account_roster_history
@@ -2785,6 +2880,8 @@ pub(super) fn list_effective_roster_fingerprints(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<DeviceFingerprint>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let mut stmt = conn.prepare(
         "SELECT DISTINCT device_fingerprint FROM account_roster_history
          WHERE account_id = ?1 AND closed_at IS NULL
@@ -2804,6 +2901,8 @@ pub(super) fn effective_roster_entry_in_snapshot(
     account_id: AccountId,
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<(RosterRef, ops::DeviceRole)>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, String)> = conn
         .query_row(
             "SELECT roster_ref, role FROM account_roster_history
@@ -2831,6 +2930,8 @@ pub(crate) fn device_is_effective_writer(
     account_id: AccountId,
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<bool> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    super::control_policy::require_supported_account_control(conn, account_id)?;
     Ok(conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM account_roster_history

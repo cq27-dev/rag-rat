@@ -79,10 +79,6 @@ pub fn adopt_local_account(
     genesis_hash: AccountEntryHash,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    if let Some(existing) = read_local_account(conn)? {
-        anyhow::ensure!(existing == account_id, "store already belongs to another local account");
-        return Ok(());
-    }
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     adopt_local_account_in_tx(&tx, account_id, genesis_hash, now_ms)?;
@@ -250,8 +246,10 @@ pub fn adopt_enrollment_bootstrap(
     conn: &Connection,
     bootstrap: EnrollmentBootstrap<'_>,
 ) -> anyhow::Result<()> {
+    super::control_policy::require_supported_account_control(conn, bootstrap.account_id)?;
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    super::control_policy::require_supported_account_control(&tx, bootstrap.account_id)?;
     // Ingest in CAUSAL order — an entry only after the entry introducing its signer's key. The
     // receipt's raw `(log_id, seq, entry_hash)` order puts EVERY promoted device's seq-0 control
     // entry before the founder-chain DeviceAdd introducing its key, so raw-order ingestion parks
@@ -343,6 +341,7 @@ fn adopt_local_account_in_tx(
     genesis_hash: AccountEntryHash,
     now_ms: i64,
 ) -> anyhow::Result<()> {
+    super::control_policy::require_supported_account_control(tx, account_id)?;
     if let Some(existing) = read_local_account(tx)? {
         anyhow::ensure!(existing == account_id, "store already belongs to another local account");
         return Ok(());

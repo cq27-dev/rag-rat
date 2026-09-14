@@ -124,11 +124,13 @@ pub fn content_ingest(
             signed.header.lamport
         )));
     }
-    if let Some(status) = stored_status_for_exact_envelope(conn, &signed, signed_bytes)? {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    crate::account::require_supported_account_control(&tx, signed.header.author_account_id)?;
+    super::super::control_policy::require_supported_stream_control(&tx, signed.header.stream_id)?;
+    if let Some(status) = stored_status_for_exact_envelope(&tx, &signed, signed_bytes)? {
         return Ok(ContentIngestOutcome::Ingested { status });
     }
 
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let public = match resolve_roster_key(&tx, &signed) {
         Ok(Some(public)) => public,
         Ok(None) => {
@@ -527,7 +529,9 @@ pub(super) fn insert_candidate(
     entry: &VerifiedContentEntry,
     signed_bytes: &[u8],
     now_ms: i64,
-) -> rusqlite::Result<()> {
+) -> anyhow::Result<()> {
+    crate::account::require_supported_account_control(tx, entry.header.author_account_id)?;
+    super::super::control_policy::require_supported_stream_control(tx, entry.header.stream_id)?;
     tx.execute(
         "INSERT OR IGNORE INTO content_entries(
              entry_hash, stream_id, author_account_id, device_fingerprint, seq, prev_hash,
@@ -2694,6 +2698,8 @@ pub fn content_entries_for_sync(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<SyncContentEntry>> {
+    let _snapshot = super::super::control_policy::read_snapshot(conn)?;
+    super::super::control_policy::require_supported_account_control(conn, account_id)?;
     let mut out = Vec::new();
 
     // `seq` is stored big-endian (`u64::to_be_bytes`), so ordering the BLOB column directly yields
@@ -2751,6 +2757,9 @@ pub fn content_entries_for_sync(
         });
     }
 
+    for entry in &out {
+        super::super::control_policy::require_supported_stream_control(conn, entry.stream_id)?;
+    }
     Ok(out)
 }
 
@@ -2772,6 +2781,8 @@ pub fn content_entries_for_public_sync(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<SyncContentEntry>> {
+    let _snapshot = super::super::control_policy::read_snapshot(conn)?;
+    super::super::control_policy::require_supported_account_control(conn, account_id)?;
     // Resolved once per distinct stream: an account's rows span very few streams, and each miss
     // costs an ownership lookup plus a StreamOwn decode.
     let mut public: std::collections::HashMap<StreamId, bool> = std::collections::HashMap::new();

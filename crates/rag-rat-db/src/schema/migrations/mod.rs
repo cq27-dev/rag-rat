@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::AppliedMigration;
 
 mod steps;
-
+pub use steps::account_checkpoint::apply_account_control_pins;
 // The step index: every function the roster names, plus the step helpers the rest of the crate
 // (the baseline, the ladder, the engine's bootstrap fixtures) calls.
 pub(crate) use steps::clones::apply_clone_subblock_postings_tables;

@@ -366,6 +366,7 @@ pub fn prepare_checkpoint_in_tx(
     account: AccountId,
     signer: &LocalDevice,
 ) -> anyhow::Result<CheckpointBundle> {
+    super::control_policy::require_supported_account_control(tx, account)?;
     let evidence = storage::account_entries_for_enrollment(tx, account)?
         .into_iter()
         .map(|entry| entry.signed_bytes)

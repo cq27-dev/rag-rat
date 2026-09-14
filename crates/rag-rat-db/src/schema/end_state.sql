@@ -2196,6 +2196,31 @@ CREATE TABLE table_sync_suffix_coverage(
             tip_hash BLOB NOT NULL CHECK(length(tip_hash) = 32),
             PRIMARY KEY(stream_id, device_fingerprint)
         ) STRICT;
+CREATE TABLE account_control_pins(
+            account_id BLOB PRIMARY KEY CHECK(length(account_id)=32),
+            checkpoint_digest BLOB NOT NULL CHECK(length(checkpoint_digest)=32),
+            required_version INTEGER NOT NULL CHECK(required_version=2),
+            certificate BLOB NOT NULL CHECK(length(certificate)<=1024)
+        ) WITHOUT ROWID;
+CREATE TABLE account_control_pin_evidence(
+            account_id BLOB NOT NULL,
+            ordinal INTEGER NOT NULL,
+            signed_bytes BLOB NOT NULL,
+            PRIMARY KEY(account_id, ordinal)
+        ) WITHOUT ROWID;
+CREATE TABLE account_control_pin_streams(
+            account_id BLOB NOT NULL, stream_id BLOB NOT NULL,
+            PRIMARY KEY(account_id, stream_id)
+        ) WITHOUT ROWID;
+CREATE INDEX account_control_pin_stream_lookup ON account_control_pin_streams(stream_id);
+CREATE TRIGGER account_control_pin_no_update BEFORE UPDATE ON account_control_pins
+        BEGIN SELECT RAISE(ABORT, 'account control pin is permanent'); END;
+CREATE TRIGGER account_control_pin_no_delete BEFORE DELETE ON account_control_pins
+        BEGIN SELECT RAISE(ABORT, 'account control pin is permanent'); END;
+CREATE TRIGGER account_control_evidence_no_update BEFORE UPDATE ON account_control_pin_evidence
+        BEGIN SELECT RAISE(ABORT, 'account checkpoint evidence is permanent'); END;
+CREATE TRIGGER account_control_evidence_no_delete BEFORE DELETE ON account_control_pin_evidence
+        BEGIN SELECT RAISE(ABORT, 'account checkpoint evidence is permanent'); END;
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('001_sqlite_storage_baseline',1789374675829,'sha256:rag-rat-sqlite-baseline-v1','SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('002_embedding_vector_metadata',1789374675829,'sha256:rag-rat-embedding-vector-metadata-v2','Add embedding model dimension metadata and per-vector dimensions for hybrid vector search');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('003_derived_artifact_reconcile_metadata',1789374675829,'sha256:rag-rat-derived-artifact-reconcile-metadata-v3','Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation');
@@ -2325,5 +2350,6 @@ INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALU
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('127_tombstone_statements',1789374676265,'sha256:rag-rat-tombstone-statements-v127','Add sync_tombstone_statements: per chain that states a row''s current tombstone, the lamport of that chain''s newest statement, so a writer can restate its own deletes at its tail and retention can reclaim the entries that first stated them (#1295); backfilled with one statement per tombstone at its own identity');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('128_table_sync_row_diagnostics',1789402525979,'sha256:rag-rat-table-sync-row-diagnostics-v128','Persist local per-row table-sync diagnostic causes independently of pending entries (#1020)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('129_table_sync_suffix_coverage',1789406001601,'sha256:rag-rat-table-sync-suffix-coverage-v129','Retain promised suffix tips across interrupted table floor adoption (#892)');
+INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('130_account_control_pins',1789415332136,'sha256:rag-rat-account-control-pins-v130','Retain permanent external account checkpoint pins and signed evidence (#1311)');
 INSERT INTO "repos"("repo_id","display_name","registered_at_ms") VALUES('__unassigned__','',0);
 INSERT INTO "content_digest_state"("id","state","rows_folded") VALUES(1,'0000000000000000000000000000000000000000000000000000000000000000',0);
