@@ -16,8 +16,22 @@ const INITIAL_BACKFILL_BOUNDARY: &str = "2970-12-31T23:59:59Z";
 /// later runs enter the normal probe/delta path and discover items created after that walk.
 const EMPTY_PROJECT_HIGH_MARK: &str = "1970-01-01T00:00:00Z";
 
+/// One item's identity in the cursor's `delta_processed_keys` / `backfill_processed_keys` /
+/// `item_thread_cursor` JSON. `kind` serializes as its [`ItemKind`] token (`issue` /
+/// `change_request`), so the stored spelling is the persisted token. The sets serialize in variant
+/// order (`Ord`), not lexical token order; every read is a membership test, so order is
+/// meaningless.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ProcessedItem {
+    kind: ItemKind,
+    key: String,
+    updated_at: Option<String>,
+}
+
+/// A stored [`ProcessedItem`] with its kind still a raw token, so an entry whose kind is outside
+/// [`ItemKind`] can be skipped instead of failing the whole cursor decode.
+#[derive(Deserialize)]
+struct StoredProcessedItem {
     kind: String,
     key: String,
     updated_at: Option<String>,
@@ -281,7 +295,7 @@ enum PageLane {
 
 fn processed_item(item: &PapertrailItem) -> ProcessedItem {
     ProcessedItem {
-        kind: item.item_kind.as_db_str().to_string(),
+        kind: item.item_kind,
         key: item.item_key.clone(),
         updated_at: item.updated_at.clone(),
     }
@@ -548,9 +562,10 @@ impl<C: PapertrailClient> MirrorWalk<'_, C> {
         lane: PageLane,
     ) -> anyhow::Result<()> {
         if let Some(active) = self.cursor.item_thread_cursor.clone() {
-            if let Some(item) = items.iter().find(|item| {
-                item.item_kind.as_db_str() == active.item.kind && item.item_key == active.item.key
-            }) {
+            if let Some(item) = items
+                .iter()
+                .find(|item| item.item_kind == active.item.kind && item.item_key == active.item.key)
+            {
                 let current = processed_item(item);
                 if current != active.item {
                     let mut item = item.clone();
@@ -630,7 +645,7 @@ impl<C: PapertrailClient> MirrorWalk<'_, C> {
     async fn resume_item_thread(&mut self) -> anyhow::Result<()> {
         loop {
             let thread = self.cursor.item_thread_cursor.clone().expect("active item thread");
-            let kind = ItemKind::from_db_str(&thread.item.kind)?;
+            let kind = thread.item.kind;
             let streams = self.client.item_comment_streams(kind);
             let Some(stream) = streams.get(thread.stream_index) else {
                 if thread.saw_pagination
@@ -775,7 +790,7 @@ fn load_cursor(conn: &Connection, binding: &ResolvedTracker) -> anyhow::Result<M
                     item_delta_in_progress: row.get(12)?,
                     item_delta_replay_required: row.get(13)?,
                     backfill_page_cursor: decode_json(row.get(14)?, 14)?,
-                    item_thread_cursor: decode_json(row.get(15)?, 15)?,
+                    item_thread_cursor: decode_item_thread_cursor(row.get(15)?, 15)?,
                     delta_processed_keys: decode_processed_items(row.get(16)?, 16)?,
                     backfill_processed_keys: decode_processed_items(row.get(17)?, 17)?,
                     full_rewalk: row.get(18)?,
@@ -878,24 +893,56 @@ fn decode_json<T: serde::de::DeserializeOwned + Default>(
     )
 }
 
+/// Decode a processed-key set. Legacy rows are bare `(kind, key)` pairs. An entry whose kind is
+/// outside [`ItemKind`] is SKIPPED: the sets are membership-only, so a drifted entry costs one
+/// re-processed item, where failing the decode would wedge the walk.
 fn decode_processed_items(
     value: Option<String>,
     column: usize,
 ) -> rusqlite::Result<BTreeSet<ProcessedItem>> {
     let Some(value) = value else { return Ok(BTreeSet::new()) };
-    if let Ok(items) = serde_json::from_str(&value) {
-        return Ok(items);
-    }
-    serde_json::from_str::<BTreeSet<(String, String)>>(&value)
-        .map(|legacy| {
-            legacy
-                .into_iter()
-                .map(|(kind, key)| ProcessedItem { kind, key, updated_at: None })
-                .collect()
+    let stored = serde_json::from_str::<Vec<StoredProcessedItem>>(&value)
+        .or_else(|_| {
+            serde_json::from_str::<Vec<(String, String)>>(&value).map(|legacy| {
+                legacy
+                    .into_iter()
+                    .map(|(kind, key)| StoredProcessedItem { kind, key, updated_at: None })
+                    .collect()
+            })
         })
         .map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+        })?;
+    Ok(stored
+        .into_iter()
+        .filter_map(|item| {
+            Some(ProcessedItem {
+                kind: ItemKind::from_db_str(&item.kind).ok()?,
+                key: item.key,
+                updated_at: item.updated_at,
+            })
         })
+        .collect())
+}
+
+/// Decode the active item-thread cursor. A cursor whose item kind is outside [`ItemKind`] is
+/// dropped, so that one item is re-processed from its page; any other malformation still fails
+/// the decode exactly as [`decode_json`] does.
+fn decode_item_thread_cursor(
+    value: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<ItemThreadCursor>> {
+    let drifted_kind = value
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|json| {
+            json["item"]["kind"].as_str().map(|kind| ItemKind::from_db_str(kind).is_err())
+        })
+        .unwrap_or(false);
+    if drifted_kind {
+        return Ok(None);
+    }
+    decode_json(value, column)
 }
 
 fn reset_for_full_rewalk(
@@ -1853,6 +1900,46 @@ mod tests {
         ] {
             assert_eq!(previous_civil_day(year, month, day), expected, "{year}-{month}-{day}");
         }
+    }
+
+    #[test]
+    fn processed_item_cursor_json_keeps_the_kind_tokens_and_tolerates_drifted_ones() {
+        let items = BTreeSet::from([
+            ProcessedItem { kind: ItemKind::ChangeRequest, key: "2".into(), updated_at: None },
+            ProcessedItem { kind: ItemKind::Issue, key: "1".into(), updated_at: Some("t".into()) },
+        ]);
+        let json = serde_json::to_string(&items).unwrap();
+        assert_eq!(
+            json,
+            r#"[{"kind":"issue","key":"1","updated_at":"t"},{"kind":"change_request","key":"2","updated_at":null}]"#,
+            "the persisted kind spellings are the ItemKind tokens"
+        );
+        assert_eq!(decode_processed_items(Some(json), 16).unwrap(), items);
+        let keys = |raw: &str| {
+            decode_processed_items(Some(raw.to_string()), 16)
+                .unwrap()
+                .into_iter()
+                .map(|item| item.key)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keys(
+                r#"[{"kind":"issue","key":"1","updated_at":null},{"kind":"Issue","key":"2","updated_at":null}]"#
+            ),
+            ["1"],
+            "a drifted kind is skipped, never a failed decode"
+        );
+        assert_eq!(keys(r#"[["issue","1"],["pull","2"]]"#), ["1"], "legacy pairs skip it too");
+        let thread = |kind: &str| {
+            format!(
+                r#"{{"item":{{"kind":"{kind}","key":"1","updated_at":null}},"lane":"delta","stream_index":0,"page_cursor":null}}"#
+            )
+        };
+        assert!(decode_item_thread_cursor(Some(thread("issue")), 15).unwrap().is_some());
+        assert!(
+            decode_item_thread_cursor(Some(thread("pull")), 15).unwrap().is_none(),
+            "a drifted thread kind drops the cursor so the item is re-processed"
+        );
     }
 
     /// A quiet probe must not starve an OWED boundary replay: providers without a probe
@@ -3374,7 +3461,7 @@ mod tests {
 
         let legacy = decode_processed_items(Some(r#"[["issue","1"]]"#.to_string()), 0).unwrap();
         assert!(legacy.contains(&ProcessedItem {
-            kind: "issue".to_string(),
+            kind: ItemKind::Issue,
             key: "1".to_string(),
             updated_at: None,
         }));
