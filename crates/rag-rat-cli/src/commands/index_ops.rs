@@ -162,6 +162,8 @@ fn surface_adoption_warnings(config: &Config) -> anyhow::Result<()> {
 }
 
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
+    // Deliberately no repo flock: holding it for the bulk embed budget would starve the watcher;
+    // SQLite writer serialization covers the short per-batch commits.
     let db = open_index(config)?;
     // INVARIANT (#312): this `--plan` early-return MUST stay ABOVE the `--reencode-vectors`
     // mutation below. `--plan` is a READ-ONLY dry run; returning here first is what keeps
