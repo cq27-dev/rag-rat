@@ -37,7 +37,11 @@ pub(crate) fn current_chunk_row(
         symbol_path: row.get(5)?,
         text: String::new(),
         text_hash: row.get(6)?,
-        embedding_status: row.get(7)?,
+        embedding_status: row
+            .get::<_, Option<String>>(7)?
+            .as_deref()
+            .and_then(ArtifactStatus::from_db_str),
+        embedding_status_present: row.get::<_, Option<String>>(7)?.is_some(),
         source_text_hash: row.get(8)?,
         model_version: row.get(9)?,
         embedding_dim: row.get(10)?,
@@ -67,7 +71,11 @@ fn candidate_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CurrentCh
         symbol_path: row.get(5)?,
         text: String::new(),
         text_hash: row.get(6)?,
-        embedding_status: row.get(7)?,
+        embedding_status: row
+            .get::<_, Option<String>>(7)?
+            .as_deref()
+            .and_then(ArtifactStatus::from_db_str),
+        embedding_status_present: row.get::<_, Option<String>>(7)?.is_some(),
         source_text_hash: row.get(8)?,
         model_version: row.get(9)?,
         embedding_dim: row.get(10)?,
@@ -706,4 +714,25 @@ pub(crate) fn store_failed_embedding(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod artifact_status_read_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_artifact_status_retains_row_presence_for_reason_classification() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut chunk = conn
+            .query_row(
+                "SELECT 1, 'a.rs', 'rust', 'source', 'code', NULL, 'new', 'FutureStatus', 'old', \
+                 NULL, NULL, NULL, NULL, NULL, 'Embed', 0",
+                [],
+                candidate_metadata_row,
+            )
+            .unwrap();
+        chunk.reason = ReconcileReason::Missing;
+        assert_eq!(chunk.embedding_status, None);
+        assert_eq!(chunk.reason("v", 1, 0, 4000), ReconcileReason::SourceChanged);
+    }
 }

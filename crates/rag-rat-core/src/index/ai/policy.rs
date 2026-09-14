@@ -50,7 +50,7 @@ pub(crate) const EMBEDDING_POLICY_CAP_KEY: &str = "embedding_policy_cap";
 /// metadata-fresh chunk actually reaches the input-hash clause — the only staleness signal that
 /// reads the text.
 pub(crate) fn is_stale_without_text(chunk: &CurrentChunk, model_version: &str, dim: usize) -> bool {
-    chunk.embedding_status.as_deref() != Some(ArtifactStatus::Current.as_str())
+    chunk.embedding_status != Some(ArtifactStatus::Current)
         || chunk.source_text_hash.as_deref() != Some(chunk.text_hash.as_str())
         || chunk.model_version.as_deref() != Some(model_version)
         || chunk.embedding_dim != Some(i64::try_from(dim).unwrap_or(i64::MAX))

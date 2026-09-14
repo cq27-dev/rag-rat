@@ -271,7 +271,7 @@ pub(crate) fn status_artifact_count(
         WHERE chunk_embeddings.model_id = ?1 AND chunk_embeddings.status = ?2
     ";
     let count =
-        conn.query_row(sql, params![model_id, status.as_str()], |row| row.get::<_, i64>(0))?;
+        conn.query_row(sql, params![model_id, status.as_db_str()], |row| row.get::<_, i64>(0))?;
     Ok(u64::try_from(count).unwrap_or(0))
 }
 

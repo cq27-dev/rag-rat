@@ -201,7 +201,7 @@ pub(crate) fn embedding_reconcile_plan(
         }
         let metadata_current = {
             let job = &candidate.chunk;
-            job.embedding_status.as_deref() == Some(ArtifactStatus::Current.as_str())
+            job.embedding_status == Some(ArtifactStatus::Current)
                 && job.source_text_hash.as_deref() == Some(job.text_hash.as_str())
                 && job.model_version.as_deref() == Some(model_version)
                 && job.embedding_dim == Some(i64::try_from(dim).unwrap_or(i64::MAX))
@@ -233,12 +233,12 @@ pub(crate) fn embedding_reconcile_plan(
             ReconcileReason::Forced => missing += 1,
         }
         *missing_by_priority.entry(priority_label(policy.priority).to_string()).or_default() += 1;
-        if job.embedding_status.as_deref() == Some(ArtifactStatus::Failed.as_str())
+        if job.embedding_status == Some(ArtifactStatus::Failed)
             && job.next_retry_after_ms.unwrap_or(0) > now_ms()
         {
             failed_waiting += 1;
         }
-        if job.embedding_status.as_deref() == Some(ArtifactStatus::Blocked.as_str()) {
+        if job.embedding_status == Some(ArtifactStatus::Blocked) {
             blocked += 1;
         }
         Ok(())
@@ -308,11 +308,54 @@ pub(crate) fn last_reconcile_status(
                 input_chars,
                 chunks_per_sec: embeddings_written as f64 / elapsed_secs,
                 chars_per_sec: input_chars as f64 / elapsed_secs,
-                status: row.get(8)?,
+                status: ReconcileStatus::from_db_str(&row.get::<_, String>(8)?),
+                raw_status: row.get(8)?,
                 message: row.get(9)?,
             })
         },
     )
     .optional()
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod status_token_tests {
+    use super::*;
+
+    #[test]
+    fn last_reconcile_wire_retains_running_and_unknown_tokens() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        for token in ["Current", "Blocked", "Partial", "Failed", "Running", "FutureStatus"] {
+            conn.execute("DELETE FROM reconcile_attempts", []).unwrap();
+            conn.execute(
+                "INSERT INTO reconcile_attempts(started_at_ms, status, batch_size) VALUES (1, ?1, \
+                 8)",
+                [token],
+            )
+            .unwrap();
+            let status = last_reconcile_status(&conn).unwrap().unwrap();
+            assert_eq!(status.status, ReconcileStatus::from_db_str(token));
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire["status"], token);
+            assert!(wire.get("raw_status").is_none());
+        }
+    }
+
+    #[test]
+    fn artifact_tokens_match_wire() {
+        for (status, token) in [
+            (ArtifactStatus::Current, "Current"),
+            (ArtifactStatus::Missing, "Missing"),
+            (ArtifactStatus::Stale, "Stale"),
+            (ArtifactStatus::Failed, "Failed"),
+            (ArtifactStatus::Blocked, "Blocked"),
+            (ArtifactStatus::Disabled, "Disabled"),
+        ] {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(ArtifactStatus::from_db_str(token), Some(status));
+            assert_eq!(serde_json::to_value(status).unwrap(), token);
+        }
+        assert_eq!(ArtifactStatus::from_db_str("future"), None);
+    }
 }

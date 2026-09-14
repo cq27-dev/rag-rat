@@ -1853,7 +1853,7 @@ fn reconcile_status_ignores_a_sibling_repos_attempt() {
     }
     let status =
         fx.db.llm_status().unwrap().last_reconcile.expect("repo A has a reconcile attempt");
-    assert_eq!(status.status, "Ok", "the status must be repo A's, not repo B's newer attempt");
+    assert_eq!(status.raw_status, "Ok", "the status must be repo A's, not repo B's newer attempt");
     assert_eq!(status.started_at_ms, 100);
     let _ = fs::remove_dir_all(&fx.root_a);
 }
