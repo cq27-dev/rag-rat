@@ -63,17 +63,13 @@ mod listener {
     use tokio::task::JoinHandle;
 
     use super::{HookRequest, HookResponse, PROTOCOL_VERSION};
+    // Shared with the MCP output trim, so both dedup lanes resurface an item after the same
+    // window.
+    use crate::output_trim::RESURFACE_WINDOW;
 
     const ELECTION_RETRY: Duration = Duration::from_secs(5);
     const SESSION_CAP: usize = 64;
     const SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-    /// How long an injected memory / symbol stays deduped for a session before it may resurface
-    /// (#759). Measured between FULL SURFACES, not encounters: a suppressed repeat does NOT refresh
-    /// the timestamp, so an item stays hidden for exactly one window after its last SHOW, then
-    /// resurfaces — the same non-sliding semantics as the MCP output trim (#752). Matches that
-    /// window so the two dedup paths behave alike. Replaces the old monotonic "shown once, hidden
-    /// for the whole session" filter, which dropped context an agent would still benefit from.
-    const RESURFACE_WINDOW: Duration = Duration::from_secs(30 * 60);
     /// > client's 250 ms timeout; a stalled peer cannot wedge the serialized accept loop.
     const READ_BUDGET: Duration = Duration::from_millis(500);
 
