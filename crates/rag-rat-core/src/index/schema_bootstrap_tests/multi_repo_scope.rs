@@ -1558,16 +1558,20 @@ fn dream_candidate_builders_ignore_a_sibling_repos_memories() {
     .unwrap();
 
     assert!(
-        report
-            .findings
-            .iter()
-            .any(|f| f.kind == "coverage_gap" && f.subject == "src/shared.rs::shared_fn"),
+        report.findings.iter().any(|f| {
+            f.kind() == Some(rag_rat_dream::FindingKind::CoverageGap)
+                && f.subject == "src/shared.rs::shared_fn"
+        }),
         "a sibling repo's same-path memory binding must NOT suppress the active repo's \
          coverage-gap finding: {:?}",
         report.findings,
     );
     assert!(
-        !report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "bmem"),
+        !report
+            .findings
+            .iter()
+            .any(|f| f.kind() == Some(rag_rat_dream::FindingKind::StaleReference)
+                && f.subject == "bmem"),
         "a sibling repo's memory must NOT surface as the active repo's stale_reference: {:?}",
         report.findings,
     );

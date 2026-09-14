@@ -1237,7 +1237,7 @@ mod tests {
     fn divergence_subjects(findings: &[crate::WorklistFinding]) -> Vec<String> {
         findings
             .iter()
-            .filter(|f| f.kind == "memory_divergence")
+            .filter(|f| f.kind() == Some(FindingKind::MemoryDivergence))
             .map(|f| f.subject.clone())
             .collect()
     }
