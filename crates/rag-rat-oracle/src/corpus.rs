@@ -159,6 +159,20 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
         assert!(load_corpora("").is_err());
     }
 
+    /// `CorpusProfile::hash` is the comparability key stored with every baseline report, so a
+    /// loaded profile's serialized form must not move: a changed field token would silently make
+    /// every stored baseline incomparable.
+    #[test]
+    fn a_loaded_profiles_hash_is_pinned() {
+        let corpora = load_corpora(SAMPLE).unwrap();
+        for (id, hash) in [
+            ("rust-semver", "7973c3d62bbea9fbbdf3d7a4380fb7d9ccdbf2659a3503c9267eb9f9f329bb97"),
+            ("linux-kernel", "662d7b2017a76f370094d028b23f129b5ef87ea5d231f460b3e4dcd26b92a2ea"),
+        ] {
+            assert_eq!(corpus_by_id(&corpora, id).unwrap().hash(), hash, "{id}");
+        }
+    }
+
     #[test]
     fn sample_loads_and_selects_by_id_and_tier() {
         let corpora = load_corpora(SAMPLE).unwrap();
