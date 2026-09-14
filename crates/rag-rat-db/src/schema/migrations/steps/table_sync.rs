@@ -870,3 +870,59 @@ pub fn apply_table_sync_repo_incarnations(conn: &Connection) -> rusqlite::Result
     }
     Ok(())
 }
+
+/// V128: local observations, not replicated merge state. A row can be unpublishable without any
+/// incoming pending entry. The repo key lets repository purge reclaim observations as well.
+pub fn apply_table_sync_row_diagnostics(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_sync_row_diagnostics(
+             stream_id BLOB NOT NULL CHECK(length(stream_id) = 32),
+             repo_id TEXT NOT NULL,
+             table_name TEXT NOT NULL,
+             row_pk TEXT NOT NULL,
+             cause TEXT NOT NULL,
+             self_apply_failed INTEGER NOT NULL DEFAULT 0 CHECK(self_apply_failed IN (0,1)),
+             PRIMARY KEY(stream_id, repo_id, table_name, row_pk)
+         ) STRICT;",
+    )
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn row_diagnostics_upgrade_is_additive_retry_safe_and_repo_scoped() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute_batch(
+            "DROP TABLE table_sync_row_diagnostics; DELETE FROM schema_version WHERE id = \
+             '128_table_sync_row_diagnostics';",
+        )
+        .unwrap();
+        crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        for repo in ["main-checkout", "linked-sibling"] {
+            conn.execute(
+                "INSERT INTO \
+                 table_sync_row_diagnostics(stream_id,repo_id,table_name,row_pk,cause) VALUES \
+                 (?1, ?2, 't_demo', 'r1', 'future_cause')",
+                rusqlite::params![[1_u8; 32].as_slice(), repo],
+            )
+            .unwrap();
+        }
+        apply_table_sync_row_diagnostics(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM table_sync_row_diagnostics", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        crate::schema::purge_repo_rows(&conn, "main-checkout").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT repo_id FROM table_sync_row_diagnostics", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "linked-sibling"
+        );
+    }
+}

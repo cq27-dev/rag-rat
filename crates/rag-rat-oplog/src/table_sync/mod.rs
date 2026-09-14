@@ -9,6 +9,7 @@
 //! surface widens as the apply/produce siblings land and force each export.
 
 mod apply;
+mod diagnostics;
 mod engine;
 mod produce;
 mod refold;
@@ -30,6 +31,9 @@ pub const TABLE_SYNC_ENTRY_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const TABLE_SYNC_ENTRY_OVERHEAD_MAX: usize = 320;
 
 pub use apply::LocalWriterMemo;
+pub use diagnostics::{
+    TableSyncDiagnosticQuery, TableSyncRowCause, TableSyncRowDiagnostic, table_sync_row_diagnostics,
+};
 #[cfg(test)]
 pub(crate) use refold::refold_stale_projections_against;
 /// The store-open forward-compat seam: replay entries retained but not projected when they

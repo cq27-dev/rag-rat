@@ -50,6 +50,12 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         SyncCommand::Publish { seed } => with_repo_db(config, |db| publish(db, seed.as_deref())),
         SyncCommand::CatchUp { target } => with_repo_db(config, |db| catch_up(db, *target)),
         SyncCommand::Whoami => with_repo_db(config, whoami),
+        SyncCommand::Diagnostics { limit } => with_repo_db(config, |db| {
+            let rows = db.sync_row_diagnostics(usize::from(*limit))?;
+            print_output(
+                &serde_json::json!({"rows": rows, "limit": limit, "limit_reached": rows.len() == usize::from(*limit)}),
+            )
+        }),
         SyncCommand::Grant { account } => with_repo_db(config, |db| grant(db, account)),
         SyncCommand::Revoke { account, reason, keep_until } =>
             with_repo_db(config, |db| revoke(db, account, reason, keep_until.as_deref())),

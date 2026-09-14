@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 127;
+pub const LATEST_SCHEMA_VERSION: u32 = 128;
 
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
@@ -1140,6 +1140,11 @@ additive_migrations! {
          retention can reclaim the entries that first stated them (#1295); backfilled with one \
          statement per tombstone at its own identity",
     ) => MigrationFn::Plain(migrations::apply_tombstone_statements);
+    MIGRATION_128_ID, MIGRATION_128_CHECKSUM, MIGRATION_128_DESCRIPTION = (
+        "128_table_sync_row_diagnostics",
+        "sha256:rag-rat-table-sync-row-diagnostics-v128",
+        "Persist local per-row table-sync diagnostic causes independently of pending entries (#1020)",
+    ) => MigrationFn::Plain(migrations::apply_table_sync_row_diagnostics);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

@@ -1624,6 +1624,10 @@ mod repo_id_scope_coverage {
     /// instead of being deleted, and so the open question is visible in the source.
     const TABLE_SYNC_UNRESOLVED: &[(&str, &str)] = &[
         (
+            "table_sync_row_diagnostics",
+            "local diagnostic observations remain bound to the retired stream; purge reclaims them",
+        ),
+        (
             "table_sync_streams",
             "the stream directory row records the `repo_id` it was derived under",
         ),

@@ -654,7 +654,7 @@ fn a_winner_lookup_that_lands_on_another_rows_entry_resolves_to_unknown() {
     .unwrap();
     assert_eq!(
         verdict,
-        apply::StaleRow::Unknown,
+        apply::StaleRow::Unknown(super::super::diagnostics::TableSyncRowCause::WrongKey),
         "an entry that is not this row's op must not produce a verdict about this row"
     );
 }
@@ -700,6 +700,7 @@ fn ingest_defers_an_upsert_whose_row_state_cannot_be_established() {
         "each upsert is deferred rather than applied: {outcomes:?}",
     );
     assert_eq!(b.row().unwrap().0, "edited", "the possibly-unsent local edit survives");
+    assert_eq!(diagnostics_tests::causes(&b.conn), ["missing_entry"]);
     // The retained chain-tip witness now deliberately blocks B from authoring until continuity
     // is restored; the row-survival assertion above is the behavior this test owns.
 }
@@ -750,6 +751,7 @@ fn the_refold_defers_when_the_rows_winner_cannot_be_resolved_at_all() {
         "and the entry says WHY it is stuck — this reason, unlike the other three, is the one \
          retention/GC has to be able to find"
     );
+    assert_eq!(diagnostics_tests::causes(&b.conn), ["missing_entry"]);
 }
 
 #[test]
@@ -2665,3 +2667,6 @@ fn a_subset_constraint_failure_parks_the_restate_instead_of_quarantining_it() {
         .unwrap();
     assert_eq!(r2, 1, "r2 could not be deleted and raised no tombstone");
 }
+
+#[path = "diagnostics_tests.rs"]
+mod diagnostics_tests;

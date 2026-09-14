@@ -134,12 +134,15 @@ pub(crate) fn produce_and_author(
                 // its stream come apart, which is precisely the condition worth reporting — a
                 // panic would replace a diagnosable error with a crash.
                 apply::ApplyOutcome::Superseded => {
-                    anyhow::bail!(
-                        "table-sync: a locally-produced op lost its own self-apply on `{}` — the \
-                         row's write clock carries a lamport from another stream, so authoring \
-                         cannot settle it",
-                        spec.name
-                    );
+                    return Err(super::diagnostics::SelfApplyConflict {
+                        stream,
+                        repo_id: ctx.repo_id.to_owned(),
+                        table: spec.name.to_owned(),
+                        row_pk: row_op::row_pk_string(
+                            op.pks().next().expect("produced upsert/remove names one row"),
+                        ),
+                    }
+                    .into());
                 },
                 // A locally-produced op failing to self-apply is UNREACHABLE for a registered
                 // table: the lint rejects every shape that would quarantine (nullable pk, cross-row
@@ -498,11 +501,13 @@ fn author_repair(
         // MAX(lamport)+1, so losing its own self-apply means the row's clock carries a lamport
         // from ANOTHER stream — the shape a scope or account move leaves behind. Swallowing it
         // would record the repair done with the row unrepaired and no retry left.
-        ApplyOutcome::Superseded => anyhow::bail!(
-            "table-sync: a {what} op lost its own self-apply on `{}` — the row's write clock \
-             carries a lamport from another stream",
-            spec.name
-        ),
+        ApplyOutcome::Superseded => Err(super::diagnostics::SelfApplyConflict {
+            stream,
+            repo_id: ctx.repo_id.to_owned(),
+            table: spec.name.to_owned(),
+            row_pk: row_op::row_pk_string(op.pks().next().expect("repair names at least one row")),
+        }
+        .into()),
         outcome @ (ApplyOutcome::Quarantined { .. } | ApplyOutcome::Unprojectable(_)) => {
             anyhow::bail!(
                 "table-sync: a {what} op did not self-apply on `{}`: {outcome:?}",
