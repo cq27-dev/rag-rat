@@ -206,6 +206,28 @@ const UNCONTRIBUTE_NOTE: &str =
      conflict, and write nothing. Indexing, search and reconcile are unaffected. Publish the repo \
      with `sync publish`, re-run `sync contribute`, or index it in a separate database";
 
+const SUBSCRIBE_NOTE_PREFIX: &str =
+    "this repo's memories now mirror the owner's stream instead of its own — nothing is authored \
+     back, and this store's own memories are untouched. But exactly one stream materializes a \
+     repo, so the next drain REMOVES the memories this account's other devices had synced here; \
+     `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made \
+     on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the \
+     anchors its author published).";
+const SUBSCRIBE_NOTE_ROUTED: &str = "The locator's peers are recorded, so automatic sync pulls \
+                                     the owner's log without any [sync] server_peers; run";
+const SUBSCRIBE_NOTE_UNROUTED: &str = "This store needs the owner's log and no routing was \
+                                       supplied: automatic sync pulls it once the owner's host is \
+                                       in [sync] server_peers, or run";
+
+fn subscribe_note(owner: &str, routed: bool) -> String {
+    let tail = if routed {
+        format!("{SUBSCRIBE_NOTE_ROUTED} `{}` to fetch it now", subscribe_pull_hint(owner, false))
+    } else {
+        format!("{SUBSCRIBE_NOTE_UNROUTED} `{}` now", subscribe_pull_hint(owner, true))
+    };
+    format!("{SUBSCRIBE_NOTE_PREFIX} {tail}")
+}
+
 fn contribute(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
     db.sync_contribute(account)?;
     let effects = rag_rat_core::drain_synced_memory(db.connection())?;
@@ -261,20 +283,7 @@ fn subscribe(config: &Config, db: &IndexDatabase, account: Option<&str>) -> anyh
         "read_only": true,
         "memories_added": effects.nodes_written,
         "memories_removed": effects.nodes_removed,
-        "note": if locator.as_ref().is_some_and(|l| !l.peers.is_empty()) {
-            format!(
-                "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). The locator's peers are recorded, so automatic sync pulls the \
-                 owner's log without any [sync] server_peers; run `{}` to fetch it now",
-                subscribe_pull_hint(&owner, false),
-            )
-        } else {
-            format!(
-                "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log and no routing was supplied: \
-                 automatic sync pulls it once the owner's host is in [sync] server_peers, \
-                 or run `{}` now",
-                subscribe_pull_hint(&owner, true),
-            )
-        },
+        "note": subscribe_note(&owner, locator.as_ref().is_some_and(|l| !l.peers.is_empty())),
     }))
 }
 
@@ -1622,5 +1631,35 @@ mod tests {
     fn decode_node_secret_rejects_wrong_length_and_non_hex() {
         assert!(decode_node_secret("abcd").is_err(), "too short is rejected");
         assert!(decode_node_secret(&"zz".repeat(32)).is_err(), "non-hex chars are rejected");
+    }
+}
+
+#[cfg(test)]
+mod subscribe_note_tests {
+    #[test]
+    fn subscription_notes_preserve_operator_text() {
+        assert_eq!(
+            super::subscribe_note("owner", true),
+            "this repo's memories now mirror the owner's stream instead of its own — nothing is \
+             authored back, and this store's own memories are untouched. But exactly one stream \
+             materializes a repo, so the next drain REMOVES the memories this account's other \
+             devices had synced here; `sync unsubscribe` restores them, except for local binding \
+             work — a `memory rebind` you made on a synced memory, and any local edge onto it, go \
+             with the row (a re-drain seeds only the anchors its author published). The locator's \
+             peers are recorded, so automatic sync pulls the owner's log without any [sync] \
+             server_peers; run `rag-rat sync pull owner` to fetch it now"
+        );
+        assert_eq!(
+            super::subscribe_note("owner", false),
+            "this repo's memories now mirror the owner's stream instead of its own — nothing is \
+             authored back, and this store's own memories are untouched. But exactly one stream \
+             materializes a repo, so the next drain REMOVES the memories this account's other \
+             devices had synced here; `sync unsubscribe` restores them, except for local binding \
+             work — a `memory rebind` you made on a synced memory, and any local edge onto it, go \
+             with the row (a re-drain seeds only the anchors its author published). This store \
+             needs the owner's log and no routing was supplied: automatic sync pulls it once the \
+             owner's host is in [sync] server_peers, or run `rag-rat sync pull owner --peer \
+             <NODE_ID>` now"
+        );
     }
 }
