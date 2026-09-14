@@ -1927,6 +1927,8 @@ fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
             .collect();
         let selected = select_coherent_branches(rows, &effective);
         let accepted = close_selection_over_authority(rows, selected);
+        // `forked` here is effective-relative, not rooted-relative, and a stranded entry is
+        // re-derived on the next read, so a late predecessor can heal it.
         let newly_forked: Vec<AccountEntryHash> =
             effective.difference(&accepted).copied().collect();
         if newly_forked.is_empty() {
@@ -1940,6 +1942,9 @@ fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
 }
 
 /// Select one contiguous effective hash-chain per `(log_id, device)` (§16.2).
+/// Unlike content/secrets selection in [`super::branch`], this consumes the post-fold effective
+/// set: registers have already condemned off-branch authority, so no watermark pins are needed.
+/// Content/secrets must preserve the watermark's branch against smaller-hash forks below it.
 fn select_coherent_branches(
     rows: &[CandidateRow],
     effective: &HashSet<AccountEntryHash>,

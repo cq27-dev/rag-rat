@@ -7,6 +7,13 @@
 //! slot walk, the pinned-over-min-hash tie-break, the rooted-minus-accepted fork rule, and the
 //! backward walk that re-derives a real predecessor from a signed `prev_hash`.
 
+//! Control-log selection in [`super::storage`] instead consumes post-fold effective entries:
+//! registers have already condemned off-branch authority, so it needs no watermark pins. Its
+//! forked set is effective-relative, including entries stranded above gaps; that projection is
+//! rebuilt on every read, allowing a late predecessor to heal the stranded entry. Content and
+//! secrets selection here leave unrooted entries undecided and use pins to preserve the branch
+//! named by a revocation watermark, even if an attacker produces a smaller-hash fork below it.
+
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::ControlFlow;

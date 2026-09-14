@@ -1,14 +1,8 @@
 //! Pin-aware branch selection for the secrets log (`log_id = 1`, §16.2, C4.2b, B-1).
 //!
-//! The account-side [`super::super::candidate`] primitives (`ancestry`, `validate_cut_target`,
-//! `HeaderView`) are log-generic, but `select_coherent_branches` in [`super::super::storage`] has
-//! NO watermark-pin mechanism — the control fold never needs one. The secrets acceptance loop DOES:
-//! a compromised-then-removed owner device can fork its secrets chain BELOW its `DeviceRemove`
-//! secrets cut, and a pin-less min-hash tiebreak would select the attacker fork (deterministic,
-//! convergent, WRONG), forking the honest cut-preserved wraps off the accepted branch. So this
-//! module runs the pin-aware selection the content refold uses ([`super::super::branch`]) over
-//! `AccountEntryHeader` rows: a register pin promotes the branch its watermark names over the hash
-//! order, which is what makes the off-branch condemnation of the other fork enforceable.
+//! Uses the pin-aware selection shared with content ([`super::super::branch`]). A register pin
+//! promotes its watermark's branch over hash order; see that module for why the control log uses
+//! a different selection rule.
 //!
 //! Pins are sourced from BOTH secrets boundaries of a wrap's cited owner incarnation (the device
 //! register AND the owner-incarnation register — two registers can bound one chain), revalidated
