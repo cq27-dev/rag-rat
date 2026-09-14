@@ -4,12 +4,14 @@
 //! (`mod.rs`) curates the surface and the v2 verification pass lives in its own sibling (`verify`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use rag_rat_query::pagerank::{self, ImportanceOptions};
 use regex::Regex;
 use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use strum::IntoEnumIterator;
 
 use super::DreamFinding;
 
@@ -21,8 +23,8 @@ use super::DreamFinding;
 const COVERAGE_RANK_POOL: usize = 500;
 
 /// The closed set of `dream_findings.kind` tokens the finding builders emit. A stored row keeps its
-/// kind as a string (`WorklistFinding::kind`); the resolve sweep parses it back to decide whether
-/// this run computed that kind.
+/// kind as the raw token (`WorklistFinding::kind`, `ReviewedFinding::kind`), so a kind a newer
+/// build wrote still lists and reviews; each row's `kind()` and the resolve sweep parse it back.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, strum::EnumString, strum::IntoStaticStr,
 )]
@@ -77,9 +79,20 @@ impl FindingKind {
 }
 
 /// The `dream_findings.status` lifecycle tokens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
 #[strum(serialize_all = "snake_case")]
-pub(crate) enum FindingStatus {
+#[serde(rename_all = "snake_case")]
+pub enum FindingStatus {
     Open,
     Accepted,
     Dismissed,
@@ -90,7 +103,7 @@ pub(crate) enum FindingStatus {
 
 impl FindingStatus {
     /// The exact persisted token.
-    pub(crate) fn as_db_str(self) -> &'static str {
+    pub fn as_db_str(self) -> &'static str {
         self.into()
     }
 
@@ -106,10 +119,17 @@ impl FindingStatus {
     }
 }
 
-/// The SQL list of current statuses, for `status IN {current_statuses_sql()}` — the set
-/// [`FindingStatus::is_current`] names, pinned to it by `current_statuses_sql_matches_is_current`.
+/// The SQL list of current statuses, for `status IN {current_statuses_sql()}` — derived from
+/// [`FindingStatus::is_current`], so the SQL set cannot drift from the Rust predicate.
 pub(crate) fn current_statuses_sql() -> &'static str {
-    "('open', 'accepted', 'dismissed')"
+    static CURRENT_STATUSES_SQL: LazyLock<String> = LazyLock::new(|| {
+        let current: Vec<&str> = FindingStatus::iter()
+            .filter(|status| status.is_current())
+            .map(FindingStatus::as_db_str)
+            .collect();
+        format!("('{}')", current.join("', '"))
+    });
+    &CURRENT_STATUSES_SQL
 }
 
 fn claim_hash(kind: &str, subject: &str, evidence: &str) -> String {
@@ -615,9 +635,18 @@ pub enum ReviewVerdict {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewedFinding {
     pub id: String,
+    /// The stored kind token, verbatim, so a kind a newer build wrote still reviews; `kind()`
+    /// types it.
     pub kind: String,
     pub subject: String,
-    pub status: String,
+    pub status: FindingStatus,
+}
+
+impl ReviewedFinding {
+    /// The typed kind, or `None` for a stored token this build does not know.
+    pub fn kind(&self) -> Option<FindingKind> {
+        FindingKind::from_db_str(&self.kind)
+    }
 }
 
 /// Apply a human review verdict to a dream finding by id — a full id or an unambiguous PREFIX
@@ -676,8 +705,7 @@ pub fn review_dream_finding(
         ReviewVerdict::Accept => FindingStatus::Accepted,
         ReviewVerdict::Dismiss => FindingStatus::Dismissed,
         ReviewVerdict::Reset => FindingStatus::Open,
-    }
-    .as_db_str();
+    };
     // Reset clears the human verdict; accept/dismiss stamp when it was reviewed.
     let reviewed_at = match verdict {
         ReviewVerdict::Reset => None,
@@ -695,14 +723,14 @@ pub fn review_dream_finding(
             "UPDATE dream_findings SET status = ?2, reviewed_at_ms = ?3 WHERE id = ?1 AND status \
              IN {current}{repo_clause}"
         ),
-        rusqlite::params![id, new_status, reviewed_at],
+        rusqlite::params![id, new_status.as_db_str(), reviewed_at],
     )?;
     if changed == 0 {
         anyhow::bail!(
             "finding `{id}` is no longer reviewable — it was resolved or superseded concurrently"
         );
     }
-    Ok(ReviewedFinding { id, kind, subject, status: new_status.to_string() })
+    Ok(ReviewedFinding { id, kind, subject, status: new_status })
 }
 
 #[cfg(test)]
@@ -727,15 +755,30 @@ mod tests {
     }
 
     #[test]
-    fn current_statuses_sql_matches_is_current() {
-        use FindingStatus::*;
-        let all = [Open, Accepted, Dismissed, Resolved, Superseded, Archived];
-        for status in all {
-            assert_eq!(FindingStatus::from_db_str(status.as_db_str()), Some(status));
+    fn finding_status_tokens_are_exact_and_round_trip() {
+        let statuses = [
+            (FindingStatus::Open, "open"),
+            (FindingStatus::Accepted, "accepted"),
+            (FindingStatus::Dismissed, "dismissed"),
+            (FindingStatus::Resolved, "resolved"),
+            (FindingStatus::Superseded, "superseded"),
+            (FindingStatus::Archived, "archived"),
+        ];
+        for (status, token) in statuses {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(FindingStatus::from_db_str(token), Some(status));
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                token,
+                "serialized as the same token"
+            );
         }
-        let listed: Vec<&str> =
-            all.into_iter().filter(|s| s.is_current()).map(FindingStatus::as_db_str).collect();
-        assert_eq!(current_statuses_sql(), format!("('{}')", listed.join("', '")));
+        assert_eq!(FindingStatus::iter().count(), statuses.len(), "every status is pinned");
+    }
+
+    #[test]
+    fn current_statuses_sql_lists_exactly_the_current_statuses() {
+        assert_eq!(current_statuses_sql(), "('open', 'accepted', 'dismissed')");
     }
 
     // A single coverage_gap finding, synced into the active repo; returns its id.
@@ -771,7 +814,7 @@ mod tests {
         assert_eq!(status_and_reviewed(&c, &id), ("open".into(), None));
 
         let r = review_dream_finding(&c, &id, ReviewVerdict::Accept, 2000).unwrap();
-        assert_eq!(r.status, "accepted");
+        assert_eq!(r.status, FindingStatus::Accepted);
         assert_eq!(status_and_reviewed(&c, &id), ("accepted".into(), Some(2000)));
 
         review_dream_finding(&c, &id, ReviewVerdict::Dismiss, 3000).unwrap();

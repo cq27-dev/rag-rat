@@ -33,7 +33,7 @@ pub use compact::CompactPass;
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
 // `repo_id`.
-pub use findings::{FindingKind, ReviewVerdict, ReviewedFinding};
+pub use findings::{FindingKind, FindingStatus, ReviewVerdict, ReviewedFinding};
 pub use findings::{rederive_finding_ids, review_dream_finding};
 // The single-turn chat client the verdict/compact passes consume lives in `rag-rat-llm`
 // (`rag_rat_llm::chat`): the CLI builds one from `[llm.dream.remote]` and hands the borrowed
@@ -76,11 +76,20 @@ pub struct DreamFinding {
 #[derive(Debug, Clone, Serialize)]
 pub struct WorklistFinding {
     pub id: String,
+    /// The stored kind token, verbatim, so a kind a newer build wrote still lists; `kind()` types
+    /// it.
     pub kind: String,
     pub subject: String,
     pub evidence: String,
     pub rank: f64,
-    pub status: String,
+    pub status: FindingStatus,
+}
+
+impl WorklistFinding {
+    /// The typed kind, or `None` for a stored token this build does not know.
+    pub fn kind(&self) -> Option<FindingKind> {
+        FindingKind::from_db_str(&self.kind)
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -160,7 +169,7 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamR
     let status_filter = if opts.include_reviewed {
         format!("status IN {}", findings::current_statuses_sql())
     } else {
-        format!("status = '{}'", findings::FindingStatus::Open.as_db_str())
+        format!("status = '{}'", FindingStatus::Open.as_db_str())
     };
     let mut open: Vec<WorklistFinding> = conn
         .prepare(&format!(
@@ -170,13 +179,22 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamR
         .query_map([], |r| {
             let base: f64 = r.get(4)?;
             let first_seen: i64 = r.get(5)?;
+            // The status filter above admits only known tokens, so this parse cannot miss.
+            let status: String = r.get(6)?;
+            let status = FindingStatus::from_db_str(&status).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    format!("unknown dream finding status `{status}`").into(),
+                )
+            })?;
             Ok(WorklistFinding {
                 id: r.get(0)?,
                 kind: r.get(1)?,
                 subject: r.get(2)?,
                 evidence: r.get(3)?,
                 rank: effective_rank(base, first_seen, opts.now_ms),
-                status: r.get(6)?,
+                status,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -388,7 +406,7 @@ pub(crate) mod tests {
             "the default worklist shows only open findings",
         );
         assert_eq!(default.findings[0].id, "d0001", "the stable finding id is surfaced");
-        assert_eq!(default.findings[0].status, "open");
+        assert_eq!(default.findings[0].status, FindingStatus::Open);
 
         let all = dream_run(&c, DreamOptions {
             now_ms: 10,
@@ -397,14 +415,75 @@ pub(crate) mod tests {
             include_reviewed: true,
         })
         .unwrap();
-        let mut pairs: Vec<(&str, &str)> =
-            all.findings.iter().map(|f| (f.subject.as_str(), f.status.as_str())).collect();
-        pairs.sort();
+        let mut pairs: Vec<(&str, FindingStatus)> =
+            all.findings.iter().map(|f| (f.subject.as_str(), f.status)).collect();
+        pairs.sort_by_key(|(subject, _)| *subject);
         assert_eq!(
             pairs,
-            vec![("mA", "open"), ("mB", "dismissed")],
+            vec![("mA", FindingStatus::Open), ("mB", FindingStatus::Dismissed)],
             "--all also surfaces the human-reviewed (dismissed) finding, with its status",
         );
+    }
+
+    #[test]
+    fn worklist_and_review_keep_a_kind_this_build_does_not_know() {
+        // The index is shared across worktrees, so a newer build can write a kind this one does not
+        // know: the worklist still lists it under its raw token, and a review still applies to it.
+        let c = mem_db();
+        set_repo(&c, "r");
+        for (id, kind, subject) in
+            [("d0001", "memory_divergence", "mA"), ("d0002", "future_kind", "mB")]
+        {
+            c.execute(
+                "INSERT INTO dream_findings(repo_id, id, kind, subject, claim_hash, evidence, \
+                 base_rank, status, first_seen_at_ms, last_seen_at_ms) \
+                 VALUES('r',?1,?2,?3,'ch',?3,0.6,'open',1,1)",
+                rusqlite::params![id, kind, subject],
+            )
+            .unwrap();
+        }
+        let report = dream_run(&c, DreamOptions {
+            now_ms: 1,
+            limit: 10,
+            verify: false,
+            include_reviewed: false,
+        })
+        .expect("an unknown stored kind must not fail the worklist");
+        let mut listed: Vec<(&str, &str, Option<FindingKind>)> = report
+            .findings
+            .iter()
+            .map(|f| (f.subject.as_str(), f.kind.as_str(), f.kind()))
+            .collect();
+        listed.sort_by_key(|(subject, ..)| *subject);
+        assert_eq!(
+            listed,
+            vec![
+                ("mA", "memory_divergence", Some(FindingKind::MemoryDivergence)),
+                ("mB", "future_kind", None),
+            ],
+            "the unknown-kind row is listed under its raw token beside the known one",
+        );
+
+        assert_eq!(
+            serde_json::to_string(&report.findings).unwrap(),
+            r#"[{"id":"d0001","kind":"memory_divergence","subject":"mA","evidence":"mA","rank":0.6,"status":"open"},{"id":"d0002","kind":"future_kind","subject":"mB","evidence":"mB","rank":0.6,"status":"open"}]"#,
+            "known and unknown kinds retain the baseline worklist JSON bytes",
+        );
+
+        let reviewed = review_dream_finding(&c, "d0002", ReviewVerdict::Accept, 20)
+            .expect("an unknown-kind finding is still reviewable");
+        assert_eq!(
+            serde_json::to_string(&reviewed).unwrap(),
+            r#"{"id":"d0002","kind":"future_kind","subject":"mB","status":"accepted"}"#,
+            "an unknown kind retains the baseline review JSON bytes",
+        );
+        assert_eq!(reviewed.kind, "future_kind", "the review echoes the stored kind token");
+        assert_eq!(reviewed.kind(), None);
+        assert_eq!(reviewed.status, FindingStatus::Accepted);
+        let status: String = c
+            .query_row("SELECT status FROM dream_findings WHERE id = 'd0002'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "accepted", "the review applied to the stored row");
     }
 
     #[test]
@@ -459,11 +538,17 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(before, snap(&c), "dream_run must leave EVERY repo_memories column unchanged");
         assert!(
-            report.findings.iter().any(|f| f.kind == "stale_reference" && f.subject == "m1"),
+            report
+                .findings
+                .iter()
+                .any(|f| f.kind() == Some(FindingKind::StaleReference) && f.subject == "m1"),
             "non-vacuous: the seeded memory produced a stale_reference finding"
         );
         assert!(
-            report.findings.iter().any(|f| f.kind == "memory_unverifiable" && f.subject == "m1"),
+            report
+                .findings
+                .iter()
+                .any(|f| f.kind() == Some(FindingKind::MemoryUnverifiable) && f.subject == "m1"),
             "non-vacuous: the verify pass produced a memory_unverifiable finding"
         );
     }
@@ -488,7 +573,7 @@ pub(crate) mod tests {
         })
         .unwrap();
         assert!(
-            !report.findings.iter().any(|f| f.kind == "memory_unverifiable"),
+            !report.findings.iter().any(|f| f.kind() == Some(FindingKind::MemoryUnverifiable)),
             "the verify pass must be dormant when DreamOptions::verify is false"
         );
     }
