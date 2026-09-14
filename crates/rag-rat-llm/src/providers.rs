@@ -82,3 +82,19 @@ impl Embedder for MockEmbedder {
         Ok(texts.iter().map(|text| crate::serving::hash_embed_text(text, self.dim)).collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_endpoint;
+
+    #[test]
+    fn sanitize_endpoint_strips_credentials_and_path() {
+        assert_eq!(sanitize_endpoint("http://u:p@h:7997/embeddings"), "http://h:7997");
+        assert_eq!(sanitize_endpoint("http://localhost:7997"), "http://localhost:7997");
+        assert_eq!(
+            sanitize_endpoint("https://user:secret@gpu.host/v1/embeddings"),
+            "https://gpu.host"
+        );
+        assert_eq!(sanitize_endpoint(""), "");
+    }
+}

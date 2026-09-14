@@ -138,7 +138,24 @@ pub(crate) fn resolve_auth_header(
 
 #[cfg(test)]
 mod tests {
-    use super::{bearer_header, endpoint_is_loopback, resolve_auth_header};
+    use super::{bearer_header, endpoint_is_loopback, resolve_auth_header, url_authority};
+
+    #[test]
+    fn url_authority_strips_scheme_userinfo_and_path() {
+        for (url, authority) in [
+            ("http://[::1]:11434/v1/embeddings", "[::1]:11434"),
+            ("http://user@[::1]:11434", "[::1]:11434"),
+            // An `@` after the authority is path, not userinfo, and must not expose `user:pass`.
+            ("https://user:pass@host:8080/path@elsewhere", "host:8080"),
+            // An `@` inside the password: the LAST `@` of the authority ends the userinfo.
+            ("http://u:p@ss@host/x", "host"),
+            ("http://host:1?x=a@b#frag", "host:1"),
+            ("host:7997/embeddings", "host:7997"),
+            ("", ""),
+        ] {
+            assert_eq!(url_authority(url), authority, "{url}");
+        }
+    }
 
     #[test]
     fn bearer_header_trims_and_rejects_blank_tokens() {
