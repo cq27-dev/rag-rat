@@ -22,7 +22,7 @@ fn maintenance_pass_defers_on_a_first_time_empty_config() {
     // A single rust target with NO directories → discovers nothing → first-time-empty.
     let (config, _) = whole_root_config(&scratch, &[]);
     let result = maintenance_pass(&config, false);
-    assert!(result.is_ok(), "an empty first-time config must defer, not error: {result:?}");
+    assert!(result.is_ok(), "an empty first-time config must defer, not error");
     assert!(!config.database.exists(), "deferring must register no empty index");
 }
 
