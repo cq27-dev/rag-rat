@@ -35,7 +35,7 @@ pub const LIVE_FILES_GENERATION_META_KEY: &str = "live_files_generation";
 /// parent moved). `repo_meta` is handled separately (its FK is to `repos`, and it moved in V039).
 /// The A1 adoption contract requires every direct-scoped table backfill in the same call as the
 /// `repos`-row rewrite.
-const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
+pub const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
     // V040 (phase A3) core tables.
     "files",
     "packages",
@@ -96,7 +96,7 @@ const DIRECT_SCOPED_ADOPTION_TABLES: &[&str] = &[
 /// `repo_id` column), the real backfill once V042 has run (every normal open applies the full
 /// ladder). The `DIRECT_SCOPED_ADOPTION_TABLES` loop above guards on table-presence instead; a
 /// periphery table can exist without the column, so it needs the stronger column-level guard.
-const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
+pub const A5_PERIPHERY_DIRECT_SCOPED_TABLES: &[&str] = &[
     "clone_graph_generations",
     "clone_token_df",
     "clone_refinements",
