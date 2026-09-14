@@ -71,10 +71,8 @@ use render::coverage_from_mask;
 use render::render_template;
 #[cfg(test)]
 use spans::any_member_inserts_within;
-#[allow(unused_imports)]
-pub(crate) use types::{ClassAlignment, OccSpan};
 #[cfg(test)]
-use types::{EmittedSpan, RunMetavar};
+use types::{ClassAlignment, EmittedSpan, RunMetavar};
 pub(crate) use types::{MetavarKind, Template, VariationPoint};
 #[cfg(test)]
 use values::recover_values;
