@@ -303,8 +303,6 @@ fn uncontribute(db: &IndexDatabase) -> anyhow::Result<()> {
     }))
 }
 
-/// The relay this invocation binds: `RAG_RAT_SYNC_RELAY` (ops/tests) overrides the configured
-/// `[sync] relay_url`, which itself defaults to the shipped relay.
 /// Where a subscribe reads `.rag-rat-stream`: the git root of the ACTIVE checkout, provided that
 /// checkout belongs to the repository the config names.
 ///
@@ -339,6 +337,8 @@ fn subscribe_pull_hint(owner: &str, needs_peer: bool) -> String {
     }
 }
 
+/// The relay this invocation binds: `RAG_RAT_SYNC_RELAY` (ops/tests) overrides the configured
+/// `[sync] relay_url`, which itself defaults to the shipped relay.
 fn effective_relay_url(config: &Config) -> String {
     match std::env::var("RAG_RAT_SYNC_RELAY") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -872,17 +872,6 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
     })
 }
 
-/// Fetch a DIFFERENT account's log and content from a peer, then materialize them locally.
-///
-/// The escape hatch behind automatic sync (#1174): the resident host runs this same shape after a
-/// HEAD change, and an operator reaches for the command when automation is off. Cross-account
-/// contribution needs it in both directions — a contributor fetches the owner's memories, and an
-/// owner collects a contributor's — because a contribution first leaves its author through the
-/// author's own account. Once the owner has accepted it, the owner's sessions relay it with the
-/// contributor's log (#1280), so everyone else reaches it by syncing the owner alone.
-///
-/// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
-/// private account data, pinned `Closed`), and no founder-incarnation repair.
 /// Redeem a writer invite (`sync contribute <ticket>`): dial the owner named by the ticket, have
 /// it author the grant for THIS store's account, pull the owner's log over the same route so the
 /// grant fact folds locally, verify it, and configure contribution — the whole flow the two-paste
@@ -1009,6 +998,17 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
     })
 }
 
+/// Fetch a DIFFERENT account's log and content from a peer, then materialize them locally.
+///
+/// The escape hatch behind automatic sync (#1174): the resident host runs this same shape after a
+/// HEAD change, and an operator reaches for the command when automation is off. Cross-account
+/// contribution needs it in both directions — a contributor fetches the owner's memories, and an
+/// owner collects a contributor's — because a contribution first leaves its author through the
+/// author's own account. Once the owner has accepted it, the owner's sessions relay it with the
+/// contributor's log (#1280), so everyone else reaches it by syncing the owner alone.
+///
+/// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
+/// private account data, pinned `Closed`), and no founder-incarnation repair.
 fn pull(
     config: &Config,
     target: rag_rat_oplog::AccountId,
