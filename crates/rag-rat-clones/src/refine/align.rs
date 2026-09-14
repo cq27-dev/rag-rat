@@ -16,6 +16,7 @@
 //! mirroring Plan-2's min-not-average discipline.
 
 use super::budget::CellBudget;
+use super::score;
 
 /// One step in an LCS alignment of two token sequences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,11 +143,12 @@ pub(crate) const LCS_MAX_SEQ_TOKENS: usize = 2000;
 /// [`LCS_MAX_SEQ_TOKENS`] is a token-BAG overlap: it ignores token ORDER, so two long functions
 /// with the same normalized token multiset but very different ordering score ~1.0 even though their
 /// true (order-sensitive) LCS ratio is far lower. Dice is therefore an UPPER BOUND on the LCS
-/// ratio, never a lower one. We clamp a proxied pair's ratio to this ceiling — set just BELOW the
-/// `confidence_v1` High threshold of 0.9 — so a class whose fidelity rests on the order-blind proxy
-/// can reach at most Medium confidence and never full refactorability on the strength of a metric
-/// that can't see ordering.
+/// ratio, never a lower one. We clamp a proxied pair's ratio to this ceiling — set just BELOW
+/// [`score::CONFIDENCE_HIGH_FLOOR`] — so a class whose fidelity rests on the order-blind proxy can
+/// reach at most Medium confidence and never full refactorability on the strength of a metric that
+/// can't see ordering.
 const DICE_PROXY_CEILING: f64 = 0.85;
+const _: () = assert!(DICE_PROXY_CEILING < score::CONFIDENCE_HIGH_FLOOR);
 
 /// Token-multiset Dice coefficient: `2·|a∩b| / (|a|+|b|)`. Used as a proxy for the LCS ratio
 /// when either sequence exceeds [`LCS_MAX_SEQ_TOKENS`] tokens — avoids the O(n·m) DP table

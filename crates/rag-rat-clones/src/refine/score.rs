@@ -24,6 +24,7 @@
     serde::Serialize,
     strum::EnumString,
     strum::IntoStaticStr,
+    strum::FromRepr,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -36,8 +37,8 @@ pub enum Confidence {
 impl Confidence {
     /// The band `steps` bands below this one, clamped at `Low`.
     pub(crate) fn downgraded_by(self, steps: u32) -> Self {
-        const BANDS: [Confidence; 3] = [Confidence::Low, Confidence::Medium, Confidence::High];
-        BANDS[(self as usize).saturating_sub(steps as usize)]
+        Confidence::from_repr((self as usize).saturating_sub(steps as usize))
+            .unwrap_or(Confidence::Low)
     }
 
     pub fn as_db_str(&self) -> &'static str {
@@ -59,12 +60,20 @@ pub(crate) fn refactorability_v1(lcs_ratio: f64) -> f64 {
     lcs_ratio.clamp(f64::EPSILON, 1.0)
 }
 
+/// [`confidence_v1`] is `High` only when BOTH inputs reach this floor. The fidelity lane's
+/// order-blind proxy ratio is clamped below it (`align::DICE_PROXY_CEILING`, checked at compile
+/// time) so a proxied class can never earn `High`.
+pub(crate) const CONFIDENCE_HIGH_FLOOR: f64 = 0.9;
+/// [`confidence_v1`] is `Low` when EITHER input falls below this ceiling.
+const CONFIDENCE_LOW_CEILING: f64 = 0.7;
+
 /// 4a confidence band from the class LCS ratio and the Plan-2 pairwise-similarity floor
-/// (`similarity_min`): `High` only when BOTH are ≥ 0.9, `Low` when EITHER is < 0.7, else `Medium`.
+/// (`similarity_min`): `High` only when BOTH reach [`CONFIDENCE_HIGH_FLOOR`], `Low` when EITHER is
+/// below [`CONFIDENCE_LOW_CEILING`], else `Medium`.
 pub(crate) fn confidence_v1(lcs_ratio: f64, similarity_min: f64) -> Confidence {
-    if lcs_ratio >= 0.9 && similarity_min >= 0.9 {
+    if lcs_ratio >= CONFIDENCE_HIGH_FLOOR && similarity_min >= CONFIDENCE_HIGH_FLOOR {
         Confidence::High
-    } else if lcs_ratio < 0.7 || similarity_min < 0.7 {
+    } else if lcs_ratio < CONFIDENCE_LOW_CEILING || similarity_min < CONFIDENCE_LOW_CEILING {
         Confidence::Low
     } else {
         Confidence::Medium
