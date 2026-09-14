@@ -8,6 +8,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::hooks::MigrationHooks;
 
+/// Active commit half of the connection's checkout scope.
+pub const CONNECTION_CONTEXT_COMMIT_KEY: &str = "commit_sha";
+/// Active worktree half of the connection's checkout scope.
+pub const CONNECTION_CONTEXT_WORKTREE_KEY: &str = "worktree_id";
+
 /// The `temp.connection_context` key under which the scope view stashes the active repo id (beside
 /// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
 pub const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";

@@ -496,8 +496,11 @@ pub(crate) fn edge_id_matches_fingerprint_in_linked_worktree(
     repo_id: &str,
     fingerprint: &str,
 ) -> anyhow::Result<bool> {
-    let active_worktree =
-        rag_rat_db::schema::connection_context_value(conn, "worktree_id").unwrap_or_default();
+    let active_worktree = rag_rat_db::schema::connection_context_value(
+        conn,
+        rag_rat_db::schema::CONNECTION_CONTEXT_WORKTREE_KEY,
+    )
+    .unwrap_or_default();
     let edge = conn
         .query_row(
             "SELECT edges.id AS edge_id,

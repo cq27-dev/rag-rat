@@ -1109,7 +1109,11 @@ fn path_is_live_in_another_scope(conn: &Connection, path: &str) -> anyhow::Resul
 
 /// The active context's worktree id, `''` when no scope view is installed on this connection.
 fn context_worktree_id(conn: &Connection) -> String {
-    rag_rat_db::schema::connection_context_value(conn, "worktree_id").unwrap_or_default()
+    rag_rat_db::schema::connection_context_value(
+        conn,
+        rag_rat_db::schema::CONNECTION_CONTEXT_WORKTREE_KEY,
+    )
+    .unwrap_or_default()
 }
 
 /// Whether `dir` (repo-root-relative, `""` = repo root) resolves to an existing directory under

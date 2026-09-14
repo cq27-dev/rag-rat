@@ -1,6 +1,9 @@
 use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_db::meta::{read_meta, repo_meta};
-use rag_rat_db::schema;
+use rag_rat_db::schema::{
+    self, CONNECTION_CONTEXT_COMMIT_KEY, CONNECTION_CONTEXT_GENERATION_KEY,
+    CONNECTION_CONTEXT_REPO_KEY, CONNECTION_CONTEXT_WORKTREE_KEY,
+};
 use rag_rat_papertrail as papertrail;
 
 use super::*;
@@ -912,6 +915,10 @@ fn write_scope_view(conn: &rusqlite::Connection, ctx: &ScopeContext<'_>) -> rusq
     }
 }
 
+const SCOPED_FILES_COLUMNS: &str = "id, path, language, kind, sha256, modified_at_ms, generated, \
+                                    indexed_at_ms, indexed_revision, commit_sha, worktree_id, \
+                                    has_test_code, graph_version, scope_version";
+
 /// Installs the per-connection repo/commit/worktree scoping view; callers query `files` afterward
 /// and see only the active context. The `files` view filters on `repo_id` FIRST (A3) so a
 /// consolidated DB never leaks another repo's rows through the view — every read path that goes
@@ -929,8 +936,8 @@ fn write_scope_view_inner(
     let mut stmt =
         conn.prepare("INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)")?;
     stmt.execute(params![schema::CONNECTION_CONTEXT_REPO_KEY, ctx.repo_id])?;
-    stmt.execute(params!["commit_sha", ctx.checkout.commit_sha])?;
-    stmt.execute(params!["worktree_id", ctx.checkout.worktree_id])?;
+    stmt.execute(params![CONNECTION_CONTEXT_COMMIT_KEY, ctx.checkout.commit_sha])?;
+    stmt.execute(params![CONNECTION_CONTEXT_WORKTREE_KEY, ctx.checkout.worktree_id])?;
     // A6: the file generation the view filters on. Stored as TEXT beside the other context keys;
     // the INTEGER `generation` column's numeric affinity coerces it back in the comparisons
     // below.
@@ -943,38 +950,40 @@ fn write_scope_view_inner(
     // the `generation` predicate keeps a superseded full-rebuild generation (dead until gc sweeps
     // it) out, so a reader sees the COMPLETE old generation until the rebuild flips
     // `live_files_generation`, then the complete new one — never a half-built mix.
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
-            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
+            SELECT {SCOPED_FILES_COLUMNS}
             FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation')
+         '{CONNECTION_CONTEXT_GENERATION_KEY}')
               AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-         'worktree_id') AND worktree_id != '' AND kind != 'deleted'
+         '{CONNECTION_CONTEXT_WORKTREE_KEY}') AND worktree_id != '' AND kind != 'deleted'
             UNION ALL
-            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
+            SELECT {SCOPED_FILES_COLUMNS}
             FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation')
-              AND commit_sha = (SELECT value FROM temp.connection_context WHERE key = 'commit_sha')
+         '{CONNECTION_CONTEXT_GENERATION_KEY}')
+              AND commit_sha = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_COMMIT_KEY}')
               AND commit_sha != ''
               AND path NOT IN (
                   SELECT path FROM main.files
-                  WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+                  WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
                     AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation')
+         '{CONNECTION_CONTEXT_GENERATION_KEY}')
                     AND worktree_id = (SELECT value FROM temp.connection_context WHERE key = \
-         'worktree_id')
+         '{CONNECTION_CONTEXT_WORKTREE_KEY}')
                     AND worktree_id != ''
               );
-        ",
-    )?;
+        "
+    ))?;
 
     Ok(())
 }
@@ -1000,22 +1009,22 @@ fn write_repo_generation_view(
     let mut stmt =
         conn.prepare("INSERT OR REPLACE INTO temp.connection_context(key, value) VALUES (?1, ?2)")?;
     stmt.execute(params![schema::CONNECTION_CONTEXT_REPO_KEY, repo_id])?;
-    stmt.execute(params!["commit_sha", ""])?;
-    stmt.execute(params!["worktree_id", ""])?;
+    stmt.execute(params![CONNECTION_CONTEXT_COMMIT_KEY, ""])?;
+    stmt.execute(params![CONNECTION_CONTEXT_WORKTREE_KEY, ""])?;
     stmt.execute(params![schema::CONNECTION_CONTEXT_GENERATION_KEY, generation.to_string()])?;
     drop(stmt);
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
             DROP VIEW IF EXISTS temp.files;
             CREATE TEMP VIEW temp.files AS
-            SELECT id, path, language, kind, sha256, modified_at_ms, generated, indexed_at_ms, \
-         indexed_revision, commit_sha, worktree_id, has_test_code, graph_version, scope_version
+            SELECT {SCOPED_FILES_COLUMNS}
             FROM main.files
-            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = 'repo_id')
+            WHERE repo_id = (SELECT value FROM temp.connection_context WHERE key = \
+         '{CONNECTION_CONTEXT_REPO_KEY}')
               AND generation = (SELECT value FROM temp.connection_context WHERE key = \
-         'files_generation');
-        ",
-    )?;
+         '{CONNECTION_CONTEXT_GENERATION_KEY}');
+        "
+    ))?;
     Ok(())
 }
 
