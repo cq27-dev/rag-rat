@@ -77,7 +77,25 @@ enum PurgeIdSet {
     Streams,
 }
 
+/// Where an id set's ids come from: `column` of `table`, scoped to the repo directly or through a
+/// parent id set. The live read-path subquery ([`PurgeIdSet::id_select`]) and the temp-table
+/// capture ([`PurgeIdSet::capture_sql`]) are both rendered from this, so they cannot disagree about
+/// which rows a set holds.
+struct IdSource {
+    column: &'static str,
+    table: &'static str,
+    scope: IdScope,
+}
+
+enum IdScope {
+    /// `WHERE repo_id = ?1`.
+    ByRepoId,
+    /// `WHERE {fk} IN (<the parent set's ids>)`.
+    ByParent { fk: &'static str, parent: PurgeIdSet },
+}
+
 impl PurgeIdSet {
+    /// Every set, in capture order: a parent precedes every set that scopes through it.
     const ALL: [Self; 6] = [
         Self::Files,
         Self::Chunks,
@@ -86,6 +104,23 @@ impl PurgeIdSet {
         Self::Generations,
         Self::Streams,
     ];
+
+    fn source(self) -> IdSource {
+        let (column, table, scope) = match self {
+            Self::Files => ("id", "files", IdScope::ByRepoId),
+            Self::Chunks =>
+                ("id", "chunks", IdScope::ByParent { fk: "file_id", parent: Self::Files }),
+            Self::Symbols =>
+                ("id", "symbols", IdScope::ByParent { fk: "file_id", parent: Self::Files }),
+            Self::Memories => ("id", "repo_memories", IdScope::ByRepoId),
+            Self::Generations => ("generation", "clone_graph_generations", IdScope::ByRepoId),
+            // This capture is what makes the entry-log delete possible at all: `stream_id` is a
+            // one-way hash of `(repo_id, account_id, incarnation_ref, scope_id)`, so once the class
+            // sweep removes the directory row there is no way back from an entry to its repo.
+            Self::Streams => ("stream_id", "table_sync_streams", IdScope::ByRepoId),
+        };
+        IdSource { column, table, scope }
+    }
 
     /// The `temp.`-qualified capture table every read names.
     fn qualified(self) -> &'static str {
@@ -105,35 +140,50 @@ impl PurgeIdSet {
         &self.qualified()["temp.".len()..]
     }
 
-    /// The live read-path subquery for this id set, mirroring the temp-table capture in
-    /// [`capture_purge_ids`] but evaluated inline against the current rows (used only by
-    /// [`count_repo_rows`], which runs before any delete).
-    fn id_select(self) -> &'static str {
-        match self {
-            Self::Files => "SELECT id FROM files WHERE repo_id = ?1",
-            Self::Chunks =>
-                "SELECT id FROM chunks WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
-            Self::Symbols =>
-                "SELECT id FROM symbols WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
-            Self::Memories => "SELECT id FROM repo_memories WHERE repo_id = ?1",
-            Self::Generations =>
-                "SELECT generation FROM clone_graph_generations WHERE repo_id = ?1",
-            Self::Streams => "SELECT stream_id FROM table_sync_streams WHERE repo_id = ?1",
+    /// The live read-path subquery for this id set — the same rows [`Self::capture_sql`]
+    /// snapshots, but evaluated inline against the current rows (used only by
+    /// [`count_repo_rows`], which runs before any delete). A child set nests its parent's live
+    /// subquery. Binds `?1` (the repo id).
+    fn id_select(self) -> String {
+        let IdSource { column, table, scope } = self.source();
+        match scope {
+            IdScope::ByRepoId => format!("SELECT {column} FROM {table} WHERE repo_id = ?1"),
+            IdScope::ByParent { fk, parent } =>
+                format!("SELECT {column} FROM {table} WHERE {fk} IN ({})", parent.id_select()),
         }
     }
 
-    /// The `repo_id`-bearing table this id set reads from — the PARENT half of the count-path
-    /// existence check. A child can outlive its parent's introduction: `table_sync_entries` arrived
-    /// in V087 and the `table_sync_streams` directory that scopes it only in V093, so on a store in
-    /// between, the child exists while the subquery's table does not. `count_repo_rows` runs on
-    /// exactly such a store (planning is read-only and pre-migration, so `--dry-run` never writes),
-    /// and an unguarded reference there fails the plan before the destructive path can migrate.
+    /// The `CREATE TEMP TABLE` that snapshots this id set for [`purge_repo_rows`]. The captured
+    /// column is always named `id` (aliased when the source column is not), so every child delete
+    /// reads `SELECT id FROM <temp>`; a child set scopes through its parent's CAPTURE rather than
+    /// the live parent rows. Binds `?1` (the repo id) only for an [`IdScope::ByRepoId`] set.
+    fn capture_sql(self) -> String {
+        let IdSource { column, table, scope } = self.source();
+        let projection =
+            if column == "id" { column.to_string() } else { format!("{column} AS id") };
+        let filter = match scope {
+            IdScope::ByRepoId => "repo_id = ?1".to_string(),
+            IdScope::ByParent { fk, parent } =>
+                format!("{fk} IN (SELECT id FROM {})", parent.qualified()),
+        };
+        format!(
+            "CREATE TEMP TABLE {} AS SELECT {projection} FROM {table} WHERE {filter}",
+            self.temp_name()
+        )
+    }
+
+    /// The `repo_id`-bearing table this id set is ultimately scoped by (a child set's root parent)
+    /// — the PARENT half of the count-path existence check. A child can outlive its parent's
+    /// introduction: `table_sync_entries` arrived in V087 and the `table_sync_streams` directory
+    /// that scopes it only in V093, so on a store in between, the child exists while the
+    /// subquery's table does not. `count_repo_rows` runs on exactly such a store (planning is
+    /// read-only and pre-migration, so `--dry-run` never writes), and an unguarded reference there
+    /// fails the plan before the destructive path can migrate.
     fn parent_table(self) -> &'static str {
-        match self {
-            Self::Files | Self::Chunks | Self::Symbols => "files",
-            Self::Memories => "repo_memories",
-            Self::Generations => "clone_graph_generations",
-            Self::Streams => "table_sync_streams",
+        let IdSource { table, scope, .. } = self.source();
+        match scope {
+            IdScope::ByRepoId => table,
+            IdScope::ByParent { parent, .. } => parent.parent_table(),
         }
     }
 }
@@ -469,58 +519,14 @@ pub fn purge_repo_rows(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
 fn capture_purge_ids(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     // Dropped first so a reused connection (a second purge on one process) starts clean.
     drop_purge_ids(conn)?;
-    conn.execute(
-        &format!(
-            "CREATE TEMP TABLE {} AS SELECT id FROM files WHERE repo_id = ?1",
-            PurgeIdSet::Files.temp_name()
-        ),
-        params![repo_id],
-    )?;
-    conn.execute(
-        &format!(
-            "CREATE TEMP TABLE {} AS SELECT id FROM chunks WHERE file_id IN (SELECT id FROM {})",
-            PurgeIdSet::Chunks.temp_name(),
-            PurgeIdSet::Files.qualified()
-        ),
-        [],
-    )?;
-    conn.execute(
-        &format!(
-            "CREATE TEMP TABLE {} AS SELECT id FROM symbols WHERE file_id IN (SELECT id FROM {})",
-            PurgeIdSet::Symbols.temp_name(),
-            PurgeIdSet::Files.qualified()
-        ),
-        [],
-    )?;
-    conn.execute(
-        &format!(
-            "CREATE TEMP TABLE {} AS SELECT id FROM repo_memories WHERE repo_id = ?1",
-            PurgeIdSet::Memories.temp_name()
-        ),
-        params![repo_id],
-    )?;
-    // The clone-generation id set uses the column name `id` in the temp table for a uniform
-    // `SELECT id FROM <temp>` in the child deletes, even though the source column is `generation`.
-    conn.execute(
-        &format!(
-            "CREATE TEMP TABLE {} AS SELECT generation AS id FROM clone_graph_generations WHERE \
-             repo_id = ?1",
-            PurgeIdSet::Generations.temp_name()
-        ),
-        params![repo_id],
-    )?;
-    // Same aliasing for the sync stream directory. This capture is what makes the entry-log delete
-    // possible at all: `stream_id` is a one-way hash of
-    // `(repo_id, account_id, incarnation_ref, scope_id)`, so once the class sweep removes the
-    // directory row there is no way back from an entry to its repo.
-    conn.execute(
-        &format!(
-            "CREATE TEMP TABLE {} AS SELECT stream_id AS id FROM table_sync_streams WHERE repo_id \
-             = ?1",
-            PurgeIdSet::Streams.temp_name()
-        ),
-        params![repo_id],
-    )?;
+    // `ALL` is in capture order, so a child set's parent capture already exists.
+    for set in PurgeIdSet::ALL {
+        let sql = set.capture_sql();
+        match set.source().scope {
+            IdScope::ByRepoId => conn.execute(&sql, params![repo_id])?,
+            IdScope::ByParent { .. } => conn.execute(&sql, [])?,
+        };
+    }
     Ok(())
 }
 
@@ -534,6 +540,62 @@ fn drop_purge_ids(conn: &Connection) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both spellings of every id set, as rendered from its one descriptor — pinned so the live
+    /// `--dry-run` count and the destructive capture keep selecting the same rows, and so the
+    /// count-path guard keeps checking the same parent table.
+    #[test]
+    fn id_sets_render_their_live_and_captured_sql() {
+        let expected = [
+            (
+                PurgeIdSet::Files,
+                "SELECT id FROM files WHERE repo_id = ?1",
+                "CREATE TEMP TABLE rmp_file_ids AS SELECT id FROM files WHERE repo_id = ?1",
+                "files",
+            ),
+            (
+                PurgeIdSet::Chunks,
+                "SELECT id FROM chunks WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
+                "CREATE TEMP TABLE rmp_chunk_ids AS SELECT id FROM chunks WHERE file_id IN \
+                 (SELECT id FROM temp.rmp_file_ids)",
+                "files",
+            ),
+            (
+                PurgeIdSet::Symbols,
+                "SELECT id FROM symbols WHERE file_id IN (SELECT id FROM files WHERE repo_id = ?1)",
+                "CREATE TEMP TABLE rmp_symbol_ids AS SELECT id FROM symbols WHERE file_id IN \
+                 (SELECT id FROM temp.rmp_file_ids)",
+                "files",
+            ),
+            (
+                PurgeIdSet::Memories,
+                "SELECT id FROM repo_memories WHERE repo_id = ?1",
+                "CREATE TEMP TABLE rmp_memory_ids AS SELECT id FROM repo_memories WHERE repo_id = \
+                 ?1",
+                "repo_memories",
+            ),
+            (
+                PurgeIdSet::Generations,
+                "SELECT generation FROM clone_graph_generations WHERE repo_id = ?1",
+                "CREATE TEMP TABLE rmp_generation_ids AS SELECT generation AS id FROM \
+                 clone_graph_generations WHERE repo_id = ?1",
+                "clone_graph_generations",
+            ),
+            (
+                PurgeIdSet::Streams,
+                "SELECT stream_id FROM table_sync_streams WHERE repo_id = ?1",
+                "CREATE TEMP TABLE rmp_stream_ids AS SELECT stream_id AS id FROM \
+                 table_sync_streams WHERE repo_id = ?1",
+                "table_sync_streams",
+            ),
+        ];
+        assert_eq!(expected.map(|(set, ..)| set), PurgeIdSet::ALL);
+        for (set, live, capture, parent) in expected {
+            assert_eq!(set.id_select(), live, "{set:?} live subquery");
+            assert_eq!(set.capture_sql(), capture, "{set:?} capture");
+            assert_eq!(set.parent_table(), parent, "{set:?} count-path parent table");
+        }
+    }
 
     /// `count_repo_rows` is the read-only planning path, and `rag-rat rm` runs it BEFORE migrating
     /// so `--dry-run` never writes. Every transitive child must therefore tolerate a schema
