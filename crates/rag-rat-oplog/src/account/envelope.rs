@@ -77,11 +77,6 @@ pub(super) struct VerifiedAccountEntry {
     pub(super) entry_hash: [u8; 32],
 }
 
-/// Author a signed account entry: encode the header, wrap `[header, payload]` as the body, sign the
-/// body under `secret`, and build the transport envelope. Pure + deterministic given `secret`
-/// (ed25519 signing is deterministic). The author device is DERIVED from `secret` — the header's
-/// `device_fingerprint` is overwritten with `secret.public().fingerprint()` — so a signed entry can
-/// never name a device other than its signer (mirrors `super::super::entry::sign_entry`).
 /// The exact byte length of the signed wire for `(header, payload)` — the real header encoding,
 /// the body framing, and a 64-byte signature. Signing is deterministic in these lengths (the
 /// signature is always 64 bytes and never affects the count), so this is what §18a actually bounds,
@@ -99,6 +94,11 @@ pub(super) fn entry_fits_envelope(header: &AccountEntryHeader, payload: &[u8]) -
     signed_entry_len(header, payload) <= ACCOUNT_ENVELOPE_MAX_BYTES
 }
 
+/// Author a signed account entry: encode the header, wrap `[header, payload]` as the body, sign the
+/// body under `secret`, and build the transport envelope. Pure + deterministic given `secret`
+/// (ed25519 signing is deterministic). The author device is DERIVED from `secret` — the header's
+/// `device_fingerprint` is overwritten with `secret.public().fingerprint()` — so a signed entry can
+/// never name a device other than its signer (mirrors `super::super::entry::sign_entry`).
 pub(super) fn sign_account_entry(
     secret: &DeviceSecret,
     header: &AccountEntryHeader,

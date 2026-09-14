@@ -390,7 +390,15 @@ pub fn roster_ref_effective(
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
     let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-    let conn: &Connection = &read_tx;
+    roster_ref_effective_in_snapshot(&read_tx, account_id, roster_ref, device_fingerprint)
+}
+
+fn roster_ref_effective_in_snapshot(
+    conn: &Connection,
+    account_id: AccountId,
+    roster_ref: AccountEntryHash,
+    device_fingerprint: DeviceFingerprint,
+) -> anyhow::Result<fold::AuthorityQuery<fold::RosterAuthority>> {
     let Some((authority, effective_at, closed_at)) =
         load_roster_fact(conn, account_id, &roster_ref)?
     else {

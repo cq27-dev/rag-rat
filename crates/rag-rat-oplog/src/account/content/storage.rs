@@ -40,8 +40,8 @@ type AccountEntryHash = [u8; 32];
 const PENDING_REFOLD_CONTENT_CANDIDATE: i64 = 1;
 const PENDING_REFOLD_ACCOUNT_CHANGE: i64 = 2;
 
-const PRE_VERIFY_PER_AUTHOR_MAX: i64 = 64;
-const PRE_VERIFY_GLOBAL_MAX: i64 = 256;
+const PRE_VERIFY_PER_AUTHOR_MAX: usize = 64;
+const PRE_VERIFY_GLOBAL_MAX: usize = 256;
 const PRE_VERIFY: PreVerifyQueue =
     PreVerifyQueue { table: "content_pre_verify", owner_column: "claimed_author_account_id" };
 const CANDIDATES_PER_AUTHOR_MAX: i64 = 4_096;
@@ -315,13 +315,10 @@ fn enforce_pre_verify_budget(
         author,
         inserted_hash,
         QueueBudget {
-            max: PRE_VERIFY_PER_AUTHOR_MAX as usize,
+            max: PRE_VERIFY_PER_AUTHOR_MAX,
             scope: ContentCapacityScope::PreVerifyAuthor,
         },
-        QueueBudget {
-            max: PRE_VERIFY_GLOBAL_MAX as usize,
-            scope: ContentCapacityScope::PreVerifyGlobal,
-        },
+        QueueBudget { max: PRE_VERIFY_GLOBAL_MAX, scope: ContentCapacityScope::PreVerifyGlobal },
     )?;
     Ok(match outcome {
         BudgetOutcome::Parked { evicted } if evicted.is_empty() => ContentIngestOutcome::PreVerify,
@@ -3683,7 +3680,7 @@ mod tests {
             conn.query_row("SELECT count(*) FROM content_pre_verify", [], |row| row
                 .get::<_, i64>(0))
                 .unwrap(),
-            PRE_VERIFY_PER_AUTHOR_MAX
+            PRE_VERIFY_PER_AUTHOR_MAX as i64
         );
         assert!(!PRE_VERIFY.contains(&conn, &first_hash.unwrap()).unwrap());
         assert!(PRE_VERIFY.contains(&conn, &newest_hash.unwrap()).unwrap());
@@ -3746,13 +3743,16 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(a_count, PRE_VERIFY_PER_AUTHOR_MAX, "author A is capped at the per-author max");
+        assert_eq!(
+            a_count, PRE_VERIFY_PER_AUTHOR_MAX as i64,
+            "author A is capped at the per-author max"
+        );
         // The global total is PER_AUTHOR_MAX + 1 (author A's cap + author B's surviving row), well
         // under the global cap — proving the global eviction never fired.
         let total: i64 = conn
             .query_row("SELECT count(*) FROM content_pre_verify", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(total, PRE_VERIFY_PER_AUTHOR_MAX + 1);
+        assert_eq!(total, PRE_VERIFY_PER_AUTHOR_MAX as i64 + 1);
     }
 
     #[test]
@@ -4001,7 +4001,7 @@ mod tests {
     #[test]
     fn global_pre_verify_evicts_oldest_and_exact_candidate_replay_bypasses_capacity() {
         let conn = db();
-        for ordinal in 0..PRE_VERIFY_GLOBAL_MAX {
+        for ordinal in 0..PRE_VERIFY_GLOBAL_MAX as i64 {
             let signed_hash = cbor::sha256(&ordinal.to_be_bytes());
             conn.execute(
                 "INSERT INTO content_pre_verify(
@@ -4025,7 +4025,7 @@ mod tests {
         let unknown_account = super::super::super::AccountId::from_bytes([0xf1; 32]);
         let parked = content(&secret, unknown_account, [0xf2; 32], 0, None);
         assert_eq!(
-            content_ingest(&conn, &parked.signed_bytes, PRE_VERIFY_GLOBAL_MAX + 1).unwrap(),
+            content_ingest(&conn, &parked.signed_bytes, PRE_VERIFY_GLOBAL_MAX as i64 + 1).unwrap(),
             ContentIngestOutcome::PreVerifyWithEviction {
                 scopes: vec![ContentCapacityScope::PreVerifyGlobal]
             }
