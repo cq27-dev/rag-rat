@@ -73,7 +73,7 @@ pub struct TableSessionReport {
 #[derive(Debug, thiserror::Error)]
 pub enum TableSessionError {
     #[error("table-sync session transport: {0}")]
-    Codec(TableCodecError),
+    Codec(#[from] TableCodecError),
     #[error("table-sync protocol violation: {0}")]
     Protocol(String),
     /// The peer made no progress within the idle window: it sent no frame, took none of ours, or

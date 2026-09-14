@@ -236,7 +236,7 @@ pub trait NodeAuth {
 pub enum AuthError {
     /// The transport failed or the peer sent an unreadable frame.
     #[error("sync auth transport: {0}")]
-    Codec(CodecError),
+    Codec(#[from] CodecError),
     /// The peer's binding did not satisfy our admission policy — the UNIFORM refusal (cause
     /// hidden).
     #[error("peer is not authorized for this account")]

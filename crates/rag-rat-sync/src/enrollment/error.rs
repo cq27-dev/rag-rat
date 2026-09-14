@@ -38,17 +38,11 @@ pub enum InviteError {
     #[error("enrollment transport: {0}")]
     Transport(String),
     #[error("enrollment stream: {0}")]
-    Io(std::io::Error),
+    Io(#[from] std::io::Error),
 }
 
 impl From<anyhow::Error> for InviteError {
     fn from(value: anyhow::Error) -> Self {
         Self::Storage(value)
-    }
-}
-
-impl From<std::io::Error> for InviteError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
     }
 }
