@@ -59,7 +59,7 @@ use super::backend::{self, CheckoutScope, LiveBackend, ProjectLayout};
 use super::lsp::client::LspClient;
 use super::lsp::position::LineIndex;
 use super::store::{self, EdgeOracleRow};
-use super::{OracleResolutionKind, OracleTool, ToolAvailability, ToolManifest, join};
+use super::{OracleResolutionKind, OracleTool, RunStatus, ToolAvailability, ToolManifest, join};
 
 /// A resident live-oracle language-server session: the spawned client, the backend it drives, the
 /// `tool_version` its rows are stamped with, and the checkout root URI documents are opened
@@ -478,7 +478,14 @@ pub struct LivePassReport {
     /// text; this is the half a caller branches on.
     #[serde(skip)]
     pub abort: Option<LivePassAbort>,
-    pub status: String,
+    pub status: RunStatus,
+}
+
+impl LivePassReport {
+    /// Whether the server was still (or again) loading its project, so the pass asked nothing.
+    pub fn is_warming(&self) -> bool {
+        self.status == RunStatus::Warming
+    }
 }
 
 /// Run one live oracle pass: resolve the worklist's callees through the resident client and
@@ -498,7 +505,7 @@ pub fn live_oracle_pass(
     if let Some(reason) = session.layout_change_ending_the_pass(input.scope) {
         report.unfinished_paths = input.worklist.to_vec();
         report.abort = Some(LivePassAbort::LayoutChanged);
-        report.status = format!("Aborted: {reason}");
+        report.status = pass_status(Some(&PassStop::Aborted(reason.to_string())), &report);
         return Ok(report);
     }
     match session.readiness_checkpoint() {
@@ -510,13 +517,13 @@ pub fn live_oracle_pass(
                 session.trigger_warmup_open(input.scope, input.worklist);
             }
             report.unfinished_paths = input.worklist.to_vec();
-            report.status = "Warming".to_string();
+            report.status = pass_status(Some(&PassStop::Warming), &report);
             return Ok(report);
         },
         Err(err) => {
             report.unfinished_paths = input.worklist.to_vec();
             report.abort = Some(LivePassAbort::Server);
-            report.status = format!("Aborted: {err}");
+            report.status = pass_status(Some(&PassStop::Aborted(err.to_string())), &report);
             return Ok(report);
         },
     }
@@ -547,7 +554,7 @@ pub fn live_oracle_pass(
                 // preserve the active checkout's old-version coverage and retry after the
                 // collision clears.
                 report.unfinished_paths = input.worklist.to_vec();
-                report.status = "VersionMigrationBlocked".to_string();
+                report.status = pass_status(Some(&PassStop::VersionMigrationBlocked), &report);
                 tx.commit()?;
                 return Ok(report);
             },
@@ -594,7 +601,7 @@ pub fn live_oracle_pass(
             session.tool_version(),
             input.checkout,
             input.started_at_ms,
-            &report.status,
+            &report.status.as_db_str(),
             &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
         )?;
     }
@@ -965,17 +972,18 @@ fn resolve_one_file(
     Ok(FileOutcome::Next)
 }
 
-/// The operator-facing status for a pass that ended with `stop`. A recorded run tells a
-/// version-only transition and a completed pass apart from the unrecorded no-verdict pass.
-fn pass_status(stop: Option<&PassStop>, report: &LivePassReport) -> String {
+/// The status for a pass that ended with `stop` — the one place a live status is derived, early
+/// exits included. A recorded run tells a version-only transition and a completed pass apart from
+/// the unrecorded no-verdict pass.
+fn pass_status(stop: Option<&PassStop>, report: &LivePassReport) -> RunStatus {
     match stop {
-        Some(PassStop::Aborted(err)) => format!("Aborted: {err}"),
-        Some(PassStop::Warming) => "Warming".to_string(),
-        None if report.run_recorded && report.rows_written == 0 => "VersionMigrated".to_string(),
-        None if report.unfinished_paths.is_empty() && report.run_recorded =>
-            "Completed".to_string(),
-        None if report.unfinished_paths.is_empty() => "NoVerdicts".to_string(),
-        None => "BudgetExhausted".to_string(),
+        Some(PassStop::Aborted(err)) => RunStatus::Aborted(err.clone()),
+        Some(PassStop::Warming) => RunStatus::Warming,
+        Some(PassStop::VersionMigrationBlocked) => RunStatus::VersionMigrationBlocked,
+        None if report.run_recorded && report.rows_written == 0 => RunStatus::VersionMigrated,
+        None if report.unfinished_paths.is_empty() && report.run_recorded => RunStatus::Completed,
+        None if report.unfinished_paths.is_empty() => RunStatus::NoVerdicts,
+        None => RunStatus::BudgetExhausted,
     }
 }
 
@@ -996,6 +1004,9 @@ enum PassStop {
     Warming,
     /// A dead or wedged server, or a readiness error; the watcher replaces the session.
     Aborted(String),
+    /// The version migration would collide with a sibling checkout's content key, so the pass
+    /// processed nothing; the whole worklist rides the backlog.
+    VersionMigrationBlocked,
 }
 
 /// The server's readiness checkpoint for the next definition batch, or why the pass must stop.

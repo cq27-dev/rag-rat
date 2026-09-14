@@ -876,8 +876,8 @@ impl LiveBackendTail {
     /// Refusing to ask a warming server is the correct behaviour, but on its own it is
     /// indistinguishable from working: the backlog just rides forever. Say so once, and reset as
     /// soon as the backend gets anywhere, so a normally-warming server stays quiet.
-    fn note_warming(&mut self, status: &str) {
-        if status != "Warming" {
+    fn note_warming(&mut self, report: &LivePassReport) {
+        if !report.is_warming() {
             self.warming_passes = 0;
             self.warming_reported = false;
             return;
@@ -1119,12 +1119,12 @@ impl LiveBackendTail {
                         "live oracle: server aborted; session dropped, respawn after backoff"
                     );
                     self.lifecycle.on_failure(Instant::now());
-                } else if report.status != "Warming" {
+                } else if !report.is_warming() {
                     // A completed request batch proves the replacement session is stable enough
                     // to end an earlier crash/spawn-failure streak. Warm-up alone does not.
                     self.lifecycle.on_stable_batch();
                 }
-                self.note_warming(&report.status);
+                self.note_warming(&report);
                 self.note_unconfigured(&report);
                 // A pass whose candidates were all skipped as unconfigured writes no rows and
                 // defers nothing (those skips are not retried), so it has to be admitted to the
@@ -1374,17 +1374,24 @@ mod tests {
         // watcher has to say so, once, and stop as soon as the backend gets anywhere.
         let mut tail =
             LiveBackendTail::new(LiveBackend::for_tool(rag_rat_oracle::OracleTool::TsLsp).unwrap());
+        let warming = LivePassReport {
+            status: rag_rat_oracle::RunStatus::Warming,
+            ..LivePassReport::default()
+        };
         for _ in 0..WARMING_PASSES_BEFORE_REPORT - 1 {
-            tail.note_warming("Warming");
+            tail.note_warming(&warming);
             assert!(!tail.warming_reported, "a normally-warming server must stay quiet");
         }
-        tail.note_warming("Warming");
+        tail.note_warming(&warming);
         assert!(tail.warming_reported, "a server that never warms must be reported");
-        tail.note_warming("Warming");
+        tail.note_warming(&warming);
         assert!(tail.warming_reported, "reported ONCE, not on every later pass");
 
         // Any progress at all clears the streak, so a later cold start reports afresh.
-        tail.note_warming("Completed");
+        tail.note_warming(&LivePassReport {
+            status: rag_rat_oracle::RunStatus::Completed,
+            ..LivePassReport::default()
+        });
         assert_eq!(tail.warming_passes, 0);
         assert!(!tail.warming_reported);
     }

@@ -45,3 +45,29 @@ fn persisted_enums_round_trip_through_db_strings() {
     }
     assert_eq!(OracleResolutionKind::from_db_str("nonsense"), None);
 }
+
+/// `RunStatus` is persisted as `oracle_runs.status` and rides `stats_json`, so its tokens are
+/// schema too — and `rag-rat-core`'s eval asserts the stored `Completed` literally. Pinned as
+/// literals, through both the DB string and the serde form, for the same reason as above.
+#[test]
+fn run_status_tokens_are_pinned_through_db_strings_and_serde() {
+    let aborted = RunStatus::Aborted("the server exited".to_string());
+    for (status, token) in [
+        (RunStatus::Completed, "Completed"),
+        (RunStatus::Warming, "Warming"),
+        (RunStatus::VersionMigrated, "VersionMigrated"),
+        (RunStatus::VersionMigrationBlocked, "VersionMigrationBlocked"),
+        (RunStatus::NoVerdicts, "NoVerdicts"),
+        (RunStatus::BudgetExhausted, "BudgetExhausted"),
+        (aborted, "Aborted: the server exited"),
+    ] {
+        assert_eq!(status.as_db_str(), token);
+        assert_eq!(status.to_string(), token);
+        assert_eq!(serde_json::to_value(&status).unwrap(), serde_json::json!(token));
+        assert_eq!(RunStatus::from_db_str(token), Some(status));
+    }
+    // A bare `Aborted` is not a token the crate writes, and an unknown one stays unknown: the
+    // status read-back keeps historical rows as raw strings rather than failing on them.
+    assert_eq!(RunStatus::from_db_str("Aborted"), None);
+    assert_eq!(RunStatus::from_db_str("Blocked"), None);
+}

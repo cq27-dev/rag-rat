@@ -337,7 +337,7 @@ mod tests {
             rows_written: 13,
             monikers_written: monikers,
             external_symbols_written: 0,
-            status: "Completed".to_string(),
+            status: crate::RunStatus::Completed,
         };
         OracleResolutionReport::assemble(
             &sample_profile(),

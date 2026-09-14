@@ -21,7 +21,7 @@ fn run_with_empty_scip_completes_with_no_verdicts() {
     assert_eq!(report.no_occurrence, 1, "no document → no occurrence bucket");
     assert_eq!(report.rows_written, 0);
     assert_eq!(report.oracle_only_calls, 0);
-    assert_eq!(report.status, "Completed");
+    assert_eq!(report.status, RunStatus::Completed);
     assert!(h.verdict(edge).is_none());
     // The run is still recorded.
     let runs: i64 = h.conn.query_row("SELECT COUNT(*) FROM oracle_runs", [], |r| r.get(0)).unwrap();
