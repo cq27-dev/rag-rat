@@ -116,6 +116,20 @@ mod listener {
         }
     }
 
+    /// Outside tests the listener carries no instrumentation: the hooks are a zero-sized no-op.
+    /// Braced rather than a unit struct so `ListenerHooks::default()` reads the same in both
+    /// builds.
+    #[cfg(not(test))]
+    #[derive(Default)]
+    pub struct ListenerHooks {}
+
+    #[cfg(not(test))]
+    impl ListenerHooks {
+        fn signal_waiting(&self) {}
+
+        fn signal_bound(&self) {}
+    }
+
     /// Per-session record of when each memory / symbol was last SURFACED IN FULL, so a repeat is
     /// deduped only within [`RESURFACE_WINDOW`] of its last show (#759). Whole sessions are pruned
     /// by LRU cap + [`SESSION_TTL`]; individual entries past the window are dropped on read
@@ -136,89 +150,68 @@ mod listener {
         seen.keys().cloned().collect()
     }
 
-    /// Shared body of the listener task. In non-test builds the `$hooks` argument is compiled away.
-    macro_rules! spawn_listener_task {
-        ($config:expr, $hooks:expr) => {{
-            let config = $config;
-            tokio::spawn(async move {
-                let lock_path = socket_lock_path_for(&config);
-                let socket = socket_path_for(&config);
-                if let Some(parent) = socket.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                // Win the socket election, then bind. The lock must live inside this task: aborting
-                // the task drops it, so a surviving process's retry loop can take over
-                // (election, watcher-identical). A bind that fails AFTER winning the
-                // election (a transient FS/permissions hiccup) must not strand the
-                // worktree serving nothing while holding the lock (#53): drop the
-                // election so a sibling can try, back off, and re-elect — the same
-                // die→next-process-takes-over model, made resilient for the single-process case
-                // too.
-                let (_lock, listener): (FileLock, UnixListener) = loop {
-                    let lock = loop {
-                        match FileLock::try_acquire(&lock_path) {
-                            Ok(Some(lock)) => break lock,
-                            _ => {
-                                #[cfg(test)]
-                                {
-                                    let hooks = $hooks.clone();
-                                    hooks.signal_waiting();
-                                }
-                                tokio::time::sleep(ELECTION_RETRY).await;
-                            },
-                        }
-                    };
-                    // Only the lock holder ever unlinks: race-free stale-socket cleanup.
-                    let _ = std::fs::remove_file(&socket);
-                    match UnixListener::bind(&socket) {
-                        Ok(listener) => break (lock, listener),
-                        Err(_) => {
-                            drop(lock);
-                            tokio::time::sleep(ELECTION_RETRY).await;
-                        },
-                    }
-                };
-                #[cfg(test)]
-                {
-                    let hooks = $hooks.clone();
-                    hooks.signal_bound();
-                }
-                let mut sessions: HashMap<String, SessionState> = HashMap::new();
-                loop {
-                    let Ok((stream, _addr)) = listener.accept().await else {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        continue;
-                    };
-                    prune_sessions(&mut sessions);
-                    if let Err(err) = serve_one(stream, &config, &mut sessions).await
-                        && std::env::var_os("RAG_RAT_HOOK_DEBUG").is_some()
-                    {
-                        eprintln!("agent-hook listener: {err:#}");
-                    }
-                }
-            })
-        }};
-    }
-
     /// Spawn the hook listener task: win the socket election (retrying forever, like the
     /// watcher), then accept hook clients until the task is dropped. Returns the JoinHandle so
     /// the server can abort it on teardown; the lock and socket release with the process.
     pub fn spawn_listener(config: Config) -> JoinHandle<()> {
-        #[cfg(test)]
-        {
-            spawn_listener_with_hooks(config, ListenerHooks::default())
-        }
-        #[cfg(not(test))]
-        {
-            spawn_listener_task!(config, ())
-        }
+        spawn_listener_with_hooks(config, ListenerHooks::default())
     }
 
-    /// Same as [`spawn_listener`], but with test hooks that signal readiness/waiting states.
-    /// Production logic is unchanged; the hooks are no-ops by default.
-    #[cfg(test)]
-    pub fn spawn_listener_with_hooks(config: Config, hooks: ListenerHooks) -> JoinHandle<()> {
-        spawn_listener_task!(config, hooks)
+    /// Same as [`spawn_listener`], with hooks that signal the waiting / bound states. Outside tests
+    /// the hooks are no-ops, so production behavior is unchanged.
+    pub(super) fn spawn_listener_with_hooks(
+        config: Config,
+        hooks: ListenerHooks,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let lock_path = socket_lock_path_for(&config);
+            let socket = socket_path_for(&config);
+            if let Some(parent) = socket.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // Win the socket election, then bind. The lock must live inside this task: aborting
+            // the task drops it, so a surviving process's retry loop can take over
+            // (election, watcher-identical). A bind that fails AFTER winning the
+            // election (a transient FS/permissions hiccup) must not strand the
+            // worktree serving nothing while holding the lock (#53): drop the
+            // election so a sibling can try, back off, and re-elect — the same
+            // die→next-process-takes-over model, made resilient for the single-process case
+            // too.
+            let (_lock, listener): (FileLock, UnixListener) = loop {
+                let lock = loop {
+                    match FileLock::try_acquire(&lock_path) {
+                        Ok(Some(lock)) => break lock,
+                        _ => {
+                            hooks.signal_waiting();
+                            tokio::time::sleep(ELECTION_RETRY).await;
+                        },
+                    }
+                };
+                // Only the lock holder ever unlinks: race-free stale-socket cleanup.
+                let _ = std::fs::remove_file(&socket);
+                match UnixListener::bind(&socket) {
+                    Ok(listener) => break (lock, listener),
+                    Err(_) => {
+                        drop(lock);
+                        tokio::time::sleep(ELECTION_RETRY).await;
+                    },
+                }
+            };
+            hooks.signal_bound();
+            let mut sessions: HashMap<String, SessionState> = HashMap::new();
+            loop {
+                let Ok((stream, _addr)) = listener.accept().await else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                prune_sessions(&mut sessions);
+                if let Err(err) = serve_one(stream, &config, &mut sessions).await
+                    && std::env::var_os("RAG_RAT_HOOK_DEBUG").is_some()
+                {
+                    eprintln!("agent-hook listener: {err:#}");
+                }
+            }
+        })
     }
 
     /// Drop sessions idle past the TTL, then evict least-recently-used down to the cap.
