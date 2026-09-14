@@ -31,7 +31,7 @@ pub(crate) fn ensure_model_manifest(conn: &Connection) -> anyhow::Result<()> {
     // on explicit `install_model`. `upsert_model` is `ON CONFLICT DO NOTHING`, so this only
     // seeds rows.
     for s in EMBEDDING_MODELS {
-        upsert_model(conn, s.model_id, "embedding", Some(s.dim), s.backend.runtime(), false)?;
+        upsert_model(conn, s.model_id, "embedding", Some(s.dim), s.backend.as_db_str(), false)?;
     }
     normalize_embedding_model_versions(conn)?;
     Ok(())

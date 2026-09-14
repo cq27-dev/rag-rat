@@ -16,7 +16,8 @@
 
 /// The runtime that actually produces vectors for a model. Maps 1:1 to the `ai_models.runtime`
 /// column persisted in the index, and selects which embedder `index::ai` constructs.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase")]
 pub enum Backend {
     /// The dependency-free locality-sensitive hash embedder — always available, the fallback tier.
     Hash,
@@ -36,15 +37,15 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// The `ai_models.runtime` column value for this backend. Stable wire string — keep in sync
-    /// with the persisted manifest (`upsert_model`), never reorder/rename without a migration.
-    pub fn runtime(self) -> &'static str {
-        match self {
-            Self::Hash => "hash",
-            Self::FastEmbed => "fastembed",
-            Self::Model2Vec => "model2vec",
-            Self::Ollama => "ollama",
-        }
+    /// The `ai_models.runtime` column value for this backend. Stable wire string — never rename a
+    /// variant without a migration.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// The exact inverse of [`Self::as_db_str`]; `None` for any other stored text.
+    pub fn from_db_str(token: &str) -> Option<Self> {
+        token.parse().ok()
     }
 }
 
@@ -54,8 +55,9 @@ impl Backend {
 pub struct EmbeddingModelSpec {
     /// The persisted `ai_models.model_id` — the stable identity used everywhere in the index.
     pub model_id: &'static str,
-    /// Human-facing model name (the upstream HF repo / canonical name) for status output.
-    pub display: &'static str,
+    /// Human-facing name for status output when it differs from [`Self::model_id`] (only the hash
+    /// tier's). Read through [`Self::display`].
+    pub display_name: Option<&'static str>,
     /// Embedding dimension. A change here is a re-embed (new vectors), not a schema migration.
     pub dim: usize,
     /// The model's maximum input length in TOKENS (its transformer context window), or `None` for
@@ -87,6 +89,12 @@ pub struct EmbeddingModelSpec {
 const CHARS_PER_TOKEN_ESTIMATE: usize = 4;
 
 impl EmbeddingModelSpec {
+    /// Human-facing model name for status output: the upstream HF path, which is the model id,
+    /// unless the row names another.
+    pub fn display(&self) -> &'static str {
+        self.display_name.unwrap_or(self.model_id)
+    }
+
     /// The embedding input length (in CHARS) this model can actually use: `max_tokens × ~4`, or
     /// `None` for a model with no sequence limit. A rough over-estimate (see
     /// [`CHARS_PER_TOKEN_ESTIMATE`]) used to judge whether a model is "short-context" for typical
@@ -107,15 +115,13 @@ pub const HASH_EMBEDDING_DIM: usize = 384;
 /// all-MiniLM-L6-v2 (384-dim) — the default FastEmbed general-purpose backend. The model_id is the
 /// HF path (also the toml `model = "..."` selector, #317): no aliases.
 pub const FASTEMBED_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
-pub const FASTEMBED_DISPLAY_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
+pub const FASTEMBED_DISPLAY_MODEL: &str = FASTEMBED_MODEL_ID;
 pub const FASTEMBED_EMBEDDING_DIM: usize = 384;
 
 /// BGE-small-en-v1.5 (#112): a stronger general-retrieval embedder than all-MiniLM at the SAME
 /// 384-dim — switching to it is a re-embed, not a schema/dim change. MIT-licensed; ships via
 /// fastembed (downloads on first use). Measured against `FASTEMBED_MODEL_ID` on the replay eval.
 pub const BGE_SMALL_MODEL_ID: &str = "BAAI/bge-small-en-v1.5";
-pub const BGE_SMALL_DISPLAY_MODEL: &str = "BAAI/bge-small-en-v1.5";
-pub const BGE_SMALL_EMBEDDING_DIM: usize = 384;
 
 /// jina-embeddings-v2-base-code (#112): a CODE-specific embedder — 768-dim, Apache-2.0, a built-in
 /// fastembed model. SYMMETRIC: queries and code both embed RAW (no query instruction, unlike
@@ -123,14 +129,11 @@ pub const BGE_SMALL_EMBEDDING_DIM: usize = 384;
 /// schema change. Measured against all-MiniLM / BGE on the commit-replay eval before it ships as
 /// the code tier.
 pub const JINA_CODE_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-code";
-pub const JINA_CODE_DISPLAY_MODEL: &str = "jinaai/jina-embeddings-v2-base-code";
-pub const JINA_CODE_EMBEDDING_DIM: usize = 768;
 
 /// Model2Vec static-embedding backend: a token→vector lookup + mean-pool (no transformer forward
 /// pass), ~100-500× faster than FastEmbed on CPU at some retrieval-quality cost. The right choice
 /// for very large repos where the FastEmbed backfill is infeasible.
 pub const MODEL2VEC_MODEL_ID: &str = "minishlab/potion-retrieval-32M";
-pub const MODEL2VEC_DISPLAY_MODEL: &str = "minishlab/potion-retrieval-32M";
 pub const MODEL2VEC_EMBEDDING_DIM: usize = 512;
 
 // NOTE (#317 rework): there is intentionally NO `ollama-*` registry row, alias, or const. Ollama is
@@ -144,7 +147,7 @@ pub const MODEL2VEC_EMBEDDING_DIM: usize = 512;
 pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
     EmbeddingModelSpec {
         model_id: HASH_MODEL_ID,
-        display: "hash",
+        display_name: Some("hash"),
         dim: HASH_EMBEDDING_DIM,
         // A char-level locality hash, not a transformer — no token window.
         max_tokens: None,
@@ -154,7 +157,7 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
     },
     EmbeddingModelSpec {
         model_id: FASTEMBED_MODEL_ID,
-        display: FASTEMBED_DISPLAY_MODEL,
+        display_name: None,
         dim: FASTEMBED_EMBEDDING_DIM,
         // all-MiniLM-L6-v2's context is 256 tokens — short for code; long chunks lose their tail.
         max_tokens: Some(256),
@@ -164,8 +167,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
     },
     EmbeddingModelSpec {
         model_id: BGE_SMALL_MODEL_ID,
-        display: BGE_SMALL_DISPLAY_MODEL,
-        dim: BGE_SMALL_EMBEDDING_DIM,
+        display_name: None,
+        dim: 384,
         // BGE-small-en-v1.5's context is 512 tokens.
         max_tokens: Some(512),
         version: "BAAI/bge-small-en-v1.5-v1",
@@ -174,8 +177,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
     },
     EmbeddingModelSpec {
         model_id: JINA_CODE_MODEL_ID,
-        display: JINA_CODE_DISPLAY_MODEL,
-        dim: JINA_CODE_EMBEDDING_DIM,
+        display_name: None,
+        dim: 768,
         // jina-v2-base-code handles 8192 tokens (ALiBi) — whole code chunks fit; no tail loss.
         max_tokens: Some(8192),
         version: "jinaai/jina-embeddings-v2-base-code-v1",
@@ -184,7 +187,7 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
     },
     EmbeddingModelSpec {
         model_id: MODEL2VEC_MODEL_ID,
-        display: MODEL2VEC_DISPLAY_MODEL,
+        display_name: None,
         dim: MODEL2VEC_EMBEDDING_DIM,
         // Model2Vec mean-pools token vectors with no attention — no sequence limit to truncate at.
         max_tokens: None,
@@ -238,6 +241,30 @@ mod tests {
         }
     }
 
+    /// `ai_models.runtime` holds these tokens: pinned byte-for-byte, and the DB side is exact.
+    #[test]
+    fn runtime_tokens_are_pinned_and_round_trip() {
+        for (backend, token) in [
+            (Backend::Hash, "hash"),
+            (Backend::FastEmbed, "fastembed"),
+            (Backend::Model2Vec, "model2vec"),
+            (Backend::Ollama, "ollama"),
+        ] {
+            assert_eq!(backend.as_db_str(), token);
+            assert_eq!(Backend::from_db_str(token), Some(backend));
+        }
+        assert_eq!(Backend::from_db_str("FastEmbed"), None);
+    }
+
+    /// Status output shows the HF path for every model but the hash tier.
+    #[test]
+    fn display_is_the_model_id_except_for_the_hash_tier() {
+        for s in EMBEDDING_MODELS {
+            let expected = if s.backend == Backend::Hash { "hash" } else { s.model_id };
+            assert_eq!(s.display(), expected);
+        }
+    }
+
     #[test]
     fn ollama_is_not_a_selectable_model_id() {
         // The removed `ollama-*` ids/aliases must not resolve — selecting Ollama is done via the
@@ -272,7 +299,7 @@ mod tests {
                 Backend::Hash | Backend::Model2Vec => {
                     assert_eq!(s.max_tokens, None, "{} has no token window", s.model_id)
                 },
-                _ => {},
+                Backend::Ollama => unreachable!("no registry row is served by Ollama"),
             }
             assert_eq!(s.max_input_chars().is_some(), s.max_tokens.is_some());
         }
@@ -290,7 +317,9 @@ mod tests {
         for s in EMBEDDING_MODELS {
             match s.backend {
                 Backend::Hash => assert!(!s.model_id.contains('/'), "hash id stays bare"),
-                _ => assert!(s.model_id.contains('/'), "{} should be an HF path", s.model_id),
+                Backend::FastEmbed | Backend::Model2Vec | Backend::Ollama => {
+                    assert!(s.model_id.contains('/'), "{} should be an HF path", s.model_id)
+                },
             }
         }
     }
