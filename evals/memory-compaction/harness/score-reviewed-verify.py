@@ -14,7 +14,7 @@ MIN_CITATION_CHARS = 10
 MIN_CLAIM_CHARS = 20
 MIN_CLAIM_WORDS = 4
 
-# Comparison/boolean operators, two-character first (mirrors verdict.rs `mixed_stream`).
+# Comparison/boolean operators, two-character first (mirrors dream/verdict/guard.rs `mixed_stream`).
 OPERATORS = ("==", "!=", "<=", ">=", "&&", "||")
 
 
@@ -36,7 +36,7 @@ def ascii_case_equal(left: str, right: str) -> bool:
 
 def mixed_stream(value: str) -> list[tuple]:
     """Words and operators in source order as ("word", text, code, glued_to_prev) /
-    ("op", symbol, glued_to_prev), case preserved — mirrors verdict.rs `mixed_stream`:
+    ("op", symbol, glued_to_prev), case preserved — mirrors dream/verdict/guard.rs `mixed_stream`:
     arrows are punctuation, a unary `!` counts only glued to a following word, and `code`
     marks backticked word occurrences."""
     items = []
@@ -83,7 +83,7 @@ def mixed_stream(value: str) -> list[tuple]:
 
 def text_mentions_identifier(text: str, identifier: str) -> bool:
     """Case-exact, separator-preserving identifier match with word boundaries — mirrors
-    verdict.rs `text_mentions_identifier` (`foo/bar` never aliases `foo::bar`)."""
+    dream/verdict/guard.rs `text_mentions_identifier` (`foo/bar` never aliases `foo::bar`)."""
     identifier = identifier.strip()
     if not identifier:
         return False
@@ -103,7 +103,7 @@ def text_mentions_identifier(text: str, identifier: str) -> bool:
 def claim_grounds_in_span(claim: str, span: str) -> bool:
     """The WHOLE claim grounds in the span: one contiguous verbatim word run (prose case-folded,
     backticked words case-exact per occurrence) whose operators keep the same positions — extended
-    over operators GLUED to the boundary words (mirrors verdict.rs)."""
+    over operators GLUED to the boundary words (mirrors dream/verdict/guard.rs)."""
     stream = mixed_stream(span)
     claim_stream = mixed_stream(claim)
     claim_words = [item[1] for item in claim_stream if item[0] == "word"]
@@ -155,7 +155,7 @@ def claim_grounds_in_span(claim: str, span: str) -> bool:
 
 def claim_mentions_identifier(claim: str, identifier: str) -> bool:
     """The identifier must occur in the claim with its COMPLETE, case-exact shape — not as a
-    substring, case variant, or separator variant (mirrors verdict.rs)."""
+    substring, case variant, or separator variant (mirrors dream/verdict/guard.rs)."""
     return text_mentions_identifier(claim, identifier)
 
 
@@ -167,7 +167,7 @@ def parse(answer: str) -> dict | None:
         marker, separator, value = line.partition(":")
         marker = ascii_lower(marker)
         value = value.strip()
-        # A marker requires its colon (mirrors verdict.rs `strip_ci`); a colon-less `EVIDENCE`
+        # A marker requires its colon (mirrors dream/verdict/mod.rs `strip_ci`); a colon-less `EVIDENCE`
         # or `REASON` line must not open/close the evidence section.
         if not separator:
             marker = ""
@@ -254,7 +254,7 @@ def is_bare_locator(citation: str) -> bool:
 
 def identifier_from_pack_line(line: str) -> str | None:
     """The identifier of a rendered table row (``- `identifier` -> resolution``), else None —
-    mirrors verdict.rs `identifier_from_pack_line`."""
+    mirrors dream/verdict/guard.rs `identifier_from_pack_line`."""
     if not line.startswith("- `"):
         return None
     identifier, separator, _ = line[3:].partition("` ->")
@@ -294,7 +294,7 @@ def production_accepts(case: dict, pack: str, answer: str) -> str:
         r"-> (?:not a defined symbol; appears verbatim as source text|"
         r"not an indexed file; appears verbatim only as source text)"
     )
-    # Mirror verdict.rs `verdict_is_grounded`'s final predicate EXACTLY: some citation must match
+    # Mirror dream/verdict/guard.rs `verdict_is_grounded`'s final predicate EXACTLY: some citation must match
     # some content line that is not a text-present row AND is linked to the claim — an
     # identifier-table row only as ABSENCE evidence the citation names (`-> NOT FOUND`, the
     # citation contains the identifier, the identifier occurs in the claim as a complete token

@@ -454,11 +454,11 @@ def verify_test():
     (RESULTS / "verify-results.json").write_text(json.dumps(out, indent=1))
 
 
-# Mirrors the SHIPPED evidence-pack verdict prompt: dream/verdict.rs `VERDICT_PROMPT_HEAD`
+# Mirrors the SHIPPED evidence-pack verdict prompt: dream/verdict/mod.rs `VERDICT_PROMPT_HEAD`
 # (prompts/verdict_head.md) + `render_verdict_prompt` tail (PROMPT_VERSION "verify-pack-v6"). It is a
 # 2-way verdict (current | diverged) — `unverifiable` is decided deterministically in pass 0 and
 # NEVER asked of the model, so it is absent here. RE-SYNC this string whenever PROMPT_VERSION bumps
-# in dream/verdict.rs.
+# in dream/verdict/mod.rs.
 VERIFY_PACK_PROMPT = """You are auditing a repo-intelligence memory NOTE against the repository as it exists RIGHT NOW. You are given a mechanically-generated EVIDENCE PACK from the current checkout: indexed resolutions of the identifiers the note mentions, plus current text excerpts from the note's bound files. The note was written in the past: the code may have moved past it, the note may describe in-flight work not present in this checkout, or they may agree.
 
 Read each identifier's resolution LITERALLY. The resolutions mean exactly:
