@@ -353,12 +353,12 @@ fn mcp_stdio_dormant_server_stays_dormant_until_restart() {
 }
 
 /// Regression guard: every tool advertised by `tools/list` (built from `TOOL_NAMES`) must be
-/// ROUTABLE by `tools/call`. The two are built from different sources — `list_tools` from
-/// `TOOL_NAMES`, the call router from the `#[tool]`-annotated methods — so a tool added to one but
-/// not the other is advertised yet uncallable (the SDK answers "tool not found"). `memory_rebind`
-/// regressed exactly this way: it was in `TOOL_NAMES` + handlers + schema but had no `#[tool]`
-/// method. Calling each tool with empty args is fine here: a routable tool answers with a result or
-/// an argument/validation error — only an unroutable one yields "tool not found".
+/// ROUTABLE by `tools/call`. `list_tools` advertises `TOOL_NAMES` while `call_tool_with_db` matches
+/// on the name — a tool added to the catalog without a match arm is advertised yet answers
+/// `unknown tool`. `memory_rebind` once regressed exactly this way: it was in `TOOL_NAMES` +
+/// handlers + schema but was not routable. Calling each tool with empty args is fine here: a
+/// routable tool answers with a result or an argument/validation error — only an unroutable one
+/// yields "unknown tool".
 #[test]
 fn mcp_stdio_every_advertised_tool_is_routable() {
     let root = unique_dir("mcp-stdio");

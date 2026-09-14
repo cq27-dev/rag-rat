@@ -50,7 +50,8 @@ pub fn call_tool(database: &Path, name: &str, arguments: Value) -> anyhow::Resul
 /// never lock them out (#143). This is a writer DENY-list, not a reader allow-list, on purpose: a
 /// newly added read tool is read-only by default (worst case: it falls back to a read-write open).
 /// Every tool listed here mutates the index — keep it in sync with the write handlers in
-/// `handlers.rs` (`tool_classification_covers_every_tool` guards that no tool is missed).
+/// `handlers.rs` (`read_only_classification_covers_every_tool_and_denies_writers` guards that no
+/// tool is missed).
 pub(crate) fn is_write_tool(name: &str) -> bool {
     matches!(
         name,
