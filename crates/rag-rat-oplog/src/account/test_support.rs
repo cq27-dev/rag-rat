@@ -57,15 +57,32 @@ pub(in crate::account) fn control_op(
 
 /// A `Private` `/2` StreamOwn for `account` over `repo-a`.
 pub(in crate::account) fn stream_own(account: AccountId) -> (StreamId, AccountOp) {
+    stream_own_private(account)
+}
+
+pub(in crate::account) fn stream_own_private(account: AccountId) -> (StreamId, AccountOp) {
+    stream_own_mode(account, crate::stream::AccessMode::Private, "repo-a")
+}
+
+/// Public ownership for tests exercising grants, which require PublicRead.
+pub(in crate::account) fn stream_own_public(account: AccountId) -> (StreamId, AccountOp) {
+    stream_own_mode(account, crate::stream::AccessMode::PublicRead, "repo-a")
+}
+
+pub(in crate::account) fn stream_own_mode(
+    account: AccountId,
+    access_mode: crate::stream::AccessMode,
+    repo: &str,
+) -> (StreamId, AccountOp) {
     let spec = StreamSpecV2 {
         owner_account_id: account,
         policy: StreamSpec {
-            repo_set: vec!["repo-a".to_string()],
+            repo_set: vec![repo.to_string()],
             kind_allow_list: None,
             relation_policy: None,
             node_overrides: Vec::new(),
         },
-        access_mode: crate::stream::AccessMode::Private,
+        access_mode,
     };
     let stream_id = stream::derive_v2(&spec).unwrap();
     let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
