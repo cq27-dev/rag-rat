@@ -16,11 +16,10 @@
 
 use rusqlite::{Connection, OptionalExtension};
 
-use super::align;
-use super::antiunify::{align_to_anchor, anti_unify, anti_unify_global, resolve_anchor_idx};
-use super::budget::CellBudget;
+use super::antiunify::{anti_unify_global, resolve_anchor_idx};
 use super::score::{Confidence, confidence_v2, metavar_profile, refactorability_v2};
 use super::signature::propose_signature;
+use super::{align, budget};
 use crate::refine::RefineMember;
 use crate::{ALIGNMENT_VERSION, NORM_VERSION};
 
@@ -295,12 +294,14 @@ pub fn refine_compute_and_store_budgeted(
         "baseline refine must not receive members with attached callee monikers"
     );
     // `lcs_ratio` stays the NiCad class fidelity (min pairwise 2·LCS/(|a|+|b|)) + its sampling bit.
+    // Without a shared allowance each lane draws from a local one at its own per-class cap, and
+    // `draw_from_global(cap, cap)` is exactly the fresh `new(cap)` budget.
     let seqs: Vec<Vec<String>> = members.iter().map(|m| m.seq.clone()).collect();
-    let fidelity = match global_remaining.as_deref_mut() {
-        Some(remaining) => align::class_fidelity_global(&seqs, remaining),
-        None =>
-            align::class_fidelity(&seqs, &mut CellBudget::new(align::LCS_AGGREGATE_CELLS_BUDGET)),
-    };
+    let mut fidelity_allowance = align::LCS_AGGREGATE_CELLS_BUDGET;
+    let fidelity = align::class_fidelity_global(
+        &seqs,
+        global_remaining.as_deref_mut().unwrap_or(&mut fidelity_allowance),
+    );
     let (lcs_ratio, lcs_sampled) = (fidelity.min_ratio, fidelity.sampled);
 
     // ── Anti-unification (Plan 4b §1.1-§1.10): medoid-anchored star LCS → template + VPs
@@ -313,14 +314,9 @@ pub fn refine_compute_and_store_budgeted(
     // budget-degraded matched-statement re-descent. Fold BOTH into `lcs_sampled` so the persisted
     // sampling bit reflects the fidelity-metric cap AND the whole template lane — a
     // degraded/skipped template is never reported as exact.
-    let (alignment, template) = match global_remaining {
-        Some(remaining) => anti_unify_global(members, anchor_idx, remaining),
-        None => {
-            let alignment = align_to_anchor(members, anchor_idx);
-            let template = anti_unify(members, &alignment);
-            (alignment, template)
-        },
-    };
+    let mut template_allowance = budget::ALIGN_AGGREGATE_CELLS_BUDGET;
+    let (alignment, template) =
+        anti_unify_global(members, anchor_idx, global_remaining.unwrap_or(&mut template_allowance));
     let lcs_sampled = lcs_sampled || alignment.sampled || template.sampled;
 
     // ── Proposed signature (Plan 4b §1.11) ───────────────────────────────────────────────────────

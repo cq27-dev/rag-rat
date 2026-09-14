@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::super::RefineMember;
 use super::super::align::{self, AlignOp, lcs_align};
-use super::super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
+use super::super::budget::CellBudget;
 use super::types::ClassAlignment;
 
 /// Resolve the anchor's position within the canonical-sorted `members` slice.
@@ -14,6 +14,13 @@ use super::types::ClassAlignment;
 pub(crate) fn resolve_anchor_idx(members: &[RefineMember], medoid_symbol_id: Option<i64>) -> usize {
     let Some(medoid) = medoid_symbol_id else { return 0 };
     members.iter().position(|m| m.symbol_id == medoid).unwrap_or(0)
+}
+
+/// [`align_to_anchor_with_budget`] at a fresh per-class budget — the tests' entry point.
+#[cfg(test)]
+pub(crate) fn align_to_anchor(members: &[RefineMember], anchor_idx: usize) -> ClassAlignment {
+    let mut budget = CellBudget::new(super::super::budget::ALIGN_AGGREGATE_CELLS_BUDGET);
+    align_to_anchor_with_budget(members, anchor_idx, &mut budget)
 }
 
 /// Star-align every non-anchor member to the anchor's spine.
@@ -39,16 +46,12 @@ pub(crate) fn resolve_anchor_idx(members: &[RefineMember], medoid_symbol_id: Opt
 ///
 /// Also defensively caps the align pass at [`align::LCS_MEMBER_SAMPLE`] (the loader already returns
 /// ≤ `MAX_MEMBERS=50`, so this never engages in practice — it bounds a pathological caller).
-pub(crate) fn align_to_anchor(members: &[RefineMember], anchor_idx: usize) -> ClassAlignment {
-    let mut budget = CellBudget::new(ALIGN_AGGREGATE_CELLS_BUDGET);
-    align_to_anchor_with_budget(members, anchor_idx, &mut budget)
-}
-
-/// [`align_to_anchor`] drawing from a CALLER-OWNED [`CellBudget`]. Production passes a fresh budget
-/// at [`ALIGN_AGGREGATE_CELLS_BUDGET`] (via the wrapper above); the re-descent passes its PARENT's
-/// budget so the parent star-align + every matched-statement re-descent share ONE per-class budget;
-/// the aggregate-budget test injects a TINY budget on small seqs to exercise the cutover in
-/// milliseconds. The cutover logic is byte-identical at any budget value.
+///
+/// The budget is CALLER-OWNED: production draws it from the shared allowance
+/// ([`anti_unify_global`]); the re-descent passes its PARENT's budget so the parent star-align +
+/// every matched-statement re-descent share ONE per-class budget; the aggregate-budget test injects
+/// a TINY budget on small seqs to exercise the cutover in milliseconds. The cutover logic is
+/// byte-identical at any budget value.
 pub(super) fn align_to_anchor_with_budget(
     members: &[RefineMember],
     anchor_idx: usize,
@@ -182,6 +185,7 @@ pub(super) fn align_to_anchor_with_budget(
         aligned,
         col_map,
         member_inserts,
+        #[cfg(test)]
         spent_cells: budget.spent(),
     }
 }

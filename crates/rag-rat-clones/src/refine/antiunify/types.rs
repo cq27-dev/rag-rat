@@ -142,9 +142,11 @@ pub(crate) struct ClassAlignment {
     /// The anchor's own map is empty.
     pub(super) member_inserts: Vec<BTreeMap<usize, Vec<usize>>>,
     /// Cumulative LCS-DP cells (`Σ |anchor|·|member|`) the star align actually charged against the
-    /// shared [`CellBudget`]. [`anti_unify`] seeds its re-descent budget with this so the
-    /// matched-statement re-descent CONTINUES from where the parent star-align left off (one
-    /// budget across the whole per-class anti-unify), rather than restarting at a full budget.
+    /// shared [`CellBudget`]. The test entry [`anti_unify`] resumes its re-descent budget from
+    /// this so the matched-statement re-descent CONTINUES where the parent star-align left
+    /// off; production never needs it, because [`anti_unify_global`] hands the same budget
+    /// straight on.
+    #[cfg(test)]
     pub(super) spent_cells: u64,
 }
 
