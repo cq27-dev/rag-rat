@@ -1,23 +1,28 @@
-//! SCIP-oracle subsystem (#61 / #68 phase 1).
+//! SCIP / LSP oracle subsystem (#61 / #68).
 //!
-//! Consumes a pre-built SCIP index (`rust-analyzer scip`, `scip-typescript`, …) and uses it as a
-//! *resolution oracle* for the tree-sitter graph: it confirms / contradicts heuristic edge
-//! resolutions and recovers low-confidence / unresolved ones with compiler-grade data. The pass is
-//! batch, diff-friendly, and opt-in — the same architectural slot as the embeddings `reconcile`.
+//! Uses compiler-grade resolution data as a *resolution oracle* for the tree-sitter graph: it
+//! confirms / contradicts heuristic edge resolutions and recovers low-confidence / unresolved ones.
+//! Two writers feed the same `edge_oracle` seam under distinct tool ids: a whole-checkout BATCH
+//! pass over a `.scip` index (pre-built, or produced by invoking the indexer), and a LIVE pass that
+//! asks a resident language server about just-changed files at watcher cadence. The heuristic
+//! resolution on the `edges` row is **never** overwritten — both coexist so eval and the read
+//! paths can diff them (see [`rag_rat_db::schema::migrations::apply_oracle_tables`]).
 //!
-//! Phase 1 is **eval-only**: no CLI command, no MCP tool (those are #69). It reads a `.scip`,
-//! joins occurrences against edge candidates, writes `edge_oracle` side rows, and emits
-//! precision/recall metrics. The heuristic resolution on the `edges` row is **never** overwritten —
-//! both coexist so eval can diff them (see
-//! [`rag_rat_db::schema::migrations::apply_oracle_tables`]).
-//!
-//! Layout mirrors `index/ai/`:
-//! - `scip.rs`  — `.scip` reader: per-document `position_encoding`-aware occurrence + definition
-//!   maps.
-//! - `join.rs`  — occurrence → edge join (identifier-token containment, not line equality).
-//! - `run.rs`   — the pass over edge candidates, producing an [`OracleReport`].
-//! - `status.rs`— status type surfaced like `llm_status`.
-//! - `store.rs` — `oracle_runs` / `edge_oracle` read + write helpers.
+//! Modules:
+//! - `auto_run`      — the background auto-fresh decision (is the batch run stale?).
+//! - `backend`       — batch invocation specs, the live-backend registry, project layout.
+//! - `corpus`        — corpus profiles and the report's health gate.
+//! - `join`          — occurrence → edge join (identifier-token containment) and classification.
+//! - `library_usage` — `check_library_usage`: external call sites joined to dependency contracts.
+//! - `live`          — the live pass over the watcher's worklist.
+//! - `lsp`           — the resident LSP client: framing, positions, readiness, definitions.
+//! - `manifest`      — the tool registry: probes, prerequisites, languages, install hints.
+//! - `report`        — the typed before/after resolution report.
+//! - `run`           — the batch pass producing an [`OracleReport`], and the eval metrics.
+//! - `scip`          — `.scip` reader: `position_encoding`-aware occurrence + definition maps.
+//! - `status`        — the persisted status summary.
+//! - `store`         — `oracle_runs` / `edge_oracle` / moniker / contract read + write helpers.
+//! - `test_support`  — the synthetic-DB harness shared with downstream crates' tests.
 
 mod auto_run;
 mod backend;
@@ -72,7 +77,7 @@ pub use store::{
 };
 
 /// Run one oracle pass over the current edge candidates from a pre-built `.scip` and return its
-/// [`OracleReport`]. Phase-1 public entry point (consumed by `eval`); no CLI/MCP surface yet (#69).
+/// [`OracleReport`].
 ///
 /// `checkout_root` is the source root whose bytes are read for per-document position-encoding
 /// conversion (the `.scip` document paths are relative to it).
@@ -657,9 +662,9 @@ pub fn current_oracle_comparisons(
     store::current_oracle_comparisons(conn, tool, tool_version, checkout)
 }
 
-/// The oracle tool that produced a SCIP index. Phase 1 ships only the Rust backend (consumed from a
-/// pre-built `.scip`); the enum is the registry seam phase 2 (#69) extends. Persisted enum →
-/// `as_db_str` / `from_db_str` per `rust-modern-style`.
+/// An oracle backend — a batch SCIP indexer or a live language server — and the persisted tool id
+/// its verdicts and runs are keyed by. Persisted enum → `as_db_str` / `from_db_str` per
+/// `rust-modern-style`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
 #[strum(serialize_all = "kebab-case")]
 pub enum OracleTool {

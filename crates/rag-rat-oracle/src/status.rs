@@ -1,5 +1,4 @@
-//! Oracle status — the serializable summary surfaced like `llm_status` (phase 2 wires it into
-//! the MCP `llm_status`-style view; phase 1 just exposes the type + builder).
+//! Oracle status — the serializable summary `oracle status` prints, surfaced like `llm_status`.
 
 use rag_rat_base::checkout::CheckoutRef;
 use rusqlite::Connection;

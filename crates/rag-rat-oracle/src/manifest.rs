@@ -1,7 +1,6 @@
 //! The oracle tool registry: per-tool id, version detection, invocation command, prerequisites,
-//! and languages. Phase 2 (#69) ships only the `rust-analyzer scip` backend; the registry is the
-//! seam later language backends (#71 TS, #72 Kotlin, #74 live LSP) extend with one entry each
-//! rather than new protocol code.
+//! and languages — one entry per backend, batch (#69 Rust, #71 TS / C / C++, #72 Kotlin, …) and
+//! live (#74). A new language backend is one entry here rather than new protocol code.
 //!
 //! A missing or unrunnable tool is NOT an error: [`ToolManifest::probe`] returns
 //! [`ToolAvailability::Blocked`] with an install hint, the same UX as a missing embedding model.
