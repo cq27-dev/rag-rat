@@ -1,8 +1,9 @@
 //! Shared HTTP substrate for the papertrail provider clients (#589): an async `reqwest`/rustls
 //! transport on the workspace tokio, a per-(provider, host, token) rate governor that keeps a
 //! user reserve (default 35%) of header-reported quota untouched, and secret-free auth
-//! resolution (env var / `token_command`). NO provider logic lives here — URL building,
-//! pagination, and payload mapping belong to the per-provider clients built on top (#591+).
+//! resolution (env var / `token_command`). Provider quota quirks are declared here as data
+//! (`ProviderQuirks`); URL building, pagination, and payload mapping belong to the per-provider
+//! clients built on top (#591+).
 //!
 //! The transport's futures are driven through the papertrail module's `block_on` bridge at the
 //! synchronous entry points, exactly like the `PapertrailClient` trait methods.

@@ -9,8 +9,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::transport::{PauseReason, TransportError};
 use super::*;
 
-// GitHub Search accepts years only through 2970. This remains safely beyond any real item while
-// keeping the initial strict `updated:<boundary` query valid.
+// The first backfill page's strict upper boundary: a sentinel above any real item's `updated_at`,
+// so the newest-first descent starts at the top. Its value is capped by the strictest provider —
+// GitHub Search accepts years only through 2970, and the strict `updated:<boundary` query must
+// stay valid there.
 const INITIAL_BACKFILL_BOUNDARY: &str = "2970-12-31T23:59:59Z";
 /// An empty initial walk has consumed no provider item. Persist the lowest practical timestamp so
 /// later runs enter the normal probe/delta path and discover items created after that walk.
