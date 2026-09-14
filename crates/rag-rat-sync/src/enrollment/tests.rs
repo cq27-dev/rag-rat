@@ -2003,3 +2003,41 @@ async fn request_length_is_capped_before_allocating_its_body() {
         "the unauthenticated request uses its small cap"
     );
 }
+
+#[test]
+fn an_unknown_stored_role_preserves_each_flows_refusal_order() {
+    let (conn, account, _stream, ticket) = writer_fixture();
+    conn.execute_batch("PRAGMA ignore_check_constraints = ON").unwrap();
+    conn.execute("UPDATE sync_invites SET role = 'future_role' WHERE nonce = ?1", [ticket
+        .nonce
+        .as_slice()])
+        .unwrap();
+    let writer = WriterGrantRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        contributor_account: AccountId::from_bytes([0x77; 32]),
+    };
+    assert!(matches!(
+        redeem_writer_invite(&conn, &writer, [9; 32], &|| NOW + 1),
+        Err(InviteError::Unknown)
+    ));
+    let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+    let pairing = EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    conn.execute("UPDATE sync_invites SET expires_at_ms = ?1 WHERE nonce = ?2", rusqlite::params![
+        NOW,
+        ticket.nonce.as_slice()
+    ])
+    .unwrap();
+    assert!(matches!(
+        redeem_invite(&conn, pairing, [9; 32], &|| NOW + 1),
+        Err(InviteError::Expired)
+    ));
+}
