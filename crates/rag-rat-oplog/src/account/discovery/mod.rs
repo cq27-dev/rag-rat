@@ -44,18 +44,23 @@ pub const ANNOUNCEMENT_VERSION: u8 = 1;
 
 /// One sealed wrap on the wire: the ephemeral public key then the tagged ciphertext.
 ///
-/// Public because the envelope's size law — one version byte plus this per roster-effective device
-/// — is what the publish side's recipient ceiling is computed from. A publisher that spelled `80`
-/// beside its own byte limit would keep sealing envelopes the service refuses the moment the wrap
-/// layout changed here, and the refusal reads like any other transient publish error.
+/// Public because the envelope's size law — one version byte plus this per wrap slot, with
+/// at least [`PADDED_WRAP_SLOTS`] slots — determines the publish side's recipient ceiling.
+/// A publisher that spelled `80` beside its own byte limit would keep sealing envelopes the
+/// service refuses the moment the wrap layout changed here, and the refusal reads like any
+/// other transient publish error.
 pub const WRAP_LEN: usize = 32 + 48;
+
+/// Fixed minimum wrap count: publishable rosters all occupy 2001 bytes. Larger rosters
+/// remain complete so the publisher can refuse them rather than silently exclude devices.
+pub const PADDED_WRAP_SLOTS: usize = 25;
 
 /// The `key_epoch` slot of the wrap context. Discovery has no epochs — the whole point of sealing
 /// per recipient is that nothing rotates — so it is pinned at zero and covered by the golden vector
 /// rather than left to drift.
 const DISCOVERY_KEY_EPOCH: u64 = 0;
 
-/// A digest of the recipient set an announcement was sealed to.
+/// A digest of the recipient set and sealing policy an announcement was sealed with.
 ///
 /// The reason this exists: **sealing is not deterministic.** Every wrap carries a fresh ephemeral,
 /// so two seals of the same node id to an unchanged roster produce different bytes. A caller that
@@ -106,21 +111,36 @@ pub fn seal_discovery_announcement(
     // The node id is 32 bytes of material to seal; `ContentKey` is the crate's 32-byte sealable
     // payload and carries the zeroize-on-drop this wants anyway. It is not a content key.
     let payload = ContentKey::from_seed(node_id);
-    let mut bytes = Vec::with_capacity(1 + recipients.len() * WRAP_LEN);
-    bytes.push(ANNOUNCEMENT_VERSION);
+    let slots = recipients.len().max(PADDED_WRAP_SLOTS);
+    let mut wraps = Vec::with_capacity(slots);
     for (fingerprint, recipient_pub) in &recipients {
         let ctx = wrap_context(account, tag, &recipient_pub.to_bytes());
         let sealed = keywrap::seal_content_key(&payload, &ctx, recipient_pub)
             .with_context(|| format!("sealing a discovery announcement to device {fingerprint}"))?;
-        push_wrap(&mut bytes, &sealed);
+        wraps.push(sealed);
+    }
+    for _ in recipients.len()..slots {
+        // Random bytes are distinguishable from X25519 public keys. Use the same seal path
+        // as real recipients, discarding the generated recipient secret immediately.
+        let public = DeviceX25519Secret::generate()?.public();
+        let ctx = wrap_context(account, tag, &public.to_bytes());
+        wraps.push(keywrap::seal_content_key(&payload, &ctx, &public)?);
+    }
+    // Fresh ephemerals already supply random ordering, independent of roster order and of
+    // whether a wrap is padding. Sorting them avoids a recognizable real-recipient prefix.
+    wraps.sort_unstable_by_key(|wrap| wrap.ephemeral_pubkey);
+    let mut bytes = Vec::with_capacity(1 + slots * WRAP_LEN);
+    bytes.push(ANNOUNCEMENT_VERSION);
+    for sealed in &wraps {
+        push_wrap(&mut bytes, sealed);
     }
     Ok(Some(SealedAnnouncement { bytes, recipients: recipients.len() }))
 }
 
 /// The current recipient set's stamp, without sealing anything.
 ///
-/// Cheap enough to call on a cadence — it is one roster read — which is the point: a long-running
-/// host checks this between sessions and only pays for a re-seal when it changes.
+/// Includes the padding policy so cached unpadded advertisements are replaced after upgrade.
+/// Cheap enough to call on a cadence: a long-running host only re-seals when it changes.
 pub fn roster_stamp(conn: &Connection) -> anyhow::Result<Option<RosterStamp>> {
     let Some(account) = bootstrap::read_local_account(conn)? else {
         return Ok(None);
@@ -133,7 +153,9 @@ pub fn roster_stamp(conn: &Connection) -> anyhow::Result<Option<RosterStamp>> {
 /// different recipient even at the same fingerprint.
 fn stamp_of(recipients: &[(DeviceFingerprint, DeviceX25519Public)]) -> RosterStamp {
     let mut hasher = Sha256::new();
-    hasher.update(b"rag-rat/discovery-roster-stamp/1");
+    // Cache policy, not wire version: invalidate pre-padding advertisements even when the
+    // roster is unchanged, while keeping the v1 reader grammar and tag namespace intact.
+    hasher.update(b"rag-rat/discovery-roster-stamp/2/padding-25");
     for (fingerprint, public) in recipients {
         hasher.update(fingerprint.to_bytes());
         hasher.update(public.to_bytes());
@@ -181,10 +203,10 @@ impl AnnouncementOpener {
     /// `None` covers every "not for us, or not ours to read" case: an unrecognised version, a
     /// malformed length, and — the ordinary case — no wrap that opens under this device's key.
     ///
-    /// **Silent when a wrap fails its tag.** Every announcement carries one wrap per roster device,
-    /// so all but one are expected to fail here. The content path records unwrap failures as
-    /// security events; doing that here would write a security event per foreign wrap per
-    /// announcement per discovery pass, burying the real ones.
+    /// **Silent when a wrap fails its tag.** Wraps for other devices and padding are expected
+    /// to fail here. The content path records unwrap failures as security events; doing that here
+    /// would write a security event per foreign wrap per announcement per discovery pass,
+    /// burying the real ones.
     pub fn open(&self, envelope: &[u8]) -> Option<[u8; 32]> {
         parse_wraps(envelope)?.iter().find_map(|wrap| {
             // Failure here is the expected case, not an error: this device matches at most one

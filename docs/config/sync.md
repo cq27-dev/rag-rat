@@ -103,11 +103,11 @@ machine without `discoverable` costs nothing here; it only fetches. Past that, h
 other and discoverability **flaps**: a host findable this hour may not be next hour. Pin those hosts
 in `server_peers` instead.
 
-**How many devices an account can have.** An announcement is sealed once per recipient, so it grows
-by one fixed-size wrap per roster-effective device against the service's publish limit — **a few
-dozen devices** at today's wrap layout. The exact figure is `MAX_PUBLISHABLE_RECIPIENTS`, which the
-code derives from those two rather than writing down. Past it a host logs `roster is too large to
-seal into one announcement` and does not advertise; it serves normally, and every device that
+**How many devices an account can have.** Announcements use **25 wrap slots (2001 bytes)**, padding
+unused slots with indistinguishable seals to discarded recipients. More than 25 devices exceeds
+the service's 2048-byte publish limit. `MAX_PUBLISHABLE_RECIPIENTS` derives the ceiling from the
+byte limit and wrap size. Past it a host logs `roster is too large to seal into one announcement`
+and does not advertise; it serves normally, and every device that
 reaches it through `server_peers` is unaffected. The announcement is never truncated to fit,
 because which recipients got dropped would silently decide who can find that host.
 
@@ -290,13 +290,13 @@ folded it, because they do not depend on anything the account can take back:
 
 - **The discovery tag**, which is derived from immutable account material already in that device's
   database. It can therefore keep watching the tag: how many hosts advertise and when they renew or
-  stop, and — because each sealed envelope is a version byte plus one fixed-size wrap per recipient
-  (80 bytes at today's wrap layout) — the exact number of devices on the account, tracked across
-  enrollments and removals without opening a single wrap. It can also publish junk under the tag,
+  stop. Newly published announcements have 25 wrap slots regardless of the actual recipient count,
+  so their length hides enrollments and removals. Older publishers still expose their exact
+  recipient count; cached unpadded envelopes are replaced on upgrade, but published copies remain
+  visible until expiry. It can also publish junk under the tag,
   costing whoever fetches it a wasted slot. What it can no longer do is read a host's node id out
   of any announcement sealed after its removal. Rotating the tag itself is
-  [#1081](https://github.com/cq27-dev/rag-rat/issues/1081); padding the envelope to hide device
-  count is [#1087](https://github.com/cq27-dev/rag-rat/issues/1087).
+  [#1081](https://github.com/cq27-dev/rag-rat/issues/1081).
 - **Announcements sealed before it stops being a recipient**, which stay openable by it until they
   expire — at most one TTL, so 15 minutes at the default cadence. The window is measured from when a
   host **learns** of the removal, not from when it was authored: a removal authored on another

@@ -323,6 +323,115 @@ fn a_persisted_envelope_over_the_announcement_ceiling_is_not_advertised() {
     );
 }
 
+/// An upgrade invalidates the old policy stamp even when identity and roster match.
+/// A lone device still must not advertise merely because padding adds dummy wraps.
+#[test]
+fn an_unpadded_cached_advertisement_is_replaced_on_upgrade() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let database = dir.path().join("index.sqlite");
+    persist_advertised_envelope(&database, vec![1; 81]);
+    let storage = super::IndexConnection::open(&database).unwrap();
+    let conn = storage.connection();
+    let device = rag_rat_oplog::local_device(conn, 1_000).unwrap();
+    let mut legacy = Sha256::new();
+    legacy.update(b"rag-rat/discovery-roster-stamp/1");
+    legacy.update(device.fingerprint().to_bytes());
+    legacy.update(device.x25519_public_key());
+    let mut record = read_advertisement(conn).unwrap().unwrap();
+    record.roster_stamp = Some(legacy.finalize().into());
+    record.published_at_ms = Some(1_000);
+    write_advertisement(conn, &record).unwrap();
+
+    assert!(prepare_advertised(&database).0.is_none(), "dummy wraps are not recipients");
+    let replaced = read_advertisement(conn).unwrap().unwrap();
+    assert_eq!(replaced.roster_stamp, rag_rat_oplog::discovery::roster_stamp(conn).unwrap());
+    assert_ne!(replaced.roster_stamp, record.roster_stamp);
+    assert_eq!(replaced.published_at_ms, None);
+    assert_eq!(replaced.envelope, None);
+    assert!(prepare_advertised(&database).0.is_none());
+    assert_eq!(read_advertisement(conn).unwrap().unwrap().roster_stamp, replaced.roster_stamp);
+}
+
+#[test]
+fn a_live_unpadded_cache_is_resealed_and_reused_across_restarts() {
+    use rag_rat_sync::enrollment::{self, EnrollmentRequest, InviteSpec};
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let database = dir.path().join("index.sqlite");
+    persist_advertised_envelope(&database, vec![1; 161]);
+    {
+        let storage = super::IndexConnection::open(&database).unwrap();
+        let conn = storage.connection();
+        let account = rag_rat_oplog::local_account(conn, 1_000).unwrap();
+        let founder = rag_rat_oplog::local_device(conn, 1_000).unwrap();
+        let joiner_conn = schema_conn();
+        let joiner = rag_rat_oplog::local_device(&joiner_conn, 1_000).unwrap();
+        let ticket = enrollment::mint_invite(conn, InviteSpec {
+            account_id: account,
+            inviter_node_id: rag_rat_sync::endpoint::node_id_from_secret([2; 32]),
+            relay_url: ADVERTISED_RELAY.to_owned(),
+            role: rag_rat_oplog::DeviceRole::Member,
+            label: None,
+            now_ms: &|| 1_000,
+            ttl: Duration::from_secs(60),
+        })
+        .unwrap();
+        enrollment::redeem_invite(
+            conn,
+            EnrollmentRequest {
+                nonce: ticket.nonce,
+                expected_account: account,
+                ed25519_pubkey: joiner.ed25519_public_key(),
+                x25519_pubkey: joiner.x25519_public_key(),
+                transport_node_id: [9; 32],
+                budget: rag_rat_oplog::enrollment_budget(&joiner_conn, account, 1_000).unwrap(),
+                held_entry_hashes: Vec::new(),
+            },
+            [9; 32],
+            &|| 1_000,
+        )
+        .unwrap();
+        let mut recipients = [
+            (founder.fingerprint().to_bytes(), founder.x25519_public_key()),
+            (joiner.fingerprint().to_bytes(), joiner.x25519_public_key()),
+        ];
+        recipients.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+        let mut legacy = Sha256::new();
+        legacy.update(b"rag-rat/discovery-roster-stamp/1");
+        for (fingerprint, public) in recipients {
+            legacy.update(fingerprint);
+            legacy.update(public);
+        }
+        let mut record = read_advertisement(conn).unwrap().unwrap();
+        record.roster_stamp = Some(legacy.finalize().into());
+        record.published_at_ms = Some(1_000);
+        write_advertisement(conn, &record).unwrap();
+    }
+    let publication = prepare_advertised(&database).0.expect("replace even a live old envelope");
+    assert_eq!(publication.envelope.len(), 2001);
+    assert!(rag_rat_sync::discovery::fits_publish(&publication.envelope));
+    assert_eq!(prepare_advertised(&database).0.unwrap().envelope, publication.envelope);
+    super::record_advertisement_liveness(&database, &publication, 2_000).unwrap();
+    assert!(prepare_advertised(&database).0.is_none(), "restart honors the new live publication");
+    let storage = super::IndexConnection::open(&database).unwrap();
+    let record = read_advertisement(storage.connection()).unwrap().unwrap();
+    assert_eq!(record.envelope.as_ref(), Some(&publication.envelope));
+    assert_eq!(record.published_at_ms, Some(2_000));
+    assert_eq!(
+        rag_rat_oplog::discovery::AnnouncementOpener::load(
+            storage.connection(),
+            &publication.identity.tag
+        )
+        .unwrap()
+        .unwrap()
+        .open(&publication.envelope),
+        Some(ADVERTISED_NODE)
+    );
+}
+
 /// The over-size verdict is reported ONCE, however long the roster stays too large.
 ///
 /// `prepare_advertisement` runs on the one-second `ADVERTISEMENT_REFRESH` tick, and nothing the

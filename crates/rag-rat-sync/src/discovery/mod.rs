@@ -42,7 +42,7 @@ mod tests;
 use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
-use rag_rat_oplog::discovery::WRAP_LEN;
+use rag_rat_oplog::discovery::{PADDED_WRAP_SLOTS, WRAP_LEN};
 use sha2::{Digest, Sha256};
 
 use self::wire::{DiscoveryRequest, DiscoveryResponse, TAG_LEN};
@@ -110,6 +110,11 @@ pub const MAX_SEALED_ANNOUNCEMENTS: usize = 64;
 /// It binds at a smaller roster than it looks — see [`MAX_PUBLISHABLE_RECIPIENTS`]; the service's
 /// own frame budget would not bite until several hundred.
 pub const MAX_ANNOUNCEMENT_BYTES: usize = 2048;
+
+const _: () = assert!(
+    PADDED_WRAP_SLOTS * WRAP_LEN < MAX_ANNOUNCEMENT_BYTES,
+    "discovery padding must fit the service publish limit"
+);
 
 /// Most roster-effective devices an account can have and still be advertised by one host.
 ///

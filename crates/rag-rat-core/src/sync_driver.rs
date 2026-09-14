@@ -546,6 +546,7 @@ fn prepare_advertisement(
         service: *endpoint.service,
         relay: endpoint.relay.to_owned(),
     };
+    // The stamp includes sealing policy, so upgrading padding also replaces cached envelopes.
     let stamp = rag_rat_oplog::discovery::roster_stamp(conn)?;
     let persisted = read_advertisement(conn)?;
     let current = persisted.filter(|record| record.matches(&identity, stamp.as_ref()));
@@ -592,7 +593,7 @@ fn fits_one_announcement(envelope: &[u8]) -> bool {
         return true;
     }
     tracing::warn!(
-        // The envelope's size law: one version byte, then one fixed-size wrap per recipient.
+        // Above the padding floor, every wrap represents an actual recipient.
         recipients = (envelope.len() - 1) / rag_rat_oplog::discovery::WRAP_LEN,
         bytes = envelope.len(),
         max_recipients = rag_rat_sync::discovery::MAX_PUBLISHABLE_RECIPIENTS,
