@@ -29,6 +29,7 @@
 //! than staying trusted up to a cut. The cost is availability only — snapshots are re-derivable,
 //! and every peer still holds the full history this phase.
 
+use super::super::id::AccountEntryHash;
 use super::ops::SnapshotTarget;
 
 /// The key identifying which log (or content stream) a target covers.
@@ -66,7 +67,7 @@ pub(in crate::account) fn dominates(a: &[SnapshotTarget], b: &[SnapshotTarget]) 
 /// keeps this module free of any knowledge of how snapshots are stored.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::account) struct Candidate<'a> {
-    pub(in crate::account) entry_hash: [u8; 32],
+    pub(in crate::account) entry_hash: AccountEntryHash,
     pub(in crate::account) targets: &'a [SnapshotTarget],
 }
 
@@ -76,7 +77,7 @@ pub(in crate::account) struct Candidate<'a> {
 /// Deterministic given the same usable set, which is what matters — the set itself is
 /// device-dependent, because verification depends on what a device holds, and that is fine for a
 /// read-time selector. Nothing here may influence acceptance.
-pub(in crate::account) fn select(usable: &[Candidate<'_>]) -> Option<[u8; 32]> {
+pub(in crate::account) fn select(usable: &[Candidate<'_>]) -> Option<AccountEntryHash> {
     usable
         .iter()
         .filter(|candidate| {
@@ -103,7 +104,7 @@ mod tests {
         CoveredWatermark {
             device_fingerprint: DeviceFingerprint::from_bytes([device; 32]),
             seq,
-            entry_hash: [device; 32],
+            entry_hash: AccountEntryHash::from_bytes([device; 32]),
         }
     }
 
@@ -118,7 +119,7 @@ mod tests {
     }
 
     fn candidate<'a>(id: u8, targets: &'a [SnapshotTarget]) -> Candidate<'a> {
-        Candidate { entry_hash: [id; 32], targets }
+        Candidate { entry_hash: AccountEntryHash::from_bytes([id; 32]), targets }
     }
 
     #[test]
@@ -165,12 +166,19 @@ mod tests {
         // The dominated candidate loses even though its hash sorts first, so this cannot pass by
         // accident of ordering.
         let chosen = select(&[candidate(0x01, &behind), candidate(0xff, &ahead)]);
-        assert_eq!(chosen, Some([0xff; 32]), "greater coverage wins over a smaller hash");
+        assert_eq!(
+            chosen,
+            Some(Into::into([0xff; 32])),
+            "greater coverage wins over a smaller hash"
+        );
 
         // Equal coverage is mutual domination: neither is discarded, and the hash decides.
         let same_a = [control(vec![watermark(1, 5)])];
         let same_b = [control(vec![watermark(1, 5)])];
-        assert_eq!(select(&[candidate(0xbb, &same_a), candidate(0x11, &same_b)]), Some([0x11; 32]),);
+        assert_eq!(
+            select(&[candidate(0xbb, &same_a), candidate(0x11, &same_b)]),
+            Some(Into::into([0x11; 32])),
+        );
     }
 
     #[test]
@@ -183,7 +191,11 @@ mod tests {
         let forward = select(&[candidate(0x30, &a), candidate(0x20, &b), candidate(0x10, &c)]);
         let reversed = select(&[candidate(0x10, &c), candidate(0x20, &b), candidate(0x30, &a)]);
         assert_eq!(forward, reversed);
-        assert_eq!(forward, Some([0x20; 32]), "c is dominated; a and b tie and 0x20 sorts first");
+        assert_eq!(
+            forward,
+            Some(Into::into([0x20; 32])),
+            "c is dominated; a and b tie and 0x20 sorts first"
+        );
     }
 
     #[test]

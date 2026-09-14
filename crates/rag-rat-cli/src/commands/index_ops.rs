@@ -1094,7 +1094,7 @@ mod tests {
         let checkpoint = &report["wal_checkpoint"];
         assert!(
             checkpoint.is_object(),
-            "the maintenance pass reports a wal checkpoint — the hook-path owner (#573): {report}"
+            "the maintenance pass reports a wal checkpoint — the hook-path owner (#573)"
         );
         assert_eq!(
             checkpoint["attempted"],
@@ -1162,7 +1162,7 @@ mod tests {
 
         // Fields the cheap ACTIVE-model counts compute exactly.
         for key in ["current", "stale", "failed", "blocked", "total_chunks"] {
-            assert!(backlog[key].is_number(), "cheap backlog count `{key}` present: {backlog}");
+            assert!(backlog[key].is_number(), "cheap backlog count `{key}` present");
         }
         // Fields the cheap counts CAN'T compute exactly are omitted (reconcile --plan's job):
         // `missing` (would count policy-skipped chunks as a permanent backlog), the exact policy

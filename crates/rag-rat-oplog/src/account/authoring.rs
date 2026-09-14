@@ -23,7 +23,7 @@ use super::bootstrap::{self, LocalAccountRef};
 use super::envelope::{
     AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, signed_entry_len,
 };
-use super::id::AccountId;
+use super::id::{AccountEntryHash, AccountId, GrantId, OwnerId};
 use super::limits::ACCOUNT_ENVELOPE_MAX_BYTES;
 use super::ops::{self, AccountOp};
 use super::storage::{self, CandidateInsert};
@@ -33,8 +33,6 @@ use crate::identity::LocalDevice;
 use crate::local_device;
 use crate::op::DeviceFingerprint;
 use crate::stream::{self, StreamId};
-
-type AccountEntryHash = [u8; 32];
 
 /// Ensure the repo's `/2` owner stream is owned by the store's local account, authoring exactly one
 /// `StreamOwn` if the ownership fact is not already present, and return the `/2` `stream_id`.
@@ -238,7 +236,7 @@ fn author_account_op_in_tx(
         key_id: None,
         // The founder incarnation this op acts under (§"authority rule"): the account's own
         // genesis, whose incarnation id is its own entry hash.
-        authority_ref: Some(genesis_hash),
+        authority_ref: Some(genesis_hash.into()),
     };
     let payload =
         ops::encode(op).map_err(|err| anyhow::anyhow!("encoding the account op failed: {err}"))?;
@@ -343,14 +341,14 @@ fn device_add_envelope(
         log_id: 0,
         device_fingerprint: author.public().fingerprint(),
         seq: u64::MAX,
-        prev_hash: Some([u8::MAX; 32]),
-        parent_ref: Some([u8::MAX; 32]),
+        prev_hash: Some(AccountEntryHash::from_bytes([u8::MAX; 32])),
+        parent_ref: Some(AccountEntryHash::from_bytes([u8::MAX; 32])),
         entry_type: ops::entry_type_of(&op),
         op_version: 1,
         crypto_suite: 0,
         auth_len: u64::MAX,
         key_id: None,
-        authority_ref: Some([u8::MAX; 32]),
+        authority_ref: Some(OwnerId::from_bytes([u8::MAX; 32])),
     };
     (header, payload)
 }
@@ -477,7 +475,7 @@ fn author_device_add_with_promotion_in_tx(
     // ours), so this still errors for a non-owner.
     match storage::effective_roster_entry_in_snapshot(tx, account_id, fingerprint)? {
         Some((roster_ref, effective_role))
-            if roster_ref == entry_hash && effective_role == role => {},
+            if roster_ref == entry_hash.into() && effective_role == role => {},
         _ => anyhow::bail!(
             "the DeviceAdd did not become the joiner's effective roster entry at the requested \
              role — the local device lacks effective owner authority to enroll (founder-owner \
@@ -504,7 +502,7 @@ pub fn author_stream_grant_in_tx(
     grantee_account_id: AccountId,
     role: ops::GrantRole,
     now_ms: i64,
-) -> anyhow::Result<AccountEntryHash> {
+) -> anyhow::Result<GrantId> {
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
         "cannot author a stream grant before the store's local account is minted (call \
          local_account first)",
@@ -515,7 +513,7 @@ pub fn author_stream_grant_in_tx(
     match storage::grant_effective_in_snapshot(
         tx,
         account_id,
-        grant_id,
+        grant_id.into(),
         stream_id,
         grantee_account_id,
     )? {
@@ -525,7 +523,7 @@ pub fn author_stream_grant_in_tx(
              effective owner authority on this account, or a concurrent op won the fold",
         ),
     }
-    Ok(grant_id)
+    Ok(grant_id.into())
 }
 
 /// Why a writer grant is revoked — the machine-readable token that DRIVES the cut semantics
@@ -535,7 +533,8 @@ pub fn author_stream_grant_in_tx(
 /// departing reasons keep prior accepted work valid via chain-tail cuts taken from the OWNER's
 /// own store, which the revoked device cannot rewrite. The token is the frozen wire `reason`
 /// string; tests pin the exact spellings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum RevokeReason {
     Departed,
     Rotated,
@@ -545,25 +544,16 @@ pub enum RevokeReason {
 
 impl RevokeReason {
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Departed => "departed",
-            Self::Rotated => "rotated",
-            Self::Superseded => "superseded",
-            Self::Compromised => "compromised",
-        }
+        self.into()
     }
 
     pub fn from_db_str(token: &str) -> anyhow::Result<Self> {
-        match token {
-            "departed" => Ok(Self::Departed),
-            "rotated" => Ok(Self::Rotated),
-            "superseded" => Ok(Self::Superseded),
-            "compromised" => Ok(Self::Compromised),
-            other => anyhow::bail!(
-                "unknown revoke reason `{other}` — one of: departed, rotated, superseded, \
+        token.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "unknown revoke reason `{token}` — one of: departed, rotated, superseded, \
                  compromised"
-            ),
-        }
+            )
+        })
     }
 
     /// Hard revocation: no self-reported boundary is trusted, everything from the grantee is
@@ -578,7 +568,7 @@ impl RevokeReason {
 pub struct StreamRevocation {
     /// The WRITER grants this revoke closed — plural, because double-granting authors two
     /// effective grant ids and leaving either open would leave the grantee writing.
-    pub grant_ids: Vec<AccountEntryHash>,
+    pub grant_ids: Vec<GrantId>,
     /// The authored `StreamRevoke` entries, one per closed grant.
     pub revoke_ids: Vec<AccountEntryHash>,
     /// The chain cuts each revoke carries — what prior work stays valid.
@@ -645,7 +635,7 @@ pub fn author_stream_revoke_in_tx(
         let op = AccountOp::StreamRevoke {
             stream_id,
             grantee_account_id,
-            grant_id: *grant_id,
+            grant_id: (*grant_id),
             device_cuts: cuts.clone(),
             reason: reason.as_db_str().to_string(),
         };
@@ -1048,7 +1038,10 @@ mod tests {
             assert_eq!(RevokeReason::from_db_str(token).unwrap(), reason);
         }
         let err = RevokeReason::from_db_str("fired").unwrap_err().to_string();
-        assert!(err.contains("departed, rotated, superseded, compromised"), "{err}");
+        assert_eq!(
+            err,
+            "unknown revoke reason `fired` — one of: departed, rotated, superseded, compromised"
+        );
     }
 
     #[test]

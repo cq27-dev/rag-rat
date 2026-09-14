@@ -30,6 +30,7 @@ use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
 use super::AccountId;
+use super::id::{AccountEntryHash, OwnerId};
 use super::limits::{ACCOUNT_ENTRY_DOMAIN, ACCOUNT_ENVELOPE_MAX_BYTES, ACCOUNT_SIGNED_DOMAIN};
 use crate::cbor::{self, VecEncoderExt};
 use crate::device::{DevicePublic, DeviceSecret};
@@ -44,14 +45,14 @@ pub(super) struct AccountEntryHeader {
     pub(super) log_id: u8,
     pub(super) device_fingerprint: DeviceFingerprint,
     pub(super) seq: u64,
-    pub(super) prev_hash: Option<[u8; 32]>,
-    pub(super) parent_ref: Option<[u8; 32]>,
+    pub(super) prev_hash: Option<AccountEntryHash>,
+    pub(super) parent_ref: Option<AccountEntryHash>,
     pub(super) entry_type: u32,
     pub(super) op_version: u32,
     pub(super) crypto_suite: u8,
     pub(super) auth_len: u64,
     pub(super) key_id: Option<[u8; 32]>,
-    pub(super) authority_ref: Option<[u8; 32]>,
+    pub(super) authority_ref: Option<OwnerId>,
 }
 
 /// A signed account-entry: its structured header, the opaque payload, the signature over
@@ -66,7 +67,7 @@ pub(super) struct SignedAccountEntry {
     pub(super) header_bytes: Vec<u8>,
     pub(super) body_bytes: Vec<u8>,
     pub(super) signed_bytes: Vec<u8>,
-    pub(super) entry_hash: [u8; 32],
+    pub(super) entry_hash: AccountEntryHash,
 }
 
 /// A decoded + cryptographically-verified account entry (payload left opaque).
@@ -74,14 +75,9 @@ pub(super) struct SignedAccountEntry {
 pub(super) struct VerifiedAccountEntry {
     pub(super) header: AccountEntryHeader,
     pub(super) payload: Vec<u8>,
-    pub(super) entry_hash: [u8; 32],
+    pub(super) entry_hash: AccountEntryHash,
 }
 
-/// Author a signed account entry: encode the header, wrap `[header, payload]` as the body, sign the
-/// body under `secret`, and build the transport envelope. Pure + deterministic given `secret`
-/// (ed25519 signing is deterministic). The author device is DERIVED from `secret` — the header's
-/// `device_fingerprint` is overwritten with `secret.public().fingerprint()` — so a signed entry can
-/// never name a device other than its signer (mirrors `super::super::entry::sign_entry`).
 /// The exact byte length of the signed wire for `(header, payload)` — the real header encoding,
 /// the body framing, and a 64-byte signature. Signing is deterministic in these lengths (the
 /// signature is always 64 bytes and never affects the count), so this is what §18a actually bounds,
@@ -99,6 +95,11 @@ pub(super) fn entry_fits_envelope(header: &AccountEntryHeader, payload: &[u8]) -
     signed_entry_len(header, payload) <= ACCOUNT_ENVELOPE_MAX_BYTES
 }
 
+/// Author a signed account entry: encode the header, wrap `[header, payload]` as the body, sign the
+/// body under `secret`, and build the transport envelope. Pure + deterministic given `secret`
+/// (ed25519 signing is deterministic). The author device is DERIVED from `secret` — the header's
+/// `device_fingerprint` is overwritten with `secret.public().fingerprint()` — so a signed entry can
+/// never name a device other than its signer (mirrors `super::super::entry::sign_entry`).
 pub(super) fn sign_account_entry(
     secret: &DeviceSecret,
     header: &AccountEntryHeader,
@@ -135,7 +136,7 @@ pub(super) fn sign_account_entry(
         header_bytes,
         body_bytes,
         signed_bytes,
-        entry_hash,
+        entry_hash: AccountEntryHash::from_bytes(entry_hash),
     })
 }
 
@@ -190,14 +191,14 @@ fn encode_header(h: &AccountEntryHeader) -> Vec<u8> {
         enc.put_u8(h.log_id);
         enc.put_bytes(&h.device_fingerprint.to_bytes());
         enc.put_u64(h.seq);
-        encode_opt_hash(&mut enc, h.prev_hash);
-        encode_opt_hash(&mut enc, h.parent_ref);
+        encode_opt_hash(&mut enc, h.prev_hash.map(Into::into));
+        encode_opt_hash(&mut enc, h.parent_ref.map(Into::into));
         enc.put_u32(h.entry_type);
         enc.put_u32(h.op_version);
         enc.put_u8(h.crypto_suite);
         enc.put_u64(h.auth_len);
         encode_opt_hash(&mut enc, h.key_id);
-        encode_opt_hash(&mut enc, h.authority_ref);
+        encode_opt_hash(&mut enc, h.authority_ref.map(Into::into));
     }
     buf
 }
@@ -259,7 +260,7 @@ fn decode_account_signed_cbor(bytes: &[u8]) -> Result<SignedAccountEntry, CborEr
         header_bytes,
         body_bytes,
         signed_bytes: bytes.to_vec(),
-        entry_hash,
+        entry_hash: AccountEntryHash::from_bytes(entry_hash),
     })
 }
 
@@ -298,14 +299,14 @@ fn decode_header(header_bytes: &[u8]) -> Result<AccountEntryHeader, CborError> {
         log_id,
         device_fingerprint,
         seq,
-        prev_hash,
-        parent_ref,
+        prev_hash: prev_hash.map(Into::into),
+        parent_ref: parent_ref.map(Into::into),
         entry_type,
         op_version,
         crypto_suite,
         auth_len,
         key_id,
-        authority_ref,
+        authority_ref: authority_ref.map(Into::into),
     };
     if let Some(msg) = header_nullity_error(&header) {
         return Err(CborError::message(msg));
@@ -431,7 +432,7 @@ mod tests {
         assert_eq!(&b[107..112], payload().as_slice(), "payload content");
         assert_eq!(
             signed.entry_hash,
-            cbor::sha256(&signed.body_bytes),
+            AccountEntryHash::from_bytes(cbor::sha256(&signed.body_bytes)),
             "entry_hash = sha256(body)"
         );
     }
@@ -515,7 +516,7 @@ mod tests {
         bad_prev.seq = 5;
         bad_prev.prev_hash = None;
         let mut bad_genesis = genesis_header();
-        bad_genesis.prev_hash = Some([0x11; 32]);
+        bad_genesis.prev_hash = Some(AccountEntryHash::from_bytes([0x11; 32]));
         let mut bad_key = genesis_header();
         bad_key.key_id = Some([0x22; 32]);
         let mut bad_sealed = genesis_header();

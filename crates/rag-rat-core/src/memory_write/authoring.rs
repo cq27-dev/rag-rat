@@ -123,7 +123,7 @@ pub(crate) struct PreparedOwnerAuthoring {
 /// the stream. `Grantee` (#1164) is a granted contributor authoring onto ANOTHER account's stream.
 enum AuthoringRole {
     Owner { policy: StreamSealPolicy, prepared: PreparedContentAuthoring },
-    Grantee { owner_account: rag_rat_oplog::AccountId, grant_id: [u8; 32] },
+    Grantee { owner_account: rag_rat_oplog::AccountId, grant_id: rag_rat_oplog::GrantId },
 }
 
 impl PreparedOwnerAuthoring {

@@ -15,6 +15,7 @@
 use minicbor::Encoder;
 use minicbor::decode::{Decoder, Error as CborError};
 
+use super::super::id::AccountEntryHash;
 use super::super::keywrap::SealedKeyWrap;
 use super::super::limits::WRAP_RECIPIENTS_MAX;
 use crate::cbor::{self, VecEncoderExt};
@@ -37,7 +38,7 @@ pub(in crate::account) mod entry_type {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoIncarnation {
     pub repo_id: String,
-    pub predecessor_ref: Option<[u8; 32]>,
+    pub predecessor_ref: Option<AccountEntryHash>,
 }
 
 /// One recipient's wrap inside a [`StreamKeyWrap`]: the recipient device and the C4.1 sealed key.
@@ -110,7 +111,7 @@ pub fn encode_repo_incarnation(op: &RepoIncarnation) -> Result<Vec<u8>, CborErro
     enc.put_array(2);
     enc.put_str(&op.repo_id);
     match op.predecessor_ref {
-        Some(predecessor) => enc.put_bytes(&predecessor),
+        Some(predecessor) => enc.put_bytes(predecessor.as_slice()),
         None => enc.put_null(),
     };
     Ok(buf)
@@ -208,7 +209,7 @@ fn decode_repo_incarnation(bytes: &[u8]) -> Result<RepoIncarnation, CborError> {
     } else {
         Some(cbor::fixed_bytes::<32>(d.bytes()?, "predecessor_ref")?)
     };
-    Ok(RepoIncarnation { repo_id, predecessor_ref })
+    Ok(RepoIncarnation { repo_id, predecessor_ref: predecessor_ref.map(Into::into) })
 }
 
 /// Validate + canonicalize the wrap fan-out (mirrors the control cut arrays): sort by recipient
@@ -323,7 +324,10 @@ mod tests {
 
     #[test]
     fn repo_incarnation_round_trips_and_has_a_golden_wire() {
-        let op = RepoIncarnation { repo_id: "repo-a".into(), predecessor_ref: Some([0x11; 32]) };
+        let op = RepoIncarnation {
+            repo_id: "repo-a".into(),
+            predecessor_ref: Some(AccountEntryHash::from_bytes([0x11; 32])),
+        };
         let bytes = encode_repo_incarnation(&op).unwrap();
         let mut golden = vec![0x82, 0x66, b'r', b'e', b'p', b'o', b'-', b'a', 0x58, 0x20];
         golden.extend([0x11; 32]);

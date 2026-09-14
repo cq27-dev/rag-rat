@@ -16,6 +16,82 @@ pub(in crate::account) fn fixed<const N: usize>(bytes: &[u8]) -> anyhow::Result<
     bytes.try_into().map_err(|_| anyhow::anyhow!("stored blob is {} bytes, not {N}", bytes.len()))
 }
 
+// Fixed-width representations preserve byte order at the persistence and wire boundaries.
+macro_rules! byte_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name([u8; 32]);
+        // Preserve the raw-array diagnostic representation at existing error boundaries.
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Debug::fmt(&self.0, f)
+            }
+        }
+        impl $name {
+            pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+                Self(bytes)
+            }
+            pub fn to_bytes(self) -> [u8; 32] {
+                self.0
+            }
+            pub fn as_slice(&self) -> &[u8] {
+                &self.0
+            }
+        }
+        impl From<[u8; 32]> for $name {
+            fn from(bytes: [u8; 32]) -> Self {
+                Self::from_bytes(bytes)
+            }
+        }
+        impl From<$name> for [u8; 32] {
+            fn from(id: $name) -> Self {
+                id.to_bytes()
+            }
+        }
+        impl TryFrom<&[u8]> for $name {
+            type Error = std::array::TryFromSliceError;
+            fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
+                bytes.try_into().map(Self::from_bytes)
+            }
+        }
+        impl TryFrom<Vec<u8>> for $name {
+            type Error = Vec<u8>;
+            fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
+                bytes.try_into().map(Self::from_bytes)
+            }
+        }
+    };
+}
+byte_id!(AccountEntryHash, "A candidate entry's body hash. Ordering is lexicographic byte order.");
+byte_id!(SignedHash, "The hash of a complete signed envelope, distinct from its body address.");
+byte_id!(OwnerId, "The control entry that mints one owner incarnation.");
+byte_id!(GrantId, "The control entry that mints one stream grant.");
+byte_id!(RosterRef, "The control entry that enrolls a device in the roster.");
+
+macro_rules! entry_reference {
+    ($name:ident) => {
+        impl From<AccountEntryHash> for $name {
+            fn from(hash: AccountEntryHash) -> Self {
+                Self::from_bytes(hash.to_bytes())
+            }
+        }
+        impl From<$name> for AccountEntryHash {
+            fn from(reference: $name) -> Self {
+                Self::from_bytes(reference.to_bytes())
+            }
+        }
+        impl $name {
+            pub fn entry_hash(self) -> AccountEntryHash {
+                self.into()
+            }
+        }
+    };
+}
+entry_reference!(OwnerId);
+entry_reference!(GrantId);
+entry_reference!(RosterRef);
+
 /// An account's immutable, content-derived identity: `sha256` of the domain-tagged genesis
 /// commitment. The store-global key for a principal's roster, grants, and folds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -79,6 +155,32 @@ pub(super) fn account_id_from_genesis_payload(genesis_payload_bytes: &[u8]) -> A
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reference_ids_preserve_byte_order_and_diagnostics() {
+        // A last-byte difference must sort before a first-byte difference, not as a
+        // little-endian integer. These types participate in consensus tie-breaks.
+        let mut low = [0; 32];
+        low[31] = 255;
+        let mut high = [0; 32];
+        high[0] = 1;
+        macro_rules! check {
+            ($id:ty) => {{
+                let a = <$id>::from_bytes(low);
+                let b = <$id>::from_bytes(high);
+                assert!(a < b);
+                assert_eq!(a.as_slice(), low.as_slice());
+                assert_eq!(a.to_bytes(), low);
+                assert_eq!(format!("{a:?}"), format!("{low:?}"));
+                assert_eq!(format!("{a:#?}"), format!("{low:#?}"));
+            }};
+        }
+        check!(AccountEntryHash);
+        check!(OwnerId);
+        check!(GrantId);
+        check!(RosterRef);
+        check!(SignedHash);
+    }
+
     /// `from_hex` is the one decoder every operator-facing surface uses (`sync grant` /
     /// `contribute` / `pull`), so its rejections are the error text a person actually reads.
     #[test]

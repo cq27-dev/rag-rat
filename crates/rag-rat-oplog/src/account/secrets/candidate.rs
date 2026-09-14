@@ -1,14 +1,8 @@
 //! Pin-aware branch selection for the secrets log (`log_id = 1`, §16.2, C4.2b, B-1).
 //!
-//! The account-side [`super::super::candidate`] primitives (`ancestry`, `validate_cut_target`,
-//! `HeaderView`) are log-generic, but `select_coherent_branches` in [`super::super::storage`] has
-//! NO watermark-pin mechanism — the control fold never needs one. The secrets acceptance loop DOES:
-//! a compromised-then-removed owner device can fork its secrets chain BELOW its `DeviceRemove`
-//! secrets cut, and a pin-less min-hash tiebreak would select the attacker fork (deterministic,
-//! convergent, WRONG), forking the honest cut-preserved wraps off the accepted branch. So this
-//! module runs the pin-aware selection the content refold uses ([`super::super::branch`]) over
-//! `AccountEntryHeader` rows: a register pin promotes the branch its watermark names over the hash
-//! order, which is what makes the off-branch condemnation of the other fork enforceable.
+//! Uses the pin-aware selection shared with content ([`super::super::branch`]). A register pin
+//! promotes its watermark's branch over hash order; see that module for why the control log uses
+//! a different selection rule.
 //!
 //! Pins are sourced from BOTH secrets boundaries of a wrap's cited owner incarnation (the device
 //! register AND the owner-incarnation register — two registers can bound one chain), revalidated
@@ -21,27 +15,32 @@ use super::super::branch::{self, BranchSelection, Candidate, ChainLink};
 use super::super::candidate::{self, CutCoordinate, HeaderView};
 use super::super::cut::Cut;
 use super::super::envelope::AccountEntryHeader;
+#[cfg(test)]
 use super::super::fold::SECRETS_LOG;
+use super::super::id::AccountEntryHash;
 use crate::op::DeviceFingerprint;
 
-type AccountEntryHash = [u8; 32];
-
-/// The chain one secrets cut bounds: `(account, device)` on `log: SECRETS_LOG`.
+/// The full account-log coordinate; log identity is part of every forged-link check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::account) struct SecretsCoordinate {
     pub(super) account_id: AccountId,
+    pub(super) log_id: u8,
     pub(super) device_fingerprint: DeviceFingerprint,
 }
 
 impl SecretsCoordinate {
     fn of(header: &AccountEntryHeader) -> Self {
-        Self { account_id: header.account_id, device_fingerprint: header.device_fingerprint }
+        Self {
+            account_id: header.account_id,
+            log_id: header.log_id,
+            device_fingerprint: header.device_fingerprint,
+        }
     }
 
     fn cut_coordinate(&self) -> CutCoordinate {
         CutCoordinate {
             account: self.account_id,
-            log: SECRETS_LOG,
+            log: self.log_id,
             device: self.device_fingerprint,
         }
     }
@@ -55,8 +54,7 @@ pub(super) type SecretsCandidate = Candidate<AccountEntryHeader>;
 /// PROMOTES it, which is what makes an off-branch condemnation of the other fork enforceable.
 pub(super) type BranchPin = branch::BranchPin<SecretsCoordinate>;
 
-/// An account header seen as a link on its SECRETS chain — this module only ever walks log-1
-/// candidates, whose chain is `(account, device)`.
+/// An account header linked only within its full `(account, log, device)` coordinate.
 impl ChainLink for AccountEntryHeader {
     type Coordinate = SecretsCoordinate;
 
@@ -104,6 +102,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::account::id::OwnerId;
 
     const ACCOUNT: [u8; 32] = [0xaa; 32];
     const DEVICE: [u8; 32] = [0xbb; 32];
@@ -111,6 +110,7 @@ mod tests {
     fn chain() -> SecretsCoordinate {
         SecretsCoordinate {
             account_id: AccountId::from_bytes(ACCOUNT),
+            log_id: SECRETS_LOG,
             device_fingerprint: DeviceFingerprint::from_bytes(DEVICE),
         }
     }
@@ -128,15 +128,21 @@ mod tests {
             crypto_suite: 0,
             auth_len: seq,
             key_id: None,
-            authority_ref: Some([1; 32]),
+            authority_ref: Some(OwnerId::from_bytes([1; 32])),
         }
     }
 
     fn linear() -> HashMap<AccountEntryHash, AccountEntryHeader> {
         HashMap::from([
-            ([0x0a; 32], header(0, None)),
-            ([0x0b; 32], header(1, Some([0x0a; 32]))),
-            ([0x0c; 32], header(2, Some([0x0b; 32]))),
+            (AccountEntryHash::from_bytes([0x0a; 32]), header(0, None)),
+            (
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                header(1, Some(AccountEntryHash::from_bytes([0x0a; 32]))),
+            ),
+            (
+                AccountEntryHash::from_bytes([0x0c; 32]),
+                header(2, Some(AccountEntryHash::from_bytes([0x0b; 32]))),
+            ),
         ])
     }
 
@@ -157,48 +163,132 @@ mod tests {
     }
 
     #[test]
+    fn a_control_log_predecessor_is_not_on_the_secrets_chain() {
+        let mut view = linear();
+        view.get_mut(&AccountEntryHash::from_bytes([0x0a; 32])).unwrap().log_id =
+            super::super::super::fold::CONTROL_LOG;
+        let mut reached = false;
+        let end = branch::walk_back(
+            &AccountEntryHash::from_bytes([0x0c; 32]),
+            |hash| view.get(hash),
+            |hash, _| {
+                reached |= *hash == AccountEntryHash::from_bytes([0x0a; 32]);
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        assert!(matches!(end, branch::WalkEnd::ForgedLink));
+        assert!(!reached, "reject the foreign coordinate before visiting its target");
+    }
+
+    #[test]
     fn a_linear_chain_is_accepted_in_full() {
         let view = linear();
         let rows = candidates(&view);
         let selection = select_accepted_branch(&rows, &all(&view), &[], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
+        assert_eq!(
+            selection.accepted,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0a; 32]),
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                AccountEntryHash::from_bytes([0x0c; 32])
+            ])
+        );
         assert!(selection.forked.is_empty());
     }
 
     #[test]
     fn an_unforced_fork_resolves_to_the_smaller_hash_and_the_loser_is_terminal() {
         let mut view = linear();
-        view.insert([0x1b; 32], header(1, Some([0x0a; 32]))); // sibling of 0x0b, larger hash
-        view.insert([0x1c; 32], header(2, Some([0x1b; 32])));
+        view.insert(
+            AccountEntryHash::from_bytes([0x1b; 32]),
+            header(1, Some(AccountEntryHash::from_bytes([0x0a; 32]))),
+        ); // sibling of 0x0b, larger hash
+        view.insert(
+            AccountEntryHash::from_bytes([0x1c; 32]),
+            header(2, Some(AccountEntryHash::from_bytes([0x1b; 32]))),
+        );
         let rows = candidates(&view);
         let selection = select_accepted_branch(&rows, &all(&view), &[], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
-        assert_eq!(selection.forked, HashSet::from([[0x1b; 32], [0x1c; 32]]));
+        assert_eq!(
+            selection.accepted,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0a; 32]),
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                AccountEntryHash::from_bytes([0x0c; 32])
+            ])
+        );
+        assert_eq!(
+            selection.forked,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x1b; 32]),
+                AccountEntryHash::from_bytes([0x1c; 32])
+            ])
+        );
     }
 
     #[test]
     fn a_register_watermark_promotes_the_branch_it_names_over_the_hash_order() {
         let mut view = linear();
         // The equivocating sibling has the LARGER hash, so the unforced rule would fork it out.
-        view.insert([0x1b; 32], header(1, Some([0x0a; 32])));
-        view.insert([0x1c; 32], header(2, Some([0x1b; 32])));
+        view.insert(
+            AccountEntryHash::from_bytes([0x1b; 32]),
+            header(1, Some(AccountEntryHash::from_bytes([0x0a; 32]))),
+        );
+        view.insert(
+            AccountEntryHash::from_bytes([0x1c; 32]),
+            header(2, Some(AccountEntryHash::from_bytes([0x1b; 32]))),
+        );
         let rows = candidates(&view);
-        let pin = BranchPin { coordinate: chain(), seq: 2, watermark: [0x1c; 32] };
+        let pin = BranchPin {
+            coordinate: chain(),
+            seq: 2,
+            watermark: AccountEntryHash::from_bytes([0x1c; 32]),
+        };
         let selection = select_accepted_branch(&rows, &all(&view), &[pin], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x1b; 32], [0x1c; 32]]));
-        assert_eq!(selection.forked, HashSet::from([[0x0b; 32], [0x0c; 32]]));
+        assert_eq!(
+            selection.accepted,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0a; 32]),
+                AccountEntryHash::from_bytes([0x1b; 32]),
+                AccountEntryHash::from_bytes([0x1c; 32])
+            ])
+        );
+        assert_eq!(
+            selection.forked,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                AccountEntryHash::from_bytes([0x0c; 32])
+            ])
+        );
     }
 
     #[test]
     fn a_withheld_or_foreign_pin_cannot_steer_selection() {
         let mut view = linear();
-        view.insert([0x1b; 32], header(1, Some([0x0a; 32])));
-        view.insert([0x1c; 32], header(2, Some([0x1b; 32])));
+        view.insert(
+            AccountEntryHash::from_bytes([0x1b; 32]),
+            header(1, Some(AccountEntryHash::from_bytes([0x0a; 32]))),
+        );
+        view.insert(
+            AccountEntryHash::from_bytes([0x1c; 32]),
+            header(2, Some(AccountEntryHash::from_bytes([0x1b; 32]))),
+        );
         let rows = candidates(&view);
         // A watermark we do not hold cannot pin.
-        let withheld = BranchPin { coordinate: chain(), seq: 2, watermark: [0x99; 32] };
+        let withheld = BranchPin {
+            coordinate: chain(),
+            seq: 2,
+            watermark: AccountEntryHash::from_bytes([0x99; 32]),
+        };
         let selection = select_accepted_branch(&rows, &all(&view), &[withheld], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
+        assert_eq!(
+            selection.accepted,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0a; 32]),
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                AccountEntryHash::from_bytes([0x0c; 32])
+            ])
+        );
         // Nor a pin whose watermark names a foreign coordinate.
         let foreign = BranchPin {
             coordinate: SecretsCoordinate {
@@ -206,29 +296,52 @@ mod tests {
                 ..chain()
             },
             seq: 2,
-            watermark: [0x1c; 32],
+            watermark: AccountEntryHash::from_bytes([0x1c; 32]),
         };
         let selection = select_accepted_branch(&rows, &all(&view), &[foreign], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
+        assert_eq!(
+            selection.accepted,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0a; 32]),
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                AccountEntryHash::from_bytes([0x0c; 32])
+            ])
+        );
     }
 
     #[test]
     fn a_condemned_entry_never_competes_for_a_slot() {
         let mut view = linear();
         // A smaller-hash equivocating sibling that WOULD win the tiebreak, but is ineligible.
-        view.insert([0x00; 32], header(1, Some([0x0a; 32])));
+        view.insert(
+            AccountEntryHash::from_bytes([0x00; 32]),
+            header(1, Some(AccountEntryHash::from_bytes([0x0a; 32]))),
+        );
         let rows = candidates(&view);
         let mut eligible = all(&view);
-        eligible.remove(&[0x00; 32]);
+        eligible.remove(&AccountEntryHash::from_bytes([0x00; 32]));
         let selection = select_accepted_branch(&rows, &eligible, &[], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
+        assert_eq!(
+            selection.accepted,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0a; 32]),
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                AccountEntryHash::from_bytes([0x0c; 32])
+            ])
+        );
     }
 
     #[test]
     fn selection_is_independent_of_row_order() {
         let mut view = linear();
-        view.insert([0x1b; 32], header(1, Some([0x0a; 32])));
-        view.insert([0x1c; 32], header(2, Some([0x1b; 32])));
+        view.insert(
+            AccountEntryHash::from_bytes([0x1b; 32]),
+            header(1, Some(AccountEntryHash::from_bytes([0x0a; 32]))),
+        );
+        view.insert(
+            AccountEntryHash::from_bytes([0x1c; 32]),
+            header(2, Some(AccountEntryHash::from_bytes([0x1b; 32]))),
+        );
         let mut rows = candidates(&view);
         let expected = select_accepted_branch(&rows, &all(&view), &[], &view);
         for rotation in 1..rows.len() {
@@ -240,10 +353,20 @@ mod tests {
     #[test]
     fn an_entry_stranded_above_a_gap_is_neither_accepted_nor_forked() {
         let mut view = linear();
-        view.insert([0x0e; 32], header(4, Some([0x0d; 32]))); // seq-3 predecessor absent
+        view.insert(
+            AccountEntryHash::from_bytes([0x0e; 32]),
+            header(4, Some(AccountEntryHash::from_bytes([0x0d; 32]))),
+        ); // seq-3 predecessor absent
         let rows = candidates(&view);
         let selection = select_accepted_branch(&rows, &all(&view), &[], &view);
-        assert_eq!(selection.accepted, HashSet::from([[0x0a; 32], [0x0b; 32], [0x0c; 32]]));
-        assert!(!selection.forked.contains(&[0x0e; 32]));
+        assert_eq!(
+            selection.accepted,
+            HashSet::from([
+                AccountEntryHash::from_bytes([0x0a; 32]),
+                AccountEntryHash::from_bytes([0x0b; 32]),
+                AccountEntryHash::from_bytes([0x0c; 32])
+            ])
+        );
+        assert!(!selection.forked.contains(&AccountEntryHash::from_bytes([0x0e; 32])));
     }
 }

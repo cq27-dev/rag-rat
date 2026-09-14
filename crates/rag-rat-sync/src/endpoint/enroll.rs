@@ -45,14 +45,17 @@ pub async fn connect_and_enroll(
     request.transport_node_id = *endpoint.id().as_bytes();
     request.budget = rag_rat_oplog::enrollment_budget(database, expected_account, now_ms)?;
     request.held_entry_hashes =
-        rag_rat_oplog::held_account_entry_hashes(database, expected_account)?;
+        rag_rat_oplog::held_account_entry_hashes(database, expected_account)?
+            .into_iter()
+            .map(|hash| hash.to_bytes())
+            .collect();
     validate_enrollment_request_identity(database, expected_account, &request, now_ms)?;
     let (conn, mut send, mut recv) = dial_enroll(endpoint, peer, InviteTicketKind::Pairing).await?;
     let receipt = run_enrollment_dialer(&mut recv, &mut send, expected_account, &request).await?;
     let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
         &receipt.account_entries,
         expected_account,
-        receipt.device_add_hash,
+        receipt.device_add_hash.into(),
         &receipt.device_add_signed,
         request.ed25519_pubkey,
         request.x25519_pubkey,
@@ -64,7 +67,7 @@ pub async fn connect_and_enroll(
         account_id: expected_account,
         genesis_hash,
         device_fingerprint: fingerprint,
-        device_add_hash: receipt.device_add_hash,
+        device_add_hash: receipt.device_add_hash.into(),
         now_ms,
     })?;
     // Best-effort maintenance AFTER the durable adoption: retry parked rows the receipt's keys

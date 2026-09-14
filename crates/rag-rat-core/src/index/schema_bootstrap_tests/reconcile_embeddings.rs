@@ -445,11 +445,7 @@ fn force_reconcile_progress_is_honest_and_terminates_without_limit() {
         )
         .unwrap();
 
-    assert_eq!(
-        report.status,
-        ai::ReconcileStatus::Current,
-        "did not terminate naturally: {report:?}"
-    );
+    assert_eq!(report.status, ai::ReconcileStatus::Current, "did not terminate naturally");
     assert_eq!(report.processed_chunks, 2);
 
     let started_total = events.iter().find_map(|event| match event {
@@ -777,14 +773,12 @@ fn policy_skip_summary_recomputes_exactly_for_a_non_default_char_cap() {
         .unwrap();
     assert!(
         default_run.skipped_by_policy.get("SkipGenerated").copied().unwrap_or(0) >= 1,
-        "default cap: {:?}",
-        default_run.skipped_by_policy
+        "default cap must skip generated chunks"
     );
     assert_eq!(
         default_run.skipped_by_policy.get("SkipTooLarge"),
         None,
-        "default cap must not see SkipTooLarge: {:?}",
-        default_run.skipped_by_policy
+        "default cap must not see SkipTooLarge"
     );
 
     // Non-default cap: the fallback recomputes and the same chunk is now SkipTooLarge — the report
@@ -801,8 +795,7 @@ fn policy_skip_summary_recomputes_exactly_for_a_non_default_char_cap() {
         .unwrap();
     assert!(
         small_cap_run.skipped_by_policy.get("SkipTooLarge").copied().unwrap_or(0) >= 1,
-        "cap=1000 must recompute SkipTooLarge: {:?}",
-        small_cap_run.skipped_by_policy
+        "cap=1000 must recompute SkipTooLarge"
     );
 
     let _ = fs::remove_dir_all(&root);

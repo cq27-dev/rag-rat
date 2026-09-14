@@ -14,6 +14,7 @@ use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
+use super::id::AccountEntryHash;
 use crate::cbor::{self, VecEncoderExt};
 
 /// A cut (§11): `Empty` (CBOR `null`) means nothing on the chain is valid; `At { seq, hash }` pins
@@ -21,7 +22,7 @@ use crate::cbor::{self, VecEncoderExt};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Cut {
     Empty,
-    At { seq: u64, hash: [u8; 32] },
+    At { seq: u64, hash: AccountEntryHash },
 }
 
 impl Cut {
@@ -35,7 +36,7 @@ impl Cut {
             Cut::At { seq, hash } => {
                 enc.put_array(2);
                 enc.put_u64(*seq);
-                enc.put_bytes(hash);
+                enc.put_bytes(hash.as_slice());
             },
         }
     }
@@ -60,7 +61,7 @@ impl Cut {
             cbor::expect_array(d, 2)?;
             let seq = d.u64()?;
             let hash = cbor::fixed_bytes::<32>(d.bytes()?, "cut hash")?;
-            Ok(Cut::At { seq, hash })
+            Ok(Cut::At { seq, hash: AccountEntryHash::from_bytes(hash) })
         }
     }
 
@@ -73,7 +74,7 @@ impl Cut {
     }
 
     /// The watermark entry_hash if this is an `At` cut.
-    pub(super) fn hash(&self) -> Option<[u8; 32]> {
+    pub(super) fn hash(&self) -> Option<AccountEntryHash> {
         match self {
             Cut::Empty => None,
             Cut::At { hash, .. } => Some(*hash),
@@ -105,7 +106,7 @@ mod tests {
         // `Empty` is a bare CBOR null; `At` is `[seq, hash]`. These bytes ride inside DeviceRemove
         // / OwnerDemote / CutExtend payloads, so a change is a wire bump.
         assert_eq!(hex(&Cut::Empty.encode()), "f6", "empty cut is null");
-        let at = Cut::At { seq: 5, hash: [0x11; 32] };
+        let at = Cut::At { seq: 5, hash: AccountEntryHash::from_bytes([0x11; 32]) };
         assert_eq!(
             hex(&at.encode()),
             "82055820".to_string() + &"11".repeat(32),
@@ -115,9 +116,11 @@ mod tests {
 
     #[test]
     fn cut_round_trips_through_decode() {
-        for cut in
-            [Cut::Empty, Cut::At { seq: 0, hash: [0u8; 32] }, Cut::At { seq: 42, hash: [0xab; 32] }]
-        {
+        for cut in [
+            Cut::Empty,
+            Cut::At { seq: 0, hash: AccountEntryHash::from_bytes([0u8; 32]) },
+            Cut::At { seq: 42, hash: AccountEntryHash::from_bytes([0xab; 32]) },
+        ] {
             let bytes = cut.encode();
             let mut d = Decoder::new(&bytes);
             assert_eq!(Cut::decode(&mut d).unwrap(), cut);
@@ -154,7 +157,7 @@ mod tests {
         // Empty condemns everything; At condemns strictly-greater seqs, from `[seq]` alone.
         assert!(beyond(0, &Cut::Empty));
         assert!(beyond(u64::MAX, &Cut::Empty));
-        let cut = Cut::At { seq: 41, hash: [0x11; 32] };
+        let cut = Cut::At { seq: 41, hash: AccountEntryHash::from_bytes([0x11; 32]) };
         assert!(!beyond(41, &cut), "the watermark slot itself is within the cut");
         assert!(!beyond(0, &cut), "under-cut slots are within");
         assert!(beyond(42, &cut), "slot past the watermark is beyond");

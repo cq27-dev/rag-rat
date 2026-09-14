@@ -721,7 +721,11 @@ fn validated_scope(
         return Ok(None);
     };
     let current = account::repo_incarnation_state(conn, account_id, &stream.repo_id)?;
-    if current != RepoIncarnationState::Current(stream.incarnation_ref) {
+    if current
+        != RepoIncarnationState::Current(crate::AccountEntryHash::from_bytes(
+            stream.incarnation_ref,
+        ))
+    {
         return Ok(None);
     }
     let derived = scope_stream_id(&stream.repo_id, account_id, stream.incarnation_ref, scope);

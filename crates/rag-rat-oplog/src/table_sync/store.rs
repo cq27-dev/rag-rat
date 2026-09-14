@@ -1497,7 +1497,8 @@ pub(crate) fn assert_current_incarnation(
     incarnation_ref: [u8; 32],
 ) -> anyhow::Result<()> {
     match crate::account::repo_incarnation_state(tx, account_id, repo_id)? {
-        crate::account::RepoIncarnationState::Current(current) if current == incarnation_ref =>
+        crate::account::RepoIncarnationState::Current(current)
+            if current == crate::AccountEntryHash::from_bytes(incarnation_ref) =>
             Ok(()),
         crate::account::RepoIncarnationState::Current(_) => {
             anyhow::bail!("table-sync context names a stale repository incarnation")

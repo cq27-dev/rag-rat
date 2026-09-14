@@ -45,7 +45,11 @@ async fn enroll_member_over_endpoint(
         x25519_pubkey: local.x25519_public_key(),
         transport_node_id: *joiner_endpoint.id().as_bytes(),
         budget: rag_rat_oplog::enrollment_budget(joiner, account, NOW).unwrap(),
-        held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(joiner, account).unwrap(),
+        held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(joiner, account)
+            .unwrap()
+            .into_iter()
+            .map(|hash| hash.to_bytes())
+            .collect(),
     };
     let server = rag_rat_sync::accept_enrollment(owner_endpoint, owner, || NOW);
     let client = rag_rat_sync::connect_and_enroll(

@@ -18,23 +18,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use super::super::branch::BranchSelection;
-use super::super::candidate::{self as account_candidate, Ancestry, HeaderView, UnknownCause};
+use super::super::branch::{AncestryRelation, BranchSelection, CitedFreshness};
+use super::super::candidate::{self as account_candidate, HeaderView};
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader};
 use super::super::fold::{EntryStatus, SECRETS_LOG, SUPPORTED_OP_VERSION};
-use super::super::id::fixed;
+use super::super::id::{self, AccountEntryHash, OwnerId};
 use super::super::{
     AccountId, AuthorityBoundary, AuthorityFreshness, AuthorityQuery, OwnerChainAuthority, storage,
 };
-use super::acceptance::{
-    self, AncestryRelation, CitedFreshness, SecretsAcceptance, SecretsAcceptanceInput,
-    SecretsParkReason, UnknownAncestry,
-};
+use super::acceptance::{self, SecretsAcceptance, SecretsAcceptanceInput, SecretsParkReason};
 use super::candidate::{self, BranchPin, SecretsCandidate, SecretsCoordinate};
 use super::ops::{self, DecodedSecretsOp};
-
-type AccountEntryHash = [u8; 32];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoIncarnationState {
@@ -59,7 +54,9 @@ pub fn repo_incarnation_state(
     match row {
         None => Ok(RepoIncarnationState::Absent),
         Some(None) => Ok(RepoIncarnationState::Contested),
-        Some(Some(reference)) => Ok(RepoIncarnationState::Current(fixed::<32>(&reference)?)),
+        Some(Some(reference)) => Ok(RepoIncarnationState::Current(AccountEntryHash::from_bytes(
+            id::fixed::<32>(&reference)?,
+        ))),
     }
 }
 
@@ -89,7 +86,7 @@ impl ResolvedSecretsEntry {
 
 /// The authority facts for one evaluable `StreamKeyWrap`, all read from ONE fold snapshot.
 struct WrapFacts {
-    authority_ref: Option<AccountEntryHash>,
+    authority_ref: Option<OwnerId>,
     owner_authority: AuthorityQuery<OwnerChainAuthority>,
     ownership: Option<AuthorityQuery<AccountEntryHash>>,
     freshness: CitedFreshness,
@@ -245,7 +242,7 @@ fn load_secrets_headers(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for (entry_hash, signed_bytes) in rows {
-        let entry_hash = fixed::<32>(&entry_hash)?;
+        let entry_hash = AccountEntryHash::from_bytes(id::fixed::<32>(&entry_hash)?);
         // A row stored outside `account_ingest` (or a corrupt blob) that no longer decodes / hashes
         // to its key cannot belong to any valid chain — treat it as absent (it keeps the main
         // loop's `retained_unfolded` baseline), rather than aborting the whole account fold
@@ -331,10 +328,7 @@ fn resolve_secrets_entries(
 /// sharing one owner incarnation resolves each fact once.
 #[derive(Default)]
 struct Caches {
-    owner: HashMap<
-        (AccountEntryHash, crate::op::DeviceFingerprint),
-        AuthorityQuery<OwnerChainAuthority>,
-    >,
+    owner: HashMap<(OwnerId, crate::op::DeviceFingerprint), AuthorityQuery<OwnerChainAuthority>>,
     ownership: HashMap<crate::stream::StreamId, AuthorityQuery<AccountEntryHash>>,
     held_control_log: Option<u64>,
 }
@@ -429,6 +423,7 @@ fn branch_pins(resolved: &[ResolvedSecretsEntry]) -> Vec<BranchPin> {
         };
         let coordinate = SecretsCoordinate {
             account_id: r.header.account_id,
+            log_id: r.header.log_id,
             device_fingerprint: r.header.device_fingerprint,
         };
         for boundary in [owner.device_boundary, owner.incarnation_boundary] {
@@ -454,6 +449,7 @@ fn prefix_closed_accepted(
         if selection.accepted.contains(&r.entry_hash) {
             let coordinate = SecretsCoordinate {
                 account_id: r.header.account_id,
+                log_id: r.header.log_id,
                 device_fingerprint: r.header.device_fingerprint,
             };
             chains.entry(coordinate).or_default().push((
@@ -540,7 +536,7 @@ fn rewrite_repo_incarnation_projection(
             "INSERT INTO account_repo_incarnation_current(
                  account_id, repository_id, incarnation_ref
              ) VALUES (?1, ?2, ?3)",
-            params![account.as_slice(), repo_id, current.as_ref().map(<[u8; 32]>::as_slice),],
+            params![account.as_slice(), repo_id, current.as_ref().map(AccountEntryHash::as_slice),],
         )?;
     }
     Ok(())
@@ -569,8 +565,7 @@ fn write_secrets_verdict(
     Ok(())
 }
 
-/// Map the account-log ancestry verdict into the evaluator's `AncestryRelation` (both name a
-/// withheld watermark and a missing mid-chain link apart — I11).
+/// Evaluate a secrets watermark through the shared account-log ancestry walk.
 fn ancestry_relation(
     target: AccountEntryHash,
     watermark: AccountEntryHash,
@@ -578,14 +573,7 @@ fn ancestry_relation(
 ) -> AncestryRelation {
     // The seq is unused by the ancestry walk (it follows `prev_hash` from the watermark hash), so a
     // placeholder 0 is correct here.
-    match account_candidate::ancestry(&target, &Cut::At { seq: 0, hash: watermark }, view) {
-        Ancestry::OnBranch => AncestryRelation::OnBranch,
-        Ancestry::OffBranch => AncestryRelation::OffBranch,
-        Ancestry::Unknown(UnknownCause::UnknownCutTarget) =>
-            AncestryRelation::Unknown(UnknownAncestry::UnknownCutTarget),
-        Ancestry::Unknown(UnknownCause::IncompleteCutAncestry) =>
-            AncestryRelation::Unknown(UnknownAncestry::IncompleteCutAncestry),
-    }
+    account_candidate::ancestry(&target, &Cut::At { seq: 0, hash: watermark }, view)
 }
 
 #[cfg(test)]
@@ -638,7 +626,7 @@ mod tests {
             authority_ref: None,
         };
         let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
-        (account_id, signed.signed_bytes, signed.entry_hash)
+        (account_id, signed.signed_bytes, signed.entry_hash.into())
     }
 
     /// Build a `StreamKeyWrap` op sealing a seed-derived content key to `recipient`.
@@ -672,7 +660,7 @@ mod tests {
         signer: &Dev,
         seq: u64,
         prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
+        authority_ref: Option<OwnerId>,
         wrap: &StreamKeyWrap,
     ) -> (Vec<u8>, [u8; 32]) {
         let payload = super::super::ops::encode(wrap).unwrap();
@@ -692,9 +680,9 @@ mod tests {
         signer: &Dev,
         seq: u64,
         prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
+        authority_ref: Option<OwnerId>,
         repo_id: &str,
-        predecessor_ref: Option<[u8; 32]>,
+        predecessor_ref: Option<AccountEntryHash>,
     ) -> (Vec<u8>, [u8; 32]) {
         let payload = super::super::ops::encode_repo_incarnation(&ops::RepoIncarnation {
             repo_id: repo_id.to_string(),
@@ -719,7 +707,7 @@ mod tests {
         signer: &Dev,
         seq: u64,
         prev: Option<[u8; 32]>,
-        authority_ref: Option<[u8; 32]>,
+        authority_ref: Option<OwnerId>,
         entry_type: u32,
         payload: &[u8],
     ) -> (Vec<u8>, [u8; 32]) {
@@ -728,8 +716,8 @@ mod tests {
             log_id: SECRETS_LOG,
             device_fingerprint: signer.fp,
             seq,
-            prev_hash: prev,
-            parent_ref: Some([0u8; 32]),
+            prev_hash: prev.map(Into::into),
+            parent_ref: Some(AccountEntryHash::from_bytes([0u8; 32])),
             entry_type,
             op_version: 1,
             crypto_suite: 0,
@@ -738,7 +726,7 @@ mod tests {
             authority_ref,
         };
         let signed = sign_account_entry(&signer.secret, &header, payload).unwrap();
-        (signed.signed_bytes, signed.entry_hash)
+        (signed.signed_bytes, signed.entry_hash.into())
     }
 
     fn ingest(conn: &Connection, bytes: &[u8]) -> IngestOutcome {
@@ -746,7 +734,7 @@ mod tests {
     }
 
     fn status(conn: &Connection, hash: &[u8; 32]) -> (String, Option<String>) {
-        entry_status(conn, hash).unwrap().expect("entry is stored")
+        entry_status(conn, &(*(hash)).into()).unwrap().expect("entry is stored")
     }
 
     fn accepted_flag(conn: &Connection, hash: &[u8; 32]) -> i64 {
@@ -765,8 +753,14 @@ mod tests {
         let (account, genesis_bytes, genesis_hash) = genesis(&founder);
         ingest(conn, &genesis_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, _) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, _) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(conn, &own_bytes);
         (account, founder, genesis_hash, stream_id)
     }
@@ -776,11 +770,16 @@ mod tests {
         let conn = db();
         let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
         let wrap = wrap_op(account, stream_id, &founder, 0x20);
-        let (bytes, hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (bytes, hash) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         // S4: the ingest-returned status is the secrets pass's verdict, not the `retained_unfolded`
         // baseline the main loop wrote.
         let outcome = ingest(&conn, &bytes);
-        assert_eq!(outcome, IngestOutcome::Ingested { status: "accepted".into() });
+        assert_eq!(outcome, IngestOutcome::Ingested {
+            status: "accepted".into(),
+            account_promotions: Default::default(),
+            content_promotions: Default::default()
+        });
         assert_eq!(status(&conn, &hash), ("accepted".to_string(), None));
         assert_eq!(accepted_flag(&conn, &hash), 1);
     }
@@ -800,18 +799,35 @@ mod tests {
             role: DeviceRole::Member,
             label: None,
         };
-        let (add_bytes, _) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &add);
+        let (add_bytes, _) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &add,
+        );
         ingest(&conn, &add_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, _) =
-            control_op(account, &founder, 2, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, _) = control_op(
+            account,
+            &founder,
+            2,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(&conn, &own_bytes);
         // The member signs a wrap citing the founder's owner incarnation — a device mismatch, so
         // the owner-only gate rejects it (WrongSubject → invalid_owner).
         let wrap = wrap_op(account, stream_id, &member, 0x20);
-        let (bytes, hash) = wrap_entry(account, &member, 0, None, Some(genesis_hash), &wrap);
-        assert_eq!(ingest(&conn, &bytes), IngestOutcome::Ingested { status: "rejected".into() });
+        let (bytes, hash) =
+            wrap_entry(account, &member, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
+        assert_eq!(ingest(&conn, &bytes), IngestOutcome::Ingested {
+            status: "rejected".into(),
+            account_promotions: Default::default(),
+            content_promotions: Default::default()
+        });
         assert_eq!(
             status(&conn, &hash),
             ("rejected".to_string(), Some("invalid_owner".to_string()))
@@ -842,7 +858,8 @@ mod tests {
         // The wrap arrives BEFORE the StreamOwn: the account does not yet own the stream, so it
         // parks (recoverable), never rejects (§14).
         let wrap = wrap_op(account, stream_id, &founder, 0x20);
-        let (bytes, hash) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap);
+        let (bytes, hash) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
         ingest(&conn, &bytes);
         assert_eq!(
             status(&conn, &hash),
@@ -850,8 +867,14 @@ mod tests {
         );
         // The StreamOwn folds in the same account → the secrets pass re-classifies the wrap as
         // accepted in that same refold (the account→content retro-trigger analog).
-        let (own_bytes, _) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &own);
+        let (own_bytes, _) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(&conn, &own_bytes);
         assert_eq!(status(&conn, &hash), ("accepted".to_string(), None));
         assert_eq!(accepted_flag(&conn, &hash), 1);
@@ -880,7 +903,7 @@ mod tests {
             &founder,
             0,
             None,
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             secrets_entry_type::STREAM_KEY_WRAP,
             &payload,
         );
@@ -888,7 +911,10 @@ mod tests {
             matches!(ingest(&conn, &bytes), IngestOutcome::Rejected(_)),
             "twin rejects at ingest"
         );
-        assert!(entry_status(&conn, &hash).unwrap().is_none(), "a rejected entry is not stored");
+        assert!(
+            entry_status(&conn, &hash.into()).unwrap().is_none(),
+            "a rejected entry is not stored"
+        );
     }
 
     #[test]
@@ -897,16 +923,31 @@ mod tests {
         let conn = db();
         let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
         let wrap0 = wrap_op(account, stream_id, &founder, 0x20);
-        let (w0_bytes, w0) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap0);
+        let (w0_bytes, w0) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap0);
         ingest(&conn, &w0_bytes);
         // An unknown secrets tag with a canonical (empty-array) payload: storable, slot-eligible.
         let mut unknown_payload = Vec::new();
         Encoder::new(&mut unknown_payload).array(0).unwrap();
-        let (u_bytes, u1) =
-            secrets_entry(account, &founder, 1, Some(w0), Some(genesis_hash), 99, &unknown_payload);
+        let (u_bytes, u1) = secrets_entry(
+            account,
+            &founder,
+            1,
+            Some(w0),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            99,
+            &unknown_payload,
+        );
         ingest(&conn, &u_bytes);
         let wrap2 = wrap_op(account, stream_id, &founder, 0x21);
-        let (w2_bytes, w2) = wrap_entry(account, &founder, 2, Some(u1), Some(genesis_hash), &wrap2);
+        let (w2_bytes, w2) = wrap_entry(
+            account,
+            &founder,
+            2,
+            Some(u1),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &wrap2,
+        );
         ingest(&conn, &w2_bytes);
 
         assert_eq!(status(&conn, &w0), ("accepted".to_string(), None), "wrap@0 accepts");
@@ -928,10 +969,18 @@ mod tests {
         let conn = db();
         let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
         let wrap0 = wrap_op(account, stream_id, &founder, 0x20);
-        let (w0_bytes, w0) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap0);
+        let (w0_bytes, w0) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap0);
         ingest(&conn, &w0_bytes);
-        let (inc_bytes, incarnation) =
-            incarnation_entry(account, &founder, 1, Some(w0), Some(genesis_hash), "repo-a", None);
+        let (inc_bytes, incarnation) = incarnation_entry(
+            account,
+            &founder,
+            1,
+            Some(w0),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            "repo-a",
+            None,
+        );
         // The exact payload is canonical under an unknown tag on an old client and known under the
         // new tag; either way it occupies the same slot and is prefix-transparent.
         let signed = crate::account::envelope::decode_account_signed(&inc_bytes).unwrap();
@@ -941,14 +990,20 @@ mod tests {
         ));
         ingest(&conn, &inc_bytes);
         let wrap2 = wrap_op(account, stream_id, &founder, 0x21);
-        let (w2_bytes, w2) =
-            wrap_entry(account, &founder, 2, Some(incarnation), Some(genesis_hash), &wrap2);
+        let (w2_bytes, w2) = wrap_entry(
+            account,
+            &founder,
+            2,
+            Some(incarnation),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &wrap2,
+        );
         ingest(&conn, &w2_bytes);
         assert_eq!(status(&conn, &incarnation), ("accepted".into(), None));
         assert_eq!(status(&conn, &w2), ("accepted".into(), None));
         assert_eq!(
             repo_incarnation_state(&conn, account, "repo-a").unwrap(),
-            RepoIncarnationState::Current(incarnation)
+            RepoIncarnationState::Current(AccountEntryHash::from_bytes(incarnation))
         );
     }
 
@@ -957,7 +1012,8 @@ mod tests {
         let conn = db();
         let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
         let wrap0 = wrap_op(account, stream_id, &founder, 0x20);
-        let (w0_bytes, w0) = wrap_entry(account, &founder, 0, None, Some(genesis_hash), &wrap0);
+        let (w0_bytes, w0) =
+            wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap0);
         ingest(&conn, &w0_bytes);
 
         // Tag 1 was unknown to old clients, which admit any canonical definite array. This is not a
@@ -968,7 +1024,7 @@ mod tests {
             &founder,
             1,
             Some(w0),
-            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
             secrets_entry_type::REPO_INCARNATION,
             &malformed_payload,
         );
@@ -980,8 +1036,14 @@ mod tests {
         ingest(&conn, &malformed_bytes);
 
         let wrap2 = wrap_op(account, stream_id, &founder, 0x21);
-        let (w2_bytes, w2) =
-            wrap_entry(account, &founder, 2, Some(malformed), Some(genesis_hash), &wrap2);
+        let (w2_bytes, w2) = wrap_entry(
+            account,
+            &founder,
+            2,
+            Some(malformed),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &wrap2,
+        );
         ingest(&conn, &w2_bytes);
         assert_eq!(status(&conn, &malformed), ("retained_unfolded".into(), None));
         assert_eq!(status(&conn, &w2), ("accepted".into(), None));
@@ -1012,13 +1074,20 @@ mod tests {
             account,
             &founder,
             2,
-            Some(fixed::<32>(&control_tail).unwrap()),
-            Some(founder_id),
+            Some(AccountEntryHash::from_bytes(id::fixed::<32>(&control_tail).unwrap())),
+            Some(OwnerId::from_bytes(founder_id)),
             &add,
         );
         ingest(&conn, &add_bytes);
-        let (bytes, hash) =
-            incarnation_entry(account, &member, 0, None, Some(founder_id), "repo-a", None);
+        let (bytes, hash) = incarnation_entry(
+            account,
+            &member,
+            0,
+            None,
+            Some(OwnerId::from_bytes(founder_id)),
+            "repo-a",
+            None,
+        );
         ingest(&conn, &bytes);
         assert_eq!(status(&conn, &hash).0, "rejected");
         assert_eq!(
@@ -1032,20 +1101,34 @@ mod tests {
         let conn = db();
         let (account, founder, owner_b, owner_b_id, _stream, _) = account_with_second_owner(&conn);
         let founder_id = owner_id_of_founder(&conn, account);
-        let (root_bytes, root) =
-            incarnation_entry(account, &founder, 0, None, Some(founder_id), "repo-a", None);
+        let (root_bytes, root) = incarnation_entry(
+            account,
+            &founder,
+            0,
+            None,
+            Some(OwnerId::from_bytes(founder_id)),
+            "repo-a",
+            None,
+        );
         ingest(&conn, &root_bytes);
         let (a_bytes, _) = incarnation_entry(
             account,
             &founder,
             1,
             Some(root),
-            Some(founder_id),
+            Some(OwnerId::from_bytes(founder_id)),
             "repo-a",
-            Some(root),
+            Some(AccountEntryHash::from_bytes(root)),
         );
-        let (b_bytes, _) =
-            incarnation_entry(account, &owner_b, 0, None, Some(owner_b_id), "repo-a", Some(root));
+        let (b_bytes, _) = incarnation_entry(
+            account,
+            &owner_b,
+            0,
+            None,
+            Some(OwnerId::from_bytes(owner_b_id)),
+            "repo-a",
+            Some(AccountEntryHash::from_bytes(root)),
+        );
         ingest(&conn, &a_bytes);
         ingest(&conn, &b_bytes);
         assert_eq!(
@@ -1058,8 +1141,15 @@ mod tests {
     fn v099_projects_a_previously_opaque_incarnation_entry() {
         let conn = db();
         let (account, founder, founder_id, _stream_id) = account_with_owned_stream(&conn);
-        let (bytes, incarnation) =
-            incarnation_entry(account, &founder, 0, None, Some(founder_id), "repo-a", None);
+        let (bytes, incarnation) = incarnation_entry(
+            account,
+            &founder,
+            0,
+            None,
+            Some(OwnerId::from_bytes(founder_id)),
+            "repo-a",
+            None,
+        );
         ingest(&conn, &bytes);
 
         // Recreate the pre-V099 state: the signed tag-1 candidate exists, but an older binary only
@@ -1083,7 +1173,7 @@ mod tests {
         schema::migrate_forward(&conn, &crate::test_hooks()).unwrap();
         assert_eq!(
             repo_incarnation_state(&conn, account, "repo-a").unwrap(),
-            RepoIncarnationState::Current(incarnation),
+            RepoIncarnationState::Current(AccountEntryHash::from_bytes(incarnation)),
         );
         assert_eq!(status(&conn, &incarnation), ("accepted".into(), None));
     }
@@ -1093,34 +1183,50 @@ mod tests {
         let conn = db();
         let (account, founder, owner_b, owner_b_id, _stream, own_hash) =
             account_with_second_owner(&conn);
-        let (root_bytes, root) =
-            incarnation_entry(account, &owner_b, 0, None, Some(owner_b_id), "repo-a", None);
+        let (root_bytes, root) = incarnation_entry(
+            account,
+            &owner_b,
+            0,
+            None,
+            Some(OwnerId::from_bytes(owner_b_id)),
+            "repo-a",
+            None,
+        );
         ingest(&conn, &root_bytes);
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner_b.fp,
-            owner_id: owner_b_id,
+            owner_id: OwnerId::from_bytes(owner_b_id),
             control_cut: super::super::super::cut::Cut::Empty,
-            secrets_cut: super::super::super::cut::Cut::At { seq: 0, hash: root },
+            secrets_cut: super::super::super::cut::Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(root),
+            },
             reason: "remove".into(),
         };
         let founder_id = owner_id_of_founder(&conn, account);
-        let (demote_bytes, _) =
-            control_op(account, &founder, 3, Some(own_hash), Some(founder_id), &demote);
+        let (demote_bytes, _) = control_op(
+            account,
+            &founder,
+            3,
+            Some(AccountEntryHash::from_bytes(own_hash)),
+            Some(OwnerId::from_bytes(founder_id)),
+            &demote,
+        );
         ingest(&conn, &demote_bytes);
         let (late_bytes, late) = incarnation_entry(
             account,
             &owner_b,
             1,
             Some(root),
-            Some(owner_b_id),
+            Some(OwnerId::from_bytes(owner_b_id)),
             "repo-a",
-            Some(root),
+            Some(AccountEntryHash::from_bytes(root)),
         );
         ingest(&conn, &late_bytes);
         assert_eq!(status(&conn, &late).0, "condemned");
         assert_eq!(
             repo_incarnation_state(&conn, account, "repo-a").unwrap(),
-            RepoIncarnationState::Current(root),
+            RepoIncarnationState::Current(AccountEntryHash::from_bytes(root)),
         );
     }
 
@@ -1153,8 +1259,15 @@ mod tests {
             account_with_second_owner(&conn);
         let founder_id = owner_id_of_founder(&conn, account);
 
-        let (a_bytes, incarnation_a) =
-            incarnation_entry(account, &owner_b, 0, None, Some(owner_b_id), "repo-a", None);
+        let (a_bytes, incarnation_a) = incarnation_entry(
+            account,
+            &owner_b,
+            0,
+            None,
+            Some(OwnerId::from_bytes(owner_b_id)),
+            "repo-a",
+            None,
+        );
         ingest(&conn, &a_bytes);
         let stream = scope_stream_id("repo-a", account, incarnation_a, TABLE.scope_id);
         let tx = conn.transaction().unwrap();
@@ -1192,14 +1305,14 @@ mod tests {
             &owner_b,
             1,
             Some(incarnation_a),
-            Some(owner_b_id),
+            Some(OwnerId::from_bytes(owner_b_id)),
             "repo-a",
-            Some(incarnation_a),
+            Some(AccountEntryHash::from_bytes(incarnation_a)),
         );
         ingest(&conn, &b_bytes);
         assert_eq!(
             repo_incarnation_state(&conn, account, "repo-a").unwrap(),
-            RepoIncarnationState::Current(incarnation_b),
+            RepoIncarnationState::Current(AccountEntryHash::from_bytes(incarnation_b)),
         );
         assert!(refold_stale_projections_against(&conn, &[TABLE]).unwrap());
         assert_eq!(
@@ -1214,18 +1327,27 @@ mod tests {
 
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner_b.fp,
-            owner_id: owner_b_id,
+            owner_id: OwnerId::from_bytes(owner_b_id),
             control_cut: super::super::super::cut::Cut::Empty,
-            secrets_cut: super::super::super::cut::Cut::At { seq: 0, hash: incarnation_a },
+            secrets_cut: super::super::super::cut::Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(incarnation_a),
+            },
             reason: "late cut".into(),
         };
-        let (demote_bytes, _) =
-            control_op(account, &founder, 3, Some(own_hash), Some(founder_id), &demote);
+        let (demote_bytes, _) = control_op(
+            account,
+            &founder,
+            3,
+            Some(AccountEntryHash::from_bytes(own_hash)),
+            Some(OwnerId::from_bytes(founder_id)),
+            &demote,
+        );
         ingest(&conn, &demote_bytes);
         assert_eq!(status(&conn, &incarnation_b).0, "condemned");
         assert_eq!(
             repo_incarnation_state(&conn, account, "repo-a").unwrap(),
-            RepoIncarnationState::Current(incarnation_a),
+            RepoIncarnationState::Current(AccountEntryHash::from_bytes(incarnation_a)),
         );
 
         assert!(refold_stale_projections_against(&conn, &[TABLE]).unwrap());
@@ -1255,7 +1377,14 @@ mod tests {
         let mut hashes = Vec::new();
         for (seq, seed) in [(0u64, 0x20u8), (1, 0x21), (2, 0x22)] {
             let wrap = wrap_op(account, stream_id, &founder, seed);
-            let (bytes, hash) = wrap_entry(account, &founder, seq, prev, Some(genesis_hash), &wrap);
+            let (bytes, hash) = wrap_entry(
+                account,
+                &founder,
+                seq,
+                prev,
+                Some(OwnerId::from_bytes(genesis_hash)),
+                &wrap,
+            );
             ingest(&conn, &bytes);
             prev = Some(hash);
             hashes.push(hash);
@@ -1286,14 +1415,26 @@ mod tests {
             role: DeviceRole::Owner,
             label: None,
         };
-        let (add_bytes, owner_id_b) =
-            control_op(account, &founder, 1, Some(genesis_hash), Some(genesis_hash), &add);
+        let (add_bytes, owner_id_b) = control_op(
+            account,
+            &founder,
+            1,
+            Some(AccountEntryHash::from_bytes(genesis_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &add,
+        );
         ingest(conn, &add_bytes);
         let (stream_id, own) = stream_own(account);
-        let (own_bytes, own_hash) =
-            control_op(account, &founder, 2, Some(owner_id_b), Some(genesis_hash), &own);
+        let (own_bytes, own_hash) = control_op(
+            account,
+            &founder,
+            2,
+            Some(owner_id_b),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &own,
+        );
         ingest(conn, &own_bytes);
-        (account, founder, owner_b, owner_id_b, stream_id, own_hash)
+        (account, founder, owner_b, owner_id_b.into(), stream_id, own_hash.into())
     }
 
     #[test]
@@ -1303,10 +1444,18 @@ mod tests {
             account_with_second_owner(&conn);
         // B authors two wraps on its secrets chain; both accept while B is a live owner.
         let w0op = wrap_op(account, stream_id, &owner_b, 0x30);
-        let (w0_bytes, w0) = wrap_entry(account, &owner_b, 0, None, Some(owner_id_b), &w0op);
+        let (w0_bytes, w0) =
+            wrap_entry(account, &owner_b, 0, None, Some(OwnerId::from_bytes(owner_id_b)), &w0op);
         ingest(&conn, &w0_bytes);
         let w1op = wrap_op(account, stream_id, &owner_b, 0x31);
-        let (w1_bytes, w1) = wrap_entry(account, &owner_b, 1, Some(w0), Some(owner_id_b), &w1op);
+        let (w1_bytes, w1) = wrap_entry(
+            account,
+            &owner_b,
+            1,
+            Some(w0),
+            Some(OwnerId::from_bytes(owner_id_b)),
+            &w1op,
+        );
         ingest(&conn, &w1_bytes);
         assert_eq!(status(&conn, &w0), ("accepted".to_string(), None), "wrap@0 accepts pre-cut");
         assert_eq!(status(&conn, &w1), ("accepted".to_string(), None), "wrap@1 accepts pre-cut");
@@ -1315,14 +1464,23 @@ mod tests {
         // beyond-cut wrap@1 in the SAME refold — wrap@0 (within the cut, on-branch) stays accepted.
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner_b.fp,
-            owner_id: owner_id_b,
+            owner_id: OwnerId::from_bytes(owner_id_b),
             control_cut: super::super::super::cut::Cut::Empty,
-            secrets_cut: super::super::super::cut::Cut::At { seq: 0, hash: w0 },
+            secrets_cut: super::super::super::cut::Cut::At {
+                seq: 0,
+                hash: AccountEntryHash::from_bytes(w0),
+            },
             reason: "demote".to_string(),
         };
         let genesis_hash = owner_id_of_founder(&conn, account);
-        let (demote_bytes, _) =
-            control_op(account, &founder, 3, Some(own_hash), Some(genesis_hash), &demote);
+        let (demote_bytes, _) = control_op(
+            account,
+            &founder,
+            3,
+            Some(AccountEntryHash::from_bytes(own_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &demote,
+        );
         ingest(&conn, &demote_bytes);
         assert_eq!(
             status(&conn, &w0),
@@ -1346,17 +1504,30 @@ mod tests {
         let (account, founder, owner_b, owner_id_b, stream_id, own_hash) =
             account_with_second_owner(&conn);
         let w0op = wrap_op(account, stream_id, &owner_b, 0x30);
-        let (w0_bytes, w0) = wrap_entry(account, &owner_b, 0, None, Some(owner_id_b), &w0op);
+        let (w0_bytes, w0) =
+            wrap_entry(account, &owner_b, 0, None, Some(OwnerId::from_bytes(owner_id_b)), &w0op);
         ingest(&conn, &w0_bytes);
         // Two DIFFERENT seq-1 entries off w0 — an equivocation with distinct payloads (distinct
         // hashes).
         let honest_op = wrap_op(account, stream_id, &owner_b, 0x31);
-        let (honest_bytes, honest) =
-            wrap_entry(account, &owner_b, 1, Some(w0), Some(owner_id_b), &honest_op);
+        let (honest_bytes, honest) = wrap_entry(
+            account,
+            &owner_b,
+            1,
+            Some(w0),
+            Some(OwnerId::from_bytes(owner_id_b)),
+            &honest_op,
+        );
         ingest(&conn, &honest_bytes);
         let attacker_op = wrap_op(account, stream_id, &owner_b, 0x41);
-        let (attacker_bytes, attacker) =
-            wrap_entry(account, &owner_b, 1, Some(w0), Some(owner_id_b), &attacker_op);
+        let (attacker_bytes, attacker) = wrap_entry(
+            account,
+            &owner_b,
+            1,
+            Some(w0),
+            Some(OwnerId::from_bytes(owner_id_b)),
+            &attacker_op,
+        );
         ingest(&conn, &attacker_bytes);
 
         // A demotes B with a secrets cut naming the HONEST seq-1 head. The register pins the honest
@@ -1364,13 +1535,22 @@ mod tests {
         let genesis_hash = owner_id_of_founder(&conn, account);
         let demote = AccountOp::OwnerDemote {
             device_fingerprint: owner_b.fp,
-            owner_id: owner_id_b,
+            owner_id: OwnerId::from_bytes(owner_id_b),
             control_cut: super::super::super::cut::Cut::Empty,
-            secrets_cut: super::super::super::cut::Cut::At { seq: 1, hash: honest },
+            secrets_cut: super::super::super::cut::Cut::At {
+                seq: 1,
+                hash: AccountEntryHash::from_bytes(honest),
+            },
             reason: "demote".to_string(),
         };
-        let (demote_bytes, _) =
-            control_op(account, &founder, 3, Some(own_hash), Some(genesis_hash), &demote);
+        let (demote_bytes, _) = control_op(
+            account,
+            &founder,
+            3,
+            Some(AccountEntryHash::from_bytes(own_hash)),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &demote,
+        );
         ingest(&conn, &demote_bytes);
 
         assert_eq!(status(&conn, &w0), ("accepted".to_string(), None), "the shared root accepts");
@@ -1399,7 +1579,7 @@ mod tests {
             ],
             |row| row.get::<_, Vec<u8>>(0),
         )
-        .map(|bytes| fixed::<32>(&bytes).unwrap())
+        .map(|bytes| id::fixed::<32>(&bytes).unwrap())
         .unwrap()
     }
 }

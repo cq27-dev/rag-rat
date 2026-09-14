@@ -188,7 +188,7 @@ impl SyncStore for OplogSyncStore<'_> {
         };
         Ok(entries
             .into_iter()
-            .map(|e| (account_signed_hash(&e.signed_bytes), e.signed_bytes))
+            .map(|e| (account_signed_hash(&e.signed_bytes).to_bytes(), e.signed_bytes))
             .collect())
     }
 
@@ -225,16 +225,11 @@ impl SyncStore for OplogSyncStore<'_> {
         // this binary refuses (e.g. over a future cap) — so map it to NoChange, not a failure that
         // would abort the whole session.
         match account_ingest(self.conn, signed_bytes, (self.now_fn)())? {
-            // Newly durable: stored, or durably parked pending its signer. Every `Ingested*`
-            // variant added state (the `RejectedPromotions` suffixes report collateral pre-verify
-            // eviction of OTHER parked rows, not a failure of THIS entry).
+            // Newly durable: stored, or durably parked pending its signer. Promotion outcomes
+            // report collateral eviction of other parked rows; this entry was stored.
             IngestOutcome::PreVerify
             | IngestOutcome::PreVerifyWithEviction { .. }
-            | IngestOutcome::Ingested { .. }
-            | IngestOutcome::IngestedWithRejectedPromotions { .. }
-            | IngestOutcome::IngestedWithRejectedContentPromotions { .. }
-            | IngestOutcome::IngestedWithRejectedAccountAndContentPromotions { .. } =>
-                Ok(Ingested::Stored),
+            | IngestOutcome::Ingested { .. } => Ok(Ingested::Stored),
             // Already held / structurally refused / capacity-blocked: nothing new landed. A refusal
             // is not a session error — a peer may legitimately offer what this binary declines.
             IngestOutcome::Rejected(_) | IngestOutcome::CapacityReached { .. } =>
@@ -305,7 +300,7 @@ impl SyncStore for OplogContentSyncStore<'_> {
         };
         Ok(entries
             .into_iter()
-            .map(|e| (content_signed_hash(&e.signed_bytes), e.signed_bytes))
+            .map(|e| (content_signed_hash(&e.signed_bytes).to_bytes(), e.signed_bytes))
             .collect())
     }
 

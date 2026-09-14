@@ -13,12 +13,14 @@
 use rusqlite::{Connection, params};
 
 use super::super::AccountId;
+use super::super::id::AccountEntryHash;
 use super::super::keywrap::KeyId;
 use crate::stream::StreamId;
 
 /// The closed set of sealing-adoption audit event kinds, persisted as the `kind` TEXT column via
 /// [`as_db_str`](Self::as_db_str). The machine strings are stable schema — a rename is a migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(super) enum SyncSecurityEventKind {
     /// A wrap naming this device unwrapped cleanly, but the recovered key's `key_id` disagrees with
     /// the op's signed `key_id` (the residual a valid authority gate can't catch: a wrong key
@@ -32,18 +34,11 @@ pub(super) enum SyncSecurityEventKind {
 
 impl SyncSecurityEventKind {
     pub(super) fn as_db_str(self) -> &'static str {
-        match self {
-            Self::WrapKeyIdMismatch => "wrap_key_id_mismatch",
-            Self::WrapUnwrapFailed => "wrap_unwrap_failed",
-        }
+        self.into()
     }
 
     pub(super) fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "wrap_key_id_mismatch" => Some(Self::WrapKeyIdMismatch),
-            "wrap_unwrap_failed" => Some(Self::WrapUnwrapFailed),
-            _ => None,
-        }
+        value.parse().ok()
     }
 }
 
@@ -55,7 +50,7 @@ pub(super) struct SyncSecurityEvent {
     pub(super) stream_id: StreamId,
     pub(super) key_epoch: u64,
     /// The accepted wrap op whose wrap failed the cross-check — the dedup key with `kind`.
-    pub(super) entry_hash: [u8; 32],
+    pub(super) entry_hash: AccountEntryHash,
     /// The op's signed (claimed) `key_id` — the value the recovered key was required to match.
     pub(super) expected_key_id: Option<KeyId>,
     /// The `key_id` of the key actually recovered; `None` for an unwrap failure (no key
@@ -124,7 +119,7 @@ mod tests {
             account_id: AccountId::from_bytes([1; 32]),
             stream_id: StreamId::from_bytes([2; 32]),
             key_epoch: 7,
-            entry_hash: [9; 32],
+            entry_hash: AccountEntryHash::from_bytes([9; 32]),
             expected_key_id: Some(KeyId::from_bytes([3; 32])),
             observed_key_id: None,
             observed_at_ms: 111,

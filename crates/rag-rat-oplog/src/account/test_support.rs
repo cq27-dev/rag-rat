@@ -3,6 +3,7 @@
 use super::AccountId;
 use super::envelope::{AccountEntryHeader, sign_account_entry};
 use super::fold::CONTROL_LOG;
+use super::id::{AccountEntryHash, OwnerId};
 use super::ops::{self as control_ops, AccountOp};
 use crate::device::{DeviceSecret, DeviceX25519Secret};
 use crate::op::DeviceFingerprint;
@@ -31,10 +32,10 @@ pub(in crate::account) fn control_op(
     account: AccountId,
     signer: &Dev,
     seq: u64,
-    prev: Option<[u8; 32]>,
-    authority_ref: Option<[u8; 32]>,
+    prev: Option<AccountEntryHash>,
+    authority_ref: Option<OwnerId>,
     op: &AccountOp,
-) -> (Vec<u8>, [u8; 32]) {
+) -> (Vec<u8>, AccountEntryHash) {
     let payload = control_ops::encode(op).unwrap();
     let header = AccountEntryHeader {
         account_id: account,
@@ -56,15 +57,32 @@ pub(in crate::account) fn control_op(
 
 /// A `Private` `/2` StreamOwn for `account` over `repo-a`.
 pub(in crate::account) fn stream_own(account: AccountId) -> (StreamId, AccountOp) {
+    stream_own_private(account)
+}
+
+pub(in crate::account) fn stream_own_private(account: AccountId) -> (StreamId, AccountOp) {
+    stream_own_mode(account, crate::stream::AccessMode::Private, "repo-a")
+}
+
+/// Public ownership for tests exercising grants, which require PublicRead.
+pub(in crate::account) fn stream_own_public(account: AccountId) -> (StreamId, AccountOp) {
+    stream_own_mode(account, crate::stream::AccessMode::PublicRead, "repo-a")
+}
+
+pub(in crate::account) fn stream_own_mode(
+    account: AccountId,
+    access_mode: crate::stream::AccessMode,
+    repo: &str,
+) -> (StreamId, AccountOp) {
     let spec = StreamSpecV2 {
         owner_account_id: account,
         policy: StreamSpec {
-            repo_set: vec!["repo-a".to_string()],
+            repo_set: vec![repo.to_string()],
             kind_allow_list: None,
             relation_policy: None,
             node_overrides: Vec::new(),
         },
-        access_mode: crate::stream::AccessMode::Private,
+        access_mode,
     };
     let stream_id = stream::derive_v2(&spec).unwrap();
     let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();

@@ -402,7 +402,7 @@ fn reconcile_embed_path_recomputes_at_a_non_default_cap() {
         .unwrap();
     assert!(
         report.embeddings_written >= 1,
-        "a non-default-cap reconcile must not trust the DEFAULT-cap column: {report:?}"
+        "a non-default-cap reconcile must not trust the DEFAULT-cap column"
     );
     assert!(
         ai::policy_fromtext_calls() > 0,

@@ -190,7 +190,7 @@ pub fn account_tag(secret: &[u8; 32]) -> [u8; TAG_LEN] {
 /// removal (#1081); routing every caller through this one function is what keeps that change from
 /// touching the wire, the tag domain, the client, or the driver.
 pub fn discovery_secret(conn: &rusqlite::Connection) -> anyhow::Result<Option<[u8; 32]>> {
-    rag_rat_oplog::read_local_account_genesis(conn)
+    rag_rat_oplog::read_local_account_genesis(conn).map(|hash| hash.map(|hash| hash.to_bytes()))
 }
 
 /// How long an announcement should live.

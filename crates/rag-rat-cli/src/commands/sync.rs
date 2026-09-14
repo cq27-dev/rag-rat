@@ -1012,7 +1012,7 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
             contributor,
         )?;
         anyhow::ensure!(
-            grant == Some(receipt.grant_id),
+            grant == Some(receipt.grant_id.into()),
             "the owner's synced log does not fold the redeemed grant effective yet; re-run this \
              command to retry the pull"
         );
