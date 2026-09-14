@@ -54,7 +54,7 @@ skips the model turn entirely — no network calls, deterministic findings only.
 
 `--compact` (independent of `--verify`, and gated the same way on `[llm.dream] enabled = true`)
 runs the **compaction pass**, which rewrites each un-summarized memory into a 3–5 sentence,
-self-contained summary and stores it in the derived `memory_summaries` table:
+self-contained summary and stores it in the derived `memory_note_summaries` table:
 
 ```bash
 rag-rat dream --compact --max-memories 20

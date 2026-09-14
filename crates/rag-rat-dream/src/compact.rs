@@ -6,28 +6,31 @@
 //! The pass is deliberately spartan: one model turn per memory, NO tools, NO code context, NO
 //! evidence pack —
 //! the note body is the whole input (the offline eval measured that code context DEGRADES
-//! compaction fidelity). Accepted summaries land in `memory_summaries` (PK `(repo_id, memory_id,
-//! content_hash)`, so a title/body edit self-invalidates and re-queues); a rejected one records a
+//! compaction fidelity). Accepted summaries land in `memory_note_summaries` (one row per memory,
+//! PK `(repo_id, memory_id)`; the row's `content_hash` is checked against the current note on
+//! every read, so a title/body edit invalidates it and re-queues); a rejected one records a
 //! failure row, and with no summary row its over-envelope body stays deferred behind the surfaces'
 //! one-line expand marker.
 //!
 //! Two surfaces the rest of dream consumes:
 //!   - [`run_compact_pass`] — the budgeted runner: queue (surfaced memories with no summary for
 //!     their CURRENT note) → prompt → summary → deterministic acceptance guards (retry once) → on
-//!     accept, UPSERT `memory_summaries` and prune the superseded (older content_hash) rows.
+//!     accept, UPSERT the memory's one `memory_note_summaries` row.
 //!   - the [`guards`] module — the ONLY runtime checks (a deliberate design decision: no
 //!     shape-regex ref linting). Sentence count, the size envelope, no paragraph breaks, non-empty,
 //!     and tracker-ref resolvability by SET-MEMBERSHIP against the indexed papertrail.
 //!
-//! Like every dream pass it NEVER writes a `repo_memories` column — `memory_summaries` holds
-//! derived, regenerable data.
+//! Like every dream pass it NEVER writes a `repo_memories` column — `memory_note_summaries` holds
+//! derived, regenerable data. (`memory_summaries`, keyed per content hash, is retired: every
+//! regeneration there was a delete plus an insert, which synced as a tombstone on every device,
+//! #1319.)
 
 use rag_rat_db::schema;
 use rag_rat_llm::chat::ChatModel;
 use rag_rat_query::memory::evidence;
-/// The compaction prompt version, stamped into `memory_summaries.prompt_version`. Bump on any
-/// change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can be
-/// regenerated).
+/// The compaction prompt version, stamped into `memory_note_summaries.prompt_version`. Bump on
+/// any change to [`COMPACT_PROMPT_HEAD`] so a stale-prompt summary is distinguishable (and can
+/// be regenerated).
 pub(crate) use rag_rat_query::memory::evidence::COMPACT_PROMPT_VERSION;
 use rusqlite::{Connection, OptionalExtension};
 
@@ -46,8 +49,8 @@ pub struct CompactPass<'a> {
 }
 
 /// One memory that needs (re)compaction — a surfaced memory LONGER than the summary envelope with
-/// no `memory_summaries` row for its CURRENT note (title+body). Ordered by `memory_id`, capped by
-/// the pass budget.
+/// no `memory_note_summaries` row for its CURRENT note (title+body). Ordered by `memory_id`, capped
+/// by the pass budget.
 struct CompactionEntry {
     memory_id: String,
     title: String,
@@ -58,7 +61,7 @@ struct CompactionEntry {
 
 /// Run the compaction pass over the churn-skip queue (budget-capped). For each queued memory:
 /// render the prompt (note body only), ask the model, run the deterministic acceptance guards
-/// (retry once), and on accept UPSERT `memory_summaries` (pruning superseded rows). A
+/// (retry once), and on accept UPSERT the memory's `memory_note_summaries` row. A
 /// rejected-twice completion records `memory_model_failures`; a transient model-call error is
 /// recorded for audit but remains retryable. With no summary row the queued memory's body stays
 /// deferred at surfacing. Repo-scoped; never writes a `repo_memories` column.
@@ -108,7 +111,7 @@ pub(super) fn run_compact_pass(
                 continue;
             },
         };
-        // #767 review: summary prune/UPSERT + failure clear commit in ONE guarded transaction.
+        // #767 review: the summary UPSERT + failure clear commit in ONE guarded transaction.
         super::removal_guarded_write_tx(conn, &scope, |tx| {
             record_summary(tx, RecordSummary {
                 memory_id: &entry.memory_id,
@@ -127,15 +130,15 @@ pub(super) fn run_compact_pass(
 }
 
 /// Memories that still need a summary — outside the summary envelope
-/// ([`evidence::note_is_shown_whole`]) and with no `memory_summaries` row keyed on their CURRENT
-/// `content_hash`. A title or body edit changes the key and re-enqueues (the summary
-/// self-invalidates); an unchanged, already-summarized memory churn-skips, so re-running is cheap.
+/// ([`evidence::note_is_shown_whole`]) and with no `memory_note_summaries` row carrying their
+/// CURRENT `content_hash`. A title or body edit changes the hash and re-enqueues (the stored row
+/// no longer matches); an unchanged, already-summarized memory churn-skips, so re-running is cheap.
 /// Repo-scoped and ordered by `memory_id`; uncapped — the pass budget is enforced by the runner,
 /// which skips failure-blocked entries before counting.
 fn compaction_queue(conn: &Connection) -> rusqlite::Result<Vec<CompactionEntry>> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
     let mem_clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
-    let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_summaries");
+    let summary_clause = schema::periphery_repo_scope_clause(&scope, "memory_note_summaries");
 
     // Both statuses the memory surfaces render — a `stale`-status memory is flagged, not retired,
     // and still attaches to every drive-by surface. Compacting only the active half would leave an
@@ -152,26 +155,27 @@ fn compaction_queue(conn: &Connection) -> rusqlite::Result<Vec<CompactionEntry>>
     for (memory_id, title, body) in mems {
         // A note whose body already fits the summary envelope is never compacted: the guards would
         // accept a rewrite no shorter than the note itself, and every rewrite risks losing a
-        // condition or the reason behind it. No `memory_summaries` row is ever written for it, so
-        // the summary surfaces show it whole — they gate on this SAME predicate, and a note
-        // stranded in a gap between the two would surface as a bare title forever. A row left over
-        // from before the note fell under the gate is inert, not stale-visible: every read gates on
-        // the current `COMPACT_PROMPT_VERSION`, and no rewrite adds more.
+        // condition or the reason behind it. No `memory_note_summaries` row is ever written for it,
+        // so the summary surfaces show it whole — they gate on this SAME predicate, and a
+        // note stranded in a gap between the two would surface as a bare title forever. A
+        // row left over from before the note fell under the gate is inert, not
+        // stale-visible: every read gates on the current `COMPACT_PROMPT_VERSION`, and no
+        // rewrite adds more.
         if evidence::note_is_shown_whole(&body) {
             continue;
         }
-        // The current content hash keys the summary; a stored summary under a DIFFERENT hash is
-        // stale (a TITLE or body edit — the compaction prompt frames both) and does NOT count as
-        // covered, so the memory re-queues. The `prompt_version` predicate does the same for a
-        // `COMPACT_PROMPT_VERSION` bump: a summary produced by an older prompt/guards no longer
-        // counts as covered, so a prompt change regenerates every summary instead of surfacing
-        // stale ones indefinitely.
+        // The memory's one row carries the hash it was generated for; a stored summary under a
+        // DIFFERENT hash is stale (a TITLE or body edit — the compaction prompt frames both) and
+        // does NOT count as covered, so the memory re-queues. The `prompt_version` predicate does
+        // the same for a `COMPACT_PROMPT_VERSION` bump: a summary produced by an older
+        // prompt/guards no longer counts as covered, so a prompt change regenerates every
+        // summary instead of surfacing stale ones indefinitely.
         let content_hash = super::verify::note_content_hash(&title, &body);
         let covered = conn
             .query_row(
                 &format!(
-                    "SELECT 1 FROM memory_summaries WHERE memory_id = ?1 AND content_hash = ?2 \
-                     AND prompt_version = ?3{summary_clause}"
+                    "SELECT 1 FROM memory_note_summaries WHERE memory_id = ?1 AND content_hash = \
+                     ?2 AND prompt_version = ?3{summary_clause}"
                 ),
                 rusqlite::params![memory_id, content_hash, COMPACT_PROMPT_VERSION],
                 |_| Ok(()),
@@ -286,9 +290,9 @@ fn render_compact_prompt(title: &str, body: &str) -> String {
     p
 }
 
-// ── memory_summaries write ────────────────────────────────────────────────────────────────────
+// ── memory_note_summaries write ───────────────────────────────────────────────────────────────
 
-/// Params for the single `memory_summaries` UPSERT — one struct so the writer isn't a long
+/// Params for the single `memory_note_summaries` UPSERT — one struct so the writer isn't a long
 /// positional train of same-typed strings.
 struct RecordSummary<'a> {
     memory_id: &'a str,
@@ -300,27 +304,19 @@ struct RecordSummary<'a> {
     now_ms: i64,
 }
 
-/// UPSERT the accepted summary into `memory_summaries` (PK `(repo_id, memory_id, content_hash)`)
-/// AND prune every superseded row (same memory, a DIFFERENT content_hash). The caller runs both
-/// statements in ONE [`super::removal_guarded_write_tx`] transaction. That prune is the invariant:
-/// in steady state `memory_summaries` holds exactly ONE row per memory —
-/// the summary of its current note. Without it a churny memory would accrete a stale summary per
-/// past content_hash, and the surfacing LEFT JOIN (keyed on the current content_hash) would still
-/// be correct but the table would grow unboundedly. NEVER writes a `repo_memories` column.
+/// UPSERT the accepted summary into `memory_note_summaries` (PK `(repo_id, memory_id)`): the
+/// memory's one row takes the new `content_hash`, summary and stamps in place. One statement, no
+/// prune — the row IS the memory's current summary, and a stale one is simply overwritten. On
+/// `overlay/1` that is one `Upsert`; the retired per-hash table needed a `Remove` first, which
+/// synced as a tombstone on every device (#1319). NEVER writes a `repo_memories` column.
 fn record_summary(conn: &Connection, r: RecordSummary<'_>) -> rusqlite::Result<()> {
     let content_hash = super::verify::note_content_hash(r.title, r.body);
-    // Prune superseded summaries (older content_hash) FIRST, so the memory is left with only its
-    // current-note summary after the UPSERT.
     conn.execute(
-        "DELETE FROM memory_summaries WHERE repo_id = ?1 AND memory_id = ?2 AND content_hash != ?3",
-        rusqlite::params![r.repo_id, r.memory_id, content_hash],
-    )?;
-    conn.execute(
-        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, model_id, \
+        "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, model_id, \
          prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(repo_id, \
-         memory_id, content_hash) DO UPDATE SET summary = excluded.summary, model_id = \
-         excluded.model_id, prompt_version = excluded.prompt_version, generated_at_ms = \
-         excluded.generated_at_ms",
+         memory_id) DO UPDATE SET content_hash = excluded.content_hash, summary = \
+         excluded.summary, model_id = excluded.model_id, prompt_version = \
+         excluded.prompt_version, generated_at_ms = excluded.generated_at_ms",
         rusqlite::params![
             r.memory_id,
             r.repo_id,
@@ -641,8 +637,8 @@ mod tests {
 
     fn summary_rows(c: &Connection, memory_id: &str) -> Vec<(String, String)> {
         c.prepare(
-            "SELECT content_hash, summary FROM memory_summaries WHERE memory_id = ?1 ORDER BY \
-             content_hash",
+            "SELECT content_hash, summary FROM memory_note_summaries WHERE memory_id = ?1 ORDER \
+             BY content_hash",
         )
         .unwrap()
         .query_map([memory_id], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -837,7 +833,7 @@ mod tests {
         let row: (String, String, String, String, i64) = c
             .query_row(
                 "SELECT summary, model_id, prompt_version, content_hash, generated_at_ms FROM \
-                 memory_summaries WHERE memory_id='m1' AND repo_id='r'",
+                 memory_note_summaries WHERE memory_id='m1' AND repo_id='r'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
@@ -857,7 +853,7 @@ mod tests {
 
     #[test]
     fn a_summary_write_advances_the_memories_lens_lane() {
-        // V107 dropped the memory_summaries revision triggers, so a summary write advances the
+        // The overlay tables carry no revision triggers, so a summary write advances the
         // memories Lens lane only via the explicit bump on the dream write path. Gated on repo
         // registration, so the repo must exist in `repos`.
         let c = mem_db();
@@ -899,11 +895,44 @@ mod tests {
         c.execute("UPDATE repo_memories SET title='a corrected title' WHERE id='m1'", []).unwrap();
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 3000).unwrap();
         assert_eq!(model.calls(), 2, "a title-only edit re-compacts");
-        assert_eq!(summary_rows(&c, "m1").len(), 1, "old-note summary pruned, one row remains");
+        assert_eq!(summary_rows(&c, "m1").len(), 1, "the memory's one row was overwritten");
+    }
+
+    /// #1319: a regeneration must never DELETE a summary row. On overlay/1 a delete is a `Remove`
+    /// entry and a tombstone on every device; the per-hash table's prune was exactly that, and a
+    /// test that only counts rows cannot tell a delete-then-insert from an in-place overwrite. A
+    /// temp trigger records every delete the real writer issues.
+    #[test]
+    fn a_regeneration_overwrites_the_row_and_never_deletes_one() {
+        let c = mem_db();
+        set_repo(&c, "r");
+        c.execute_batch(
+            "CREATE TEMP TABLE summary_deletes(memory_id TEXT NOT NULL);
+             CREATE TEMP TRIGGER summary_delete_probe AFTER DELETE ON main.memory_note_summaries
+             BEGIN INSERT INTO summary_deletes(memory_id) VALUES (old.memory_id); END;",
+        )
+        .unwrap();
+        seed_memory(&c, "m1", "note", &long_body("first"), "r");
+        let model = MockChatModel::new([GOOD_SUMMARY]);
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 1000).unwrap();
+        c.execute("UPDATE repo_memories SET body = ?1 WHERE id = 'm1'", [long_body("second")])
+            .unwrap();
+        let model = MockChatModel::new([GOOD_SUMMARY]);
+        run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 2000).unwrap();
+
+        let deletes: i64 =
+            c.query_row("SELECT COUNT(*) FROM summary_deletes", [], |r| r.get(0)).unwrap();
+        assert_eq!(deletes, 0, "a regeneration overwrites the memory's row; it never deletes");
+        let rows = summary_rows(&c, "m1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].0,
+            rag_rat_query::memory::evidence::note_content_hash("note", &long_body("second"))
+        );
     }
 
     #[test]
-    fn second_run_churn_skips_and_body_edit_recompacts_and_prunes() {
+    fn second_run_churn_skips_and_body_edit_recompacts_in_place() {
         let c = mem_db();
         set_repo(&c, "r");
         seed_memory(&c, "m1", "note", &long_body("original"), "r");
@@ -917,12 +946,12 @@ mod tests {
         assert_eq!(model.calls(), 1, "an unchanged, already-summarized memory is churn-skipped");
 
         // A body edit changes content_hash → re-enqueued → the model runs again and the OLD summary
-        // row (under the previous content_hash) is pruned, leaving exactly one row.
+        // row is overwritten in place (new content_hash), never deleted — exactly one row.
         c.execute("UPDATE repo_memories SET body=?1 WHERE id='m1'", [long_body("edited")]).unwrap();
         run_compact_pass(&c, CompactPass { model: &model, budget: 10 }, 3000).unwrap();
         assert_eq!(model.calls(), 2, "a body edit re-invokes the model");
         let rows = summary_rows(&c, "m1");
-        assert_eq!(rows.len(), 1, "steady state is one summary row per memory (old body pruned)");
+        assert_eq!(rows.len(), 1, "steady state is one summary row per memory, overwritten");
         assert_eq!(
             rows[0].0,
             rag_rat_query::memory::evidence::note_content_hash("note", &long_body("edited")),
@@ -947,7 +976,7 @@ mod tests {
         assert_eq!(before, snap(&c), "the compaction pass leaves repo_memories byte-identical");
         // ...but it DID write a summary into the sibling table.
         let stored: String = c
-            .query_row("SELECT summary FROM memory_summaries WHERE memory_id='m1'", [], |r| {
+            .query_row("SELECT summary FROM memory_note_summaries WHERE memory_id='m1'", [], |r| {
                 r.get(0)
             })
             .unwrap();
@@ -1059,7 +1088,7 @@ mod tests {
         // The summary is written under r1 for m1, and NOTHING is written under r2 / for m2.
         let r1_row: (String, String) = c
             .query_row(
-                "SELECT repo_id, memory_id FROM memory_summaries WHERE memory_id='m1'",
+                "SELECT repo_id, memory_id FROM memory_note_summaries WHERE memory_id='m1'",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -1067,7 +1096,7 @@ mod tests {
         assert_eq!(r1_row, ("r1".to_string(), "m1".to_string()));
         let r2_count: i64 = c
             .query_row(
-                "SELECT COUNT(*) FROM memory_summaries WHERE repo_id='r2' OR memory_id='m2'",
+                "SELECT COUNT(*) FROM memory_note_summaries WHERE repo_id='r2' OR memory_id='m2'",
                 [],
                 |r| r.get(0),
             )

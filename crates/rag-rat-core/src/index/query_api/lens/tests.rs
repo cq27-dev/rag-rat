@@ -239,7 +239,7 @@ fn lens_version_tracks_binding_validation_and_in_place_enrichment_updates() {
     );
 
     conn.execute(
-        "INSERT INTO memory_summaries(
+        "INSERT INTO memory_note_summaries(
              memory_id, repo_id, content_hash, summary, prompt_version, generated_at_ms
          ) VALUES (?1, ?2, 'same-time-summary', 'Before', '1', 7)",
         params![memory.memory_id, db.active_repo_id],
@@ -247,12 +247,12 @@ fn lens_version_tracks_binding_validation_and_in_place_enrichment_updates() {
     .unwrap();
     let before_summary_update = db.lens_version().unwrap();
     conn.execute(
-        "UPDATE memory_summaries SET summary = 'After'
+        "UPDATE memory_note_summaries SET summary = 'After'
          WHERE repo_id = ?1 AND memory_id = ?2",
         params![db.active_repo_id, memory.memory_id],
     )
     .unwrap();
-    // memory_summaries syncs on overlay/1 and is trigger-free; the dream write advances the
+    // memory_note_summaries syncs on overlay/1 and is trigger-free; the dream write advances the
     // memories lane explicitly, mirrored here.
     rag_rat_db::meta::bump_lens_revisions(conn, &db.active_repo_id, &[
         rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
@@ -773,7 +773,7 @@ fn file_enrichments_scope_memories_and_order_coupling() {
     let content_hash =
         rag_rat_query::memory::evidence::note_content_hash(&path_memory.title, &path_memory.body);
     conn.execute(
-        "INSERT INTO memory_summaries(
+        "INSERT INTO memory_note_summaries(
              memory_id, repo_id, content_hash, summary, prompt_version, generated_at_ms
          ) VALUES (?1, ?2, ?3, 'Compact path summary', ?4, 0)",
         params![

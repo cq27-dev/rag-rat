@@ -36,8 +36,8 @@ impl IndexDatabase {
         // verdict/compaction passes. Fail early before FTS healing, model provisioning/inference,
         // and derived writes. The authoritative per-entry checks live inside each model-pass
         // IMMEDIATE write transaction (`rag_rat_dream::removal_guarded_write_tx`), so a removal
-        // landing after this preflight still cannot leave `memory_reality`, `memory_summaries`, or
-        // `memory_model_failures` rows behind.
+        // landing after this preflight still cannot leave `memory_reality`,
+        // `memory_note_summaries`, or `memory_model_failures` rows behind.
         let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
         crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
         // #582 review: the model passes rank chunk_fts (evidence-pack probes) MID-RUN, after

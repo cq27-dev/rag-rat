@@ -91,7 +91,7 @@ const TEXT_PRESENCE_SCAN_CAP: usize = 2000;
 /// by the verdict pass and compared by the queue + surfacing gates: a bump re-queues every memory
 /// (which is why prompt-observable changes ride version bumps backfill-free).
 pub const VERDICT_PROMPT_VERSION: &str = "verify-pack-v6";
-/// Version stamp of the compaction prompt, gating `memory_summaries` reuse the same way.
+/// Version stamp of the compaction prompt, gating `memory_note_summaries` reuse the same way.
 pub const COMPACT_PROMPT_VERSION: &str = "compact-v2";
 
 /// Word ceiling on a compacted summary — the compaction acceptance guards accept nothing longer
@@ -109,9 +109,9 @@ pub const SUMMARY_MAX_CHARS: usize = 1200;
 
 /// Whether compaction skips this body for already fitting the summary envelope — the ONE predicate
 /// the compaction queue and both summary surfaces share. A skipped note never gets a
-/// `memory_summaries` row and never will, so the summary surfaces must show it WHOLE (bounded by
-/// [`SUMMARY_MAX_WORDS`] and [`SUMMARY_MAX_CHARS`]); letting the two sides disagree strands a note
-/// in the gap, where it surfaces as a bare title forever.
+/// `memory_note_summaries` row and never will, so the summary surfaces must show it WHOLE (bounded
+/// by [`SUMMARY_MAX_WORDS`] and [`SUMMARY_MAX_CHARS`]); letting the two sides disagree strands a
+/// note in the gap, where it surfaces as a bare title forever.
 pub fn note_is_shown_whole(body: &str) -> bool {
     body.split_whitespace().count() <= SUMMARY_MAX_WORDS
         && body.chars().count() <= SUMMARY_MAX_CHARS
@@ -452,14 +452,14 @@ fn queue_reason(
 }
 
 /// The dream freshness key for a memory's NOTE content — the single `content_hash` stamped into
-/// `memory_reality` / `memory_summaries`. It is `sha256(trim(title) + "\n" + trim(body))`, covering
-/// EXACTLY what the verdict and compaction prompts render: the title and body, and nothing else. So
-/// a title / body edit re-verifies / re-summarizes and drops the stale verdict / summary / marker,
-/// while a change to a dimension the prompts don't render (kind, tags, payload) does NOT churn the
-/// derived overlays. It becomes the §5.5 canonical [`content_hash`] (which folds the payload) only
-/// when the prompts start rendering the payload — bundled with a [`PROMPT_VERSION`] bump so that
-/// rollout is backfill-free (a bump re-queues every memory anyway). Distinct from the raw
-/// create-time `memory_input_hash`, which also folds kind + tags (dimensions the prompts don't
+/// `memory_reality` / `memory_note_summaries`. It is `sha256(trim(title) + "\n" + trim(body))`,
+/// covering EXACTLY what the verdict and compaction prompts render: the title and body, and nothing
+/// else. So a title / body edit re-verifies / re-summarizes and drops the stale verdict / summary /
+/// marker, while a change to a dimension the prompts don't render (kind, tags, payload) does NOT
+/// churn the derived overlays. It becomes the §5.5 canonical [`content_hash`] (which folds the
+/// payload) only when the prompts start rendering the payload — bundled with a [`PROMPT_VERSION`]
+/// bump so that rollout is backfill-free (a bump re-queues every memory anyway). Distinct from the
+/// raw create-time `memory_input_hash`, which also folds kind + tags (dimensions the prompts don't
 /// audit) and reads the frozen-at-creation stored `input_hash`.
 ///
 /// [`PROMPT_VERSION`]: dream verdict PROMPT_VERSION (engine)

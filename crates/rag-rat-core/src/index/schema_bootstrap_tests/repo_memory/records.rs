@@ -115,7 +115,7 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
         .unwrap();
     let seed_summary = |id: &str, title: &str, body: &str, summary: &str| {
         conn.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
              prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
             rusqlite::params![
                 id,

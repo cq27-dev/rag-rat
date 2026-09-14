@@ -1119,7 +1119,7 @@ mod tests {
         let title = "One watcher per worktree";
         let body = "The election lock guarantees a single watcher; never bind without it.";
         conn.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
              prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
             rusqlite::params![
                 id,
@@ -1244,7 +1244,7 @@ mod tests {
         let long_summary = format!("Election lock first. {} Tailmarker.", "filler ".repeat(60));
         assert!(long_summary.chars().count() > MAX_MEMORY_BODY_CHARS, "the clamp must engage");
         conn.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
              prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
             rusqlite::params![
                 id,

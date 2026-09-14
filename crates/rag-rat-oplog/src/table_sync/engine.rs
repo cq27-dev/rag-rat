@@ -32,6 +32,9 @@ pub(crate) struct SyncCtx<'a> {
     pub device: &'a LocalDevice,
     pub registry: &'a [TableSpec],
     pub now_ms: i64,
+    /// Whether this device was ever a writer on `account_id` — shared with the session's table
+    /// store so it is memoised across the pass, not re-derived per ingested entry.
+    pub local_writer: apply::LocalWriterMemo,
 }
 
 /// What ingesting one received entry did.
@@ -164,7 +167,7 @@ pub(crate) fn produce_and_author(
     // here rather than leaving it for the next store open. This is where author-before-apply
     // actually holds: a remote op deferred to protect a local edit gets its rematch immediately
     // after that edit is authored, and loses on the merits instead of by default.
-    refold::replay_deferred_entries(tx, ctx.registry)?;
+    refold::replay_deferred_entries(tx, ctx.registry, &ctx.local_writer)?;
     Ok(authored)
 }
 
@@ -598,14 +601,19 @@ fn ingest_one(
                 // a column change becomes undeletable across the skew. That exemption is for
                 // `Remove` only — an unprovable verdict against an `Upsert` still defers, because
                 // applying it would destroy the very edit this guard exists to protect.
-                if let apply::PreApply::Park(deferral) = apply::pre_apply(
+                //
+                // Unless this device was never a writer on the account: then nothing it holds
+                // is unsent, and the received row applies (`RowDoubt::NothingUnsent`).
+                let doubt = apply::RowDoubt::for_local_device(
+                    &ctx.local_writer,
                     tx,
-                    spec,
-                    ctx.repo_id,
-                    stream,
-                    &op,
+                    ctx.account_id,
+                    Some(ctx.device.fingerprint()),
                     apply::RowDoubt::DeferExceptUnprovableRemoval,
-                )? {
+                )?;
+                if let apply::PreApply::Park(deferral) =
+                    apply::pre_apply(tx, spec, ctx.repo_id, stream, &op, doubt)?
+                {
                     store::mark_entry_pending(
                         tx,
                         &entry_hash,

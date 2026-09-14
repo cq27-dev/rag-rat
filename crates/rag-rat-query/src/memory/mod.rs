@@ -94,10 +94,10 @@ pub struct RepoMemory {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub body: String,
     /// The dream-compacted summary of the CURRENT body, populated ONLY by the summary-first
-    /// renderers under `[memory] surface = "summary"` when a `memory_summaries` row exists for the
-    /// current content_hash. `None` under `full` (and for every non-surfacing tool), and for a
-    /// note short enough that compaction skips it — that note surfaces whole in `body`
-    /// instead.
+    /// renderers under `[memory] surface = "summary"` when a `memory_note_summaries` row exists
+    /// for the current content_hash. `None` under `full` (and for every non-surfacing tool),
+    /// and for a note short enough that compaction skips it — that note surfaces whole in
+    /// `body` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     /// Plain-text verdict marker from the memory's `memory_reality` row (e.g. `[verdict:
@@ -453,7 +453,7 @@ impl RepoMemoryEvidence {
 
     /// [`Self::compact`] plus the dream summary + verdict marker for each memory's CURRENT body
     /// (the `[memory] surface = "summary"` view). Each header is hydrated from the derived
-    /// `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
+    /// `memory_note_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
     /// content_hash). A memory compaction SKIPS for already fitting the summary envelope
     /// ([`evidence::note_is_shown_whole`]) has no summary row and never will, so its body stands in
     /// as its own summary — it is inside the envelope by construction, so the header costs no more
@@ -511,7 +511,7 @@ impl RepoMemoryEvidence {
 /// counterpart to [`RepoMemoryEvidence::compact_summary_first`]). Under `Summary` a memory's body
 /// is DEFERRED behind [`body_elision_marker`] — the reader gets a signal that prose was withheld
 /// and the one call that expands it — while the summary + verdict marker are hydrated from the
-/// derived `memory_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
+/// derived `memory_note_summaries` / `memory_reality` siblings (repo-scoped, keyed on the current
 /// content_hash, prompt-version-gated). The ONE exception is an UNSUMMARIZED body compaction skips
 /// for already fitting the summary envelope ([`evidence::note_is_shown_whole`]): nothing will ever
 /// summarize it, so deferring would leave a bare title, and showing it whole costs no more than the
@@ -546,7 +546,7 @@ pub fn apply_memory_surface(
 }
 
 /// The one-line stand-in for a body the summary surface withheld. The stored body is NEVER deleted
-/// (`memory_summaries` is a separate derived table), so the marker names the expand path — the
+/// (`memory_note_summaries` is a separate derived table), so the marker names the expand path — the
 /// reader would otherwise have no signal that prose is missing, or that a `summary` beside it is a
 /// lossy rewrite. `rag-rat memory get <id>` is the CLI equivalent; naming one path keeps the marker
 /// cheap, since it is paid per memory on every attachment under the default surface.
@@ -572,8 +572,8 @@ pub fn body_is_elided(memory: &RepoMemory) -> bool {
 }
 
 /// The body of a note compaction skips as already inside the summary envelope, to stand in for the
-/// `memory_summaries` row it will never have — the body-less compact projection has nowhere else to
-/// put prose. `None` for a longer body (that one defers) or an empty one (nothing to show).
+/// `memory_note_summaries` row it will never have — the body-less compact projection has nowhere
+/// else to put prose. `None` for a longer body (that one defers) or an empty one (nothing to show).
 fn shown_whole_body(body: &str) -> Option<String> {
     (evidence::note_is_shown_whole(body) && !body.trim().is_empty()).then(|| body.to_string())
 }
@@ -627,7 +627,7 @@ pub struct CompactRepoMemory {
     )]
     pub logical_symbol_id: Option<i64>,
     /// The dream-compacted summary of the memory's CURRENT body, populated ONLY under `[memory]
-    /// surface = "summary"` when a `memory_summaries` row exists for the current content_hash
+    /// surface = "summary"` when a `memory_note_summaries` row exists for the current content_hash
     /// (dream v2 pass 2) — or, for a note compaction skips as already inside the summary envelope,
     /// that note's verbatim body. `None` under the `full` surface, and for a long body no summary
     /// has been generated for yet; the title then stands alone (the title-only fallback). The full
@@ -996,7 +996,7 @@ mod tests {
         // COMPACT_PROMPT_VERSION — the hydrator gates the summary read on both (like the compaction
         // queue's coverage check), so a mismatch drops the summary.
         c.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
              prompt_version, generated_at_ms) VALUES (?1,'r',?2,?3,?4,0)",
             params![
                 id,
@@ -1066,7 +1066,7 @@ mod tests {
     #[test]
     fn summary_surface_falls_back_to_title_only_without_a_summary_row() {
         let c = summary_conn();
-        // No memory_summaries / memory_reality rows, and a body too long to stand in for the
+        // No memory_note_summaries / memory_reality rows, and a body too long to stand in for the
         // missing summary → summary + verdict stay None (title-only).
         let compact = evidence(vec![memory_with_body("m1", &over_envelope_body())])
             .compact_summary_first(&c)
@@ -1157,7 +1157,7 @@ mod tests {
         let body = body.as_str();
         let content_hash = crate::memory::evidence::note_content_hash("t", body);
         c.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
              prompt_version, generated_at_ms) VALUES ('m1','r',?1,'A three sentence summary. It \
              holds. Done.','compact-OLD',0)",
             params![content_hash],

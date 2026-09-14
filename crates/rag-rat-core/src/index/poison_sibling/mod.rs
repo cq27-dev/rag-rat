@@ -42,8 +42,9 @@
 //! `repo_memory_fts`, `logical_symbol_monikers` (now direct, no longer only transitive),
 //! `oracle_runs`, `edge_oracle`, `clone_graph_generations`, `clone_token_df`, `clone_refinements`,
 //! `dream_findings`, and `reconcile_attempts` (with `repo_memory_tags` scoped transitively through
-//! `repo_memories`) — AND the dream-verification siblings `memory_reality` / `memory_summaries` /
-//! `memory_model_failures`, each of which carries its own `repo_id` — AND the typed-edge set
+//! `repo_memories`) — AND the dream-verification siblings `memory_reality` /
+//! `memory_note_summaries` / the retired `memory_summaries` / `memory_model_failures`, each of
+//! which carries its own `repo_id` — AND the typed-edge set
 //! `repo_node_edges` (V049), owner-scoped by `repo_id`.
 //! [`seed_sibling`] seeds a tripwire row into every one of those. Nothing repo-scoped is left
 //! unseeded; a table without a `repo_id` dimension (content-addressed pools like

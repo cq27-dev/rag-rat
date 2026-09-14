@@ -76,7 +76,22 @@ impl Device {
         )
         .unwrap();
         let local = crate::local_device(&conn, 0).unwrap();
-        Self { conn, local }
+        let device = Self { conn, local };
+        // The device models a writer: what it edits locally is unsent work until it authors.
+        device.enroll(device.local.fingerprint());
+        device
+    }
+
+    /// This device's one enrolment becomes read-only: it has never been a writer, so nothing
+    /// it holds is unsent.
+    fn make_read_only(&self) {
+        self.conn
+            .execute(
+                "UPDATE account_roster_history SET role = 'read_only' WHERE device_fingerprint = \
+                 ?1",
+                [self.local.fingerprint().to_bytes().as_slice()],
+            )
+            .unwrap();
     }
 
     fn pubkey(&self) -> crate::device::DevicePublic {
@@ -105,6 +120,7 @@ impl Device {
             device: &self.local,
             registry,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = engine::produce_and_author(&tx, &ctx).unwrap();
         tx.commit().unwrap();
@@ -126,6 +142,7 @@ impl Device {
             device: &self.local,
             registry,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = entries
             .iter()
@@ -317,6 +334,7 @@ fn refold_replay_of_a_memory_lane_row_bumps_the_memories_lens_lane() {
             device: &b.local,
             registry: &[OLD_REALITY],
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = entries
             .iter()
@@ -568,6 +586,7 @@ fn authoring_that_cannot_win_its_own_self_apply_fails_instead_of_looping() {
         device: &b.local,
         registry: OLD_REGISTRY,
         now_ms: 0,
+        local_writer: Default::default(),
     };
     let err = engine::produce_and_author(&tx, &ctx)
         .expect_err("a self-apply that cannot win must not be reported as settled");
@@ -898,6 +917,7 @@ fn an_older_binary_refuses_to_write_into_a_store_a_newer_projector_folded() {
         device: &b.local,
         registry: OLD_REGISTRY,
         now_ms: 0,
+        local_writer: Default::default(),
     };
     let produced = engine::produce_and_author(&tx, &ctx);
     assert!(produced.is_err(), "an older projector must not author into a newer store");
@@ -931,6 +951,7 @@ fn an_older_binary_refuses_to_ingest_into_a_store_a_newer_projector_folded() {
         device: &b.local,
         registry: OLD_REGISTRY,
         now_ms: 0,
+        local_writer: Default::default(),
     };
     let ingested = engine::ingest(&tx, &ctx, "demo/1", &entries[0], &a.pubkey(), None);
     assert!(ingested.is_err(), "an older projector must not ingest into a newer store");
@@ -1591,6 +1612,29 @@ fn defer_over_an_unsent_edit(a: &mut Device, b: &mut Device) {
     );
 }
 
+/// The same shape on a READ-ONLY replica: it can never author the local row, so the replay is
+/// not refused — the writer's entry lands over it, and nothing is left deferred.
+#[test]
+fn a_read_only_replica_replays_over_its_own_unpublished_row() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    b.make_read_only();
+    let entries = author_wide_row(&mut a);
+    b.enroll(a.pubkey().fingerprint());
+    b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey());
+    b.conn
+        .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'unsent', NULL)", [])
+        .unwrap();
+
+    assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+    assert_eq!(
+        b.row(),
+        Some(("v1".to_string(), Some("wide".to_string()))),
+        "the writer's row lands"
+    );
+    assert_eq!(b.pending_count(), 0, "nothing is deferred behind work that can never be sent");
+}
+
 #[test]
 fn authoring_the_local_edit_settles_the_deferral_in_the_same_pass() {
     // The producer is the deferral's natural redeemer: the moment the local work is published,
@@ -2080,7 +2124,10 @@ impl SharedStore {
 fn open_at(path: &Path) -> Opener {
     let db = IndexConnection::open(path).unwrap();
     let local = crate::local_device(db.connection(), 0).unwrap();
-    Opener { db, local }
+    let opener = Opener { db, local };
+    // The store's device models a writer: what it edits locally is unsent work until it authors.
+    opener.enroll(opener.fingerprint());
+    opener
 }
 
 /// One opener of a [`SharedStore`]. Deliberately not a [`Device`]: `Device` OWNS its
@@ -2123,6 +2170,7 @@ impl Opener {
             device: &self.local,
             registry,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = engine::produce_and_author(&tx, &ctx)?;
         tx.commit()?;
@@ -2144,6 +2192,7 @@ impl Opener {
             device: &self.local,
             registry,
             now_ms: 0,
+            local_writer: Default::default(),
         };
         let out = entries
             .iter()

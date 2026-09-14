@@ -1,8 +1,8 @@
 //! Persisted model-pass failures for dream verification / compaction.
 //!
-//! A missing `memory_reality` / `memory_summaries` row used to mean both "never tried" and "the
-//! model result was rejected", so deterministic guard failures were retried every run. This table
-//! records the latter explicitly, with stable enum tokens and the same freshness stamps the
+//! A missing `memory_reality` / `memory_note_summaries` row used to mean both "never tried" and
+//! "the model result was rejected", so deterministic guard failures were retried every run. This
+//! table records the latter explicitly, with stable enum tokens and the same freshness stamps the
 //! producer queues already use.
 
 use rag_rat_llm::chat::ChatModel;

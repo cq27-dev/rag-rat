@@ -429,7 +429,7 @@ fn batch_file_memory_dream_states(
     if rows.is_empty() {
         return Ok(HashMap::new());
     }
-    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "memory_summaries")?;
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "memory_note_summaries")?;
     let marks = rows.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let content_hashes: HashMap<&str, String> = rows
         .iter()
@@ -443,9 +443,10 @@ fn batch_file_memory_dream_states(
     let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
     let mut states = HashMap::new();
 
-    let summary_scope = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "memory_summaries");
+    let summary_scope =
+        rag_rat_db::schema::periphery_repo_scope_clause(&scope, "memory_note_summaries");
     let summary_sql = format!(
-        "SELECT memory_id, content_hash, summary FROM memory_summaries
+        "SELECT memory_id, content_hash, summary FROM memory_note_summaries
          WHERE memory_id IN ({marks}) AND prompt_version = ?{summary_scope}"
     );
     let mut summary_values =

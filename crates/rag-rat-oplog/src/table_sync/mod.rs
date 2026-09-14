@@ -23,6 +23,7 @@ mod transport;
 /// Largest signed table-entry envelope accepted by storage and the `/5` transport.
 pub const TABLE_SYNC_ENTRY_MAX_BYTES: usize = 64 * 1024;
 
+pub use apply::LocalWriterMemo;
 #[cfg(test)]
 pub(crate) use refold::refold_stale_projections_against;
 /// The store-open forward-compat seam: replay entries retained but not projected when they
@@ -41,8 +42,8 @@ pub(crate) use store::{
 };
 pub use transport::{
     TableSyncChainEntry, TableSyncChainHead, TableSyncEntryStart, TableSyncFrontier,
-    TableSyncIngestOutcome, TableSyncStream, scope_retention_budget, table_sync_author_pending,
-    table_sync_chain_entries, table_sync_chain_frontier, table_sync_chain_page_after,
-    table_sync_compact_overdue, table_sync_ingest, table_sync_supported_streams,
-    table_sync_validate_stream,
+    TableSyncIngestOutcome, TableSyncReceived, TableSyncStream, scope_retention_budget,
+    table_sync_author_pending, table_sync_chain_entries, table_sync_chain_frontier,
+    table_sync_chain_page_after, table_sync_compact_overdue, table_sync_ingest,
+    table_sync_supported_streams, table_sync_validate_stream,
 };

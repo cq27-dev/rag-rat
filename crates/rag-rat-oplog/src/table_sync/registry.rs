@@ -289,8 +289,12 @@ const MEMORY_REALITY: TableSpec = TableSpec {
     repo_column: Some("repo_id"),
 };
 
-// A compacted memory summary keyed WITH `content_hash`, so a title/body edit is a new row rather
-// than an in-place overwrite. Every non-pk column is regenerable model output; nothing is local.
+// RETIRED (#1319): the per-content-hash summary table. Keyed WITH `content_hash`, so every
+// regeneration was a `Remove` of the old row plus an `Upsert` of the new one — a tombstone on every
+// device and a pinned entry on the regenerating chain that nothing collects (#1295). It stays
+// registered because retained entries name it (a table that leaves the registry strands them as
+// `TableNotInScope`) and older binaries still author into it; nothing on this binary reads or
+// writes it. The live table is `memory_note_summaries` below.
 const MEMORY_SUMMARIES_PK: &[ColumnSpec] = &[
     ColumnSpec::required("repo_id", ValueType::Text),
     ColumnSpec::required("memory_id", ValueType::Text),
@@ -310,6 +314,34 @@ const MEMORY_SUMMARIES: TableSpec = TableSpec {
     spec_version: 1,
     pk: MEMORY_SUMMARIES_PK,
     columns: MEMORY_SUMMARIES_COLUMNS,
+    local_columns: &[],
+    repo_column: Some("repo_id"),
+};
+
+// The summary of a memory's CURRENT note, one row per memory. `content_hash` is a synced column,
+// not part of the key: every reader already selects on it (and on `prompt_version`) against the
+// memory's current note, so a stale row is rejected without the key having to change — and a
+// regeneration is one `Upsert` of the same row, never a delete. Every non-pk column is regenerable
+// model output; nothing is local.
+const MEMORY_NOTE_SUMMARIES_PK: &[ColumnSpec] = &[
+    ColumnSpec::required("repo_id", ValueType::Text),
+    ColumnSpec::required("memory_id", ValueType::Text),
+];
+
+const MEMORY_NOTE_SUMMARIES_COLUMNS: &[ColumnSpec] = &[
+    ColumnSpec::required("content_hash", ValueType::Text),
+    ColumnSpec::required("summary", ValueType::Text),
+    ColumnSpec::required("model_id", ValueType::Text),
+    ColumnSpec::required("prompt_version", ValueType::Text),
+    ColumnSpec::required("generated_at_ms", ValueType::I64),
+];
+
+const MEMORY_NOTE_SUMMARIES: TableSpec = TableSpec {
+    name: "memory_note_summaries",
+    scope_id: "overlay/1",
+    spec_version: 1,
+    pk: MEMORY_NOTE_SUMMARIES_PK,
+    columns: MEMORY_NOTE_SUMMARIES_COLUMNS,
     local_columns: &[],
     repo_column: Some("repo_id"),
 };
@@ -522,6 +554,7 @@ pub(crate) const SYNCABLE_TABLES: &[TableSpec] = &[
     DISTILL_RECORD_COMMITS,
     DISTILL_EVIDENCE,
     DISTILL_ANCHORS,
+    MEMORY_NOTE_SUMMARIES,
 ];
 
 /// The per-repo Lens lane metas a scope's applied rows advance — the aggregate enrichment clock
@@ -630,6 +663,21 @@ const MEMORY_SUMMARIES_V1: TableGeneration = TableGeneration {
         ("content_hash", ValueType::Text),
     ],
     columns: &[
+        ("summary", ValueType::Text, None),
+        ("model_id", ValueType::Text, None),
+        ("prompt_version", ValueType::Text, None),
+        ("generated_at_ms", ValueType::I64, None),
+    ],
+};
+
+const MEMORY_NOTE_SUMMARIES_V1: TableGeneration = TableGeneration {
+    table: "memory_note_summaries",
+    scope_id: "overlay/1",
+    spec_version: 1,
+    repo_column: Some("repo_id"),
+    pk: &[("repo_id", ValueType::Text), ("memory_id", ValueType::Text)],
+    columns: &[
+        ("content_hash", ValueType::Text, None),
         ("summary", ValueType::Text, None),
         ("model_id", ValueType::Text, None),
         ("prompt_version", ValueType::Text, None),
@@ -851,6 +899,20 @@ pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
         PAPERTRAIL_DISTILL_RECORD_COMMITS_V1,
         PAPERTRAIL_DISTILL_EVIDENCE_V1,
         PAPERTRAIL_DISTILL_ANCHORS_V1,
+    ],
+    // v9: the per-memory summary table joins overlay/1 (#1319); `memory_summaries` stays, retired.
+    // Whole-registry snapshot: v8's nine tables plus the new one, in `SYNCABLE_TABLES` order.
+    &[
+        REPO_MEMORY_BINDINGS_V1,
+        MEMORY_REALITY_V1,
+        MEMORY_SUMMARIES_V1,
+        PAPERTRAIL_DISTILL_V1,
+        PAPERTRAIL_DISTILL_EDGES_V1,
+        PAPERTRAIL_DISTILL_ALTERNATIVES_V1,
+        PAPERTRAIL_DISTILL_RECORD_COMMITS_V1,
+        PAPERTRAIL_DISTILL_EVIDENCE_V1,
+        PAPERTRAIL_DISTILL_ANCHORS_V1,
+        MEMORY_NOTE_SUMMARIES_V1,
     ],
 ];
 

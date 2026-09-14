@@ -1078,7 +1078,8 @@ async fn production_overlay_replicates_summaries_and_verdicts() {
         )
         .unwrap();
     rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
-    // Regenerable dream output: one verdict (memory_reality) and one summary (memory_summaries).
+    // Regenerable dream output: one verdict (memory_reality) and one summary
+    // (memory_note_summaries).
     owner
         .execute(
             "INSERT INTO memory_reality(
@@ -1091,7 +1092,7 @@ async fn production_overlay_replicates_summaries_and_verdicts() {
         .unwrap();
     owner
         .execute(
-            "INSERT INTO memory_summaries(
+            "INSERT INTO memory_note_summaries(
                  memory_id, repo_id, content_hash, summary, model_id, prompt_version,
                  generated_at_ms)
              VALUES ('memory-a', 'repo-a', 'hash-a', 'A concise summary.', 'model-x', 'v1', ?1)",
@@ -1146,7 +1147,7 @@ async fn production_overlay_replicates_summaries_and_verdicts() {
     assert_eq!(verdict, "confirmed");
     let summary: String = joiner
         .query_row(
-            "SELECT summary FROM memory_summaries
+            "SELECT summary FROM memory_note_summaries
              WHERE repo_id = 'repo-a' AND memory_id = 'memory-a' AND content_hash = 'hash-a'",
             [],
             |row| row.get(0),
@@ -1166,8 +1167,202 @@ async fn production_overlay_replicates_summaries_and_verdicts() {
     assert!(lane >= 1, "applying overlay rows advances the memories lane");
 }
 
+/// #1319: a regenerated summary is an `Upsert` of the memory's one row, so a device that
+/// regenerates twice authors two upserts and raises no tombstone; the peer ends with the newest
+/// row and the older upsert is a superseded entry compaction can reclaim.
 #[tokio::test]
-async fn a_pruned_overlay_summary_is_removed_on_the_peer() {
+async fn a_regenerated_summary_syncs_as_an_upsert_and_raises_no_tombstone() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, accept_and_dispatch,
+        connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+    owner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+    let regenerate = |hash: &str, summary: &str, at: i64| {
+        owner
+            .execute(
+                "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
+                 model_id, prompt_version, generated_at_ms) VALUES ('memory-a', 'repo-a', ?1, ?2, \
+                 'model-x', 'v1', ?3) ON CONFLICT(repo_id, memory_id) DO UPDATE SET content_hash \
+                 = excluded.content_hash, summary = excluded.summary, generated_at_ms = \
+                 excluded.generated_at_ms",
+                rusqlite::params![hash, summary, at],
+            )
+            .unwrap();
+        rag_rat_oplog::table_sync_author_pending(&owner, account, at).unwrap();
+    };
+    regenerate("hash-old", "First summary.", NOW + 2);
+    regenerate("hash-new", "Second summary.", NOW + 3);
+
+    let entries: i64 =
+        owner.query_row("SELECT COUNT(*) FROM table_sync_entries", [], |row| row.get(0)).unwrap();
+    assert_eq!(entries, 2, "two regenerations author two entries");
+    let tombstones: i64 =
+        owner.query_row("SELECT COUNT(*) FROM sync_row_tombstones", [], |row| row.get(0)).unwrap();
+    assert_eq!(tombstones, 0, "a regeneration is an upsert, never a delete");
+
+    let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+    let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+    let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
+    let server = accept_and_dispatch(
+        &owner_endpoint,
+        &mut account_store,
+        &mut content_store,
+        AuthPolicy::Closed,
+        || NOW,
+    );
+    let client = connect_and_table_sync(
+        &joiner_endpoint,
+        direct_addr(&owner_endpoint),
+        &mut table_store,
+        NOW,
+    );
+    let (server, client) = tokio::join!(server, client);
+    server.unwrap();
+    client.unwrap();
+
+    let rows: Vec<(String, String)> = joiner
+        .prepare(
+            "SELECT content_hash, summary FROM memory_note_summaries WHERE repo_id = 'repo-a' AND \
+             memory_id = 'memory-a'",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, vec![("hash-new".to_string(), "Second summary.".to_string())]);
+    let peer_tombstones: i64 =
+        joiner.query_row("SELECT COUNT(*) FROM sync_row_tombstones", [], |row| row.get(0)).unwrap();
+    assert_eq!(peer_tombstones, 0);
+}
+
+/// #1319: with the hash off the key, two devices regenerating one memory compete for one row
+/// under last-writer-wins by `(lamport, device)`, not by hash freshness — a later stale
+/// regeneration evicts a current one on both devices, and a later current regeneration wins it
+/// back. Readers reject the stale hash meanwhile; the queue regenerates.
+#[tokio::test]
+async fn two_devices_regenerating_one_memory_settle_by_last_writer_and_a_current_hash_wins_back() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, accept_and_dispatch,
+        connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+    for db in [&owner, &joiner] {
+        db.execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    }
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+    let regenerate = |db: &Connection, hash: &str, summary: &str, at: i64| {
+        db.execute(
+            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
+             model_id, prompt_version, generated_at_ms) VALUES ('memory-a', 'repo-a', ?1, ?2, \
+             'model-x', 'v1', ?3) ON CONFLICT(repo_id, memory_id) DO UPDATE SET content_hash = \
+             excluded.content_hash, summary = excluded.summary, generated_at_ms = \
+             excluded.generated_at_ms",
+            rusqlite::params![hash, summary, at],
+        )
+        .unwrap();
+        rag_rat_oplog::table_sync_author_pending(db, account, at).unwrap();
+    };
+    let sync = async || {
+        let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+        let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+        let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
+        let server = accept_and_dispatch(
+            &owner_endpoint,
+            &mut account_store,
+            &mut content_store,
+            AuthPolicy::Closed,
+            || NOW,
+        );
+        let client = connect_and_table_sync(
+            &joiner_endpoint,
+            direct_addr(&owner_endpoint),
+            &mut table_store,
+            NOW,
+        );
+        let (server, client) = tokio::join!(server, client);
+        server.unwrap();
+        client.unwrap();
+    };
+    let row = |db: &Connection| -> (String, String) {
+        db.query_row(
+            "SELECT content_hash, summary FROM memory_note_summaries WHERE repo_id = 'repo-a' AND \
+             memory_id = 'memory-a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    };
+
+    // The owner summarises the current note; the joiner, behind on the note, summarises a stale
+    // one later. The joiner's write is the last writer and wins on both devices.
+    regenerate(&owner, "hash-current", "Current summary.", NOW + 3);
+    sync().await;
+    regenerate(&joiner, "hash-stale", "Stale summary.", NOW + 4);
+    sync().await;
+    for db in [&owner, &joiner] {
+        assert_eq!(row(db), ("hash-stale".to_string(), "Stale summary.".to_string()));
+    }
+    // A regeneration for the current hash after that wins it back, on both devices.
+    regenerate(&owner, "hash-current", "Current summary again.", NOW + 5);
+    sync().await;
+    for db in [&owner, &joiner] {
+        assert_eq!(row(db), ("hash-current".to_string(), "Current summary again.".to_string()));
+    }
+    for db in [&owner, &joiner] {
+        let tombstones: i64 =
+            db.query_row("SELECT COUNT(*) FROM sync_row_tombstones", [], |r| r.get(0)).unwrap();
+        assert_eq!(tombstones, 0);
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_overlay_verdict_is_removed_on_the_peer() {
     use rag_rat_sync::{
         AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, accept_and_dispatch,
         connect_and_table_sync,
@@ -1197,10 +1392,11 @@ async fn a_pruned_overlay_summary_is_removed_on_the_peer() {
     rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
     owner
         .execute(
-            "INSERT INTO memory_summaries(
-                 memory_id, repo_id, content_hash, summary, model_id, prompt_version,
-                 generated_at_ms)
-             VALUES ('memory-a', 'repo-a', 'hash-old', 'Stale summary.', 'model-x', 'v1', ?1)",
+            "INSERT INTO memory_reality(
+                 memory_id, repo_id, content_hash, verdict, direction, checked_inputs_hash,
+                 evidence_json, model_id, prompt_version, checked_at_ms)
+             VALUES ('memory-a', 'repo-a', 'hash-old', 'confirmed', 'note_ahead', 'inputs-a',
+                     '[]', 'model-x', 'v1', ?1)",
             [NOW + 2],
         )
         .unwrap();
@@ -1233,25 +1429,25 @@ async fn a_pruned_overlay_summary_is_removed_on_the_peer() {
     sync_once(&owner, &joiner).await;
     let present: bool = joiner
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM memory_summaries WHERE content_hash = 'hash-old')",
+            "SELECT EXISTS(SELECT 1 FROM memory_reality WHERE content_hash = 'hash-old')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert!(present, "the summary replicates on the first pass");
+    assert!(present, "the verdict replicates on the first pass");
 
-    // A newer note supersedes the old summary: the producer's prune deletes the old row locally,
-    // and the next authoring pass emits a Remove that must delete it on the peer too.
-    owner.execute("DELETE FROM memory_summaries WHERE content_hash = 'hash-old'", []).unwrap();
+    // A local delete of a synced overlay row is authored as a Remove on the next pass, and the
+    // Remove must delete the row on the peer too.
+    owner.execute("DELETE FROM memory_reality WHERE content_hash = 'hash-old'", []).unwrap();
     sync_once(&owner, &joiner).await;
     let gone: bool = joiner
         .query_row(
-            "SELECT NOT EXISTS(SELECT 1 FROM memory_summaries WHERE content_hash = 'hash-old')",
+            "SELECT NOT EXISTS(SELECT 1 FROM memory_reality WHERE content_hash = 'hash-old')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert!(gone, "the pruned summary is removed on the peer");
+    assert!(gone, "the deleted verdict is removed on the peer");
 }
 
 #[tokio::test]

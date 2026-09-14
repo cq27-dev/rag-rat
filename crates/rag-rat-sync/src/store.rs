@@ -387,11 +387,13 @@ pub struct OplogTableSyncStore<'a, F = fn() -> i64> {
     conn: &'a Connection,
     account_id: AccountId,
     now_fn: F,
+    /// Whether this device was ever a writer, memoised across the entries this store ingests.
+    local_writer: rag_rat_oplog::LocalWriterMemo,
 }
 
 impl<'a, F: Fn() -> i64> OplogTableSyncStore<'a, F> {
     pub fn new(conn: &'a Connection, account_id: AccountId, now_fn: F) -> Self {
-        Self { conn, account_id, now_fn }
+        Self { conn, account_id, now_fn, local_writer: Default::default() }
     }
 
     /// Whether this binary currently supports any table stream for this account.
@@ -539,10 +541,13 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
                 self.conn,
                 self.account_id,
                 &to_oplog_stream(item),
-                expected_device,
-                signed_bytes,
+                &rag_rat_oplog::TableSyncReceived {
+                    expected_device,
+                    signed_bytes,
+                    advertised_floor,
+                },
                 (self.now_fn)(),
-                advertised_floor,
+                &self.local_writer,
             )? {
                 rag_rat_oplog::TableSyncIngestOutcome::Stored => Ingested::Stored,
                 rag_rat_oplog::TableSyncIngestOutcome::NoChange => Ingested::NoChange,

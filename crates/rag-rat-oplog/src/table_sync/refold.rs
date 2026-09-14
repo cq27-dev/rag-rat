@@ -57,7 +57,7 @@ use crate::op::OpMeta;
 /// registering a table or widening a spec forces an append, and an append is the bump. A widening
 /// that is not a registry change (a new row-op kind) still has to append a generation by hand,
 /// repeating the previous snapshot.
-pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 8;
+pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 9;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 
@@ -127,7 +127,7 @@ pub(crate) fn refold_stale_projections_against(
     // `refold_owed` already excludes a newer stamp; re-assert inside the write txn so this stays
     // honest if that predicate ever changes.
     assert_projector_not_newer(&tx)?;
-    replay_worklist(&tx, registry, owed.worklist())?;
+    replay_worklist(&tx, registry, owed.worklist(), &apply::LocalWriterMemo::default())?;
     stamp_fold_versions(&tx)?;
     tx.commit()?;
     Ok(true)
@@ -146,17 +146,19 @@ pub(crate) fn refold_stale_projections_against(
 pub(crate) fn replay_deferred_entries(
     tx: &Transaction<'_>,
     registry: &[TableSpec],
+    local_writer: &apply::LocalWriterMemo,
 ) -> anyhow::Result<()> {
-    replay_worklist(tx, registry, Worklist::Deferrals)
+    replay_worklist(tx, registry, Worklist::Deferrals, local_writer)
 }
 
 fn replay_worklist(
     tx: &Transaction<'_>,
     registry: &[TableSpec],
     worklist: Worklist,
+    local_writer: &apply::LocalWriterMemo,
 ) -> anyhow::Result<()> {
     for pending in store::pending_entries(tx, worklist)? {
-        replay_pending_entry(tx, registry, &pending)?;
+        replay_pending_entry(tx, registry, &pending, local_writer)?;
     }
     Ok(())
 }
@@ -248,6 +250,7 @@ fn replay_pending_entry(
     tx: &Transaction<'_>,
     registry: &[TableSpec],
     pending: &PendingEntry,
+    local_writer: &apply::LocalWriterMemo,
 ) -> anyhow::Result<()> {
     // The stream id is a ONE-WAY hash of (repo_id, account_id, incarnation_ref, scope_id), so an
     // entry with no directory row cannot be placed at all — there is no repo to apply it to, no
@@ -308,15 +311,19 @@ fn replay_pending_entry(
     // since no version bump can signal that the row moved.
     //
     // `DeferOnAnyDoubt`: nothing ordered a producer before this pass, so a row whose state cannot
-    // be established either way is treated as unsafe to write over.
-    if let apply::PreApply::Park(reason) = apply::pre_apply(
+    // be established either way is treated as unsafe to write over — on a device that was ever a
+    // writer. One that never was has no unsent work and no producer to redeem a deferral, so its
+    // local rows never hold a replay back (`RowDoubt::NothingUnsent`).
+    let doubt = apply::RowDoubt::for_local_device(
+        local_writer,
         tx,
-        spec,
-        &context.repo_id,
-        pending.stream_id,
-        &op,
+        account_id,
+        crate::identity::local_device_fingerprint(tx)?,
         apply::RowDoubt::DeferOnAnyDoubt,
-    )? {
+    )?;
+    if let apply::PreApply::Park(reason) =
+        apply::pre_apply(tx, spec, &context.repo_id, pending.stream_id, &op, doubt)?
+    {
         return repark(tx, pending, reason);
     }
     let meta = OpMeta { lamport: signed.entry.lamport, device: signed.entry.device_fingerprint };

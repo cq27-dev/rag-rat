@@ -1731,8 +1731,8 @@ fn evidence_pack_never_surfaces_a_sibling_repos_symbols_or_files() {
 
 /// Dream v2 pass 2 (poison-sibling discipline): the summary + verdict READ-JOIN that the
 /// `surface = "summary"` view uses (`current_summary_and_verdict`) must be repo-scoped. Both repos
-/// carry a `memory_summaries` + `memory_reality` row under the SAME (memory_id, content_hash) — a
-/// read that forgot its `repo_id` predicate would surface the wrong repo's summary/verdict. The
+/// carry a `memory_note_summaries` + `memory_reality` row under the SAME (memory_id, content_hash)
+/// — a read that forgot its `repo_id` predicate would surface the wrong repo's summary/verdict. The
 /// scoped read must return each repo's OWN row.
 #[test]
 fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
@@ -1748,7 +1748,7 @@ fn summary_and_verdict_read_join_never_surfaces_a_sibling_repos_row() {
         (A5_REPO_B, "repo B compacted summary", "current"),
     ] {
         conn.execute(
-            "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, \
+            "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
              prompt_version, generated_at_ms) VALUES ('shared_mem', ?1, ?2, ?3, ?4, 0)",
             rusqlite::params![
                 repo,

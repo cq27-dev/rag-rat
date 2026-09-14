@@ -947,8 +947,8 @@ fn memory_search_defers_the_body_under_the_summary_surface() {
         .query_row("SELECT repo_id FROM repo_memories WHERE id = ?1", [&memory_id], |r| r.get(0))
         .unwrap();
     conn.execute(
-        "INSERT INTO memory_summaries(memory_id, repo_id, content_hash, summary, prompt_version, \
-         generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
+        "INSERT INTO memory_note_summaries(memory_id, repo_id, content_hash, summary, \
+         prompt_version, generated_at_ms) VALUES (?1,?2,?3,?4,?5,0)",
         rusqlite::params![
             memory_id,
             repo_id,

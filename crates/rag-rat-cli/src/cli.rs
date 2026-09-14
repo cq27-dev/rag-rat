@@ -609,8 +609,8 @@ pub(crate) struct DreamArgs {
     pub verify: bool,
     /// Run the memory compaction pass (dream v2 pass 2). With `[llm.dream] enabled = true` it
     /// runs the out-of-process model compaction pass, rewriting un-summarized memories into 3–4
-    /// sentence summaries in `memory_summaries`. Off by default; independent of `--verify`, so
-    /// plain `rag-rat dream` stays byte-identical.
+    /// sentence summaries in `memory_note_summaries`. Off by default; independent of `--verify`,
+    /// so plain `rag-rat dream` stays byte-identical.
     #[arg(long)]
     pub compact: bool,
     /// Max memories each model pass may process in one run (the budget the churn-skip queues are

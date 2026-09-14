@@ -3486,10 +3486,13 @@ fn content_then_production_anchors_surface_a_synced_memory_by_path() {
             &destination,
             account,
             &route,
-            head.device_fingerprint,
-            &entry.signed_bytes,
+            &rag_rat_oplog::TableSyncReceived {
+                expected_device: head.device_fingerprint,
+                signed_bytes: &entry.signed_bytes,
+                advertised_floor: None,
+            },
             3,
-            None,
+            &Default::default(),
         )
         .unwrap();
     }

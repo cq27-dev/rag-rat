@@ -9,15 +9,15 @@ use crate::render::{print_output, print_output_or};
 
 /// Dream-mode worklist (#122): run the deterministic memory-maintenance pass (coverage gaps +
 /// stale references), sync it into `dream_findings`, and render the open worklist. Writes ONLY to
-/// `dream_findings` / the derived `memory_reality` + `memory_summaries` siblings — never mutates a
-/// `repo_memories` row.
+/// `dream_findings` / the derived `memory_reality` + `memory_note_summaries` siblings — never
+/// mutates a `repo_memories` row.
 ///
 /// `--verify` turns on the dream v2 verification pass: the deterministic `memory_unverifiable`
 /// findings always, and — when `[llm.dream] enabled = true` — the out-of-process model verdict
 /// pass (writing `memory_reality` verdicts + `memory_divergence` findings). `--compact`
 /// (independent of `--verify`) turns on the compaction pass: when the model is enabled it rewrites
-/// un-summarized memories into `memory_summaries`. With neither flag the run is byte-identical to
-/// the v1 deterministic worklist.
+/// un-summarized memories into `memory_note_summaries`. With neither flag the run is byte-identical
+/// to the v1 deterministic worklist.
 pub(crate) fn dream(config: &Config, args: &DreamArgs) -> anyhow::Result<()> {
     // `dream` WRITES dream_findings — serialize with the watcher/index like every other write
     // command (index/maintenance/oracle); WriteLock is reentrant so the open-time migrate is safe.

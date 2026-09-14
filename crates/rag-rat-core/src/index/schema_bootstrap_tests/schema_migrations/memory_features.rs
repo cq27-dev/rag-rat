@@ -1,8 +1,9 @@
 use super::*;
 
-/// V046 (dream v2 pass 0): fresh `schema::apply` creates the `memory_reality` / `memory_summaries`
-/// sibling tables, both STRICT + repo_id-scoped with the documented PKs. The absolute schema-tip
-/// pin lives on the newest migration's test; this one uses only symbolic latest checks.
+/// Fresh `schema::apply` creates the dream sibling tables — `memory_reality` and the retired
+/// `memory_summaries` (V046), `memory_note_summaries` (V126) — all STRICT + repo_id-scoped with
+/// the documented PKs. The absolute schema-tip pin lives on the newest migration's test; this one
+/// uses only symbolic latest checks.
 #[test]
 fn migration_046_creates_the_verification_tables_on_fresh_apply() {
     let conn = fresh_conn();
@@ -26,7 +27,7 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
         .map(Result::unwrap)
         .collect()
     };
-    for table in ["memory_reality", "memory_summaries"] {
+    for table in ["memory_reality", "memory_summaries", "memory_note_summaries"] {
         assert!(conn_table_exists(&conn, table), "{table} created on fresh apply");
         assert!(table_sql(table).contains("STRICT"), "{table} is STRICT");
         assert!(
@@ -42,8 +43,13 @@ fn migration_046_creates_the_verification_tables_on_fresh_apply() {
     assert_eq!(
         pk_cols("memory_summaries"),
         vec!["repo_id".to_string(), "memory_id".to_string(), "content_hash".to_string()],
-        "memory_summaries is keyed (repo_id, memory_id, content_hash) so a body edit \
-         self-invalidates"
+        "the retired memory_summaries keeps its (repo_id, memory_id, content_hash) key"
+    );
+    assert_eq!(
+        pk_cols("memory_note_summaries"),
+        vec!["repo_id".to_string(), "memory_id".to_string()],
+        "memory_note_summaries is keyed (repo_id, memory_id): content_hash is a compared column, \
+         so a regeneration is one upsert (#1319)"
     );
 
     // Re-apply is a no-op (the memory_reality existence sentinel short-circuits).
