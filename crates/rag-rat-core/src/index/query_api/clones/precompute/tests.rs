@@ -131,7 +131,11 @@ fn precompute_writes_graph_and_skips_when_current() {
     let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let db = build_clone_fixture("write");
     let report = db.precompute_clone_graph(None).unwrap();
-    assert_eq!(report.status, "Complete", "fresh precompute completes");
+    assert_eq!(
+        report.status,
+        crate::index::CloneEdgeStatus::Complete,
+        "fresh precompute completes"
+    );
     assert!(!edge_keys(&db).is_empty(), "renamed-clone fixture writes edges");
 
     let conn = db.storage.connection();
@@ -154,7 +158,7 @@ fn precompute_writes_graph_and_skips_when_current() {
 
     // Re-running on unchanged content is a skip-when-current no-op (no new generation).
     let again = db.precompute_clone_graph(None).unwrap();
-    assert_eq!(again.status, "Current");
+    assert_eq!(again.status, crate::index::CloneEdgeStatus::Current);
     let generations: i64 =
         conn.query_row("SELECT COUNT(*) FROM clone_graph_generations", [], |r| r.get(0)).unwrap();
     assert_eq!(generations, 1, "skip-when-current adds no generation");
@@ -181,8 +185,8 @@ fn precompute_resume_matches_single_pass() {
             .unwrap();
         passes += 1;
         assert!(passes < 10_000, "must converge");
-        if report.status != "Partial" {
-            assert_eq!(report.status, "Complete");
+        if report.status != crate::index::CloneEdgeStatus::Partial {
+            assert_eq!(report.status, crate::index::CloneEdgeStatus::Complete);
             break;
         }
     }
@@ -230,7 +234,10 @@ fn find_clones_precomputed_matches_live() {
         assert!(!live.is_empty(), "renamed-clone fixture has classes at θ={theta}");
 
         // Build the graph → subsequent find_clones takes the fast path.
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let fast = class_projection(&db.find_clones(opts()).unwrap());
 
         assert_eq!(fast, live, "precomputed find_clones must equal live at θ={theta}");
@@ -267,7 +274,10 @@ fn posting_keys(db: &crate::IndexDatabase) -> Vec<(i64, String, i64, String)> {
 #[test]
 fn precompute_postings_match_sub_block_index() {
     let db = build_clone_fixture("postings-parity");
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
 
     let conn = db.storage.connection();
     // Expected: token_hash -> {symbol_id} from the in-RAM sub-block index over the scoped bags.
@@ -323,8 +333,8 @@ fn precompute_postings_resume_matches_single_pass() {
             .unwrap();
         passes += 1;
         assert!(passes < 10_000, "must converge");
-        if report.status != "Partial" {
-            assert_eq!(report.status, "Complete");
+        if report.status != crate::index::CloneEdgeStatus::Partial {
+            assert_eq!(report.status, crate::index::CloneEdgeStatus::Complete);
             break;
         }
     }
@@ -343,7 +353,10 @@ fn precompute_postings_resume_matches_single_pass() {
 #[test]
 fn precompute_repopulates_postings_on_upgrade() {
     let db = build_clone_fixture("postings-upgrade");
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
 
     // Simulate the pre-feature on-disk state: a Complete live generation that predates
     // postings.
@@ -357,7 +370,10 @@ fn precompute_repopulates_postings_on_upgrade() {
     assert!(db.pending_clone_graph().unwrap(), "a postings-less live generation is pending");
 
     // One reconcile pass rebuilds a postings-full generation and clears the pending state.
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
     let postings: i64 = db
         .storage
         .connection()
@@ -458,7 +474,10 @@ fn clone_graph_quiet_gate_fires_an_armed_candidate_without_probe_permission() {
 fn clone_graph_quiet_gate_clears_once_current() {
     let db = build_clone_fixture("quiet-gate-clear");
     assert!(!db.clone_graph_rebuild_due_at(1_000, 300_000, true).unwrap(), "arm");
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
     assert!(
         !db.clone_graph_rebuild_due_at(90_000_000, 300_000, true).unwrap(),
         "a current graph is never due, regardless of the armed candidate's age"
@@ -509,7 +528,7 @@ fn a_fresh_build_snapshots_the_df_epoch_and_a_resume_preserves_it() {
 
     let db = build_clone_fixture("df-epoch-fresh");
     let report = db.precompute_clone_graph(None).unwrap();
-    assert_eq!(report.status, "Complete");
+    assert_eq!(report.status, crate::index::CloneEdgeStatus::Complete);
     let fresh_epoch = epoch_rows(&db, report.generation);
     assert!(!fresh_epoch.is_empty(), "a fresh build snapshots its df epoch");
     assert_eq!(fresh_epoch, df_rows(&db), "the snapshot equals the df the build ran under");
@@ -524,7 +543,11 @@ fn a_fresh_build_snapshots_the_df_epoch_and_a_resume_preserves_it() {
             force: false,
         })
         .unwrap();
-    assert_eq!(first.status, "Partial", "a zero-second budget trips after one batch");
+    assert_eq!(
+        first.status,
+        crate::index::CloneEdgeStatus::Partial,
+        "a zero-second budget trips after one batch"
+    );
     let open_epoch = epoch_rows(&resumed, first.generation);
     assert!(!open_epoch.is_empty(), "the epoch is pinned when the generation opens");
     // Adversarial mid-build live-df movement: invert the whole table between the paused
@@ -545,8 +568,8 @@ fn a_fresh_build_snapshots_the_df_epoch_and_a_resume_preserves_it() {
             .unwrap();
         passes += 1;
         assert!(passes < 10_000, "must converge");
-        if report.status != "Partial" {
-            assert_eq!(report.status, "Complete");
+        if report.status != crate::index::CloneEdgeStatus::Partial {
+            assert_eq!(report.status, crate::index::CloneEdgeStatus::Complete);
             break report;
         }
     };
@@ -607,14 +630,17 @@ fn an_empty_generation_without_epoch_rows_stays_current() {
         .unwrap();
     config.allow_empty = true;
     let db = crate::IndexDatabase::rebuild(&config).unwrap();
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
     assert!(
         !db.pending_clone_graph().unwrap(),
         "an empty generation with no epoch rows is current, not perpetually pending"
     );
     assert_eq!(
         db.precompute_clone_graph(None).unwrap().status,
-        "Current",
+        crate::index::CloneEdgeStatus::Current,
         "and the next pass skips instead of rebuilding the empty graph forever"
     );
     drop(db);
@@ -634,7 +660,10 @@ fn an_empty_generation_without_epoch_rows_stays_current() {
         crate::index::CloneDeltaStatus::NotEligible,
         "the delta must not create first postings on an epoch-less generation: {report:?}"
     );
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
     assert!(
         db.clone_check_indexed_generation().unwrap().is_some(),
         "the full rebuild pins an epoch and the fast path serves"
@@ -650,7 +679,10 @@ fn an_empty_generation_without_epoch_rows_stays_current() {
 fn a_generation_without_epoch_rows_is_not_servable() {
     let _poison = crate::index::poison_sibling::disable_poison_sibling();
     let db = build_clone_fixture("df-epoch-eligibility");
-    assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
     assert!(
         db.clone_check_indexed_generation().unwrap().is_some(),
         "a fresh build with its epoch serves the fast path"
@@ -674,7 +706,11 @@ fn a_generation_without_epoch_rows_is_not_servable() {
         "an epoch-less generation reads as pending, scheduling the healing rebuild"
     );
     let heal = db.precompute_clone_graph(None).unwrap();
-    assert_eq!(heal.status, "Complete", "the pass rebuilds instead of skipping as current");
+    assert_eq!(
+        heal.status,
+        crate::index::CloneEdgeStatus::Complete,
+        "the pass rebuilds instead of skipping as current"
+    );
     assert!(
         db.clone_check_indexed_generation().unwrap().is_some(),
         "the rebuilt generation pins a fresh epoch and serves again"
@@ -700,7 +736,7 @@ fn incremental_index_bumps_live_df_and_keeps_the_generation_epoch_frozen() {
     let config = clone_fixture_config("df-live-bump");
     let db = crate::IndexDatabase::rebuild(&config).unwrap();
     let report = db.precompute_clone_graph(None).unwrap();
-    assert_eq!(report.status, "Complete");
+    assert_eq!(report.status, crate::index::CloneEdgeStatus::Complete);
     let generation = report.generation;
     let df_rows = |db: &crate::IndexDatabase| -> Vec<(i64, i64)> {
         let conn = db.storage.connection();
@@ -840,7 +876,10 @@ fn a_second_full_rebuild_leaves_the_graph_pending_until_one_precompute() {
     );
 
     // Settles on the next precompute (a maintenance pass's delta would re-pin it likewise).
-    assert_eq!(db2.precompute_clone_graph(None).unwrap().status, "Complete");
+    assert_eq!(
+        db2.precompute_clone_graph(None).unwrap().status,
+        crate::index::CloneEdgeStatus::Complete
+    );
     assert!(!db2.pending_clone_graph().unwrap(), "current again after the rebuild");
     assert!(db2.clone_check_indexed_generation().unwrap().is_some(), "eligible again");
 }
@@ -1002,4 +1041,19 @@ fn open_building_generation_discards_the_stale_building_row_on_a_single_repo_db(
         })
         .unwrap();
     assert_eq!(stale, 0, "single-repo discards the stale Building row as before");
+}
+
+#[test]
+fn clone_edge_status_tokens_match_wire() {
+    for (status, token) in [
+        (CloneEdgeStatus::Current, "Current"),
+        (CloneEdgeStatus::Complete, "Complete"),
+        (CloneEdgeStatus::Partial, "Partial"),
+    ] {
+        assert_eq!(status.as_db_str(), token);
+        assert_eq!(CloneEdgeStatus::from_db_str(token), Some(status));
+        assert_eq!(serde_json::to_value(status).unwrap(), token);
+    }
+    assert_eq!(CloneEdgeStatus::from_db_str("Building"), None);
+    assert_eq!(CloneEdgeStatus::from_db_str("future"), None);
 }

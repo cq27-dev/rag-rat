@@ -33,7 +33,7 @@ pub use chunk_read::ReadChunkRequest;
 pub(crate) use clones::delta::CloneDeltaHint;
 pub use clones::delta::{CLONE_DELTA_MAX_FILES, CloneDeltaReport, CloneDeltaStatus};
 pub use clones::of_text::{CloneCheckInput, CloneFingerprintHealth, TextCloneMatch};
-pub use clones::precompute::CloneEdgeReport;
+pub use clones::precompute::{CloneEdgeReport, CloneEdgeStatus};
 pub use clones::{
     CandidateCloneClass, CloneCompleteness, CloneEligibility, CloneIneligibilityReason,
     CloneMember, CloneSymbolSelector, ClonesForSymbolResult, FindClonesOptions, FindClonesResult,

@@ -1082,7 +1082,11 @@ mod tests {
         let report = db
             .reconcile_clone_edges_pass(&CloneEdgeOptions { force: true, ..Default::default() })
             .unwrap();
-        assert_eq!(report.status, "Complete", "forced rebuild runs to completion");
+        assert_eq!(
+            report.status,
+            crate::index::CloneEdgeStatus::Complete,
+            "forced rebuild runs to completion"
+        );
         edge_keys(db)
     }
 
@@ -1094,7 +1098,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-differential");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         drop(db);
 
         let steps: &[(&str, Option<&str>)] = &[
@@ -1202,7 +1209,7 @@ mod tests {
         let config = clone_fixture_config("delta-epoch-postings");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         let built = db.precompute_clone_graph(None).unwrap();
-        assert_eq!(built.status, "Complete");
+        assert_eq!(built.status, crate::index::CloneEdgeStatus::Complete);
         // Adversarial live drift: invert the whole live table.
         db.storage.connection().execute("UPDATE clone_token_df SET df = 1000000 - df", []).unwrap();
         drop(db);
@@ -1261,7 +1268,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-noop");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         assert_eq!(db.apply_clone_graph_delta(64).unwrap().status, CloneDeltaStatus::Noop);
         drop(db);
 
@@ -1297,7 +1307,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-ineligible");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let conn = db.storage.connection();
 
         conn.execute("UPDATE clone_graph_generations SET postings_written = 0", []).unwrap();
@@ -1335,7 +1348,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-irrelevant");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let edges_before = edge_keys(&db);
         drop(db);
 
@@ -1357,7 +1373,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-escalate");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let edges_before = edge_keys(&db);
         drop(db);
 
@@ -1396,7 +1415,10 @@ mod tests {
         )
         .unwrap();
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let conn = db.storage.connection();
         let sub_block_edges: i64 = conn
             .query_row(
@@ -1469,7 +1491,7 @@ mod tests {
         let config = clone_fixture_config("delta-tail-inplace");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         let built = db.precompute_clone_graph(None).unwrap();
-        assert_eq!(built.status, "Complete");
+        assert_eq!(built.status, crate::index::CloneEdgeStatus::Complete);
         drop(db);
 
         std::fs::write(
@@ -1512,7 +1534,7 @@ mod tests {
         let config = clone_fixture_config("delta-drift-rebuild");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         let built = db.precompute_clone_graph(None).unwrap();
-        assert_eq!(built.status, "Complete");
+        assert_eq!(built.status, crate::index::CloneEdgeStatus::Complete);
         db.storage
             .connection()
             .execute(
@@ -1599,7 +1621,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-bookkeeping");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         drop(db);
 
         std::fs::write(
@@ -1640,7 +1665,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-work-budget");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         drop(db);
 
         // A near-clone family member: its bag's tokens hit the corpus postings, so hydration
@@ -1681,7 +1709,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-hydration-memo");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         drop(db);
 
         // TWO near-identical family members in the delta: their sub-block prefixes share tokens,
@@ -1713,7 +1744,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-hint-qplan");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let conn = db.storage.connection();
 
         let plan = |sql: &str, binds: &[super::Value]| -> String {
@@ -1780,7 +1814,7 @@ mod tests {
         let config = clone_fixture_config("delta-postings-count");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
         let built = db.precompute_clone_graph(None).unwrap();
-        assert_eq!(built.status, "Complete");
+        assert_eq!(built.status, crate::index::CloneEdgeStatus::Complete);
         let generation = built.generation;
 
         // The build's COUNT seed already matches the postings it just wrote.
@@ -1858,7 +1892,10 @@ mod tests {
         let prepare = |tag: &str| {
             let config = clone_fixture_config(tag);
             let db = crate::IndexDatabase::rebuild(&config).unwrap();
-            assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+            assert_eq!(
+                db.precompute_clone_graph(None).unwrap().status,
+                crate::index::CloneEdgeStatus::Complete
+            );
             drop(db);
             // Edit an existing clone-family file AND add a new near-clone member; src/b.rs is left
             // untouched (the "could disagree" element the hint names but the scan excludes).
@@ -1918,7 +1955,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-hint-irrelevant");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let edges_before = edge_keys(&db);
         drop(db);
 
@@ -1947,7 +1987,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-selfheal-genflip");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
 
         let flipped: String = db
             .storage
@@ -2015,7 +2058,10 @@ mod tests {
         let _poison = crate::index::poison_sibling::disable_poison_sibling();
         let config = clone_fixture_config("delta-selfheal-escalate");
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
 
         let conn = db.storage.connection();
         let flip: Vec<String> = conn

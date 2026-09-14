@@ -74,11 +74,28 @@ impl Default for CloneEdgeOptions {
     }
 }
 
+/// Wire tokens describing one clone graph rebuild pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
+pub enum CloneEdgeStatus {
+    Current,
+    Complete,
+    Partial,
+}
+
+impl CloneEdgeStatus {
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+    pub fn from_db_str(token: &str) -> Option<Self> {
+        token.parse().ok()
+    }
+}
+
 /// Outcome of a precompute pass (or loop). `status`: `Current` (skip — already fresh), `Complete`
 /// (the generation finished and is now live), or `Partial` (budget tripped mid-build; resume next).
 #[derive(Debug, Clone, Serialize)]
 pub struct CloneEdgeReport {
-    pub status: String,
+    pub status: CloneEdgeStatus,
     pub generation: i64,
     pub symbols_total: u64,
     pub symbols_processed: u64,
@@ -153,7 +170,7 @@ impl IndexDatabase {
                 max_seconds,
                 ..CloneEdgeOptions::default()
             })?;
-            if report.status != "Partial" {
+            if report.status != CloneEdgeStatus::Partial {
                 return Ok(report);
             }
         }

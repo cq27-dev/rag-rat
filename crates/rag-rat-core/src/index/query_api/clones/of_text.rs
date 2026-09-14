@@ -981,7 +981,10 @@ mod tests {
             allow_empty: false,
         };
         let db = crate::IndexDatabase::rebuild(&config).unwrap();
-        assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
+        assert_eq!(
+            db.precompute_clone_graph(None).unwrap().status,
+            crate::index::CloneEdgeStatus::Complete
+        );
         let db_path = root.join(".rag-rat/index.sqlite");
         (scratch, db, db_path)
     }
