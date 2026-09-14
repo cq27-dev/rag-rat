@@ -28,10 +28,7 @@ impl IndexDatabase {
         fenced_when_autocommit(self.storage.connection(), || {
             self.rebuild_chunk_fts()?;
             schema::rebuild_commit_fts(self.storage.connection())?;
-            self.record_content_revision()?;
-            self.record_fts_current()?;
-            self.set_meta_bool(FTS_DIRTY_META, false)?;
-            Ok(())
+            self.stamp_fts_fresh()
         })
     }
 
@@ -40,10 +37,7 @@ impl IndexDatabase {
     /// freshness like [`rebuild_fts`], without re-tokenizing every chunk.
     pub(super) fn finalize_full_rebuild_fts(&self) -> anyhow::Result<()> {
         schema::rebuild_commit_fts(self.storage.connection())?;
-        self.record_content_revision()?;
-        self.record_fts_current()?;
-        self.set_meta_bool(FTS_DIRTY_META, false)?;
-        Ok(())
+        self.stamp_fts_fresh()
     }
 
     /// Repopulate the contentless `chunk_fts` from scratch (#77 Phase 2): clear it, then
@@ -88,31 +82,28 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// Record the inline-maintained `chunk_fts` as fresh — every incremental index and overlay
+    /// refresh ends here.
     pub fn sync_fts(&self) -> anyhow::Result<()> {
-        // ONE `main.files` digest per sync (#821): the recomputing `record_content_revision` +
-        // `record_fts_current` pair paid the identical full-table scan twice back-to-back on the
-        // same connection (and this runs on every incremental index and overlay refresh). Compute
-        // it once and stamp both freshness keys from the same value — byte-identical to the
-        // recomputing forms (same path-ordered `main.files` input), so `ensure_fts_fresh`'s
-        // digest comparison never churns on which path stamped last.
-        let revision = self.content_revision()?;
-        self.record_content_revision_value(&revision)?;
-        self.record_fts_current_value(&revision)?;
-        self.set_meta_bool(FTS_DIRTY_META, false)?;
-        Ok(())
+        self.stamp_fts_fresh()
     }
 
-    fn record_fts_current(&self) -> anyhow::Result<()> {
+    /// The "FTS is fresh" tail every FTS writer ends with: `content_revision`, then
+    /// `fts_synced_at_ms` + `fts_source_revision`, then `fts_dirty = false`. ONE digest read feeds
+    /// both revision keys, so they are written EQUAL — `ensure_fts_fresh` compares
+    /// `fts_source_revision` against `content_revision()` and must never see the pair disagree
+    /// over which read stamped last.
+    ///
+    /// `content_revision` is GLOBAL, not per-repo (V040 reclassification): `content_revision()`
+    /// digests the WHOLE `main.files`, so its stored value is scope- and repo-invariant, and
+    /// per-repo copies would make a consolidated DB's FTS freshness alternate. `set_meta` writes
+    /// the global `index_meta`.
+    fn stamp_fts_fresh(&self) -> anyhow::Result<()> {
         let revision = self.content_revision()?;
-        self.record_fts_current_value(&revision)
-    }
-
-    /// [`Self::record_fts_current`] with the digest already in hand (#821) — for `sync_fts`,
-    /// which stamps both freshness keys from one computed `content_revision()`.
-    fn record_fts_current_value(&self, revision: &str) -> anyhow::Result<()> {
+        self.set_meta("content_revision", &revision)?;
         self.set_meta("fts_synced_at_ms", &now_ms().to_string())?;
-        self.set_meta("fts_source_revision", revision)?;
-        Ok(())
+        self.set_meta("fts_source_revision", &revision)?;
+        self.set_meta_bool(FTS_DIRTY_META, false)
     }
 
     pub(super) fn mark_fts_dirty(&self) -> anyhow::Result<()> {

@@ -8,25 +8,6 @@ use rag_rat_db::meta::*;
 use super::*;
 
 impl IndexDatabase {
-    pub(super) fn record_content_revision(&self) -> anyhow::Result<String> {
-        let revision = self.content_revision()?;
-        self.record_content_revision_value(&revision)?;
-        Ok(revision)
-    }
-
-    /// [`Self::record_content_revision`] with the digest already in hand (#821): `sync_fts`
-    /// computes ONE `main.files` digest and stamps both `content_revision` and
-    /// `fts_source_revision` from it instead of paying the full-table scan twice.
-    pub(super) fn record_content_revision_value(&self, revision: &str) -> anyhow::Result<()> {
-        // GLOBAL, not per-repo (V040 reclassification): `content_revision()` digests the WHOLE
-        // `main.files` (no repo filter — see the method below), so its stored value is scope- and
-        // repo-invariant. V039 relocated it to `repo_meta` under the one-DB-per-repo assumption;
-        // per-repo copies would make a consolidated DB's FTS freshness alternate. `set_meta` writes
-        // the global `index_meta`. (V040's `move_repo_meta_keys_to_global` migrates any stale
-        // per-repo copy back; the shared relocate helper no longer re-relocates it.)
-        self.set_meta("content_revision", revision)
-    }
-
     /// Read a per-repo meta value (`repo_meta`) for the repo owning this connection — the ergonomic
     /// per-connection twin of the [`repo_meta`] free primitive, scoped by `self.active_repo_id`
     /// (resolved at open: `register_repo` on a config open, the sole repo on a bare open).
