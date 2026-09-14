@@ -760,18 +760,7 @@ fn import_from_source(
     };
     rag_rat_query::memory::remap_call_path_callee_logical_symbol_ids(&tx, source, &callee_remap)?;
     let post = child_slice_digests(&tx, &id_map)?;
-    let counts = ImportCounts {
-        bindings: if pre.bindings == post.bindings { 0 } else { raw.bindings },
-        tags: if pre.tags == post.tags { 0 } else { raw.tags },
-        call_paths: if pre.call_paths == post.call_paths { 0 } else { raw.call_paths },
-        call_path_edges: if pre.call_path_edges == post.call_path_edges {
-            0
-        } else {
-            raw.call_path_edges
-        },
-        edges: if pre.edges == post.edges { 0 } else { raw.edges },
-        ..raw
-    };
+    let counts = ChildSliceDigests::zero_unchanged(&pre, &post, raw);
     rebuild_memory_fts_for_repo(&tx, repo_id)?;
     tx.commit()?;
     Ok(counts)
@@ -933,31 +922,72 @@ fn consolidation_logical_symbol_key(
 /// rows are serialized with type tags and sorted before hashing). Drives the honest-count gate in
 /// [`import_from_source`]: replace-then-reinsert genuinely rewrites rows on every run, but a run
 /// that leaves a slice byte-identical did no work worth reporting.
-struct ChildSliceDigests {
-    tags: [u8; 32],
-    bindings: [u8; 32],
-    call_paths: [u8; 32],
-    call_path_edges: [u8; 32],
-    edges: [u8; 32],
+struct ChildSliceDigests(BTreeMap<&'static str, [u8; 32]>);
+
+struct ChildSlice {
+    table: &'static str,
+    id_column: &'static str,
+    repo_scoped: bool,
+    count: fn(&mut ImportCounts) -> &mut u64,
+}
+
+// Preserve child-deletion order. Bindings alone additionally scope by repo; node edges are
+// owned by source_node_id, so neither exception can disappear when a child slice is added.
+const CHILD_SLICES: &[ChildSlice] = &[
+    ChildSlice {
+        table: "repo_memory_tags",
+        id_column: "memory_id",
+        repo_scoped: false,
+        count: |counts| &mut counts.tags,
+    },
+    ChildSlice {
+        table: "repo_memory_call_paths",
+        id_column: "memory_id",
+        repo_scoped: false,
+        count: |counts| &mut counts.call_paths,
+    },
+    ChildSlice {
+        table: "repo_memory_call_path_edges",
+        id_column: "memory_id",
+        repo_scoped: false,
+        count: |counts| &mut counts.call_path_edges,
+    },
+    ChildSlice {
+        table: "repo_memory_bindings",
+        id_column: "memory_id",
+        repo_scoped: true,
+        count: |counts| &mut counts.bindings,
+    },
+    ChildSlice {
+        table: "repo_node_edges",
+        id_column: "source_node_id",
+        repo_scoped: false,
+        count: |counts| &mut counts.edges,
+    },
+];
+
+impl ChildSliceDigests {
+    fn zero_unchanged(pre: &Self, post: &Self, mut raw: ImportCounts) -> ImportCounts {
+        for slice in CHILD_SLICES {
+            if pre.0[slice.table] == post.0[slice.table] {
+                *(slice.count)(&mut raw) = 0;
+            }
+        }
+        raw
+    }
 }
 
 fn child_slice_digests(
     tx: &Connection,
     id_map: &BTreeMap<String, String>,
 ) -> anyhow::Result<ChildSliceDigests> {
-    Ok(ChildSliceDigests {
-        tags: child_slice_digest(tx, "repo_memory_tags", "memory_id", id_map)?,
-        bindings: child_slice_digest(tx, "repo_memory_bindings", "memory_id", id_map)?,
-        call_paths: child_slice_digest(tx, "repo_memory_call_paths", "memory_id", id_map)?,
-        call_path_edges: child_slice_digest(
-            tx,
-            "repo_memory_call_path_edges",
-            "memory_id",
-            id_map,
-        )?,
-        // Node edges key on `source_node_id` (the owning node), not `memory_id`.
-        edges: child_slice_digest(tx, "repo_node_edges", "source_node_id", id_map)?,
-    })
+    CHILD_SLICES
+        .iter()
+        .map(|slice| {
+            Ok((slice.table, child_slice_digest(tx, slice.table, slice.id_column, id_map)?))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()
+        .map(ChildSliceDigests)
 }
 
 fn child_slice_digest(
@@ -1190,16 +1220,14 @@ fn refresh_children(
     id_map: &BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     for id in id_map.values() {
-        for table in ["repo_memory_tags", "repo_memory_call_paths", "repo_memory_call_path_edges"] {
-            tx.execute(&format!("DELETE FROM {table} WHERE memory_id = ?1"), [id])?;
+        for slice in CHILD_SLICES {
+            let sql = format!("DELETE FROM {} WHERE {} = ?1", slice.table, slice.id_column);
+            if slice.repo_scoped {
+                tx.execute(&format!("{sql} AND repo_id = ?2"), params![id, repo_id])?;
+            } else {
+                tx.execute(&sql, [id])?;
+            }
         }
-        tx.execute(
-            "DELETE FROM repo_memory_bindings WHERE memory_id = ?1 AND repo_id = ?2",
-            params![id, repo_id],
-        )?;
-        // Node edges (#464) key on `source_node_id`, not `memory_id` — delete them here too so the
-        // subsequent `copy_node_edges` REPLACES the source's edge set (the mirror invariant).
-        tx.execute("DELETE FROM repo_node_edges WHERE source_node_id = ?1", [id])?;
     }
     Ok(())
 }
@@ -1716,6 +1744,11 @@ const ACCESS_MODE_META: SingleTokenMeta = SingleTokenMeta {
     what: "memory stream access mode",
 };
 
+struct MetaSides {
+    source: Option<String>,
+    target: Option<String>,
+}
+
 impl SingleTokenMeta {
     /// The `(source, target)` values, refusing when either side holds a token this binary does not
     /// understand — before any of consolidation's reconciliation authoring.
@@ -1724,7 +1757,7 @@ impl SingleTokenMeta {
         source: &Connection,
         tx: &Connection,
         repo_id: &str,
-    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+    ) -> anyhow::Result<MetaSides> {
         let source_value = source_repo_meta(source, self.key)?;
         let target_value = target_repo_meta(tx, repo_id, self.key)?;
         for (side, value) in
@@ -1739,7 +1772,7 @@ impl SingleTokenMeta {
                 );
             }
         }
-        Ok((source_value, target_value))
+        Ok(MetaSides { source: source_value, target: target_value })
     }
 
     /// Carry a present source value onto an ABSENT target — the merge's only write. Returns the
@@ -1748,9 +1781,9 @@ impl SingleTokenMeta {
         &self,
         tx: &Connection,
         repo_id: &str,
-        (source_value, target_value): &(Option<String>, Option<String>),
+        sides: &MetaSides,
     ) -> anyhow::Result<u64> {
-        if source_value.is_some() && target_value.is_none() {
+        if sides.source.is_some() && sides.target.is_none() {
             Ok(tx.execute(
                 "INSERT INTO repo_meta(repo_id, key, value) VALUES (?1, ?2, ?3)",
                 params![repo_id, self.key, self.token],
@@ -1856,7 +1889,7 @@ fn merge_stream_access_mode(
     // Two explicit-but-disagreeing modes have no safe winner. With only `public`/absent this can
     // only be source-`public` vs target-`public` (agree) today; the guard future-proofs a
     // `private` token.
-    if let (Some(s), Some(t)) = (sides.0.as_deref(), sides.1.as_deref())
+    if let (Some(s), Some(t)) = (sides.source.as_deref(), sides.target.as_deref())
         && s != t
     {
         anyhow::bail!(
