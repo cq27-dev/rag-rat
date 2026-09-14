@@ -33,6 +33,10 @@ pub enum InviteError {
     HeldStateConflict,
     #[error("enrollment storage: {0}")]
     Storage(anyhow::Error),
+    /// Dialing, accepting, or opening the enrollment connection failed or timed out. The exchange
+    /// never reached a redemption, so this is never answered with a refusal frame.
+    #[error("enrollment transport: {0}")]
+    Transport(String),
     #[error("enrollment stream: {0}")]
     Io(std::io::Error),
 }

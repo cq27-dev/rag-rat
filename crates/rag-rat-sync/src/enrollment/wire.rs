@@ -390,7 +390,12 @@ pub(super) fn refusal_code(error: &InviteError) -> Option<RefusalCode> {
         InviteError::Revoked => Some(RefusalCode::Revoked),
         InviteError::JoinerCapacity => Some(RefusalCode::JoinerCapacity),
         InviteError::HeldStateConflict => Some(RefusalCode::HeldStateConflict),
-        InviteError::Malformed(_) | InviteError::Storage(_) | InviteError::Io(_) => None,
+        // A transport failure never reached a redemption and has never produced a wire
+        // refusal; it is named here rather than left to a wildcard so it cannot start to.
+        InviteError::Malformed(_)
+        | InviteError::Storage(_)
+        | InviteError::Io(_)
+        | InviteError::Transport(_) => None,
     }
 }
 
