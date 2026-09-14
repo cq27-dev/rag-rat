@@ -626,18 +626,11 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         if edge_kind == EdgeKind::DispatchConstruct {
             let confidence_id = interner.get(conn, EdgeConfidence::NameOnly.as_db_str())?;
             let resolution_id = interner.get(conn, EdgeResolution::Unresolved.as_db_str())?;
-            conn.prepare_cached(
-                "UPDATE edges_data
-                 SET to_symbol_id = NULL, target_start_line = NULL, target_end_line = NULL,
-                     confidence_id = ?2, resolution_id = ?3, hidden = ?4
-                 WHERE id = ?1",
-            )?
-            .execute(params![
-                edge_id,
+            super::demote_edges(conn, "id = ?1", &[&edge_id], super::EdgeDemotion {
                 confidence_id,
                 resolution_id,
-                edge_hidden_flag(edge_kind, EdgeResolution::Unresolved),
-            ])?;
+                resolution: EdgeResolution::Unresolved,
+            })?;
             continue;
         }
         let resolution = resolve_reference(
@@ -673,22 +666,11 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                 if suppressed { EdgeResolution::Suppressed } else { EdgeResolution::Unresolved };
             let confidence_id = interner.get(conn, confidence.as_db_str())?;
             let resolution_id = interner.get(conn, resolution.as_db_str())?;
-            conn.prepare_cached(
-                "UPDATE edges_data
-                 SET to_symbol_id = NULL,
-                     target_start_line = NULL,
-                     target_end_line = NULL,
-                     confidence_id = ?2,
-                     resolution_id = ?3,
-                     hidden = ?4
-                 WHERE id = ?1",
-            )?
-            .execute(params![
-                edge_id,
+            super::demote_edges(conn, "id = ?1", &[&edge_id], super::EdgeDemotion {
                 confidence_id,
                 resolution_id,
-                edge_hidden_flag(edge_kind, resolution),
-            ])?;
+                resolution,
+            })?;
             continue;
         };
         let confidence_id = interner.get(conn, confidence.as_db_str())?;

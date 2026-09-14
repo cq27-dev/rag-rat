@@ -727,24 +727,12 @@ impl IndexDatabase {
                 [],
             )?;
         }
-        // Intern-on-demand: the cascade runs where no edge-string interner is in scope.
-        let unresolved = edges::EdgeResolution::Unresolved.as_db_str();
-        self.storage
-            .connection()
-            .execute("INSERT OR IGNORE INTO main.name_strings(value) VALUES (?1)", [unresolved])?;
-        self.storage.connection().execute(
-            "UPDATE main.edges_data
-            SET to_symbol_id = NULL,
-                target_start_line = NULL,
-                target_end_line = NULL,
-                resolution_id =
-                    (SELECT id FROM main.name_strings WHERE value = ?1)
-            WHERE to_symbol_id IN (
-                SELECT symbols.id
-                FROM main.symbols
-                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
-            )",
-            [unresolved],
+        edges::dangle_edges_to(
+            self.storage.connection(),
+            "SELECT symbols.id
+             FROM main.symbols
+             JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id",
+            &[],
         )?;
         self.storage.execute_batch(
             "

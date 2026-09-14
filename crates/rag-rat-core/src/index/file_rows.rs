@@ -208,11 +208,6 @@ impl IndexDatabase {
         self.stage_logical_rederive_path(&path)?;
         // Direct edges_data writes (#79): these statements touch up to every in-edge of a file's
         // symbols, so they must not pay the view triggers' per-row dictionary probes.
-        // NameOnly is the EdgeConfidence demotion the resolver applies to a target-less edge.
-        let name_only_id = edges::intern_edge_string(
-            self.storage.connection(),
-            edges::EdgeConfidence::NameOnly.as_db_str(),
-        )?;
         let repo_id = self.active_repo_id.as_str();
         // Every delete below carries the WRITER'S generation (A6, P2 review): the V043 UNIQUE
         // admits one row per (repo, path, commit, worktree) PER GENERATION, so a scope key alone
@@ -230,20 +225,16 @@ impl IndexDatabase {
         // at FILE granularity (round up in-edge → its source file), so the whole write set
         // stays one file-id set. No-op unless armed by `begin_scoped_edge_rewrite`.
         self.stage_edge_rewrite_inedge_sources(&path, repo_id, generation)?;
-        self.storage.connection().execute(
-            "UPDATE edges_data
-             SET to_symbol_id = NULL,
-                 confidence_id = ?4
-             WHERE to_symbol_id IN (
-                 SELECT symbols.id FROM symbols
-                 JOIN main.files ON main.files.id = symbols.file_id
-                 WHERE main.files.path = ?1
-                   AND main.files.commit_sha = ?2
-                   AND main.files.worktree_id = ?3
-                   AND main.files.repo_id = ?5
-                   AND main.files.generation = ?6
-             )",
-            params![path, commit_sha, worktree_id, name_only_id, repo_id, generation],
+        edges::dangle_edges_to(
+            self.storage.connection(),
+            "SELECT symbols.id FROM symbols
+             JOIN main.files ON main.files.id = symbols.file_id
+             WHERE main.files.path = ?1
+               AND main.files.commit_sha = ?2
+               AND main.files.worktree_id = ?3
+               AND main.files.repo_id = ?4
+               AND main.files.generation = ?5",
+            params![path, commit_sha, worktree_id, repo_id, generation],
         )?;
         self.storage.connection().execute(
             "DELETE FROM edges_data
