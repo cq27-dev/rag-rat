@@ -250,76 +250,105 @@ pub fn compose(
     if normalized.is_empty() {
         return Ok(None);
     }
+    let (symbol_items, symbol_bound, symbol_lane_had_hits) =
+        symbol_lane(conn, &normalized, dedupe)?;
+    let memories = memory_lane(conn, &normalized, search_path, dedupe, surface, symbol_bound)?;
+    let lexical_lines =
+        if symbol_lane_had_hits { Vec::new() } else { lexical_lane(conn, &normalized)? };
 
-    let mut memories = Vec::new();
-    let mut symbol_items: Vec<SymbolItem> = Vec::new();
-    // Track whether the symbol lane produced any raw hits (before dedup).
-    // Lexical lane only runs when there were no symbol hits at all (not just all deduped).
-    let mut symbol_lane_had_hits = false;
+    if memories.is_empty() && symbol_items.is_empty() && lexical_lines.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(render(memories, symbol_items, lexical_lines)))
+}
 
-    // Seen set for memory dedup — preserves insertion order (symbol-bound first, then FTS,
-    // then path-bound), unlike the old sort+dedup which ordered by creation-time ID.
-    let mut seen_memory_ids: HashSet<String> = HashSet::new();
+/// Symbol lane: runs only when the pattern targets one identifier. Returns the rendered symbols,
+/// the memories bound to them (the highest-priority memories), and whether the lookup produced ANY
+/// raw hits — counted before dedupe, because the lexical lane runs only when there were no symbol
+/// hits at all, not merely when every hit was already shown.
+fn symbol_lane(
+    conn: &Connection,
+    normalized: &str,
+    dedupe: &DedupeFilter,
+) -> anyhow::Result<(Vec<SymbolItem>, Vec<memory::RepoMemory>, bool)> {
+    let mut symbol_items = Vec::new();
+    let mut bound_memories = Vec::new();
+    let mut had_hits = false;
+    let Some(ident) = extract_symbol_identifier(normalized) else {
+        return Ok((symbol_items, bound_memories, had_hits));
+    };
+    let mut seen_memory_ids = HashSet::new();
     // Within-call dedup of symbol hits by (path, qualified_name): `symbol::lookup` can return the
     // same logical symbol once per concrete row (overloads, multiple definitions, re-export rows),
     // which otherwise renders as N identical "Known symbols" lines — same defect as the lexical
     // lane (#139).
     let mut seen_symbol_keys: HashSet<String> = HashSet::new();
-
-    if let Some(ident) = extract_symbol_identifier(&normalized) {
-        // Symbol lane. Bare name for qualified queries: `Watcher::spawn` → `spawn`.
-        let bare = ident.rsplit([':', '.']).next().unwrap_or(ident);
-        for hit in symbol::lookup(conn, bare, None, MAX_SYMBOLS)? {
-            symbol_lane_had_hits = true;
-            let key = format!("{}:{}", hit.path, hit.qualified_name);
-            if dedupe.symbol_keys.contains(&key) || !seen_symbol_keys.insert(key.clone()) {
-                continue;
-            }
-            let (callers, callees) = edge_counts(conn, &hit)?;
-            let start_line = line_for_symbol(conn, &hit)?;
-            let line_suffix = match start_line {
-                Some(l) => format!("{}:{}", hit.path, l),
-                None => hit.path.clone(),
-            };
-            let rendered = format!(
-                "- `{}` ({}) — {} — {} callers / {} callees{}",
-                hit.qualified_name,
-                hit.kind,
-                line_suffix,
-                callers,
-                callees,
-                hit.signature.as_deref().map(|s| format!(" — `{s}`")).unwrap_or_default(),
-            );
-            // Gather symbol-bound memories before adding them to the main list so they
-            // come first (highest priority lane).
-            for m in memory::memories_for_symbol(conn, &hit, MAX_MEMORIES)? {
-                if seen_memory_ids.insert(m.memory_id.clone()) {
-                    memories.push(m);
-                }
-            }
-            symbol_items.push(SymbolItem { rendered, key });
+    // Bare name for qualified queries: `Watcher::spawn` → `spawn`.
+    let bare = ident.rsplit([':', '.']).next().unwrap_or(ident);
+    for hit in symbol::lookup(conn, bare, None, MAX_SYMBOLS)? {
+        had_hits = true;
+        let key = format!("{}:{}", hit.path, hit.qualified_name);
+        if dedupe.symbol_keys.contains(&key) || !seen_symbol_keys.insert(key.clone()) {
+            continue;
         }
+        let (callers, callees) = edge_counts(conn, &hit)?;
+        let start_line = line_for_symbol(conn, &hit)?;
+        let line_suffix = match start_line {
+            Some(l) => format!("{}:{}", hit.path, l),
+            None => hit.path.clone(),
+        };
+        let rendered = format!(
+            "- `{}` ({}) — {} — {} callers / {} callees{}",
+            hit.qualified_name,
+            hit.kind,
+            line_suffix,
+            callers,
+            callees,
+            hit.signature.as_deref().map(|s| format!(" — `{s}`")).unwrap_or_default(),
+        );
+        extend_new_memories(
+            &mut bound_memories,
+            &mut seen_memory_ids,
+            memory::memories_for_symbol(conn, &hit, MAX_MEMORIES)?,
+        );
+        symbol_items.push(SymbolItem { rendered, key });
     }
+    Ok((symbol_items, bound_memories, had_hits))
+}
 
-    // Memory lane: always. FTS over the normalized pattern + path-bound memories. The FTS half is
-    // relevance-gated (a corpus-wide token in the pattern otherwise drags in MAX_MEMORIES
-    // unrelated memories); the path half is not — it is a structural binding, not a text match.
-    // The gate runs over the FULL hit set, BEFORE session dedupe (the blanket retain below):
-    // relevance is a property of the query, not of what this session happened to show. Dropping an
-    // already-seen hit first would hand the reference score to the runner-up, and the weak tail
-    // would pass the gate for the rest of the resurface window — exactly the noise it removes.
-    let fts_hits = memory::memory_search_scored(conn, &normalized, MAX_MEMORIES)?;
-    for m in memories_above_relative_floor(fts_hits) {
-        if seen_memory_ids.insert(m.memory_id.clone()) {
-            memories.push(m);
-        }
-    }
+/// Memory lane: runs always. The symbol-bound memories lead, then relevance-gated FTS hits over the
+/// normalized pattern, then path-bound memories; session dedupe, drift marking and the surface
+/// projection apply to the assembled list.
+fn memory_lane(
+    conn: &Connection,
+    normalized: &str,
+    search_path: Option<&str>,
+    dedupe: &DedupeFilter,
+    surface: rag_rat_base::config::MemorySurface,
+    symbol_bound: Vec<memory::RepoMemory>,
+) -> anyhow::Result<Vec<memory::RepoMemory>> {
+    let mut seen_memory_ids: HashSet<String> =
+        symbol_bound.iter().map(|m| m.memory_id.clone()).collect();
+    let mut memories = symbol_bound;
+    // The FTS half is relevance-gated (a corpus-wide token in the pattern otherwise drags in
+    // MAX_MEMORIES unrelated memories); the path half is not — it is a structural binding, not a
+    // text match. The gate runs over the FULL hit set, BEFORE session dedupe (the blanket retain
+    // below): relevance is a property of the query, not of what this session happened to show.
+    // Dropping an already-seen hit first would hand the reference score to the runner-up, and the
+    // weak tail would pass the gate for the rest of the resurface window — exactly the noise it
+    // removes.
+    let fts_hits = memory::memory_search_scored(conn, normalized, MAX_MEMORIES)?;
+    extend_new_memories(
+        &mut memories,
+        &mut seen_memory_ids,
+        memories_above_relative_floor(fts_hits),
+    );
     if let Some(path) = search_path {
-        for m in memory::memories_for_path(conn, path, MAX_MEMORIES)? {
-            if seen_memory_ids.insert(m.memory_id.clone()) {
-                memories.push(m);
-            }
-        }
+        extend_new_memories(
+            &mut memories,
+            &mut seen_memory_ids,
+            memory::memories_for_path(conn, path, MAX_MEMORIES)?,
+        );
     }
     // Apply session-level dedupe filter last (after insertion-order dedup above).
     memories.retain(|m| !dedupe.memory_ids.contains(&m.memory_id));
@@ -332,25 +361,19 @@ pub fn compose(
     // marker (title-only fallback) instead of the clamped body — the hook context stays terse and
     // the full body is one `memory show` away.
     memory::apply_memory_surface(conn, &mut memories, surface)?;
+    Ok(memories)
+}
 
-    // Lexical lane: only when the symbol lane found nothing (never had any raw hits). Relevance
-    // gate: keep only hits within LEXICAL_RELATIVE_FLOOR of the best hit's score, so the weak tail
-    // (e.g. an incidental match several ranks down) isn't injected as noise.
-    let lexical_lines = if !symbol_lane_had_hits {
-        lexical_lines_from_hits(lexical::search_lexical_only(
-            conn,
-            &normalized,
-            MAX_LEXICAL_HITS,
-            false,
-        )?)
-    } else {
-        Vec::new()
-    };
-
-    if memories.is_empty() && symbol_items.is_empty() && lexical_lines.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(render(memories, symbol_items, lexical_lines)))
+/// Lexical lane: runs only when the symbol lane had no raw hits. Relevance gate: keep only hits
+/// within LEXICAL_RELATIVE_FLOOR of the best hit's score, so the weak tail (e.g. an incidental
+/// match several ranks down) isn't injected as noise.
+fn lexical_lane(conn: &Connection, normalized: &str) -> anyhow::Result<Vec<String>> {
+    Ok(lexical_lines_from_hits(lexical::search_lexical_only(
+        conn,
+        normalized,
+        MAX_LEXICAL_HITS,
+        false,
+    )?))
 }
 
 /// Floor-filter, dedup, and render the lexical-lane hits. Extracted so the dedup is unit-testable:
@@ -388,6 +411,21 @@ fn memories_above_relative_floor(hits: Vec<(memory::RepoMemory, f64)>) -> Vec<me
 struct SymbolItem {
     rendered: String,
     key: String,
+}
+
+/// Append each memory in `incoming` whose id is not yet in `seen`, keeping `incoming`'s order. Both
+/// hook composers assemble their memory list lane by lane through this, so the order they call it
+/// in IS the rendered priority order.
+pub(crate) fn extend_new_memories(
+    dst: &mut Vec<memory::RepoMemory>,
+    seen: &mut HashSet<String>,
+    incoming: impl IntoIterator<Item = memory::RepoMemory>,
+) {
+    for m in incoming {
+        if seen.insert(m.memory_id.clone()) {
+            dst.push(m);
+        }
+    }
 }
 
 /// A single renderable item in a section, with optional bookkeeping IDs. Shared with `read_augment`

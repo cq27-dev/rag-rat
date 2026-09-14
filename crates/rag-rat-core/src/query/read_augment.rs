@@ -44,23 +44,23 @@ pub fn compose(
     let mut seen: HashSet<String> = HashSet::new();
     // Symbol-bound memories first (the load-bearing symbols the agent is about to touch).
     for (hit, _, _) in &ranked {
-        for m in memory::memories_for_symbol(conn, hit, MAX_MEMORIES)? {
-            if seen.insert(m.memory_id.clone()) {
-                memories.push(m);
-            }
-        }
+        grep_augment::extend_new_memories(
+            &mut memories,
+            &mut seen,
+            memory::memories_for_symbol(conn, hit, MAX_MEMORIES)?,
+        );
     }
     // Then the file's own path-bound memories, then its directory memories.
-    for m in memory::memories_for_path(conn, path, MAX_MEMORIES)? {
-        if seen.insert(m.memory_id.clone()) {
-            memories.push(m);
-        }
-    }
-    for m in memory::memories_for_path(conn, parent_dir(path), MAX_MEMORIES)? {
-        if seen.insert(m.memory_id.clone()) {
-            memories.push(m);
-        }
-    }
+    grep_augment::extend_new_memories(
+        &mut memories,
+        &mut seen,
+        memory::memories_for_path(conn, path, MAX_MEMORIES)?,
+    );
+    grep_augment::extend_new_memories(
+        &mut memories,
+        &mut seen,
+        memory::memories_for_path(conn, parent_dir(path), MAX_MEMORIES)?,
+    );
     // Session-level dedupe (what this agent was already shown), then the memory-surface projection.
     memories.retain(|m| !dedupe.memory_ids.contains(&m.memory_id));
     memory::apply_memory_surface(conn, &mut memories, surface)?;
