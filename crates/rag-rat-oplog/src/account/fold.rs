@@ -1303,8 +1303,7 @@ fn fold_account_pass(
             .collect();
         reroots.sort_by_key(|(c, successor)| (successor.to_bytes(), c.hash()));
         for (c, successor) in &reroots {
-            outcomes.insert(c.hash(), effective(&state));
-            state.next_auth_epoch += 1;
+            outcomes.insert(c.hash(), state.take_epoch());
             contested_successor.get_or_insert(*successor);
         }
         for c in &candidates {
@@ -1817,10 +1816,15 @@ fn effect_pass(
             outcomes.insert(c.hash(), *verdict);
             continue;
         }
-        let outcome = classify_effect(c, incarnations, state, &verdicts.parked);
-        if let Outcome::Effective { .. } = outcome {
-            apply_effect(c, state);
-        }
+        let outcome = match classify_effect(c, incarnations, state, &verdicts.parked) {
+            EffectVerdict::Effective => {
+                let outcome = state.take_epoch();
+                apply_effect(c, state);
+                outcome
+            },
+            EffectVerdict::Rejected(reason) => Outcome::Rejected(reason),
+            EffectVerdict::Parked(reason) => Outcome::Parked(reason),
+        };
         outcomes.insert(c.hash(), outcome);
     }
 }
@@ -2480,37 +2484,37 @@ fn classify_effect(
     incarnations: &Incarnations<'_>,
     state: &FoldState,
     parked: &HashMap<[u8; 32], ParkReason>,
-) -> Outcome {
+) -> EffectVerdict {
     // The author must act under a LIVE incarnation minted for THIS device (clauses 1 + 3). This is
     // what defeats laundering (a cut authored under a since-condemned owner is not live) AND owner
     // impersonation (a member citing another device's live incarnation — P3-adjacent).
     match authority_status(c, incarnations, state, parked) {
-        AuthorityStatus::Unresolvable => return Outcome::Parked(ParkReason::UnknownOwnerRef),
-        AuthorityStatus::WrongDevice => return Outcome::Rejected(RejectReason::WrongDevice),
-        AuthorityStatus::Stale => return Outcome::Rejected(RejectReason::StaleAuthority),
+        AuthorityStatus::Unresolvable => return EffectVerdict::Parked(ParkReason::UnknownOwnerRef),
+        AuthorityStatus::WrongDevice => return EffectVerdict::Rejected(RejectReason::WrongDevice),
+        AuthorityStatus::Stale => return EffectVerdict::Rejected(RejectReason::StaleAuthority),
         // A parked authorizer parks the dependent (recoverable), never permanently stale-rejects
         // it.
-        AuthorityStatus::ParkedAuthorizer(reason) => return Outcome::Parked(reason),
+        AuthorityStatus::ParkedAuthorizer(reason) => return EffectVerdict::Parked(reason),
         AuthorityStatus::Live => {},
     }
     match &c.op {
         AccountOp::AccountGenesis { .. } => {
             if state.genesis_seen {
-                return Outcome::Rejected(RejectReason::DuplicateGenesis);
+                return EffectVerdict::Rejected(RejectReason::DuplicateGenesis);
             }
             // The self-hash was checked in `find_genesis`; a second genesis reaching here is a dup.
             if account_id_from_genesis_payload(&c.entry.payload) != c.header().account_id {
-                return Outcome::Rejected(RejectReason::GenesisSelfHash);
+                return EffectVerdict::Rejected(RejectReason::GenesisSelfHash);
             }
-            effective(state)
+            EffectVerdict::Effective
         },
         AccountOp::DeviceAdd { device_fingerprint, .. } => {
             if state.tombstoned.contains(device_fingerprint) {
-                Outcome::Rejected(RejectReason::TombstoneReAdd)
+                EffectVerdict::Rejected(RejectReason::TombstoneReAdd)
             } else if state.roster.contains_key(device_fingerprint) {
-                Outcome::Rejected(RejectReason::DuplicateAdd)
+                EffectVerdict::Rejected(RejectReason::DuplicateAdd)
             } else {
-                effective(state)
+                EffectVerdict::Effective
             }
         },
         AccountOp::OwnerPromote { device_fingerprint } => {
@@ -2522,9 +2526,9 @@ fn classify_effect(
                 .get(device_fingerprint)
                 .is_some_and(|role| role.can_author_content());
             if enrolled && authoring_role && !already_owner && !tombstoned {
-                effective(state)
+                EffectVerdict::Effective
             } else {
-                Outcome::Rejected(RejectReason::BadPromote)
+                EffectVerdict::Rejected(RejectReason::BadPromote)
             }
         },
         AccountOp::StreamOwn { stream_id, stream_spec_bytes } => {
@@ -2535,11 +2539,11 @@ fn classify_effect(
                 })
                 .unwrap_or(false);
             if !valid {
-                Outcome::Rejected(RejectReason::InvalidStreamSpec)
+                EffectVerdict::Rejected(RejectReason::InvalidStreamSpec)
             } else if state.stream_ownership.contains_key(stream_id) {
-                Outcome::Rejected(RejectReason::Ineffective)
+                EffectVerdict::Rejected(RejectReason::Ineffective)
             } else {
-                effective(state)
+                EffectVerdict::Effective
             }
         },
         AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role } => {
@@ -2561,9 +2565,9 @@ fn classify_effect(
                 || *grantee_account_id == c.header().account_id
                 || duplicate
             {
-                Outcome::Rejected(RejectReason::Ineffective)
+                EffectVerdict::Rejected(RejectReason::Ineffective)
             } else {
-                effective(state)
+                EffectVerdict::Effective
             }
         },
         AccountOp::StreamRevoke { stream_id, grantee_account_id, grant_id, .. } => {
@@ -2573,45 +2577,46 @@ fn classify_effect(
                     && grant.grantee_account_id == *grantee_account_id
             });
             if state.stream_ownership.contains_key(stream_id) && matches_open_grant {
-                effective(state)
+                EffectVerdict::Effective
             } else {
-                Outcome::Rejected(RejectReason::Ineffective)
+                EffectVerdict::Rejected(RejectReason::Ineffective)
             }
         },
         // `AccountReRoot` is admissible ONLY as the terminal recovery op once the account is
         // contested (§12) — the contested path admits it. In a `Live` account it has no effect.
-        AccountOp::AccountReRoot { .. } => Outcome::Rejected(RejectReason::Ineffective),
+        AccountOp::AccountReRoot { .. } => EffectVerdict::Rejected(RejectReason::Ineffective),
         // A DeviceRemove of a device that was never enrolled is ineffective — otherwise it would
         // tombstone a fingerprint that was never added (I4), permanently barring a future
         // legitimate DeviceAdd for it.
         AccountOp::DeviceRemove { device_fingerprint, .. } =>
             if state.roster.contains_key(device_fingerprint) {
-                effective(state)
+                EffectVerdict::Effective
             } else {
-                Outcome::Rejected(RejectReason::Ineffective)
+                EffectVerdict::Rejected(RejectReason::Ineffective)
             },
         // An OwnerDemote reaching here is an admitted cut op (register + binding decided in the
         // register pass); it is effective.
-        AccountOp::OwnerDemote { .. } => effective(state),
+        AccountOp::OwnerDemote { .. } => EffectVerdict::Effective,
         // A control- or secrets-chain CutExtend reaching here was admitted in the register pass
         // (its register joined against the fold's account-log chains), so it is effective. A
         // content extend binds a stream chain (C2's fold), not an account log — defer it rather
         // than mark it effective on a target this fold never validated.
         AccountOp::CutExtend { chain_kind, .. } => match chain_kind {
-            ChainKind::Ctrl | ChainKind::Secrets => effective(state),
-            ChainKind::Content => Outcome::Parked(ParkReason::DeferredStreamAuthorization),
+            ChainKind::Ctrl | ChainKind::Secrets => EffectVerdict::Effective,
+            ChainKind::Content => EffectVerdict::Parked(ParkReason::DeferredStreamAuthorization),
         },
     }
 }
 
-/// Mint an effective verdict, consuming the next `auth_epoch`.
-fn effective(state: &FoldState) -> Outcome {
-    Outcome::Effective { auth_epoch: state.next_auth_epoch }
+/// Classification stays pure; only the applying pass can consume an epoch.
+enum EffectVerdict {
+    Effective,
+    Rejected(RejectReason),
+    Parked(ParkReason),
 }
 
 /// Apply an EFFECTIVE op's roster/live effect (called only after an effective verdict).
 fn apply_effect(c: &Candidate, state: &mut FoldState) {
-    state.next_auth_epoch += 1;
     match &c.op {
         AccountOp::AccountGenesis { .. } => {
             state.genesis_seen = true;
@@ -2675,6 +2680,13 @@ fn apply_effect(c: &Candidate, state: &mut FoldState) {
 }
 
 impl FoldState {
+    /// Mint exactly one effective verdict and reserve its pre-normalization position.
+    fn take_epoch(&mut self) -> Outcome {
+        let auth_epoch = self.next_auth_epoch;
+        self.next_auth_epoch += 1;
+        Outcome::Effective { auth_epoch }
+    }
+
     fn seeded(genesis_owner_id: [u8; 32]) -> Self {
         Self { live: HashSet::from([genesis_owner_id]), ..Default::default() }
     }
