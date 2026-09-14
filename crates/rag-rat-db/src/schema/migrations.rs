@@ -936,14 +936,7 @@ pub(crate) fn apply_edges_hidden_flag(conn: &Connection) -> rusqlite::Result<()>
 }
 
 pub(crate) fn ensure_edges_view(conn: &Connection) -> rusqlite::Result<()> {
-    let legacy_table: Option<String> = conn
-        .query_row(
-            "SELECT type FROM sqlite_master WHERE name = 'edges' AND type = 'table'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if legacy_table.is_some() {
+    if sqlite_object_exists(conn, "table", "edges")? {
         return Ok(());
     }
     // The view body below references the dedicated import-scope columns (V022). This function runs
@@ -1191,12 +1184,7 @@ pub fn apply_edge_string_interning(conn: &Connection) -> rusqlite::Result<()> {
             // FK), so there is nothing to re-point and copying its 13 columns
             // into the 8-column legacy template below would fail (#248). Skip when `source_path`
             // exists — V031 owns the final shape.
-            let has_oracle: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
-                 'edge_oracle')",
-                [],
-                |row| row.get(0),
-            )?;
+            let has_oracle = sqlite_object_exists(conn, "table", "edge_oracle")?;
             if has_oracle && !column_exists(conn, "edge_oracle", "source_path")? {
                 conn.execute_batch(
                     "
@@ -1433,6 +1421,24 @@ pub fn column_exists(conn: &Connection, table: &str, column: &str) -> rusqlite::
         }
     }
     Ok(false)
+}
+
+/// Whether a `kind`-typed object (`"table"`, `"index"`, …) named `name` exists in `sqlite_master`.
+/// A plain table and an FTS5 virtual table both register as `type = 'table'`, so `"table"` finds
+/// either.
+pub(crate) fn sqlite_object_exists(
+    conn: &Connection,
+    kind: &str,
+    name: &str,
+) -> rusqlite::Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            [kind, name],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 /// V027 (#77 Phase 2): retire the `chunks.text` column — the irreversible payoff step. A fresh DB's
@@ -2526,19 +2532,6 @@ pub(crate) fn apply_github_natural_key_widening(conn: &Connection) -> rusqlite::
     conn.execute_batch("COMMIT;")
 }
 
-/// Whether a `type`-kind object named `name` exists in `sqlite_master` — the V044 sentinel probe
-/// (an index, but generic so the same helper reads for a table if a later widening needs it).
-fn sqlite_object_exists(conn: &Connection, kind: &str, name: &str) -> rusqlite::Result<bool> {
-    Ok(conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
-            [kind, name],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some())
-}
-
 /// Rebuild `github_issues` dropping the inline `UNIQUE(owner, repo, number)` and adding a NAMED
 /// unique index `(repo_id, owner, repo, number)` (the V044 sentinel + the `store_item` `ON
 /// CONFLICT` target). The full V041 column set (through `repo_id`) is reproduced verbatim; `id`
@@ -2762,18 +2755,8 @@ const MEMORY_REALITY_TABLE: &str = "memory_reality";
 /// hold only regenerable data, so a drop-and-recreate is always safe here).
 pub fn apply_memory_verification_tables(conn: &Connection) -> rusqlite::Result<()> {
     // All-or-nothing sentinel (see the doc comment): both CREATEs commit atomically, so
-    // `memory_reality` present means the whole migration already ran. Probes `sqlite_master`
-    // directly (a `rusqlite::Result`, like V044's `sqlite_object_exists`) so the ladder's
-    // `rusqlite::Result` apply signature carries no `anyhow` conversion.
-    let sentinel_present = conn
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
-            [MEMORY_REALITY_TABLE],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if sentinel_present {
+    // `memory_reality` present means the whole migration already ran.
+    if sqlite_object_exists(conn, "table", MEMORY_REALITY_TABLE)? {
         return Ok(());
     }
     conn.execute_batch("BEGIN IMMEDIATE;")?;
@@ -5448,12 +5431,8 @@ pub fn apply_distill_anchor_selection(conn: &Connection) -> rusqlite::Result<()>
     // Key the backfill guard to its completion artifact, not merely column presence. If a process
     // dies after ADD COLUMN (whose default makes every legacy row ordinal 0) but before the
     // backfill/index, replay must backfill again rather than fail forever on duplicate ordinals.
-    let candidate_index_exists: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master
-         WHERE type = 'index' AND name = 'idx_papertrail_distill_anchors_candidate'",
-        [],
-        |row| row.get(0),
-    )?;
+    let candidate_index_exists =
+        sqlite_object_exists(conn, "index", "idx_papertrail_distill_anchors_candidate")?;
     add_column_if_missing(
         conn,
         "papertrail_distill_anchors",
@@ -5466,7 +5445,7 @@ pub fn apply_distill_anchor_selection(conn: &Connection) -> rusqlite::Result<()>
         "selected",
         "INTEGER NOT NULL DEFAULT 0 CHECK(selected IN (0, 1))",
     )?;
-    if candidate_index_exists == 0 {
+    if !candidate_index_exists {
         conn.execute_batch(
             "
         UPDATE papertrail_distill_anchors AS anchor
@@ -7902,11 +7881,7 @@ pub fn apply_file_graph_version_provenance(conn: &Connection) -> rusqlite::Resul
     let had_scope_version = column_exists(conn, "files", "scope_version")?;
     add_column_if_missing(conn, "files", "graph_version", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(conn, "files", "scope_version", "INTEGER NOT NULL DEFAULT 0")?;
-    let has_repo_meta = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'repo_meta')",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
+    let has_repo_meta = sqlite_object_exists(conn, "table", "repo_meta")?;
     if !had_graph_version && column_exists(conn, "files", "repo_id")? && has_repo_meta {
         conn.execute(
             "UPDATE files
@@ -8916,13 +8891,7 @@ pub fn apply_memory_binding_resolution(conn: &Connection) -> rusqlite::Result<()
 /// later in the ladder — a store replaying from before it has nothing to widen yet, and reaches the
 /// column through the owning migration on the way to the tip.
 pub(crate) fn ensure_content_projection_shape(conn: &Connection) -> rusqlite::Result<()> {
-    let projected_nodes_exist: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
-         'content_projected_nodes')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !projected_nodes_exist {
+    if !sqlite_object_exists(conn, "table", "content_projected_nodes")? {
         return Ok(());
     }
     add_column_if_missing(conn, "content_projected_nodes", "anchors_json", "TEXT")?;
