@@ -27,8 +27,9 @@ use serde::Serialize;
 use super::{EdgeLooseIdentity, resolve};
 
 /// The authoritative "resolves nowhere" verdict, emitted only when the note's binding proves the
-/// searched domain is live and covered.
-const NOT_FOUND: &str = "NOT FOUND anywhere in the source tree";
+/// searched domain is live and covered. Public because the dream divergence guard recognizes an
+/// absence row by this exact label.
+pub const NOT_FOUND: &str = "NOT FOUND anywhere in the source tree";
 /// The resolution for a code-shaped-but-unresolved span that is uninformative — a paraphrase,
 /// snippet, or flag whose non-match is a shape artifact, NEVER evidence of divergence.
 const UNRESOLVABLE: &str = "not a resolvable identifier (no symbol, file, or verbatim-text match)";
@@ -42,7 +43,10 @@ const MEM_XREF: &str = "a cross-reference to another repo memory (not a code ent
 /// The verbatim-text label for a present-but-not-a-defined-symbol span (a table/column name, a
 /// local, an expression). Shared by the general text tier and the ambiguous mem-id prefix arm so
 /// the label (and thus the churn-key string) can't drift between the two paths.
-const TEXT_PRESENT_SYMBOL: &str = "not a defined symbol; appears verbatim as source text";
+pub const TEXT_PRESENT_SYMBOL: &str = "not a defined symbol; appears verbatim as source text";
+/// The verbatim-text label for a path-shaped span that is not an indexed file but appears verbatim
+/// in source — the file twin of [`TEXT_PRESENT_SYMBOL`].
+pub const TEXT_PRESENT_FILE: &str = "not an indexed file; appears verbatim only as source text";
 /// Context lines above/below an identifier hit in a bound-file excerpt window.
 const EXCERPT_RADIUS: i64 = 3;
 /// Upper bound on the total excerpt lines an evidence pack carries (keeps a single-turn verdict
@@ -831,7 +835,7 @@ fn resolve_identifier(
             // label symmetric to the symbol case; a name / expression keeps the
             // symbol-oriented one.
             let label = if is_file_path_shaped(ident, file_paths) {
-                "not an indexed file; appears verbatim only as source text"
+                TEXT_PRESENT_FILE
             } else {
                 TEXT_PRESENT_SYMBOL
             };

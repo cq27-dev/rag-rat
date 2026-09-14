@@ -557,19 +557,24 @@ fn verdict_is_grounded(
 
     let content: Vec<String> =
         pack_text.lines().filter(|line| is_pack_content_line(line)).map(normalize_ws).collect();
+    // The resolver owns the resolution labels; `render_pack` joins each to its identifier with an
+    // arrow (`->`).
+    let absent_row = format!("-> {}", verify::NOT_FOUND);
+    let text_present_symbol_row = format!("-> {}", verify::TEXT_PRESENT_SYMBOL);
+    let text_present_file_row = format!("-> {}", verify::TEXT_PRESENT_FILE);
     parsed.evidence.iter().any(|evidence| {
         let cite = normalize_ws(evidence);
         content.iter().any(|line| {
             line.contains(&cite)
-                && !line.contains("-> not a defined symbol; appears verbatim as source text")
-                && !line.contains("-> not an indexed file; appears verbatim only as source text")
+                && !line.contains(&text_present_symbol_row)
+                && !line.contains(&text_present_file_row)
                 && match identifier_from_pack_line(line) {
                     // An identifier row grounds divergence only as ABSENCE evidence the citation
                     // actually names: a `symbol`/`file` PRESENCE row never contradicts a claim on
                     // its own, and a bare resolution-label citation (`NOT FOUND …`) convicts
                     // whatever row it substring-matches without naming an identifier.
                     Some(ident) =>
-                        line.contains("-> NOT FOUND")
+                        line.contains(&absent_row)
                             && cite.contains(ident)
                             && claim_mentions_identifier(&claim, ident),
                     // Excerpts remain useful model context, but subject overlap cannot
@@ -1913,6 +1918,50 @@ mod tests {
             !verdict_is_grounded("note", &note, &pack, &parsed),
             "identifier length alone does not make it a load-bearing claim"
         );
+    }
+
+    #[test]
+    fn divergence_guard_matches_the_resolution_labels_the_resolver_emits() {
+        // The guard recognizes absence and presence rows by the resolver's own labels. The pack is
+        // rendered from those consts, so a reworded label fails here instead of silently stopping
+        // every `diverged` verdict from being accepted.
+        let note = "The `gone_symbol` function remains available to callers.";
+        let grounded_under = |resolution: &str, kind| {
+            let pack = render_pack(&EvidencePack {
+                memory_id: "m1".to_string(),
+                identifiers: vec![verify::IdentifierResolution {
+                    identifier: "gone_symbol".to_string(),
+                    resolution: resolution.to_string(),
+                    kind,
+                }],
+                excerpts: Vec::new(),
+                has_live_binding: false,
+            });
+            let parsed = parse_verdict(&format!(
+                "VERDICT: diverged\nDIRECTION: code_ahead\nCLAIM: {note}\nEVIDENCE:\n- \
+                 `gone_symbol` -> {resolution}\nREASON: gone."
+            ))
+            .unwrap();
+            verdict_is_grounded("note", note, &pack, &parsed)
+        };
+        assert!(
+            grounded_under(verify::NOT_FOUND, ResolutionKind::Absent),
+            "the resolver's absence label grounds a divergence"
+        );
+        assert!(
+            !grounded_under(verify::TEXT_PRESENT_SYMBOL, ResolutionKind::TextPresent),
+            "the resolver's symbol text-presence label never grounds a divergence"
+        );
+        assert!(
+            !grounded_under(verify::TEXT_PRESENT_FILE, ResolutionKind::TextPresent),
+            "the resolver's file text-presence label never grounds a divergence"
+        );
+        for label in [verify::NOT_FOUND, verify::TEXT_PRESENT_SYMBOL, verify::TEXT_PRESENT_FILE] {
+            assert!(
+                VERDICT_PROMPT_HEAD.contains(label),
+                "the prompt explains the `{label}` resolution verbatim"
+            );
+        }
     }
 
     #[test]
