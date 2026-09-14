@@ -52,10 +52,6 @@ use crate::providers::Embedder;
 /// The env var carrying the cookbook's JSON input. The recipe reads + parses it at startup.
 pub const COOKBOOK_INPUT_ENV: &str = "RAG_RAT_COOKBOOK_INPUT";
 
-/// How long to wait for the handshake before giving up on provisioning. Cold-starting a GPU sandbox
-/// + pulling a model can take a couple of minutes; 5 minutes is a generous ceiling.
-const PROVISION_TIMEOUT: Duration = Duration::from_secs(300);
-
 /// The gap between the RECIPE's own provisioning budget ([`CookbookInput::provision_timeout_s`])
 /// and the Rust-side handshake deadline: the input builders set the recipe budget this far UNDER
 /// the deadline so the recipe times out (clean provider-side teardown) BEFORE the Rust SIGKILL
@@ -138,23 +134,31 @@ pub fn install_provision_log_sink(tx: mpsc::Sender<String>) -> ProvisionLogSinkG
     ProvisionLogSinkGuard { previous }
 }
 
+/// What an ephemeral box SERVES — the cookbook contract's `capability` token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CookbookCapability {
+    /// `"embed"`: `/v1/embeddings` (the readiness probe posts an embeddings request).
+    Embed,
+    /// `"chat"`: `/v1/chat/completions` (generation — the dream / distill model). Only
+    /// [`RemoteBackend::supports_chat`] backends serve it; config rejects `infinity` for chat
+    /// before it reaches here.
+    Chat,
+}
+
 /// The JSON written to `RAG_RAT_COOKBOOK_INPUT` for the cookbook subprocess.
 #[derive(Debug, Clone, Serialize)]
 pub struct CookbookInput {
     /// The server-side model name the box should serve (the `[remote] model`): an ollama model
     /// name for the ollama backend, or a HuggingFace model id for infinity/vLLM.
     pub model: String,
-    /// Which backend the recipe should provision — the `RemoteBackend::as_db_str` of the
-    /// configured backend (`ollama`/`infinity`/`vllm`). Selects the recipe's image, launch
-    /// command, port, serving route, and model-load strategy.
-    pub backend: &'static str,
-    /// What the box should SERVE: `"embed"` (`/v1/embeddings`, the readiness probe posts an
-    /// embeddings request) or `"chat"` (`/v1/chat/completions`, generation — the dream verdict /
-    /// compaction model). The backend's launch args + readiness probe branch on this: `vllm` drops
-    /// its `--runner pooling` (embedding) flag for chat, and only chat-capable backends
-    /// (`ollama`/`vllm`) accept `"chat"` — config rejects `infinity` for chat before it reaches
-    /// here.
-    pub capability: &'static str,
+    /// Which backend the recipe should provision, serialized as its lowercase token
+    /// (`ollama`/`infinity`/`vllm`). Selects the recipe's image, launch command, port, serving
+    /// route, and model-load strategy.
+    pub backend: RemoteBackend,
+    /// What the box should SERVE. The backend's launch args + readiness probe branch on this:
+    /// `vllm` drops its `--runner pooling` (embedding) flag for chat.
+    pub capability: CookbookCapability,
     /// Per-REQUEST HTTP timeout the cookbook may forward to its box config — the
     /// `OpenAiEmbedder`'s per-request budget. UNRELATED to provisioning; do NOT use it as the
     /// boot budget.
@@ -163,8 +167,8 @@ pub struct CookbookInput {
     /// box, pulling the model, and verifying it serves before giving up. Decoupled from
     /// `request_timeout_s` because remote boot + model pull over the proxy takes MINUTES, not the
     /// ~60s per-request default (the live RunPod e2e timed out at 60s). Set just UNDER the
-    /// Rust-side hard [`PROVISION_TIMEOUT`] so the recipe's own budget expires first (a
-    /// cleaner provider-side teardown) before the Rust SIGKILL backstop fires.
+    /// Rust-side handshake deadline (`provision_deadline`) so the recipe's own budget expires
+    /// first (a cleaner provider-side teardown) before the Rust SIGKILL backstop fires.
     pub provision_timeout_s: u64,
     /// GPU hint for the recipe (e.g. `"T4"`); `None` lets the recipe decide. Carried as JSON
     /// `null` when absent so the contract field is always present.
@@ -285,7 +289,8 @@ impl CookbookProvisioner {
     /// handshake (the box is serving). Non-handshake stdout + all stderr are forwarded to
     /// rag-rat's stderr (the crate convention). On the handshake, returns a live
     /// [`ProvisionedBox`] whose `Drop` reclaims the box. Errors when the child exits before the
-    /// handshake (with its captured stderr) or when [`PROVISION_TIMEOUT`] elapses.
+    /// handshake (with its captured stderr) or when the handshake deadline (`provision_deadline`)
+    /// elapses.
     ///
     /// `cookbook` resolution: a `.mjs`/`.js` path → `node <path>`; a `.ts` path → `npx tsx <path>`;
     /// anything else → `npx -y <cookbook>` (an npm package spec).
@@ -562,17 +567,15 @@ fn teardown_timed_out_cookbook(child: &mut Child) {
 }
 
 /// The Rust-side handshake deadline for [`CookbookProvisioner::provision`]. The floor is
-/// backend-aware (vLLM's huge image needs longer than ollama/infinity; the default covers an
-/// unrecognized backend). A larger `provision_timeout_s` (the distill 30B box, whose weight pull
-/// exceeds the vLLM default) EXTENDS the deadline past that floor — we add back the teardown margin
-/// the input builder subtracted, so the recipe budget still expires ~20s first (clean provider
-/// teardown before the Rust SIGKILL backstop). The override can only lengthen the deadline, never
-/// starve a box below its backend floor.
+/// backend-aware (vLLM's huge image needs longer than ollama/infinity). A larger
+/// `provision_timeout_s` (the distill 30B box, whose weight pull exceeds the vLLM default) EXTENDS
+/// the deadline past that floor — we add back the teardown margin the input builder subtracted, so
+/// the recipe budget still expires ~20s first (clean provider teardown before the Rust SIGKILL
+/// backstop). The override can only lengthen the deadline, never starve a box below its backend
+/// floor.
 fn provision_deadline(input: &CookbookInput) -> Duration {
-    let backend_floor = RemoteBackend::from_db_str(input.backend)
-        .map_or(PROVISION_TIMEOUT, RemoteBackend::provision_timeout);
     Duration::from_secs(input.provision_timeout_s + PROVISION_TEARDOWN_MARGIN_SECS)
-        .max(backend_floor)
+        .max(input.backend.provision_timeout())
 }
 
 /// Build the `CookbookInput` (the env-passed provisioning request) from an ephemeral remote config.
@@ -583,10 +586,10 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
         model: remote.model.trim().to_string(),
         // The selected backend routes the recipe's image/launch/port/route; the embed wire call is
         // identical across all three.
-        backend: remote.backend.as_db_str(),
+        backend: remote.backend,
         // Embedding path: serve the `/v1/embeddings` API (readiness probe posts an embeddings
-        // request). The dream path passes `"chat"`.
-        capability: "embed",
+        // request). The dream path passes `Chat`.
+        capability: CookbookCapability::Embed,
         request_timeout_s: remote.request_timeout_s,
         // Give the recipe a provisioning budget just under the Rust hard ceiling (backend-aware:
         // vLLM's large image needs longer), so ITS budget runs out first (clean provider-side
@@ -1297,8 +1300,8 @@ mod tests {
     fn input() -> CookbookInput {
         CookbookInput {
             model: "all-minilm".to_string(),
-            backend: "ollama",
-            capability: "embed",
+            backend: RemoteBackend::Ollama,
+            capability: CookbookCapability::Embed,
             request_timeout_s: 30,
             provision_timeout_s: 280,
             gpu: None,
@@ -1317,7 +1320,7 @@ mod tests {
         // must EXTEND the Rust deadline to 1500s — otherwise the box is SIGKILLed at the vLLM
         // default (900s) long before the 30B weights finish pulling.
         let big = CookbookInput {
-            backend: "vllm",
+            backend: RemoteBackend::Vllm,
             provision_timeout_s: 1500 - PROVISION_TEARDOWN_MARGIN_SECS,
             ..input()
         };
@@ -1329,13 +1332,14 @@ mod tests {
         );
 
         // A too-small override cannot starve a box below its backend floor (vLLM = 900s).
-        let tiny = CookbookInput { backend: "vllm", provision_timeout_s: 10, ..input() };
+        let tiny =
+            CookbookInput { backend: RemoteBackend::Vllm, provision_timeout_s: 10, ..input() };
         assert_eq!(provision_deadline(&tiny), RemoteBackend::Vllm.provision_timeout());
     }
 
     #[test]
     fn embedding_input_is_embed_capability_and_field_serializes() {
-        // The embedding config→input mapping pins `capability = "embed"`; the field must serialize
+        // The embedding config→input mapping pins `capability = Embed`; the field must serialize
         // into the recipe's JSON so a chat box (dream) is distinguishable from an embed box.
         let remote = RemoteEmbeddingConfig {
             model: "all-minilm".to_string(),
@@ -1343,12 +1347,19 @@ mod tests {
             query_endpoint: Some(rag_rat_base::config::DEFAULT_QUERY_ENDPOINT.to_string()),
             ..RemoteEmbeddingConfig::default()
         };
-        assert_eq!(cookbook_input_for(&remote).capability, "embed");
-        let mut chat = input();
-        chat.capability = "chat";
-        assert!(
-            serde_json::to_string(&chat).unwrap().contains("\"capability\":\"chat\""),
-            "capability serializes for the recipe"
+        let embed = cookbook_input_for(&remote);
+        assert_eq!(embed.capability, CookbookCapability::Embed);
+        assert_eq!(serde_json::to_value(&embed).unwrap()["capability"], "embed");
+        // The whole JSON the recipe parses is a cross-language contract: pin it byte-for-byte,
+        // `backend` and `capability` tokens included.
+        let chat = CookbookInput {
+            backend: RemoteBackend::Vllm,
+            capability: CookbookCapability::Chat,
+            ..input()
+        };
+        assert_eq!(
+            serde_json::to_string(&chat).unwrap(),
+            r#"{"model":"all-minilm","backend":"vllm","capability":"chat","request_timeout_s":30,"provision_timeout_s":280,"gpu":null,"num_ctx":null,"server_concurrency":32}"#,
         );
     }
 
@@ -1432,7 +1443,7 @@ mod tests {
         // The model is trimmed into the input regardless of gpu.
         assert_eq!(cookbook_input_for(&ephemeral(Some("A100"), 16)).model, "all-minilm");
         // Backend defaults to ollama and `num_ctx` is absent unless configured.
-        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).backend, "ollama");
+        assert_eq!(cookbook_input_for(&ephemeral(None, 16)).backend, RemoteBackend::Ollama);
         assert_eq!(cookbook_input_for(&ephemeral(None, 16)).num_ctx, None);
         // A configured backend + context window are forwarded verbatim.
         let infinity = RemoteEmbeddingConfig {
@@ -1443,7 +1454,7 @@ mod tests {
             num_ctx: Some(4096),
             ..RemoteEmbeddingConfig::default()
         };
-        assert_eq!(cookbook_input_for(&infinity).backend, "infinity");
+        assert_eq!(cookbook_input_for(&infinity).backend, RemoteBackend::Infinity);
         assert_eq!(cookbook_input_for(&infinity).num_ctx, Some(4096));
     }
 
@@ -1980,11 +1991,11 @@ mod tests {
 
     #[test]
     fn leak_safety_provision_timeout_tears_down_a_live_box() {
-        // Case 4 — a PROVISION_TIMEOUT while a box is LIVE. The stub never emits `ready` but spawns
-        // a SIGTERM-ignoring grandchild, so the Rust provision deadline fires with the box
-        // up. The timeout path must run the full `teardown_group` (R1: grace, not a hard
-        // SIGKILL-only) and reap the group — NOT return the timeout error while leaking the
-        // grandchild.
+        // Case 4 — a provisioning timeout while a box is LIVE. The stub never emits `ready` but
+        // spawns a SIGTERM-ignoring grandchild, so the Rust provision deadline fires with
+        // the box up. The timeout path must run the full `teardown_group` (R1: grace, not a
+        // hard SIGKILL-only) and reap the group — NOT return the timeout error while
+        // leaking the grandchild.
         let (_scratch, pidfile) = tmp("timeout-live-gc-pid");
         let _ = std::fs::remove_file(&pidfile);
         // The box is never returned (it never serves), so the grandchild's pidfile is our handle on

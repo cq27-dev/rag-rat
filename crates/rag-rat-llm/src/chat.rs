@@ -258,15 +258,15 @@ pub fn provision_chat_model(
 
 /// The remote-config → chat [`crate::CookbookInput`] mapping — the pure, unit-testable half of
 /// [`provision_chat_model`], mirroring the embedding `cookbook_input_for`. `capability` is pinned
-/// `"chat"`; the provisioning budget sits just under the Rust hard ceiling (backend-aware — vLLM's
+/// to `Chat`; the provisioning budget sits just under the Rust hard ceiling (backend-aware — vLLM's
 /// large image needs longer) so the recipe's own budget expires first (clean provider teardown)
 /// before the Rust SIGKILL backstop fires. Chat serving ignores `num_ctx` (an ollama-embedding
 /// knob) and needs only ONE server slot — the callers invoke the model sequentially.
 fn chat_cookbook_input(remote: &RemoteDreamConfig) -> crate::CookbookInput {
     crate::CookbookInput {
         model: remote.model.trim().to_string(),
-        backend: remote.backend.as_db_str(),
-        capability: "chat",
+        backend: remote.backend,
+        capability: crate::CookbookCapability::Chat,
         request_timeout_s: remote.request_timeout_s,
         provision_timeout_s: remote
             .resolved_provision_timeout()
@@ -464,8 +464,8 @@ mod http_tests {
             ..RemoteDreamConfig::default()
         };
         let input = chat_cookbook_input(&remote);
-        assert_eq!(input.capability, "chat", "provisions a CHAT box");
-        assert_eq!(input.backend, "vllm");
+        assert_eq!(input.capability, crate::CookbookCapability::Chat, "provisions a CHAT box");
+        assert_eq!(input.backend, RemoteBackend::Vllm);
         assert_eq!(input.model, "Qwen/Qwen3-8B");
         assert_eq!(input.gpu.as_deref(), Some("A10G"));
         assert_eq!(input.num_ctx, None);
