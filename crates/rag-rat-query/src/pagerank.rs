@@ -310,17 +310,56 @@ pub fn important_symbols(
     conn: &Connection,
     options: ImportanceOptions<'_>,
 ) -> anyhow::Result<RankedImportance> {
-    // Symbol→symbol edges in the active checkout whose SOURCE resolved, source file in the scope
-    // view. `name_strings` resolves the edge-kind and confidence ids to their names — the kind sets
-    // the base weight, the confidence scales it (a name-only guess flows less rank than a
-    // structurally-resolved call). `d.id` keys the optional SCIP-oracle effect lookup.
-    //
-    // We intentionally KEEP edges with a NULL target so a SCIP-oracle UPGRADE can still supply one:
-    // the compiler routinely resolves a `NameOnly`/unresolved heuristic edge (`to_symbol_id` NULL)
-    // to an in-corpus symbol, and that recovered call must contribute PageRank — filtering NULL
-    // targets here dropped exactly the upgrade cases the SCIP-aware ranking exists to capture (#142
-    // review P1). A NULL-target edge with no Retarget verdict carries no usable callee and is
-    // skipped in the loop below.
+    let rows = ranked_edge_rows(conn)?;
+    if rows.is_empty() {
+        return Ok(RankedImportance { symbols: Vec::new(), effective_seed_count: 0 });
+    }
+    let graph = build_adjacency(&rows, options.oracle_effects);
+    let (personalize, effective_seed_count) =
+        personalization(options.personalize_to, &graph.index_of, graph.symbol_ids.len());
+    let scores = pagerank(graph.symbol_ids.len(), &graph.out_edges, personalize.as_deref());
+
+    // Top-`limit` indices by score. `sort_by` is stable, so equal scores keep insertion order →
+    // deterministic output for a fixed index. Clamp to `MAX_RESULTS` so the hydration loop below is
+    // bounded regardless of the caller's `limit`.
+    let mut ranked: Vec<usize> = (0..graph.symbol_ids.len()).collect();
+    ranked.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(options.limit.min(MAX_RESULTS));
+
+    let symbols = hydrate_winners(conn, &graph.symbol_ids, &ranked, &scores)?;
+    Ok(RankedImportance { symbols, effective_seed_count })
+}
+
+/// One edge the ranking reads: its id (keying the optional oracle effect), its resolved source,
+/// its heuristic target (`None` when the resolver found none), and its kind and confidence names.
+struct EdgeRow {
+    edge_id: i64,
+    from: i64,
+    to: Option<i64>,
+    kind: String,
+    confidence: String,
+}
+
+/// The graph PageRank runs over: symbol ids interned to a dense `0..n` index space (`symbol_ids`
+/// maps an index back to its id, `index_of` the reverse), and each node's weighted out-edges.
+struct SymbolGraph {
+    symbol_ids: Vec<i64>,
+    index_of: HashMap<i64, usize>,
+    out_edges: Adjacency,
+}
+
+/// Symbol→symbol edges in the active checkout whose SOURCE resolved, source file in the scope
+/// view. `name_strings` resolves the edge-kind and confidence ids to their names — the kind sets
+/// the base weight, the confidence scales it (a name-only guess flows less rank than a
+/// structurally-resolved call). `d.id` keys the optional SCIP-oracle effect lookup.
+///
+/// We intentionally KEEP edges with a NULL target so a SCIP-oracle UPGRADE can still supply one:
+/// the compiler routinely resolves a `NameOnly`/unresolved heuristic edge (`to_symbol_id` NULL) to
+/// an in-corpus symbol, and that recovered call must contribute PageRank — filtering NULL targets
+/// here dropped exactly the upgrade cases the SCIP-aware ranking exists to capture (#142 review
+/// P1). A NULL-target edge with no Retarget verdict carries no usable callee and is skipped by
+/// [`build_adjacency`].
+fn ranked_edge_rows(conn: &Connection) -> anyhow::Result<Vec<EdgeRow>> {
     let mut stmt = conn.prepare(
         "SELECT d.id, d.from_symbol_id, d.to_symbol_id, ek.value, cf.value
          FROM edges_data d
@@ -336,20 +375,25 @@ pub fn important_symbols(
     )?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-            ))
+            Ok(EdgeRow {
+                edge_id: row.get(0)?,
+                from: row.get(1)?,
+                to: row.get(2)?,
+                kind: row.get(3)?,
+                confidence: row.get(4)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    if rows.is_empty() {
-        return Ok(RankedImportance { symbols: Vec::new(), effective_seed_count: 0 });
-    }
+    Ok(rows)
+}
 
-    // Map symbol ids to a dense 0..n index space.
+/// Intern the edge endpoints into a dense index space and build the weighted adjacency, applying
+/// each edge's SCIP verdict where there is one. `load_bearing::in_edge_contribution` mirrors this
+/// per-edge logic for the scoped fan-in, so the two scales agree on what a verdict does.
+fn build_adjacency(
+    rows: &[EdgeRow],
+    effects: Option<&HashMap<i64, EdgeOracleEffect>>,
+) -> SymbolGraph {
     let mut index_of: HashMap<i64, usize> = HashMap::new();
     let mut symbol_ids: Vec<i64> = Vec::new();
     let intern = |id: i64, index_of: &mut HashMap<i64, usize>, ids: &mut Vec<i64>| -> usize {
@@ -359,14 +403,14 @@ pub fn important_symbols(
         })
     };
     let mut out_edges: Adjacency = Vec::new();
-    for (edge_id, from, to, kind, confidence) in &rows {
+    for EdgeRow { edge_id, from, to, kind, confidence } in rows {
         // Apply the SCIP verdict, if any: drop a contradicted/external edge entirely, retarget an
         // upgrade to the compiler's resolved symbol, and weight a confirmed/upgraded edge at the
         // compiler tier. Absent a verdict, fall back to heuristic confidence weighting. A Retarget
         // supplies a target even when the heuristic edge had none (NULL `to`); Confirm and the
         // heuristic path need an existing target, so a NULL-target edge without a Retarget is
         // skipped (no usable callee).
-        let (to_id, weight) = match options.oracle_effects.and_then(|m| m.get(edge_id)) {
+        let (to_id, weight) = match effects.and_then(|m| m.get(edge_id)) {
             Some(EdgeOracleEffect::Drop) => continue,
             Some(EdgeOracleEffect::Retarget(resolved)) =>
                 (*resolved, edge_weight(kind) * COMPILER_FACTOR),
@@ -387,42 +431,46 @@ pub fn important_symbols(
         out_edges[from_idx].push((to_idx, weight));
     }
     out_edges.resize_with(symbol_ids.len(), Vec::new);
+    SymbolGraph { symbol_ids, index_of, out_edges }
+}
 
-    // Personalization: 1.0 on each seed symbol that is present in the graph, else uniform.
-    // `effective_seed_count` is how many seeds actually landed as graph nodes — the caller uses it
-    // to avoid labeling a ranking "personalized" when no seed had any effect (#142 review).
+/// Personalization: 1.0 on each seed symbol that is present in the graph, else uniform (`None`).
+/// The count is how many seeds actually landed as graph nodes — the caller uses it to avoid
+/// labeling a ranking "personalized" when no seed had any effect (#142 review).
+fn personalization(
+    seeds: &[i64],
+    index_of: &HashMap<i64, usize>,
+    n: usize,
+) -> (Option<Vec<f64>>, u64) {
+    if seeds.is_empty() {
+        return (None, 0);
+    }
     let mut effective_seed_count: u64 = 0;
-    let personalize: Option<Vec<f64>> = if options.personalize_to.is_empty() {
-        None
-    } else {
-        let mut vector = vec![0.0_f64; symbol_ids.len()];
-        for id in options.personalize_to {
-            if let Some(&idx) = index_of.get(id)
-                && vector[idx] == 0.0
-            {
-                vector[idx] = 1.0;
-                effective_seed_count += 1;
-            }
+    let mut vector = vec![0.0_f64; n];
+    for id in seeds {
+        if let Some(&idx) = index_of.get(id)
+            && vector[idx] == 0.0
+        {
+            vector[idx] = 1.0;
+            effective_seed_count += 1;
         }
-        (effective_seed_count > 0).then_some(vector)
-    };
+    }
+    ((effective_seed_count > 0).then_some(vector), effective_seed_count)
+}
 
-    let scores = pagerank(symbol_ids.len(), &out_edges, personalize.as_deref());
-
-    // Top-`limit` indices by score. `sort_by` is stable, so equal scores keep insertion order →
-    // deterministic output for a fixed index. Clamp to `MAX_RESULTS` so the hydration loop below is
-    // bounded regardless of the caller's `limit`.
-    let mut ranked: Vec<usize> = (0..symbol_ids.len()).collect();
-    ranked.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(options.limit.min(MAX_RESULTS));
-
-    // Hydrate the winners with symbol metadata. Joining `symbols` to the per-connection `files`
-    // scope view keeps hydration scope-consistent with the edge query: a winner whose file isn't in
-    // the active checkout drops out instead of emitting an empty path. Endpoints are active-scope
-    // by the edge re-resolution invariant, so this rarely fires — when it does, the result is
-    // shorter than `limit` rather than wrong.
+/// Hydrate the winners with symbol metadata. Joining `symbols` to the per-connection `files` scope
+/// view keeps hydration scope-consistent with the edge query: a winner whose file isn't in the
+/// active checkout drops out instead of emitting an empty path. Endpoints are active-scope by the
+/// edge re-resolution invariant, so this rarely fires — when it does, the result is shorter than
+/// `limit` rather than wrong.
+fn hydrate_winners(
+    conn: &Connection,
+    symbol_ids: &[i64],
+    ranked: &[usize],
+    scores: &[f64],
+) -> anyhow::Result<Vec<SymbolImportance>> {
     let mut out = Vec::with_capacity(ranked.len());
-    for idx in ranked {
+    for &idx in ranked {
         let symbol_id = symbol_ids[idx];
         let row = conn
             .query_row(
@@ -453,7 +501,7 @@ pub fn important_symbols(
             score: scores[idx],
         });
     }
-    Ok(RankedImportance { symbols: out, effective_seed_count })
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -462,6 +510,62 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    /// `load_bearing::in_edge_contribution` mirrors `build_adjacency`'s per-edge verdict logic so
+    /// the fan-in and PageRank scales agree on what a verdict does. For an edge whose heuristic
+    /// target is `S`, the weight the graph routes INTO `S` must be the contribution the fan-in
+    /// counts for it — under every verdict, including a retarget away from `S`.
+    #[test]
+    fn build_adjacency_agrees_with_in_edge_contribution_for_every_verdict() {
+        const TARGET: i64 = 10;
+        const CALLER: i64 = 20;
+        const ELSEWHERE: i64 = 30;
+        for effect in [
+            None,
+            Some(EdgeOracleEffect::Drop),
+            Some(EdgeOracleEffect::Confirm),
+            Some(EdgeOracleEffect::Retarget(TARGET)),
+            Some(EdgeOracleEffect::Retarget(ELSEWHERE)),
+        ] {
+            for (kind, confidence) in [
+                ("calls_name", "NameOnly"),
+                ("constructs", "Exact"),
+                ("references_type", "Syntactic"),
+            ] {
+                let row = EdgeRow {
+                    edge_id: 1,
+                    from: CALLER,
+                    to: Some(TARGET),
+                    kind: kind.to_string(),
+                    confidence: confidence.to_string(),
+                };
+                let effects: HashMap<i64, EdgeOracleEffect> =
+                    effect.into_iter().map(|effect| (row.edge_id, effect)).collect();
+                let graph = build_adjacency(std::slice::from_ref(&row), Some(&effects));
+                let into_target: f64 = graph.index_of.get(&TARGET).map_or(0.0, |&target| {
+                    graph
+                        .out_edges
+                        .iter()
+                        .flatten()
+                        .filter(|(to, _)| *to == target)
+                        .map(|(_, weight)| weight)
+                        .sum()
+                });
+                let fan_in = crate::load_bearing::in_edge_weight_for_test(
+                    kind,
+                    confidence,
+                    row.edge_id,
+                    TARGET,
+                    &crate::load_bearing::OracleContext { effects: Some(&effects) },
+                );
+                assert_eq!(
+                    into_target,
+                    fan_in.unwrap_or(0.0),
+                    "{kind}/{confidence} under {effect:?}"
+                );
+            }
+        }
+    }
 
     fn approx_desc(scores: &[f64]) -> Vec<usize> {
         let mut idx: Vec<usize> = (0..scores.len()).collect();
