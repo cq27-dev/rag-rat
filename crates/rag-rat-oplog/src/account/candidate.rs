@@ -5,7 +5,7 @@
 //! self-contained [`super::cut::beyond`] handles). They are pure functions of a [`HeaderView`] —
 //! the fold implements it over its candidate map; tests implement it over a small `HashMap`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use super::AccountId;
@@ -13,12 +13,64 @@ use super::branch::{self, AncestryRelation, UnknownAncestry, WalkEnd};
 use super::cut::Cut;
 use super::envelope::AccountEntryHeader;
 use super::id::AccountEntryHash;
+use super::ops::DeviceCut;
 use crate::op::DeviceFingerprint;
 
 /// A read view over candidate entries keyed by `entry_hash` — the seam the ancestry walk and cut
 /// binding use without depending on the fold's storage.
 pub(super) trait HeaderView {
     fn header(&self, entry_hash: &AccountEntryHash) -> Option<&AccountEntryHeader>;
+}
+
+/// A frontier is usable only after every named branch reaches its exact seq-zero origin.
+/// Missing evidence never exposes a partial set that a caller could accidentally credit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum FrontierError {
+    NonCanonical,
+    MissingEvidence(AccountEntryHash),
+    InvalidBranch(AccountEntryHash),
+}
+
+/// Resolve a sorted, unique control frontier to its exact predecessor set. This proves branch
+/// membership, not authority: callers must separately establish which members were effective in
+/// the signed pre-cut view. In particular, a later descendant or an equal-sequence fork cannot
+/// enter this set merely because it is held by the receiver.
+pub(super) fn resolve_control_frontier(
+    account: AccountId,
+    frontier: &[DeviceCut],
+    view: &dyn HeaderView,
+) -> Result<HashSet<AccountEntryHash>, FrontierError> {
+    if frontier
+        .windows(2)
+        .any(|pair| pair[0].device_fingerprint.to_bytes() >= pair[1].device_fingerprint.to_bytes())
+    {
+        return Err(FrontierError::NonCanonical);
+    }
+    let mut resolved = HashSet::new();
+    for head in frontier {
+        let mut hash = head.hash;
+        let mut expected_seq = head.seq;
+        loop {
+            let header = view.header(&hash).ok_or(FrontierError::MissingEvidence(hash))?;
+            if header.account_id != account
+                || header.log_id != super::fold::CONTROL_LOG
+                || header.device_fingerprint != head.device_fingerprint
+                || header.seq != expected_seq
+                || !resolved.insert(hash)
+            {
+                return Err(FrontierError::InvalidBranch(hash));
+            }
+            match (expected_seq.checked_sub(1), header.prev_hash) {
+                (None, None) => break,
+                (Some(seq), Some(prev)) => {
+                    expected_seq = seq;
+                    hash = prev;
+                },
+                _ => return Err(FrontierError::InvalidBranch(hash)),
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 impl HeaderView for HashMap<AccountEntryHash, AccountEntryHeader> {
@@ -311,6 +363,64 @@ mod tests {
         assert_eq!(
             ancestry(&[0x0a; 32].into(), &cut, &view),
             Ancestry::Unknown(UnknownCause::IncompleteCutAncestry),
+        );
+    }
+
+    #[test]
+    fn frontier_is_exact_and_later_forks_and_descendants_cannot_expand_it() {
+        let mut view = linear_chain();
+        let account = AccountId::from_bytes([0xaa; 32]);
+        let head = DeviceCut {
+            device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
+            seq: 1,
+            hash: [0x0b; 32].into(),
+        };
+        let expected = HashSet::from([[0x0a; 32].into(), [0x0b; 32].into()]);
+        assert_eq!(
+            resolve_control_frontier(account, std::slice::from_ref(&head), &view),
+            Ok(expected.clone())
+        );
+        insert_chain_entry(&mut view, [0x01; 32].into(), 1, Some([0x0a; 32].into()));
+        insert_chain_entry(&mut view, [0x02; 32].into(), 3, Some([0x0c; 32].into()));
+        assert_eq!(resolve_control_frontier(account, &[head], &view), Ok(expected));
+        assert_eq!(resolve_control_frontier(account, &[], &view), Ok(HashSet::new()));
+    }
+
+    #[test]
+    fn frontier_requires_every_link_and_exact_coordinates() {
+        let view = linear_chain();
+        let account = AccountId::from_bytes([0xaa; 32]);
+        let head = DeviceCut {
+            device_fingerprint: DeviceFingerprint::from_bytes([0xbb; 32]),
+            seq: 2,
+            hash: [0x0c; 32].into(),
+        };
+        for missing in [head.hash, [0x0b; 32].into(), [0x0a; 32].into()] {
+            let mut incomplete = view.clone();
+            incomplete.remove(&missing);
+            assert_eq!(
+                resolve_control_frontier(account, std::slice::from_ref(&head), &incomplete),
+                Err(FrontierError::MissingEvidence(missing)),
+            );
+        }
+        for field in 0..5 {
+            let mut forged = view.clone();
+            let header = forged.get_mut(&AccountEntryHash::from_bytes([0x0b; 32])).unwrap();
+            match field {
+                0 => header.account_id = AccountId::from_bytes([0x11; 32]),
+                1 => header.log_id = 1,
+                2 => header.device_fingerprint = DeviceFingerprint::from_bytes([0x11; 32]),
+                3 => header.seq = u64::MAX,
+                _ => header.prev_hash = None,
+            }
+            assert!(matches!(
+                resolve_control_frontier(account, std::slice::from_ref(&head), &forged),
+                Err(FrontierError::InvalidBranch(_)),
+            ));
+        }
+        assert_eq!(
+            resolve_control_frontier(account, &[head.clone(), head], &view),
+            Err(FrontierError::NonCanonical),
         );
     }
 

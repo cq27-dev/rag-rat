@@ -4,6 +4,55 @@ Status: implementation plan for #1311. V2 is not implemented or enabled. Existin
 on v1. The compatibility decision is an explicit account upgrade that preserves signed v1 history;
 upgraded peers are required to apply subsequent revocations.
 
+## Checkpoint verification prerequisite
+
+`account/checkpoint.rs` implements proposal creation and verification only. It does not install a
+pin, change an account's authority projection, admit control v2, or implement bounded v2 credit.
+The public verifier requires an independently obtained `TrustedCheckpointPin` containing the
+account, certificate digest, and required control version 2. A certificate authorized at a
+historical view is insufficient without that external digest. All existing peers, enrollment,
+and recovery must eventually receive the same permanent pin; receiving a certificate from a peer
+does not establish that trust.
+
+The standalone certificate is deliberately outside the control chain. Its canonical CBOR body is:
+
+```text
+["rag-rat/control-checkpoint/1", account_id, 2, genesis_hash,
+ evidence_digest, legacy_projection_hash, signer_ed25519_key, signer_owner_incarnation]
+```
+
+Its transport is `["rag-rat/control-checkpoint-signed/1", body_bytes, ed25519_signature]`, where
+the signature covers the exact body bytes and the externally pinned digest is SHA-256 of the
+complete canonical transport. Certificates are limited to 1024 bytes. The evidence commitment is
+SHA-256 of `["rag-rat/control-checkpoint-evidence/1", sorted_entry_hashes]`; each entry hash already
+commits to its signed account header and payload. Every supplied signature is independently
+verified. Duplicate entry hashes reject, including alternate signatures of one body.
+
+The bundle contains all declared authenticated v1 account candidates, including losing forks and
+non-control ancestry evidence. Proposal creation reads every held authenticated candidate in the
+caller's transaction, not just accepted rows; unauthenticated pre-verify rows are not evidence.
+The protocol limits are 4096 entries and 16 MiB of total signed evidence, separate from the
+certificate limit. Requests beyond these bounds fail without truncation. Missing/different
+evidence commitments return `MissingEvidence`, never a partially verified projection. These
+bounds cover this single legacy proof; future pre-cut view DAGs need their own aggregate limits.
+
+Verification uses the same v1 fold, coherent-branch selection, and authority closure as storage.
+It requires a live account, the exact genesis and projection commitment, and an open owner
+incarnation bound to the certificate signer. Exact continuation branches must reach their seq-zero
+origins with matching account/log/device coordinates and contiguous signed predecessor links.
+The opaque `VerifiedCheckpoint` exposes accepted entries, branch/authority-closure losers, all
+nonaccepted control entries, and continuation heads separately. These sets are diagnostic facts,
+not a sufficient v2 activation policy: nonaccepted legacy entries can still have register effects.
+
+Next prerequisites are immutable pin persistence outside derived projections, explicit unsupported
+authority gating, and trusted pin transfer through enrollment/recovery. Activation additionally
+requires frozen legacy outcomes, readiness and register-contributor admission: merely restricting
+v1 candidates or credit hashes lets later v2 traffic awaken parked v1 cuts. V2 authoring must extend
+the checkpoint's retained continuation tip and its admitted v2 descendants, never a held v1 suffix
+outside the boundary. Omitted legitimate v1 work must be reconciled before approval or reauthored
+under v2. No existing snapshot, refold, losing-fork elimination, or later signer revocation may
+replace the pin or reopen a historical branch.
+
 ## Why the victim's head is insufficient
 
 `revocation_credit` counts entries condemned by a revocation's registers and stale operations
@@ -49,42 +98,63 @@ Required rules:
 5. Collect the frontier from the same transactional view as the revocation's `auth_len`. Do not
    infer it from the receiving peer's tail or the final post-revocation projection.
 
-A frontier bounds later traffic, but is not by itself proof of the exact effective pre-cut set:
-its branch can contain entries that were already ineffective. Before calling the resulting credit
-*exact*, specify whether v2 replays the signed pre-cut view or signs an explicit set of creditable
-entry hashes. The latter has a larger payload cost. Both require missing-evidence and size-limit
-semantics. The watermark-only proposal does not settle this distinction.
+The selected exact-credit design, not yet implemented, signs a content-addressed `PreCutViewRef`
+bound to the checkpoint and semantics version, plus the canonical branch frontier. The view
+commits to its complete declared candidate input, including losing forks. `E(V)` is the effective
+accepted set from policy-aware production fold, branch selection, and authority closure over that
+complete input. V2 `auth_len` equals this accepted-authority count; it must not be substituted with
+the legacy fold's provisional effective count.
+
+Eligible losses are members of `E(V)` on the signed frontier, in the cut-local direct/transitive
+invalidation cone, that are no longer effective in the final policy-aware fold. Deduplicate them
+and exclude the revocation itself. A descendant mint seeds credit only when it is itself in `E(V)`
+and on the frontier. Existing signer/incarnation checks and concurrent-vouch ceilings remain.
+This is exact for the declared view, not a claim of complete global account knowledge. Explicit
+credit-hash lists are deferred: a verifier would still need to replay the view to validate them.
+
+Evaluate the content-addressed dependency closure iteratively and topologically, memoizing each
+unique `(checkpoint, semantics_version, view_digest)` once. Do not recursively fold once per cut
+without a shared cache. Protocol limits must bound total reachable unique views, evidence entries,
+evidence bytes, dependency depth, and frontier size. Missing dependencies park before registers or
+vouches; protocol-limit violations reject. Local scheduling exhaustion stays pending and never
+produces partial credit. Honest authoring references only already closed earlier views.
 
 ## Explicit account transition
 
-A process configuration flag or a new binary must not silently upgrade an account. An authorized,
-signed account transition must identify the legacy history boundary and the new required control
-version. Existing signed payloads, hashes, genesis/account identity and v1 decoding stay intact.
+The selected transition is a permanent externally trusted pin to one standalone signed checkpoint.
+A binary upgrade or configuration flag cannot upgrade an account. Account/genesis identity and
+signed v1 bytes remain unchanged. The checkpoint fixes the exact declared legacy evidence and
+projection; every existing peer, enrolling peer, and recovered peer must receive the same trusted
+digest. A conflicting pin refuses rather than replacing the installed one. Unsolicited alternate
+certificates cannot poison an installed pin.
 
-The transition needs an account-wide boundary, not merely monotonic versions on each author's
-chain. Otherwise another device can append a v1 revocation after the upgrade and bypass signed
-credit bounds. Legacy entries within the certified boundary must remain replayable; entries
-outside it must not silently extend the v1 authority view. A sequence-only boundary again cannot
-identify the retained branch.
+The certificate signer must be an open owner in the complete certified v1 view. That historical
+authorization validates the certificate but does not establish trust in it: the expected digest
+comes from explicit operator approval, a trusted transferred ticket, or recovery input. This
+external approval prevents an arbitrary formerly authorized owner from selecting an older view.
+Omitted v1 work must be reconciled before approval or reauthored under v2; v1 outside the certified
+boundary never extends upgraded authority.
 
-Before freezing transition bytes, define and test:
+The pin is authoritative external trust input, persisted outside derived roster/projection tables.
+It is not a cache inferred from historical signatures or a snapshot. Derived proof/projection data
+may be recomputed, but full replay must receive and retain the pin. Later revocation of the signer,
+purge of derived state, and branch-elimination passes cannot erase it or downgrade the account.
+Independent conflicting proposals require operator reconciliation before a common digest is
+approved; arrival order never chooses one.
 
-- **Authorization:** which owner incarnation can authorize the transition, against which complete
-  historical view, and why a previously revoked key cannot certify an older view to regain power.
-- **Concurrency:** how independently authored upgrades with different frontiers converge, and what
-  happens to v1 work authored concurrently but delivered after the transition. Arrival order or a
-  local database flag cannot decide this.
-- **Revocation and forks:** how later revocation of the upgrade signer or a conflicting branch
-  affects the upgrade. Recomputing owner authority must not silently downgrade the account.
-- **Incomplete delivery:** how the transition parks while its history is missing and how peers
-  distinguish an unsupported account version from a successfully current authority projection.
-- **Replay:** how a fresh database and an existing one derive the same version and boundary.
-  Persisted state is a cache of the signed transition, not a local source of authority.
+Activation will use full-history replay with frozen legacy policy, not a new state-seeded fold.
+Preserve the exact historical winning branches and permanently excluded fork/authority-closure
+losers, even after a v2 cut removes a historical winner. Freeze legacy outcomes/readiness,
+register-contributor admission, and freshness credit so additional v2 volume cannot activate a
+previously parked legacy cut. V2 may revoke historical authority, but cannot select a different
+historical branch. Plain `fold(v1 + v2)` is insufficient.
 
-These are open protocol details, not implemented guarantees. In particular, accepting any
-certificate that was authorized at an arbitrary historical frontier would let a formerly valid
-owner present a competing transition after revocation. A rollout must resolve that before v2
-entries are admitted.
+Incomplete proofs must be observable as pending evidence; an installed pin requiring unsupported
+control semantics must block operational authority explicitly. Enrollment must bind the expected
+pin through ticket, request, redemption, cached replay, and receipt verification. Pin, validated
+history, policy-aware enrollment acceptance, and account adoption must commit atomically. Recovery
+must export/import the pin with its certificate and full evidence. These persistence, integration,
+and activation paths are not implemented by the certificate-verification prerequisite above.
 
 ## Wire and persistence integration
 
@@ -112,7 +182,7 @@ The implementation must cover these paths together:
 ## Delivery and validation
 
 1. Pin the v1 gap and decoder boundary (the tests accompanying this plan).
-2. Resolve the transition and exact-credit semantics above; add pure-fold transition tests before
+2. Implement the selected transition and exact-credit semantics above, with pure-fold tests before
    enabling v2 decoding in production ingestion.
 3. Implement versioned wire, signed bounds and fold behavior together. Test direct and multi-level
    descendants, demotion, self-cuts, wrong coordinates, equal-sequence forks, absent chains, missing
