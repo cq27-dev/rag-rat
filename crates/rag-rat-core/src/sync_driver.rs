@@ -781,7 +781,7 @@ async fn accept_loop(
                 } else {
                     AuthPolicy::Closed
                 };
-                let (alpn, report) = rag_rat_sync::dispatch_connection(
+                let (stream, report) = rag_rat_sync::dispatch_connection(
                     connection,
                     node,
                     &mut account_store,
@@ -791,13 +791,17 @@ async fn accept_loop(
                     Some(egress),
                 )
                 .await?;
-                if alpn.as_slice() == rag_rat_sync::CONTENT_SYNC_ALPN {
-                    crate::drain_synced_memory(conn)?;
-                } else if alpn.as_slice() == rag_rat_sync::TABLE_SYNC_ALPN {
+                match stream {
+                    rag_rat_sync::SyncAlpn::Content => {
+                        crate::drain_synced_memory(conn)?;
+                    },
                     // The resident host holds the index open, so the on-open re-resolution never
                     // re-fires for anchors pushed here — resolve them at the session's settle
                     // point.
-                    crate::resolve_synced_distill_anchors(conn)?;
+                    rag_rat_sync::SyncAlpn::Table => {
+                        crate::resolve_synced_distill_anchors(conn)?;
+                    },
+                    rag_rat_sync::SyncAlpn::Account | rag_rat_sync::SyncAlpn::Enroll => {},
                 }
                 anyhow::Ok(report)
             }
@@ -855,7 +859,7 @@ async fn reconcile(
         match rag_rat_sync::connect_and_reconcile(
             endpoint,
             address.clone(),
-            rag_rat_sync::SYNC_ALPN,
+            rag_rat_sync::SyncAlpn::Account,
             &mut store,
             AuthPolicy::Closed,
             time::now_ms,
@@ -878,7 +882,7 @@ async fn reconcile(
         match rag_rat_sync::connect_and_reconcile(
             endpoint,
             address.clone(),
-            rag_rat_sync::SYNC_ALPN,
+            rag_rat_sync::SyncAlpn::Account,
             &mut store,
             AuthPolicy::Closed,
             time::now_ms,
@@ -905,7 +909,7 @@ async fn reconcile(
         if let Err(error) = rag_rat_sync::connect_and_reconcile(
             endpoint,
             address.clone(),
-            rag_rat_sync::CONTENT_SYNC_ALPN,
+            rag_rat_sync::SyncAlpn::Content,
             &mut content,
             AuthPolicy::Closed,
             time::now_ms,
@@ -1214,7 +1218,7 @@ pub async fn pull_account_via_peers(
         let account_report = match rag_rat_sync::connect_and_reconcile(
             endpoint,
             addr.clone(),
-            rag_rat_sync::SYNC_ALPN,
+            rag_rat_sync::SyncAlpn::Account,
             &mut account_store,
             AuthPolicy::PublicRead,
             time::now_ms,
@@ -1270,7 +1274,7 @@ pub async fn pull_account_via_peers(
         let content_report = match rag_rat_sync::connect_and_reconcile(
             endpoint,
             addr.clone(),
-            rag_rat_sync::CONTENT_SYNC_ALPN,
+            rag_rat_sync::SyncAlpn::Content,
             &mut content_store,
             AuthPolicy::PublicRead,
             time::now_ms,
