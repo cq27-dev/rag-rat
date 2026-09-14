@@ -1,4 +1,5 @@
 use super::super::RefineMember;
+use super::spans;
 use super::types::ClassAlignment;
 
 /// Yield ONLY the aligned members' values from an ordinal-aligned `per_member_values` slice — the
@@ -22,17 +23,22 @@ pub(super) fn aligned_values<'a>(
         .map(|(_, v)| v)
 }
 
+/// `true` when every value is byte-equal — vacuously for none. The one "all agree / any differ"
+/// reduction: each caller states its own "no opinion" skips by what it feeds in.
+pub(super) fn all_equal<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
+    let Some(first) = values.next() else { return true };
+    values.all(|v| v == first)
+}
+
 /// `true` when every ALIGNED member's value is byte-equal (the C1 all-identical-drop test and its
 /// debug_assert). Skipped members' `""` sentinels are ignored (see [`aligned_values`]). There is
 /// always ≥1 aligned member (the anchor), so an empty iterator (vacuously `true`) cannot arise for
-/// a real alignment; the explicit `first` check documents the contract regardless.
+/// a real alignment.
 pub(super) fn aligned_values_all_equal(
     per_member_values: &[String],
     alignment: &ClassAlignment,
 ) -> bool {
-    let mut it = aligned_values(per_member_values, alignment);
-    let Some(first) = it.next() else { return true };
-    it.all(|v| v == first)
+    all_equal(aligned_values(per_member_values, alignment).map(String::as_str))
 }
 
 /// Recover the real source slice each member contributes to the anchor run `[lo..=hi]`.
@@ -74,20 +80,7 @@ pub(super) fn recover_values(
 ) -> Vec<String> {
     let mut values = Vec::with_capacity(members.len());
     for (m_idx, member) in members.iter().enumerate() {
-        let cm = &alignment.col_map[m_idx];
-        let inserts = &alignment.member_inserts[m_idx];
-
-        let mut token_idxs: Vec<usize> = Vec::new();
-        for &slot in &cm[lo..=hi] {
-            if let Some(j) = slot {
-                token_idxs.push(j);
-            }
-        }
-        // Inserts keyed in [lo..=hi] belong to this run (the member's own tokens for the span).
-        for (_key, idxs) in inserts.range(lo..=hi) {
-            token_idxs.extend(idxs.iter().copied());
-        }
-
+        let token_idxs = spans::member_run_tokens(alignment, m_idx, lo, hi);
         if token_idxs.is_empty() {
             // True gap: member contributes nothing to this run.
             values.push(String::new());

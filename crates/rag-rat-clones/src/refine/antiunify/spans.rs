@@ -46,7 +46,7 @@ pub(super) fn subtree_is_indel(
         if !alignment.aligned[m_idx] {
             continue;
         }
-        if member_token_count(alignment, m_idx, lo, hi) == 0 {
+        if member_run_tokens(alignment, m_idx, lo, hi).is_empty() {
             saw_empty = true;
         } else {
             saw_filled = true;
@@ -55,19 +55,24 @@ pub(super) fn subtree_is_indel(
     saw_empty && saw_filled
 }
 
-/// Number of tokens member `m_idx` contributes to anchor span `[lo..=hi]`: matched tokens plus the
-/// member-only inserts keyed in `[lo..=hi]`. With substitution-aware keying every insert is keyed
-/// at the anchor column it belongs to (a substitution at the gap column it fills, a pure insertion
-/// at the column it follows), so the span range `[lo..=hi]` is exactly this member's contribution —
-/// no `lo-1` lookback is needed (that fudge belonged to the old "key after the previous column"
-/// scheme).
-fn member_token_count(alignment: &ClassAlignment, m_idx: usize, lo: usize, hi: usize) -> usize {
-    let cm = &alignment.col_map[m_idx];
-    let mut count = (lo..=hi).filter(|&i| cm[i].is_some()).count();
-    for (_key, idxs) in alignment.member_inserts[m_idx].range(lo..=hi) {
-        count += idxs.len();
+/// The token indices member `m_idx` contributes to anchor span `[lo..=hi]`: its matched tokens in
+/// column order, then the member-only inserts keyed in `[lo..=hi]`. With substitution-aware keying
+/// every insert is keyed at the anchor column it belongs to (a substitution at the gap column it
+/// fills, a pure insertion at the column it follows), so the span range `[lo..=hi]` is exactly this
+/// member's contribution — no `lo-1` lookback is needed (that fudge belonged to the old "key after
+/// the previous column" scheme). Every per-member reading of a run gathers its tokens here.
+pub(super) fn member_run_tokens(
+    alignment: &ClassAlignment,
+    m_idx: usize,
+    lo: usize,
+    hi: usize,
+) -> Vec<usize> {
+    let mut idxs: Vec<usize> =
+        alignment.col_map[m_idx][lo..=hi].iter().flatten().copied().collect();
+    for (_key, inserted) in alignment.member_inserts[m_idx].range(lo..=hi) {
+        idxs.extend(inserted);
     }
-    count
+    idxs
 }
 
 /// `true` iff any member has an insert keyed in `[lo ..= hi]` (member-only tokens inside the span).
