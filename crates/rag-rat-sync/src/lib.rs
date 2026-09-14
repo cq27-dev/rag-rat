@@ -34,6 +34,8 @@ pub mod store;
 pub mod table_codec;
 pub mod table_session;
 pub mod table_wire;
+#[cfg(test)]
+mod testing;
 pub mod wire;
 
 pub use auth::{
