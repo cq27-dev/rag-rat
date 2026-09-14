@@ -72,23 +72,32 @@ pub fn content_row_hash(path: &str, sha256: &str) -> DigestState {
     hasher.update(path.as_bytes());
     hasher.update((sha256.len() as u64).to_le_bytes());
     hasher.update(sha256.as_bytes());
-    let digest = hasher.finalize();
-    let mut lanes = [0u64; 4];
-    for (i, lane) in lanes.iter_mut().enumerate() {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&digest[i * 8..i * 8 + 8]);
-        *lane = u64::from_le_bytes(bytes);
-    }
-    lanes
+    lanes_from_bytes(&hasher.finalize().into())
 }
 
-/// Fold a contributing row's hash into `state`: wrapping add (`add = true`, an insert) or subtract
-/// (`add = false`, a removal), lane-wise. Every element is invertible, so the state is a pure
-/// function of the current multiset.
-pub fn fold_row(state: &mut DigestState, hash: &DigestState, add: bool) {
+/// Split 32 bytes into the four little-endian `u64` lanes of a [`DigestState`].
+fn lanes_from_bytes(raw: &[u8; 32]) -> DigestState {
+    let (lanes, _) = raw.as_chunks::<8>();
+    std::array::from_fn(|i| u64::from_le_bytes(lanes[i]))
+}
+
+/// Which way a row's hash moves the digest: [`Add`](Self::Add) for an insert,
+/// [`Remove`](Self::Remove) for a removal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldSign {
+    Add,
+    Remove,
+}
+
+/// Fold a contributing row's hash into `state`: wrapping add ([`FoldSign::Add`]) or subtract
+/// ([`FoldSign::Remove`]), lane-wise. Every element is invertible, so the state is a pure function
+/// of the current multiset.
+pub fn fold_row(state: &mut DigestState, hash: &DigestState, sign: FoldSign) {
     for (lane, contribution) in state.iter_mut().zip(hash.iter()) {
-        *lane =
-            if add { lane.wrapping_add(*contribution) } else { lane.wrapping_sub(*contribution) };
+        *lane = match sign {
+            FoldSign::Add => lane.wrapping_add(*contribution),
+            FoldSign::Remove => lane.wrapping_sub(*contribution),
+        };
     }
 }
 
@@ -115,13 +124,7 @@ pub fn decode_state(hex: &str) -> Result<DigestState, MalformedDigestState> {
             .ok_or_else(|| MalformedDigestState(format!("non-hex byte {low:#04x}")))?;
         *out = (hi << 4) | lo;
     }
-    let mut lanes = [0u64; 4];
-    for (i, lane) in lanes.iter_mut().enumerate() {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&raw[i * 8..i * 8 + 8]);
-        *lane = u64::from_le_bytes(b);
-    }
-    Ok(lanes)
+    Ok(lanes_from_bytes(&raw))
 }
 
 /// The rendered digest a `content_revision()` read returns: `"ms1-" || encode_state(state)`. The
@@ -161,7 +164,7 @@ pub fn register_content_digest_fold(conn: &Connection) -> rusqlite::Result<()> {
             let sha256: String = ctx.get(2)?;
             let sign: i64 = ctx.get(4)?;
             let hash = content_row_hash(&path, &sha256);
-            fold_row(&mut state, &hash, sign >= 0);
+            fold_row(&mut state, &hash, if sign >= 0 { FoldSign::Add } else { FoldSign::Remove });
             Ok(encode_state(&state))
         },
     )
@@ -240,8 +243,8 @@ mod tests {
     #[test]
     fn encode_decode_round_trips() {
         let mut state = [0u64; 4];
-        fold_row(&mut state, &content_row_hash("src/a.rs", "aa"), true);
-        fold_row(&mut state, &content_row_hash("src/b.rs", "bb"), true);
+        fold_row(&mut state, &content_row_hash("src/a.rs", "aa"), FoldSign::Add);
+        fold_row(&mut state, &content_row_hash("src/b.rs", "bb"), FoldSign::Add);
         let hex = encode_state(&state);
         assert_eq!(hex.len(), 64);
         assert_eq!(decode_state(&hex).unwrap(), state);
@@ -252,16 +255,16 @@ mod tests {
         let a = content_row_hash("src/a.rs", "aa");
         let b = content_row_hash("src/b.rs", "bb");
         let mut ab = [0u64; 4];
-        fold_row(&mut ab, &a, true);
-        fold_row(&mut ab, &b, true);
+        fold_row(&mut ab, &a, FoldSign::Add);
+        fold_row(&mut ab, &b, FoldSign::Add);
         let mut ba = [0u64; 4];
-        fold_row(&mut ba, &b, true);
-        fold_row(&mut ba, &a, true);
+        fold_row(&mut ba, &b, FoldSign::Add);
+        fold_row(&mut ba, &a, FoldSign::Add);
         assert_eq!(ab, ba, "insertion order must not matter");
         // Removing b returns to the a-only state.
         let mut only_a = [0u64; 4];
-        fold_row(&mut only_a, &a, true);
-        fold_row(&mut ab, &b, false);
+        fold_row(&mut only_a, &a, FoldSign::Add);
+        fold_row(&mut ab, &b, FoldSign::Remove);
         assert_eq!(ab, only_a, "removal is exact");
     }
 
@@ -270,10 +273,10 @@ mod tests {
         // Two identical (path, sha256) contributions do NOT cancel (the XOR-regression pin).
         let h = content_row_hash("src/a.rs", "aa");
         let mut once = [0u64; 4];
-        fold_row(&mut once, &h, true);
+        fold_row(&mut once, &h, FoldSign::Add);
         let mut twice = [0u64; 4];
-        fold_row(&mut twice, &h, true);
-        fold_row(&mut twice, &h, true);
+        fold_row(&mut twice, &h, FoldSign::Add);
+        fold_row(&mut twice, &h, FoldSign::Add);
         assert_ne!(once, twice, "a duplicate row must change the digest");
     }
 
@@ -323,7 +326,7 @@ mod tests {
             while let Some(row) = rows.next().unwrap() {
                 let path: String = row.get(0).unwrap();
                 let sha256: String = row.get(1).unwrap();
-                fold_row(&mut state, &content_row_hash(&path, &sha256), true);
+                fold_row(&mut state, &content_row_hash(&path, &sha256), FoldSign::Add);
                 count += 1;
             }
             (encode_state(&state), count)

@@ -77,15 +77,13 @@ impl IndexConnection {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        let storage = Self {
-            conn,
-            database_path: path.to_path_buf(),
-            source_root: None,
-            fold_wal_on_close: true,
-        };
+        let storage = Self::wrap(Connection::open(path)?, path, true);
         storage.setup()?;
         Ok(storage)
+    }
+
+    fn wrap(conn: Connection, path: &Path, fold_wal_on_close: bool) -> Self {
+        Self { conn, database_path: path.to_path_buf(), source_root: None, fold_wal_on_close }
     }
 
     /// Read-only open for latency-critical, never-blocking callers (the grep-augment hook
@@ -116,12 +114,7 @@ impl IndexConnection {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         conn.busy_timeout(busy_timeout)?;
-        Ok(Self {
-            conn,
-            database_path: path.to_path_buf(),
-            source_root: None,
-            fold_wal_on_close: false,
-        })
+        Ok(Self::wrap(conn, path, false))
     }
 
     /// Read-WRITE open that neither CREATES the database nor WAITS on a busy lock — for the
@@ -148,12 +141,7 @@ impl IndexConnection {
         conn.busy_timeout(std::time::Duration::ZERO)?;
         // No drop-time fold: this open serves the watcher EVENT LOOP, which must never block or
         // do write-back IO — an oversized sidecar is the pass worker's problem, not this one's.
-        Ok(Self {
-            conn,
-            database_path: path.to_path_buf(),
-            source_root: None,
-            fold_wal_on_close: false,
-        })
+        Ok(Self::wrap(conn, path, false))
     }
 
     pub fn database_path(&self) -> &Path {

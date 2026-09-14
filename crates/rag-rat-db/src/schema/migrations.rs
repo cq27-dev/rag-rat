@@ -5716,7 +5716,11 @@ pub fn apply_content_digest_state(conn: &Connection) -> rusqlite::Result<()> {
             let path: String = row.get(0)?;
             let sha256: String = row.get(1)?;
             let hash = crate::content_digest::content_row_hash(&path, &sha256);
-            crate::content_digest::fold_row(&mut state, &hash, true);
+            crate::content_digest::fold_row(
+                &mut state,
+                &hash,
+                crate::content_digest::FoldSign::Add,
+            );
             rows_folded += 1;
         }
     }
