@@ -993,7 +993,8 @@ fn ingest_against(
             expected_device: expected_device.to_bytes(),
             signed_bytes,
             advertised_floor,
-            advertised_tip: None,
+            // Legacy unit fixtures offer a single floor entry.
+            advertised_tip: advertised_floor,
         },
         now_ms,
         local_writer,
@@ -1053,7 +1054,9 @@ fn ingest_received_against(
     let floor_before = retention::retained_floor(&tx, stream_id, signer)?;
     // An unresolved target cannot be replaced by an unrelated higher floor. Receive contiguous
     // entries from any source, but retain the original obligation until its exact tip arrives.
-    let usable_floor = advertised_floor.filter(|_| !pending);
+    // A caller without the inventory tip may still offer ordinary contiguous entries,
+    // but cannot create a floor whose required suffix would be forgotten immediately.
+    let usable_floor = advertised_floor.filter(|_| !pending && advertised_tip.is_some());
     if let (Some(floor), Some(tip)) = (usable_floor, advertised_tip) {
         anyhow::ensure!(
             tip.lamport >= floor.lamport && tip.lamport < crate::entry::MAX_ENTRY_LAMPORT,

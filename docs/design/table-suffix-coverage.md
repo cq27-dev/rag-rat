@@ -8,7 +8,7 @@ V129 records one outstanding `(stream, device, floor, tip lamport, tip hash)` wh
 
 The obligation clears only when its exact signed target is in the accepted chain, including promotion after a missing predecessor arrives. Unknown payloads may satisfy delivery while remaining pending projection. Rejected, gapped, unsigned or numerically higher tips cannot satisfy delivery. While an obligation remains, another discontinuous root is refused; source switching may supply contiguous entries but cannot overwrite the original target.
 
-Authoring, re-adoption and compaction wait for delivery on the affected stream. Physical edits stay local and unsent until recovery. Other streams remain available. Repository purge removes the obligation with the retired stream’s history; it does not turn a retained witness into accepted history.
+Authoring, re-adoption and compaction wait for delivery on the affected stream. Physical edits stay local and unsent until recovery. Other streams remain available. Repository purge removes row data, entries and floors, but retains the obligation alongside chain witnesses. A same-incarnation rejoin still owes the original suffix; a different incarnation derives another stream ID and is unaffected. Obligations alone never advertise entries or recreate a directory. Restoring a witness does not reconstruct projections intentionally discarded by purge.
 
 ## Recovery and limits
 

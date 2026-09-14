@@ -1576,6 +1576,23 @@ fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_p
             expected_device: offered.device_fingerprint,
             signed_bytes: &first.signed_bytes,
             advertised_floor: Some(floor),
+            advertised_tip: None,
+        },
+        1,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(
+        chain_lamports(&intermediary).is_empty(),
+        "a floor without its inventory tip cannot be adopted"
+    );
+    ingest_received_against(
+        &intermediary,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: offered.device_fingerprint,
+            signed_bytes: &first.signed_bytes,
+            advertised_floor: Some(floor),
             advertised_tip: Some(TableSyncChainCursor {
                 lamport: offered.lamport,
                 entry_hash: offered.entry_hash,
@@ -1662,6 +1679,47 @@ fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_p
     assert!(live_rows(&fresh).iter().any(|(id, _)| id == "deleted"));
     assert!(coverage::stream_pending(&fresh, stream_id).unwrap());
     assert!(!live_rows(&source).iter().any(|(id, _)| id == "deleted"));
+    rag_rat_db::schema::purge_repo_rows(&intermediary, "repo-a").unwrap();
+    assert!(chain_lamports(&intermediary).is_empty());
+    assert_eq!(
+        intermediary
+            .query_row("SELECT COUNT(*) FROM table_sync_streams", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        intermediary
+            .query_row("SELECT COUNT(*) FROM table_sync_retained_floors", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(
+        accepted_chain_page(&intermediary, route.stream_id, None, 16).unwrap().is_empty(),
+        "debt alone advertises no signed history"
+    );
+    assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
+    let different = scope_stream_id("repo-a", account, [0x99; 32], REPO_SPEC.scope_id);
+    assert!(!coverage::stream_pending(&intermediary, different).unwrap());
+    // Same-incarnation rejoin restores the witness but still owes the original tip.
+    ingest_received_against(
+        &intermediary,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: offered.device_fingerprint,
+            signed_bytes: &first.signed_bytes,
+            advertised_floor: Some(floor),
+            advertised_tip: Some(TableSyncChainCursor {
+                lamport: offered.lamport,
+                entry_hash: offered.entry_hash,
+            }),
+        },
+        3,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(chain_lamports(&intermediary), [floor.lamport as i64]);
+    assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
     // Reaching the full source is sufficient to repair the stale projection.
     sync_chains(&source, &intermediary, account);
     sync_chains(&intermediary, &fresh, account);

@@ -947,7 +947,7 @@ mod coverage_tests {
     use super::*;
 
     #[test]
-    fn suffix_coverage_migration_retries_and_purges_only_the_selected_repository() {
+    fn suffix_coverage_migration_retries_and_preserves_obligations_across_repository_purge() {
         let conn = Connection::open_in_memory().unwrap();
         crate::schema::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
         conn.execute_batch(
@@ -979,10 +979,15 @@ mod coverage_tests {
         );
         crate::schema::purge_repo_rows(&conn, "main-checkout").unwrap();
         assert_eq!(
-            conn.query_row("SELECT stream_id FROM table_sync_suffix_coverage", [], |r| r
-                .get::<_, Vec<u8>>(0))
+            conn.query_row("SELECT COUNT(*) FROM table_sync_suffix_coverage", [], |r| r
+                .get::<_, i64>(0))
                 .unwrap(),
-            [2_u8; 32]
+            2
+        );
+        assert_eq!(
+            conn.query_row("SELECT repo_id FROM table_sync_streams", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "linked-sibling"
         );
     }
 }
