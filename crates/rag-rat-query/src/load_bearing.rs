@@ -126,6 +126,18 @@ pub struct ImportanceEnrichment {
 impl ImportanceEnrichment {
     const LABEL: &'static str = "local structural load";
     const SIGNAL: &'static str = "scoped weighted fan-in";
+
+    /// The enrichment for a raw weighted in-degree `score`; `compiler` when any counted in-edge
+    /// was at the compiler tier.
+    fn new(score: f64, compiler: bool) -> Self {
+        Self {
+            label: Self::LABEL,
+            signal: Self::SIGNAL,
+            score: crate::round_score(score),
+            bucket: LoadBearingBucket::from_score(score),
+            oracle_tier: compiler.then_some(OracleTier::Compiler),
+        }
+    }
 }
 
 /// Pre-fetched oracle data for an enrichment call: the per-`edge_id` [`EdgeOracleEffect`] map,
@@ -224,57 +236,14 @@ pub fn scoped_weighted_fan_in(
     to_symbol_id: i64,
     oracle: &OracleContext<'_>,
 ) -> anyhow::Result<Option<ImportanceEnrichment>> {
-    // #89: in-edges are joined THROUGH the per-connection scoped `files` view
-    // (`JOIN files ON files.id = edges_data.source_file_id`), NOT raw `main.edges`/`main.files`, so
-    // the same symbol identity scores DIFFERENTLY per active scope and a foreign scope's edges
-    // never leak in. `name_strings` resolves the kind/confidence ids to names for the weight
-    // tables; `d.id` keys the optional SCIP-oracle effect lookup.
-    let mut stmt = conn.prepare(
-        "SELECT d.id, ek.value, cf.value
-         FROM edges_data d
-         JOIN files ON files.id = d.source_file_id
-         JOIN name_strings ek ON ek.id = d.edge_kind_id
-         JOIN name_strings cf ON cf.id = d.confidence_id
-         WHERE d.to_symbol_id = ?1
-           -- Materialized visibility (#734): excludes suppressed candidates and the internal
-           -- dispatch FACT rows (#200 — the handle fact duplicates the dispatcher's existing
-           -- calls_name, so counting it would double-weight the handler). The synthesized
-           -- `dispatches` edge IS counted.
-           AND d.hidden = 0",
-    )?;
-    let rows = stmt
-        .query_map([to_symbol_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut score = 0.0_f64;
-    let mut counted = false;
-    let mut compiler = false;
-    for (edge_id, kind, confidence) in &rows {
-        let Some(contribution) =
-            in_edge_contribution(kind, confidence, *edge_id, to_symbol_id, oracle)
-        else {
-            continue;
-        };
-        score += contribution.weight;
-        counted = true;
-        compiler |= contribution.compiler;
-    }
-    if !counted {
-        return Ok(None);
-    }
-    Ok(Some(ImportanceEnrichment {
-        label: ImportanceEnrichment::LABEL,
-        signal: ImportanceEnrichment::SIGNAL,
-        score: crate::round_score(score),
-        bucket: LoadBearingBucket::from_score(score),
-        oracle_tier: compiler.then_some(OracleTier::Compiler),
-    }))
+    Ok(scoped_weighted_fan_in_many(conn, &[to_symbol_id], oracle)?.remove(&to_symbol_id))
 }
 
-/// Batched sibling of [`scoped_weighted_fan_in`]. It preserves the same active-scope, visibility,
-/// weighting, and oracle semantics while loading requested symbols' in-edges in bounded queries.
+/// Batched form of [`scoped_weighted_fan_in`], and the one implementation of the metric: the
+/// single-symbol form delegates here, so both share the active-scope, visibility, weighting and
+/// oracle semantics — and the accepted oracle limitation documented there. Loads the requested
+/// symbols' in-edges in bounded queries; a symbol with no visible in-edge contribution has no
+/// entry.
 pub fn scoped_weighted_fan_in_many(
     conn: &Connection,
     symbol_ids: &[i64],
@@ -288,6 +257,12 @@ pub fn scoped_weighted_fan_in_many(
     let mut scores: HashMap<i64, (f64, bool)> = HashMap::new();
     for symbol_chunk in unique_symbol_ids.chunks(900) {
         let marks = symbol_chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // #89: in-edges are joined THROUGH the per-connection scoped `files` view, NOT raw
+        // `main.edges`/`main.files`, so the same symbol identity scores DIFFERENTLY per active
+        // scope and a foreign scope's edges never leak in. `name_strings` resolves the
+        // kind/confidence ids to names for the weight tables; `d.id` keys the optional SCIP-oracle
+        // effect lookup. `hidden = 0` is the materialized visibility filter (#734), with the
+        // meaning `pagerank::ranked_edge_rows` documents.
         let sql = format!(
             "SELECT d.id, d.to_symbol_id, ek.value, cf.value
              FROM edges_data d
@@ -320,13 +295,7 @@ pub fn scoped_weighted_fan_in_many(
     Ok(scores
         .into_iter()
         .map(|(symbol_id, (score, compiler))| {
-            (symbol_id, ImportanceEnrichment {
-                label: ImportanceEnrichment::LABEL,
-                signal: ImportanceEnrichment::SIGNAL,
-                score: crate::round_score(score),
-                bucket: LoadBearingBucket::from_score(score),
-                oracle_tier: compiler.then_some(OracleTier::Compiler),
-            })
+            (symbol_id, ImportanceEnrichment::new(score, compiler))
         })
         .collect())
 }
