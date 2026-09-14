@@ -14,8 +14,9 @@ pub use crate::cookbook::provision_box_for_benchmark;
 // `verify_ephemeral_remote` is the `pub` init-wizard seam (the CLI's Remote step calls it);
 // the underlying `provision_and_build` stays `pub(crate)`.
 pub use crate::cookbook::{
-    CookbookInput, CookbookProvisioner, ProvisionedBox, abort_active_provisioning,
-    install_provision_log_sink, verify_ephemeral_remote, verify_ephemeral_remote_cancellable,
+    CookbookCapability, CookbookInput, CookbookProvisioner, ProvisionedBox,
+    abort_active_provisioning, install_provision_log_sink, verify_ephemeral_remote,
+    verify_ephemeral_remote_cancellable,
 };
 #[cfg(feature = "fastembed")]
 pub use crate::fastembed::FastEmbedEmbedder;
