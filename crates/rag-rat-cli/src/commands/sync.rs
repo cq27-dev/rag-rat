@@ -387,28 +387,24 @@ fn invite_writer(config: &Config, ttl: Duration) -> anyhow::Result<()> {
     serve_with(config, false, Some(ServeMint::Writer { ttl }))
 }
 
-/// Shared machinery behind [`serve`] and [`init`]: acquire the session lock, open the index, bind
-/// the endpoint, and run the ALPN-dispatching accept loop. When `mint` is set (`sync init`), a
-/// one-time invite is minted AFTER the endpoint binds and the roster gate passes — so a bind
-/// failure never strands the candidate reservation the mint makes — and its ticket is printed on
-/// the startup line. Minting enforces founder/owner authority, so a non-owner `init` fails there.
-fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::Result<()> {
-    let relay = effective_relay_url(config);
+fn sync_session_and_repo_lock(
+    config: &Config,
+    repo_wait: Duration,
+    session_tail: &str,
+    busy_tail: &str,
+) -> anyhow::Result<(locks::WriteLock, locks::WriteLock, IndexDatabase)> {
     // Hold a database-scoped session lock for the SERVER'S WHOLE LIFETIME. `sync_node_secret` is
     // store-global, so a second `serve` (or a colocated device-side sync) on the same database
     // would bind a SECOND endpoint advertising the same iroh node id — the two would race relay
     // registration and inbound connections. This rejects that. Crucially it does NOT block the
     // watcher / indexing / GC (they take the per-repo write lock, not this one), so only other sync
     // ENDPOINTS are excluded — exactly the collision to prevent.
-    let _serve_lock = locks::WriteLock::acquire_sync_session_timeout(
+    let session = locks::WriteLock::acquire_sync_session_timeout(
         &config.database,
         SERVE_SESSION_LOCK_TIMEOUT,
     )?
     .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a `serve` peer or \
-             a device sync is running); only one endpoint may run at a time"
-        )
+        anyhow!("another sync session already holds this database's node identity {session_tail}")
     })?;
     // Startup WRITES — the schema migration, the account read, and the first-run node-key mint —
     // under the per-repo write lock, BOUNDED here because the global session lock is already held
@@ -418,12 +414,27 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
     // before the accept loop so the watcher / GC aren't blocked for the server's life; the loop's
     // own ingests rely on SQLite's writer serialization instead.
     let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock =
-        locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SERVE_INIT_LOCK_TIMEOUT)?
-            .ok_or_else(|| {
-            anyhow!("the index write lock is busy (another writer is mid-pass); retry `sync serve`")
+    let repo = locks::WriteLock::acquire_timeout(&config.database, &lock_repo, repo_wait)?
+        .ok_or_else(|| {
+            anyhow!("the index write lock is busy (another writer is mid-pass); {busy_tail}")
         })?;
     let db = crate::open_index(config)?;
+    Ok((session, repo, db))
+}
+
+/// Shared machinery behind [`serve`] and [`init`]: acquire the session lock, open the index, bind
+/// the endpoint, and run the ALPN-dispatching accept loop. When `mint` is set (`sync init`), a
+/// one-time invite is minted AFTER the endpoint binds and the roster gate passes — so a bind
+/// failure never strands the candidate reservation the mint makes — and its ticket is printed on
+/// the startup line. Minting enforces founder/owner authority, so a non-owner `init` fails there.
+fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::Result<()> {
+    let relay = effective_relay_url(config);
+    let (_serve_lock, repo_lock, db) = sync_session_and_repo_lock(
+        config,
+        SERVE_INIT_LOCK_TIMEOUT,
+        "(a `serve` peer or a device sync is running); only one endpoint may run at a time",
+        "retry `sync serve`",
+    )?;
     let (account_id, node_key) = {
         let conn = db.connection();
         (existing_account_or_hint(conn)?, node_secret(conn)?)
@@ -670,23 +681,12 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
     // must share a relay to meet, and the ticket names where the inviter is reachable. `sync init`
     // minted the ticket with the relay IT is serving on.
     let relay = ticket.relay_url.clone();
-    let _session = locks::WriteLock::acquire_sync_session_timeout(
-        &config.database,
-        SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a `serve` peer or \
-             a device sync is running); stop it before joining"
-        )
-    })?;
-    let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock =
-        locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SERVE_INIT_LOCK_TIMEOUT)?
-            .ok_or_else(|| {
-            anyhow!("the index write lock is busy (another writer is mid-pass); retry `sync join`")
-        })?;
-    let db = crate::open_index(config)?;
+    let (_session, repo_lock, db) = sync_session_and_repo_lock(
+        config,
+        SERVE_INIT_LOCK_TIMEOUT,
+        "(a `serve` peer or a device sync is running); stop it before joining",
+        "retry `sync join`",
+    )?;
     let node_key = {
         let conn = db.connection();
         // A store already bound to a DIFFERENT account cannot adopt this ticket — enrollment would
@@ -894,24 +894,12 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
 
     // Same endpoint discipline as `pull`: the session lock keeps this database's node identity
     // singular for the whole exchange.
-    let _session = locks::WriteLock::acquire_sync_session_timeout(
-        &config.database,
+    let (_session, repo_lock, db) = sync_session_and_repo_lock(
+        config,
         SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a resident MCP \
-             host, a `serve` peer, or a device sync is running); stop it and retry"
-        )
-    })?;
-    let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock = locks::WriteLock::acquire_timeout(
-        &config.database,
-        &lock_repo,
-        SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
-    let db = crate::open_index(config)?;
+        "(a resident MCP host, a `serve` peer, or a device sync is running); stop it and retry",
+        "retry",
+    )?;
     // Refuse a subscribed repo HERE, before the redemption. `sync_contribute` refuses it too, but
     // that call is the last step of this flow: by then the owner has authored a grant for this
     // account, and bailing would leave it live for a store that will never contribute. Same
@@ -1034,26 +1022,13 @@ fn pull(
     // registration and inbound sessions. A resident MCP host or `sync serve` holds this for its
     // lifetime, which is exactly the common case here — an operator reaching for `pull` while the
     // resident is up.
-    let _session = locks::WriteLock::acquire_sync_session_timeout(
-        &config.database,
+    let (_session, repo_lock, db) = sync_session_and_repo_lock(
+        config,
         SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a resident MCP \
-             host, a `serve` peer, or a device sync is running); stop it and retry — it cannot \
-             pull a foreign account on your behalf"
-        )
-    })?;
-
-    let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock = locks::WriteLock::acquire_timeout(
-        &config.database,
-        &lock_repo,
-        SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
-    let db = crate::open_index(config)?;
+        "(a resident MCP host, a `serve` peer, or a device sync is running); stop it and retry — \
+         it cannot pull a foreign account on your behalf",
+        "retry",
+    )?;
     let node_key = {
         let conn = db.connection();
         // Pulling your OWN account is device sync, not a cross-account fetch — say so rather than
