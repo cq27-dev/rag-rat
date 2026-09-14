@@ -15,9 +15,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::wire::{Frame, WireError};
 
-/// The largest frame this codec will read. Chosen well above one full [`Frame::Entries`] page of
-/// account entries (each entry is at most the §18a envelope, 64 KiB) plus overhead. A larger
-/// declared length is refused before any allocation.
+/// The largest frame this codec will read or write. Chosen well above one full [`Frame::Entries`]
+/// page of account entries (each entry is at most the §18a envelope, 64 KiB) plus overhead. A
+/// larger declared length is refused before any allocation, and a larger local frame before any
+/// byte is written.
 pub const MAX_FRAME_BYTES: u32 = 24 * 1024 * 1024;
 
 /// What can go wrong moving a frame over the wire.
@@ -26,7 +27,8 @@ pub enum CodecError {
     /// The underlying stream failed or closed mid-frame.
     #[error("sync stream io: {0}")]
     Io(std::io::Error),
-    /// A frame's declared length exceeded [`MAX_FRAME_BYTES`].
+    /// A frame's length — declared by the peer, or of a local frame about to be written — exceeded
+    /// [`MAX_FRAME_BYTES`].
     #[error("sync frame declared {0} bytes, over {max}", max = MAX_FRAME_BYTES)]
     FrameTooLarge(u32),
     /// The frame bytes were not a valid protocol frame.
@@ -107,8 +109,8 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     frame: &Frame,
 ) -> Result<(), CodecError> {
     // Local frames are built within the caps, so this only fires on a programmer bug, not a wire
-    // condition — but guard rather than truncate a silently-huge length prefix.
-    Ok(write_framed(w, &frame.encode(), u32::MAX).await?)
+    // condition — but refuse it here rather than send a frame every peer's reader would refuse.
+    Ok(write_framed(w, &frame.encode(), MAX_FRAME_BYTES).await?)
 }
 
 /// Read one frame, or [`CodecError::Eof`] if the stream ends cleanly before the next length prefix.
@@ -166,6 +168,20 @@ mod tests {
         a.write_all(&(MAX_FRAME_BYTES + 1).to_be_bytes()).await.unwrap();
         drop(a);
         assert!(matches!(read_frame(&mut b).await, Err(CodecError::FrameTooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_local_frame_is_refused_before_anything_is_written() {
+        // One entry past the cap: the peer's reader would refuse the prefix, so the writer must
+        // not put it on the wire at all.
+        let oversized =
+            Frame::Entries { entries: vec![vec![0; MAX_FRAME_BYTES as usize]], more: false };
+        let mut wire = Vec::new();
+        assert!(matches!(
+            write_frame(&mut wire, &oversized).await,
+            Err(CodecError::FrameTooLarge(len)) if len > MAX_FRAME_BYTES,
+        ));
+        assert!(wire.is_empty(), "no length prefix or body byte was written");
     }
 
     #[tokio::test]
