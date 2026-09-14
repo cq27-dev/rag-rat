@@ -31,26 +31,18 @@
 //! [`sibling_tripwires`] by a path-INDEPENDENT sentinel column so the intact check holds regardless
 //! of which fixture path was chosen.
 //!
-//! SCHEMA-VERSION SCOPE (load-bearing): this worktree is **V042** (`LATEST_SCHEMA_VERSION = 42`),
-//! which scopes the V040 core tables — `repos`, `repo_roots`, `repo_meta`, `files`, `packages`,
-//! `logical_symbols`, `docs`, `parser_failures`, `git_commits`, `git_file_changes` (plus
-//! `chunks`/`symbols`/`edges_data` TRANSITIVELY via `files.id` and `logical_symbol_members` via
-//! `logical_symbols.id`) — the provider-neutral papertrail tables (`papertrail_refs`,
-//! `papertrail_items`, `papertrail_comments`, `papertrail_closing_edges`, `papertrail_sync_cursor`,
-//! `papertrail_item_tags`, V060) plus the `papertrail_fts` mirror — AND the V042 periphery tables
-//! that each gained their OWN `repo_id`: `repo_memories`, `repo_memory_bindings`,
-//! `repo_memory_fts`, `logical_symbol_monikers` (now direct, no longer only transitive),
-//! `oracle_runs`, `edge_oracle`, `clone_graph_generations`, `clone_token_df`, `clone_refinements`,
-//! `dream_findings`, and `reconcile_attempts` (with `repo_memory_tags` scoped transitively through
-//! `repo_memories`) — AND the dream-verification siblings `memory_reality` /
-//! `memory_note_summaries` / the retired `memory_summaries` / `memory_model_failures`, each of
-//! which carries its own `repo_id` — AND the typed-edge set
-//! `repo_node_edges` (V049), owner-scoped by `repo_id`.
-//! [`seed_sibling`] seeds a tripwire row into every one of those. Nothing repo-scoped is left
-//! unseeded; a table without a `repo_id` dimension (content-addressed pools like
-//! `name_strings` / `embedding_cache`, the FTS-derived `chunk_fts`, `clone_edges`/postings scoped
-//! by their globally-unique `build_generation`) is deliberately absent — seeding it would
-//! manufacture a FALSE tripwire against a legitimately cross-repo store.
+//! Schema coverage targets every table with a `repo_id` dimension at
+//! [`rag_rat_db::schema::LATEST_SCHEMA_VERSION`]: repository registration and metadata, indexed
+//! files and symbols, git and papertrail evidence, distill snapshots, clone and oracle state,
+//! memories and their maintenance records. Transitively scoped children are reached through
+//! their owning files, logical symbols or memories.
+//!
+//! The [`seed_sibling`] and [`sibling_tripwires`] rosters must track that scope: the former
+//! installs tripwire rows, and the latter checks that each survives. Tables without a repo
+//! dimension — content-addressed pools such
+//! as `name_strings` / `embedding_cache`, FTS-derived `chunk_fts`, and `clone_edges`/postings
+//! scoped by globally unique `build_generation` — are deliberately absent: seeding them would
+//! manufacture a false tripwire against a legitimately shared store.
 //!
 //! REGISTRY REGISTRATION IS CONDITIONAL (A7): the sibling gets a REAL `repos` + `repo_roots` +
 //! `repo_meta` registry row **only when the fixture repo is itself a real (adopted) repo** — i.e.
