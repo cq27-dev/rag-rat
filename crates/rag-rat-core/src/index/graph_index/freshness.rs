@@ -199,10 +199,8 @@ impl IndexDatabase {
                     unverified += 1;
                     continue;
                 }
-                // Above the parse limit there are no persisted symbols to refresh at all
-                // (`prepare_index_content_from_text` skips the same bound), so the scope shape
-                // is vacuously current for this file.
-                // Rust because a scope-affecting key bump changed what its impl scopes ARE. Any
+                // A file needs its scopes re-derived: Rust because a scope-affecting key bump
+                // changed what its impl scopes ARE. Any
                 // other language because the scope entered the key at all: `scope_path` landed
                 // nullable with no backfill, so a row indexed before it reads as `''` here while a
                 // fresh index hashes a real enclosing scope. Left alone, those rows would take the
@@ -211,6 +209,9 @@ impl IndexDatabase {
                 let scope_needs_refresh = file.scope_owed
                     && file.kind != TargetKind::Generated
                     && file.language != Language::Markdown
+                // Above the parse limit there are no persisted symbols to refresh at all
+                // (`prepare_index_content_from_text` skips the same bound), so the scope shape
+                // is vacuously current for this file.
                     && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
                     && (file.language == Language::Rust
                         || self.file_has_unscoped_symbols(file.id)?);
