@@ -1188,7 +1188,7 @@ fn rule_no_non_pk_unique_index(conn: &Connection, spec: &TableSpec) -> Result<()
 }
 
 /// An IDENTITY column can never be `added`. The declared default is unreachable for it: an op
-/// authored before the key grew carries fewer pk values, and `apply_row_op`'s arity check
+/// authored before the key grew carries fewer pk values, and `apply_row_op_on_stream`'s arity check
 /// quarantines it TERMINALLY before projection ever runs — so the evolution the `added` shape
 /// promises simply does not exist here, and declaring it would advertise a redemption path that
 /// silently drops every older op instead. A changed primary key is a new table identity.
@@ -2868,9 +2868,9 @@ mod tests {
     #[test]
     fn an_identity_column_may_not_declare_an_introduction_version() {
         // `added` promises a redemption path that does not exist for a key: an op authored before
-        // the key grew carries fewer pk values, so `apply_row_op`'s arity check quarantines it
-        // TERMINALLY before any default could apply. Declaring it would advertise older→newer
-        // replication while silently dropping every older op.
+        // the key grew carries fewer pk values, so `apply_row_op_on_stream`'s arity check
+        // quarantines it TERMINALLY before any default could apply. Declaring it would
+        // advertise older→newer replication while silently dropping every older op.
         const GROWN_KEY: TableSpec = TableSpec {
             name: "t_demo",
             scope_id: ScopeId::new("demo/1"),

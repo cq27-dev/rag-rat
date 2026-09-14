@@ -1895,13 +1895,13 @@ fn enqueue_readoption_for_closed_fact(
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if streams.is_empty() {
         // A stream whose first local contact happens after this removal still owes repair. Park
-        // the removal under the impossible zero stream until the first authored/ingested entry
+        // the removal under the pre-context placeholder until the first authored/ingested entry
         // records the real context.
         crate::table_sync::enqueue_readoption_work(
             tx,
             account_id,
             fact.authority.device_fingerprint,
-            StreamId::from_bytes([0; 32]),
+            StreamId::PRECONTEXT,
             *roster_ref,
             closed_at,
             now_ms,
