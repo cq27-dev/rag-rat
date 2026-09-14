@@ -36,7 +36,7 @@ pub(crate) use memory::{dream, memory};
 pub(crate) use models::models;
 #[cfg(feature = "eval")]
 pub(crate) use models::{benchmark_embedding, eval};
-pub(crate) use oracle::{oracle, with_oracle_write_lock};
+pub(crate) use oracle::{ScipHandoff, oracle, produce_scip_outside_lock, with_oracle_write_lock};
 pub(crate) use remove::rm;
 pub(crate) use runtime_env::apply_embedding_runtime_env;
 pub(crate) use search::{brief, clusters, important_symbols, query};

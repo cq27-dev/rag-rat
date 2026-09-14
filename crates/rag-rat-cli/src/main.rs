@@ -325,23 +325,15 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
         config: &rag_rat_base::config::Config,
         tool: OracleTool,
     ) -> anyhow::Result<()> {
-        // Stamp the start INSIDE the same write-lock as the pre-spawn snapshot so no watcher
-        // reindex can interleave between reading the indexed state and recording the start; under
-        // the lock, started_at matches the indexed state this run covers (#145 + #146 review).
-        let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
-            Ok((rag_rat_base::time::now_ms(), db.oracle_pre_spawn_snapshot()?))
-        })?;
-        let scip_output = config
-            .database
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!("rag-rat-oracle-auto-{}.scip", std::process::id()));
-        let production = rag_rat_oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
-        let _ = fs::remove_file(&scip_output);
-        match production? {
-            rag_rat_oracle::ScipProduction::Blocked { .. } => Ok(()),
-            rag_rat_oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+        match commands::produce_scip_outside_lock(config, tool, "rag-rat-oracle-auto")? {
+            commands::ScipHandoff::Blocked { .. } => Ok(()),
+            commands::ScipHandoff::Produced {
+                started_at_ms,
+                pre_spawn_sha,
+                version,
+                bytes,
+                production_sha,
+            } => {
                 with_oracle_write_lock(config, |db| {
                     db.run_oracle_at(
                         tool,
