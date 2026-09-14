@@ -76,6 +76,11 @@ pub enum TableSessionError {
     Codec(TableCodecError),
     #[error("table-sync protocol violation: {0}")]
     Protocol(String),
+    /// The peer made no progress within the idle window: it sent no frame, took none of ours, or
+    /// did not let the stream close. Distinct from [`TableSessionError::Protocol`] — a silent peer
+    /// violated nothing.
+    #[error("table-sync peer made no progress within {after:?}")]
+    Timeout { after: Duration },
     #[error("read-only peer attempted to push table entries")]
     UnauthorizedPush,
     #[error("table-sync session store: {0}")]
@@ -556,8 +561,8 @@ async fn send_ack<W: AsyncWrite + Unpin>(
     idle_timeout: Duration,
 ) -> Result<(), TableSessionError> {
     write_before(send, &TableFrame::Ack, idle_timeout).await?;
-    auth::within(idle_timeout, send.shutdown(), || {
-        TableSessionError::Protocol("table session timed out while closing".into())
+    auth::within(idle_timeout, send.shutdown(), || TableSessionError::Timeout {
+        after: idle_timeout,
     })
     .await?
     .map_err(|error| TableSessionError::Codec(TableCodecError::Io(error)))
@@ -569,7 +574,7 @@ async fn write_before<W: AsyncWrite + Unpin>(
     idle_timeout: Duration,
 ) -> Result<(), TableSessionError> {
     auth::within(idle_timeout, table_codec::write_frame(send, frame), || {
-        TableSessionError::Protocol("table session timed out while writing".into())
+        TableSessionError::Timeout { after: idle_timeout }
     })
     .await?
     .map_err(TableSessionError::Codec)
@@ -593,7 +598,7 @@ async fn read_before<R: AsyncRead + Unpin>(
     idle_timeout: Duration,
 ) -> Result<TableFrame, TableSessionError> {
     let read = auth::within(idle_timeout, table_codec::read_frame(recv), || {
-        TableSessionError::Protocol("table session timed out as idle".into())
+        TableSessionError::Timeout { after: idle_timeout }
     });
     match read.await? {
         Ok(frame) => Ok(frame),
@@ -1210,7 +1215,7 @@ mod tests {
         );
         assert!(matches!(
             result,
-            Err(TableSessionError::Protocol(message)) if message.contains("timed out while writing")
+            Err(TableSessionError::Timeout { after }) if after == Duration::from_millis(20)
         ));
     }
 }
