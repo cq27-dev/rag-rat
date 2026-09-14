@@ -166,7 +166,24 @@ impl TrackerParsedRef {
 /// `GH` project). Bare `#N` resolves against the FIRST code-host binding only, per the config
 /// contract; GitLab's bare `!N` is provider-explicit syntax and resolves against its own
 /// binding regardless.
+///
+/// With NO configured bindings the text is read with the legacy GitHub grammar instead
+/// ([`parse_refs`] with no default project, so only self-contained refs resolve): configless
+/// discovery and rationale lookup keep `owner/repo#N` refs and GitHub URLs. Those refs carry no
+/// item kind — that grammar never names one.
 pub fn parse_tracker_refs(text: &str, trackers: &[ResolvedTracker]) -> Vec<TrackerParsedRef> {
+    if trackers.is_empty() {
+        return parse_refs(text, None)
+            .into_iter()
+            .map(|parsed| TrackerParsedRef {
+                provider: Tracker::Github,
+                project: parsed.project,
+                item_key: parsed.number.to_string(),
+                item_kind: None,
+                ref_kind: parsed.kind,
+            })
+            .collect();
+    }
     parse_tracker_refs_with_bindings(text, trackers).into_iter().map(|(_, parsed)| parsed).collect()
 }
 
@@ -967,6 +984,23 @@ mod grammar_tests {
             let refs = parse_tracker_refs(text, &github);
             assert_eq!(refs[0].ref_kind, RefKind::Unknown, "`{text}` does NOT close on GitHub");
         }
+    }
+
+    #[test]
+    fn configless_parsing_falls_back_to_the_legacy_github_grammar() {
+        let refs = parse_tracker_refs("Fixes o/r#5, see https://github.com/a/b/pull/7 and #9", &[]);
+        let github = |project: &str, key: &str, ref_kind| TrackerParsedRef {
+            provider: Tracker::Github,
+            project: project.into(),
+            item_key: key.into(),
+            item_kind: None,
+            ref_kind,
+        };
+        assert_eq!(
+            refs,
+            vec![github("o/r", "5", RefKind::Closing), github("a/b", "7", RefKind::Reference)],
+            "only self-contained refs resolve without a binding, and none names a kind"
+        );
     }
 
     #[test]

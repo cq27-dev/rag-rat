@@ -697,18 +697,6 @@ pub fn rationale_search(
             limit,
         )?);
     }
-    if ctx.trackers.is_empty() {
-        for parsed in parse_refs(query, None) {
-            evidence.extend(evidence_for_item(
-                conn,
-                Tracker::Github,
-                &parsed.project,
-                &parsed.number.to_string(),
-                None,
-                limit,
-            )?);
-        }
-    }
     // Over-fetch the FTS lane so collapsing a coalesced issue↔PR pair still leaves `limit` unique
     // records after truncation, rather than shrinking the result (the FTS `LIMIT` is applied before
     // coalescing, so without headroom there is no lower-ranked hit to promote into the freed slot).
