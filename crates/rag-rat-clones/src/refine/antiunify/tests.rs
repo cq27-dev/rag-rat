@@ -1,77 +1,23 @@
-use std::path::Path;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rag_rat_base::language::Language;
-use rag_rat_core::index::parser;
 
-use super::*;
-use crate::normalize::normalize_baseline_spanned;
-use crate::tokens;
-
-/// Build a `RefineMember` from a Rust snippet, mirroring `load_refine_members`: parse, descend
-/// to the first `function` symbol, span-normalize, compute the faithfulness struct_hash.
-fn member(symbol_id: i64, src: &str) -> RefineMember {
-    let text: Arc<str> = Arc::from(src);
-    let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, &text).expect("parse");
-    let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
-    let node =
-        parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-    let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
-    let struct_hash = tokens::struct_hash(&seq);
-    RefineMember {
-        callee_monikers: Default::default(),
-        symbol_id,
-        lang: Language::Rust,
-        struct_hash,
-        seq,
-        node_spans,
-        text,
-    }
-}
-
-/// Build a `RefineMember` from a TypeScript snippet — the TS analogue of [`member`]. Picks the
-/// target symbol by MAX normalized-token count (the function body), exactly as the production
-/// loader / the `normalize` tests' `target_node_for` do, so it works for TS `function`,
-/// `const`/arrow declarators, etc. Used by the template-literal / TS-string tests (#254 #274).
-fn member_ts(symbol_id: i64, src: &str) -> RefineMember {
-    let text: Arc<str> = Arc::from(src);
-    let parsed = parser::parse_file(Path::new("t.ts"), Language::TypeScript, &text).expect("parse");
-    let node = parsed
-        .symbols
-        .iter()
-        .filter_map(|s| {
-            let n = parsed.root().descendant_for_byte_range(s.start_byte, s.end_byte)?;
-            Some((normalize_baseline_spanned(n, &text, Language::TypeScript).0.len(), n))
-        })
-        .max_by_key(|(len, _)| *len)
-        .map(|(_, n)| n)
-        .expect("a body symbol");
-    let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::TypeScript);
-    let struct_hash = tokens::struct_hash(&seq);
-    RefineMember {
-        callee_monikers: Default::default(),
-        symbol_id,
-        lang: Language::TypeScript,
-        struct_hash,
-        seq,
-        node_spans,
-        text,
-    }
-}
-
-/// Sort members into the canonical order the loader guarantees. Production keys on the
-/// REINDEX-STABLE `(struct_hash, path, start_byte)` (see `canonical_member_order_key` /
-/// `refine_member_order_is_reindex_stable`). `RefineMember` (a test fixture here) carries no
-/// `path`/`start_byte`, so this helper sorts `struct_hash` then `symbol_id` — the test members
-/// assign `symbol_id` to coincide with `(path, start_byte)`, so the two keys produce the SAME
-/// order on these fixtures; the production guard is the reindex-stable unit test, not this
-/// sort.
-fn canonical(mut members: Vec<RefineMember>) -> Vec<RefineMember> {
-    members.sort_by(|a, b| {
-        a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
-    });
-    members
-}
+use super::super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
+use super::super::score::Confidence;
+use super::super::test_support::{canonical, member, member_ts};
+use super::super::{RefineMember, align};
+use super::alignment::{align_to_anchor, align_to_anchor_with_budget, resolve_anchor_idx};
+use super::build::{anti_unify, anti_unify_global, anti_unify_with_budget, collapse_recurring};
+use super::classify::{classify_run, run_in_callee_position};
+use super::render::{coverage_from_mask, render_template};
+use super::spans::any_member_inserts_within;
+use super::types::{
+    ClassAlignment, ClassView, EmittedSpan, MetavarKind, RunMetavar, Template, VariationPoint,
+};
+use super::values::recover_values;
+use super::widen::{annotation_type_context, widen_string_content_run};
+use crate::normalize::NodeSpan;
 
 fn run(members: Vec<RefineMember>) -> (Vec<RefineMember>, Template) {
     let members = canonical(members);
@@ -741,7 +687,7 @@ fn c1_guard_ignores_skipped_member_no_spurious_metavar() {
     // (un-gated) C1 check `all(v == values[0])` was FALSE (the skipped `""` differs from `k`),
     // so the spurious `k()`/`m()` ValueParams SURVIVED — inflating params, depressing coverage,
     // un-fixing `k()`/`m()` in the template. With the aligned-only gate they are dropped.
-    let cap = super::align::LCS_MAX_SEQ_TOKENS;
+    let cap = align::LCS_MAX_SEQ_TOKENS;
 
     let a = member(1, "pub fn a(x: T) -> T { let r = h(g(x)); k(); m() }");
     let b = member(2, "pub fn b(x: T) -> T { let r = h(x); k(); m() }");
@@ -1495,11 +1441,11 @@ fn method_call_differing_arg_is_value_param_not_closure() {
     // callee position; the METHOD-NAME head (column 2) IS.
     let m = synthetic_method_call();
     assert!(
-        !super::run_in_callee_position(&m, 4, 4),
+        !run_in_callee_position(&m, 4, 4),
         "a method-call ARGUMENT must NOT count as a callee position"
     );
     assert!(
-        super::run_in_callee_position(&m, 2, 2),
+        run_in_callee_position(&m, 2, 2),
         "the method-NAME head must count as a callee position"
     );
 
@@ -1833,7 +1779,7 @@ fn empty_string_vs_nonempty_widens_no_stray_quote() {
 }
 
 /// Build a synthetic `RefineMember` with `token_count` parallel leaf tokens/spans. Mirrors the
-/// `long_member` helper in cache.rs — used to exceed [`super::align::LCS_MAX_SEQ_TOKENS`]
+/// `long_member` helper in cache.rs — used to exceed [`align::LCS_MAX_SEQ_TOKENS`]
 /// without parsing a multi-thousand-token real source.
 fn synthetic_member(symbol_id: i64, struct_hash: &str, token_count: usize) -> RefineMember {
     let seq: Vec<String> = (0..token_count).map(|i| format!("t{i}")).collect();
@@ -1863,7 +1809,7 @@ fn p1_long_member_is_skipped_and_sampled_no_huge_dp() {
     // LCS_MAX_SEQ_TOKENS must refine WITHOUT calling exact lcs_align on the long pair (which
     // would allocate the (n+1)·(m+1) DP table = hundreds of MB). The long member is SKIPPED
     // from the alignment (excluded from the aligned set) and the alignment is marked sampled.
-    let cap = super::align::LCS_MAX_SEQ_TOKENS;
+    let cap = align::LCS_MAX_SEQ_TOKENS;
     // Anchor sorts FIRST canonically (struct_hash "a" < "b") and is short → spine is bounded.
     let short = synthetic_member(1, "a", 8);
     let long = synthetic_member(2, "b", cap + 50);
@@ -1904,7 +1850,7 @@ fn p1_degraded_anchor_when_anchor_seq_too_long() {
     // be computed bounded at all → DEGRADE: every non-anchor member is skipped, no
     // exact lcs_align is run, the result is an empty-variation-point template with the
     // sampled flag set.
-    let cap = super::align::LCS_MAX_SEQ_TOKENS;
+    let cap = align::LCS_MAX_SEQ_TOKENS;
     // Both long; the canonical-first member is the (long) anchor.
     let a = synthetic_member(1, "a", cap + 30);
     let b = synthetic_member(2, "a", cap + 40);
@@ -2027,12 +1973,9 @@ fn method_call_differing_receiver_is_value_param() {
     // Synthetic-spans unit check: the RECEIVER leaf (column 1) is NOT a callee position; the
     // METHOD-NAME head (column 2) IS.
     let m = synthetic_method_call();
+    assert!(!run_in_callee_position(&m, 1, 1), "the receiver must NOT count as a callee position");
     assert!(
-        !super::run_in_callee_position(&m, 1, 1),
-        "the receiver must NOT count as a callee position"
-    );
-    assert!(
-        super::run_in_callee_position(&m, 2, 2),
+        run_in_callee_position(&m, 2, 2),
         "the method-NAME head must count as a callee position"
     );
 }
@@ -2047,7 +1990,7 @@ fn method_call_differing_method_name_is_closure_param() {
     // run_in_callee_position pins the method-name head as a callee position (the structural
     // half). The full classify_run path then bands it closure_param when the values differ.
     assert!(
-        super::run_in_callee_position(&head, 2, 2),
+        run_in_callee_position(&head, 2, 2),
         "the differing method-NAME head must be a callee position → closure_param"
     );
 }
@@ -2067,7 +2010,7 @@ fn skipped_member_does_not_demote_value_param_to_gapped() {
     // The two short aligned members differ only by the literal (10 vs 20) → should be a
     // clean `ValueParam`. Without the fix, C's `""` in per_member_values triggers the old
     // `any(|v| v.is_empty())` check and classifies it `Gapped` instead.
-    let cap = super::align::LCS_MAX_SEQ_TOKENS;
+    let cap = align::LCS_MAX_SEQ_TOKENS;
 
     let a = member(1, "fn a() -> i32 { let x = 10; x }");
     let b = member(2, "fn b() -> i32 { let x = 20; x }");
@@ -2207,7 +2150,7 @@ fn uniform_literal_bucket_ignores_skipped_member() {
     // `found?` short-circuit returned `None` → NO type_hint, even when EVERY aligned member is
     // the same integer-literal kind. The fix excludes `!alignment.aligned[m]` members so the
     // stable integer-bucket hint still emits over the aligned subset.
-    let cap = super::align::LCS_MAX_SEQ_TOKENS;
+    let cap = align::LCS_MAX_SEQ_TOKENS;
 
     // Two short aligned members differing only in a SAME-KIND integer literal (10 vs 20) → a
     // clean value_param whose uniform bucket is LIT_INTEGER_LITERAL.
@@ -2932,7 +2875,7 @@ fn generic_type_head_diff_widens_to_whole_type() {
 
 #[test]
 fn defensive_member_sample_cap_marks_tail_members_unaligned() {
-    let member_count = super::align::LCS_MEMBER_SAMPLE + 1;
+    let member_count = align::LCS_MEMBER_SAMPLE + 1;
     let members: Vec<RefineMember> =
         (0..member_count).map(|i| synthetic_member(i as i64, &format!("m{i:03}"), 1)).collect();
 
@@ -2940,10 +2883,10 @@ fn defensive_member_sample_cap_marks_tail_members_unaligned() {
 
     assert!(alignment.sampled, "tail members beyond the defensive sample cap mark sampling");
     assert!(alignment.aligned[0], "the anchor remains aligned");
-    assert!(alignment.aligned[super::align::LCS_MEMBER_SAMPLE - 1]);
-    assert!(!alignment.aligned[super::align::LCS_MEMBER_SAMPLE]);
-    assert_eq!(alignment.col_map[super::align::LCS_MEMBER_SAMPLE], vec![None]);
-    assert!(alignment.member_inserts[super::align::LCS_MEMBER_SAMPLE].is_empty());
+    assert!(alignment.aligned[align::LCS_MEMBER_SAMPLE - 1]);
+    assert!(!alignment.aligned[align::LCS_MEMBER_SAMPLE]);
+    assert_eq!(alignment.col_map[align::LCS_MEMBER_SAMPLE], vec![None]);
+    assert!(alignment.member_inserts[align::LCS_MEMBER_SAMPLE].is_empty());
 }
 
 #[test]
