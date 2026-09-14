@@ -1,7 +1,7 @@
 //! The ladder's end state, provisioned in one pass on a database that has nothing in it yet.
 //!
 //! A fresh database used to reach the current schema the same way a lived-in one does: provision
-//! the V001 baseline, then replay all 111 additive migrations, several of which rebuild tables the
+//! the V001 baseline, then replay every additive migration, several of which rebuild tables the
 //! step before them just created. That is the right shape for a database with data in it, and the
 //! wrong shape for an empty one — it costs ~390ms to arrive somewhere reachable in ~25ms, and the
 //! test suite pays that per test because each test opens its own scratch database.

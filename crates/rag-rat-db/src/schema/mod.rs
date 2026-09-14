@@ -74,7 +74,7 @@ pub const REINDEX_VOLATILE_PARENTS: &[&str] =
 /// produced it), not the #248 data-loss bug.
 ///
 /// INVARIANT (#248): this is the EXPLICIT opt-out the enforcing trip-wire
-/// [`no_table_has_a_reindex_cascading_fk_to_a_volatile_parent`] consults. The trip-wire scans EVERY
+/// `no_table_has_a_reindex_cascading_fk_to_a_volatile_parent` consults. The trip-wire scans EVERY
 /// table in `sqlite_master` (not a hand-maintained list), so a NEW table that adds a cascading FK
 /// to a volatile parent FAILS the test automatically unless it is added here WITH a reason. Never
 /// allowlist a table that holds oracle/durable state — that re-creates the #248 bug; re-anchor such
