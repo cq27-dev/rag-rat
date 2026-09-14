@@ -1,5 +1,4 @@
 use super::super::RefineMember;
-use super::classify::is_type_position;
 use super::spans::subtree_token_count;
 use crate::normalize;
 
@@ -182,30 +181,11 @@ pub(super) fn widen_generic_type_head_run(
 /// part of the [`collapse_recurring`] key, so two occurrences with the same value tuple + role but
 /// DIFFERENT annotations (`let a: i32 = 1` / `let b: u8 = 1`) stay separate metavars.
 ///
-/// Scans a small window before `lo` for a `:` leaf, then forward for a type-position node, and
-/// returns that node's real source text — the same shape as `signature::try_annotation_type_span`
-/// (the recovery side), kept here as a tiny collapse-key probe rather than a cross-module call. The
-/// goal is DISTINCTNESS, not perfect recovery: if the scan misses, both occurrences get `None` and
-/// fall back to the prior (value+role) collapse, never a worse outcome than before the fix.
+/// The annotation comes from [`normalize::annotation_type_span`], the same scan signature type
+/// recovery uses, so the collapse key and the recovered param type can't disagree. The goal is
+/// DISTINCTNESS, not perfect recovery: if the scan misses, both occurrences get `None` and fall
+/// back to the prior (value+role) collapse, never a worse outcome than before the fix.
 pub(super) fn annotation_type_context(anchor: &RefineMember, lo: usize) -> Option<String> {
-    let spans = &anchor.node_spans;
-    if spans.is_empty() {
-        return None;
-    }
-    let lo = lo.min(spans.len() - 1);
-    let window_start = lo.saturating_sub(6);
-    for colon_idx in (window_start..lo).rev() {
-        let span = &spans[colon_idx];
-        if !(span.is_leaf && span.kind == ":") {
-            continue;
-        }
-        let search_end = (colon_idx + 8).min(spans.len());
-        for tspan in spans.iter().take(search_end).skip(colon_idx + 1) {
-            if is_type_position(tspan.kind) {
-                return anchor.text.get(tspan.start_byte..tspan.end_byte).map(str::to_string);
-            }
-        }
-        break;
-    }
-    None
+    let span = normalize::annotation_type_span(&anchor.node_spans, lo)?;
+    anchor.text.get(span.start_byte..span.end_byte).map(str::to_string)
 }

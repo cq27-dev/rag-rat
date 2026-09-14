@@ -506,8 +506,9 @@ fn is_closureish_kind(kind: &str) -> bool {
 }
 
 /// `true` for a tree-sitter type-position node kind. Delegates to the shared
-/// [`crate::normalize::is_rust_type_kind`] so the anti-unify classifier and the
-/// signature recoverer (`signature::is_type_kind`) can never disagree on what counts as a type —
+/// [`crate::normalize::is_rust_type_kind`] so the anti-unify classifier and signature type recovery
+/// (`normalize::annotation_type_span`, `signature::recover_return_type`) can never disagree on what
+/// counts as a type —
 /// notably the OUTER composite type nodes (`&Foo`, `[T; N]`, `(A, B)`, `Box<Foo>`, …) the
 /// classifier previously omitted, mis-routing them to `closure_param` (Fix 4, #215 Plan 4b).
 pub(super) fn is_type_position(kind: &str) -> bool {

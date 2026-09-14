@@ -322,7 +322,7 @@ fn recover_param_type(
             // SAME helper the return type uses, so they can't diverge. A class-stable
             // annotation (no overlapping TypeParam VP) renders its concrete text
             // unchanged.
-            if let Some(tspan) = try_annotation_type_span(anchor, lo)
+            if let Some(tspan) = crate::normalize::annotation_type_span(&anchor.node_spans, lo)
                 && let Some(annotated) =
                     substitute_type_params_in_type_node(anchor, tspan, type_param_cols)
             {
@@ -398,53 +398,6 @@ fn literal_bucket_to_type(bucket: &str) -> Option<&'static str> {
         // over-claim a `char` type. Recall-only fix; never promotes typedness.
         _ => None,
     }
-}
-
-/// Locate the Rust type-annotation NODE for the variation point at anchor column `lo`.
-///
-/// Scans the `node_spans` window around `lo` backward for a `:` leaf, then forward for a type-kind
-/// node, and returns that `NodeSpan` (not its text) so the caller can apply the shared
-/// TypeParam-span substitution ([`substitute_type_params_in_type_node`], Fix 5 round-7) — a varying
-/// annotation must render its declared generic, not the anchor's concrete text.
-fn try_annotation_type_span(
-    anchor: &RefineMember,
-    lo: usize,
-) -> Option<&crate::normalize::NodeSpan> {
-    let spans = &anchor.node_spans;
-    if spans.is_empty() {
-        return None;
-    }
-    let lo = lo.min(spans.len().saturating_sub(1));
-
-    // Search window: a few columns before `lo` for a `:` leaf.
-    let window_start = lo.saturating_sub(6);
-
-    // Walk backward from lo-1 looking for a colon leaf.
-    for colon_idx in (window_start..lo).rev() {
-        let span = &spans[colon_idx];
-        if !(span.is_leaf && span.kind == ":") {
-            continue;
-        }
-        // Found a colon. Look immediately after it for a type-kind node.
-        // The type node appears AFTER the colon in the pre-order sequence.
-        let search_end = (colon_idx + 8).min(spans.len());
-        for tspan in spans.iter().take(search_end).skip(colon_idx + 1) {
-            if is_type_kind(tspan.kind) {
-                return Some(tspan);
-            }
-        }
-        // Colon found but no type node after it in the window — stop searching.
-        break;
-    }
-    None
-}
-
-/// `true` for tree-sitter node kinds that represent a Rust type. Delegates to the shared
-/// [`crate::normalize::is_rust_type_kind`] — the SAME predicate
-/// `antiunify::is_type_position` uses, so the type-recovery window and the anti-unify `type_param`
-/// classification can never diverge on what counts as a type node (Fix 4, #215 Plan 4b).
-fn is_type_kind(kind: &str) -> bool {
-    crate::normalize::is_rust_type_kind(kind)
 }
 
 /// Render a recovered type node (`tspan`), substituting the DECLARED generic for every `TypeParam`
@@ -547,7 +500,7 @@ fn recover_return_type(
                 if tspan.start_byte >= body_start {
                     break;
                 }
-                if is_type_kind(tspan.kind) {
+                if crate::normalize::is_rust_type_kind(tspan.kind) {
                     // Substitute every `TypeParam` VP that overlaps this return-type node with its
                     // declared generic (Codex #1 + round-3 + round-4 Fix 5). The shared helper owns
                     // the wrapper-preserving sub-range splice so the return type and a param
