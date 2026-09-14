@@ -9,8 +9,19 @@ on:
   workflow_run:
     workflows: [bench-pr-run]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful bench-pr-run workflow run to publish
+        required: true
+        type: string
+      artifact_id:
+        description: Exact benchmark_results artifact from the latest successful attempt
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
   # `bencher run --github-actions` posts BOTH a GitHub Check and a PR comment, so the tracker needs
   # checks:write (specifying a permissions map sets omitted scopes to none) — Bencher's fork-PR
@@ -29,21 +40,48 @@ env:
 jobs:
   track:
     # Only proceed if step 1's benchmarks actually succeeded.
-    if: github.event.workflow_run.conclusion == 'success'
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubicloud-standard-2
     steps:
-      - name: Download benchmark results (from step 1)
-        uses: dawidd6/action-download-artifact@v6
+      # Only the trusted tracker revision is checked out, never the benchmark's PR head.
+      - uses: actions/checkout@v5
         with:
-          name: benchmark_results
-          run_id: ${{ github.event.workflow_run.id }}
-
-      - name: Extract PR metadata from the saved event
+          persist-credentials: false
+      - name: Test artifact selection
+        run: node --test .github/scripts/benchmark-artifact.test.cjs
+      - name: Select the successful attempt's artifact
+        id: artifact
         uses: actions/github-script@v7
         with:
           script: |
+            const select = require('./.github/scripts/benchmark-artifact.cjs');
+            const selected = await select({ github, context });
+            core.setOutput('run_id', selected.runId);
+            core.setOutput('artifact_id', selected.artifactId);
+            core.setOutput('head_sha', selected.headSha);
+            core.info(`Publishing run ${selected.runId}, attempt ${selected.attempt}, artifact ${selected.artifactId}`);
+      - name: Download benchmark results (from step 1)
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.artifact.outputs.artifact_id }}
+          run-id: ${{ steps.artifact.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: benchmark-input
+
+      - name: Extract PR metadata from the saved event
+        uses: actions/github-script@v7
+        env:
+          BENCHMARK_HEAD_SHA: ${{ steps.artifact.outputs.head_sha }}
+        with:
+          script: |
             const fs = require('fs');
-            const pr = JSON.parse(fs.readFileSync('event.json', { encoding: 'utf8' }));
+            const pr = JSON.parse(fs.readFileSync('benchmark-input/event.json', { encoding: 'utf8' }));
+            if (pr.pull_request.head.sha !== process.env.BENCHMARK_HEAD_SHA ||
+                pr.pull_request.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              throw new Error('Artifact PR metadata does not match the selected benchmark run');
+            }
             core.exportVariable('PR_HEAD', pr.pull_request.head.ref);
             core.exportVariable('PR_HEAD_SHA', pr.pull_request.head.sha);
             core.exportVariable('PR_BASE', pr.pull_request.base.ref);
@@ -72,7 +110,7 @@ jobs:
             --adapter rust_iai_callgrind \
             --github-actions '${{ secrets.GITHUB_TOKEN }}' \
             --ci-number "$PR_NUMBER" \
-            --file benchmark_results_iai.txt
+            --file benchmark-input/benchmark_results_iai.txt
 
       # Wall-clock index time (criterion) — noisier, statistical threshold lives on the main branch.
       - name: Track wall-clock index time (criterion)
@@ -88,4 +126,4 @@ jobs:
             --github-actions '${{ secrets.GITHUB_TOKEN }}' \
             --ci-number "$PR_NUMBER" \
             --err \
-            --file benchmark_results_criterion.txt
+            --file benchmark-input/benchmark_results_criterion.txt
