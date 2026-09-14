@@ -1,0 +1,7 @@
+{
+  "trigger": "manual",
+  "status": "skipped",
+  "reason": "another maintenance pass is in flight (coalesced, #267)",
+  "old_head": "old",
+  "new_head": null
+}

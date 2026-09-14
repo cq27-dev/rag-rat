@@ -353,10 +353,113 @@ enum HookStatus {
     Error,
 }
 
+/// Omission is separate from JSON null: checkout metadata is absent on deferred passes.
+#[derive(serde::Serialize)]
+struct MaintenanceReport {
+    trigger: String,
+    status: HookStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_head: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_head: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_checkout: Option<Option<String>>,
+    #[serde(flatten)]
+    completed: Option<CompletedMaintenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    papertrail: Option<HookStepReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_sync: Option<HookStepReport>,
+}
+
+impl MaintenanceReport {
+    fn new(trigger: &str, status: HookStatus) -> Self {
+        Self {
+            trigger: trigger.to_owned(),
+            status,
+            reason: None,
+            old_head: None,
+            new_head: None,
+            branch_checkout: None,
+            completed: None,
+            papertrail: None,
+            device_sync: None,
+        }
+    }
+
+    fn print(&self) -> anyhow::Result<()> {
+        // Preserve the json! report boundary for both output formats. Field declaration order
+        // mirrors the former literals, including the nested core report objects.
+        print_output(&serde_json::to_value(self)?)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CompletedMaintenance {
+    max_seconds: u64,
+    elapsed_seconds: f64,
+    wal_checkpoint: Option<rag_rat_core::index::WalCheckpointReport>,
+    reconcile: Option<rag_rat_core::index::ai::ReconcileReport>,
+    vector_reencode: Option<VectorReencodeReport>,
+    clone_graph: Option<rag_rat_core::index::CloneEdgeReport>,
+    gc: Option<rag_rat_core::index::GcReport>,
+    memory_validation: Option<rag_rat_query::memory::RepoMemoryValidationReport>,
+    remaining_backlog: BacklogSummary,
+}
+
+#[derive(serde::Serialize)]
+struct VectorReencodeReport {
+    converted: usize,
+}
+
+#[derive(serde::Serialize)]
+struct BacklogSummary {
+    model: String,
+    current: u64,
+    stale: u64,
+    failed: u64,
+    blocked: u64,
+    total_chunks: u64,
+}
+
+#[derive(serde::Serialize)]
+struct HookStepReport {
+    status: HookStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(flatten)]
+    detail: HookStepDetail,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum HookStepDetail {
+    Empty {},
+    Error { error: String },
+    Papertrail { synced_items: usize, bindings: usize, errors: usize },
+    DeviceSync { peers: usize, ok: usize, errors: usize },
+}
+
+impl HookStepReport {
+    fn reason(status: HookStatus, reason: &str) -> Self {
+        Self { status, reason: Some(reason.to_owned()), detail: HookStepDetail::Empty {} }
+    }
+
+    fn skipped(reason: &str) -> Self {
+        Self::reason(HookStatus::Skipped, reason)
+    }
+}
+
 /// The report for a hook step that failed. The failure is folded into the report rather than
 /// returned: a broken mirror or peer must never fail the git hook.
-fn hook_error(error: &impl std::fmt::Display) -> serde_json::Value {
-    serde_json::json!({"status": HookStatus::Error, "error": error.to_string()})
+fn hook_error(error: &impl std::fmt::Display) -> HookStepReport {
+    HookStepReport {
+        status: HookStatus::Error,
+        reason: None,
+        detail: HookStepDetail::Error { error: error.to_string() },
+    }
 }
 
 #[cfg(test)]
@@ -395,14 +498,14 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         == Some(crate::hooks_support::ManagedHook::PostCheckout)
         && branch_checkout.as_deref() == Some("0")
     {
-        print_output(&serde_json::json!({
-            "trigger": trigger,
-            "status": HookStatus::Skipped,
-            "reason": "file checkout",
-            "old_head": old_head,
-            "new_head": new_head,
-            "branch_checkout": branch_checkout,
-        }))?;
+        MaintenanceReport {
+            reason: Some("file checkout".to_owned()),
+            old_head: Some(old_head),
+            new_head: Some(new_head),
+            branch_checkout: Some(branch_checkout),
+            ..MaintenanceReport::new(&trigger, HookStatus::Skipped)
+        }
+        .print()?;
         return Ok(());
     }
 
@@ -422,15 +525,15 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         // hook triggers (post-checkout / post-merge).
         let papertrail = papertrail_hook_trigger(config);
         let device_sync = sync_hook_trigger(config);
-        print_output(&serde_json::json!({
-            "trigger": trigger,
-            "status": HookStatus::Skipped,
-            "reason": "watcher live — deferring to the watcher's pass",
-            "old_head": old_head,
-            "new_head": new_head,
-            "papertrail": papertrail,
-            "device_sync": device_sync,
-        }))?;
+        MaintenanceReport {
+            reason: Some("watcher live — deferring to the watcher's pass".to_owned()),
+            old_head: Some(old_head),
+            new_head: Some(new_head),
+            papertrail: Some(papertrail),
+            device_sync: Some(device_sync),
+            ..MaintenanceReport::new(&trigger, HookStatus::Skipped)
+        }
+        .print()?;
         return Ok(());
     }
 
@@ -456,22 +559,21 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         Ok(rag_rat_base::single_flight::Step::Ran(run_maintenance_pass(config, args, &trigger)?))
     })? {
         rag_rat_base::single_flight::FlightOutcome::Coalesced => {
-            let mut skip_report = serde_json::json!({
-                "trigger": trigger,
-                "status": HookStatus::Skipped,
-                "reason": "another maintenance pass is in flight (coalesced, #267)",
-                "old_head": old_head,
-                "new_head": new_head,
-            });
+            let mut skip_report = MaintenanceReport {
+                reason: Some("another maintenance pass is in flight (coalesced, #267)".to_owned()),
+                old_head: Some(old_head),
+                new_head: Some(new_head),
+                ..MaintenanceReport::new(&trigger, HookStatus::Skipped)
+            };
             // A HOOK trigger still fires its own papertrail request: the in-flight maintenance
             // holder may be a manual/cron run that never triggers papertrail, so relying on it
             // would drop this trigger's change signal. The flight lock and pending marker dedup
             // this against any flight the holder (or the watcher) does run.
             if hook_trigger {
-                skip_report["papertrail"] = papertrail_hook_trigger(config);
-                skip_report["device_sync"] = sync_hook_trigger(config);
+                skip_report.papertrail = Some(papertrail_hook_trigger(config));
+                skip_report.device_sync = Some(sync_hook_trigger(config));
             }
-            return print_output(&skip_report);
+            return skip_report.print();
         },
         rag_rat_base::single_flight::FlightOutcome::Ran(Some(report)) => report,
         // `run` was given an initial payload, so it runs at least one pass; maintenance never stops
@@ -484,11 +586,10 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     let papertrail = if hook_trigger {
         papertrail_hook_trigger(config)
     } else {
-        serde_json::json!({
-            "status": HookStatus::Skipped,
-            "reason": "papertrail auto-sync rides git-hook triggers only; run `rag-rat \
-                       papertrail sync` for an explicit mirror pass",
-        })
+        HookStepReport::skipped(
+            "papertrail auto-sync rides git-hook triggers only; run `rag-rat papertrail sync` for \
+             an explicit mirror pass",
+        )
     };
     // Device-side sync likewise rides git-hook triggers only (a manual/cron `maintenance` stays
     // bounded by its index budget); the cadence watermark keeps it to at most one dial per
@@ -496,16 +597,11 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     let device_sync = if hook_trigger {
         sync_hook_trigger(config)
     } else {
-        serde_json::json!({
-            "status": HookStatus::Skipped,
-            "reason": "device-side sync rides git-hook triggers only",
-        })
+        HookStepReport::skipped("device-side sync rides git-hook triggers only")
     };
-    if let Some(report) = report.as_object_mut() {
-        report.insert("papertrail".to_string(), papertrail);
-        report.insert("device_sync".to_string(), device_sync);
-    }
-    print_output(&report)
+    report.papertrail = Some(papertrail);
+    report.device_sync = Some(device_sync);
+    report.print()
 }
 
 /// Best-effort papertrail auto-sync riding the git trigger (#592): runs AFTER ordinary
@@ -514,27 +610,29 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
 /// into the report; a broken mirror must never fail the git hook. Per-binding failure and
 /// staleness detail is persisted as binding health inside the flight and retried by the
 /// scheduling policy on later triggers.
-fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
+fn papertrail_hook_trigger(config: &Config) -> HookStepReport {
     use rag_rat_core::index::papertrail_autosync as autosync;
     use rag_rat_papertrail::AutosyncRequest;
     match autosync::run(config, AutosyncRequest::Incremental) {
-        Ok(autosync::AutosyncOutcome::Disabled) => {
-            serde_json::json!({"status": HookStatus::Disabled, "reason": "no tracker bindings"})
+        Ok(autosync::AutosyncOutcome::Disabled) =>
+            HookStepReport::reason(HookStatus::Disabled, "no tracker bindings"),
+        Ok(autosync::AutosyncOutcome::NotIndexed) => HookStepReport::reason(
+            HookStatus::Deferred,
+            "repo is not indexed yet; automatic sync starts after the first index pass",
+        ),
+        Ok(autosync::AutosyncOutcome::Coalesced) => HookStepReport::reason(
+            HookStatus::Coalesced,
+            "another papertrail flight is in the air; request queued",
+        ),
+        Ok(autosync::AutosyncOutcome::Ran(report)) => HookStepReport {
+            status: HookStatus::Ran,
+            reason: None,
+            detail: HookStepDetail::Papertrail {
+                synced_items: report.synced_items,
+                bindings: report.bindings.len(),
+                errors: report.errors.len(),
+            },
         },
-        Ok(autosync::AutosyncOutcome::NotIndexed) => serde_json::json!({
-            "status": HookStatus::Deferred,
-            "reason": "repo is not indexed yet; automatic sync starts after the first index pass",
-        }),
-        Ok(autosync::AutosyncOutcome::Coalesced) => serde_json::json!({
-            "status": HookStatus::Coalesced,
-            "reason": "another papertrail flight is in the air; request queued",
-        }),
-        Ok(autosync::AutosyncOutcome::Ran(report)) => serde_json::json!({
-            "status": HookStatus::Ran,
-            "synced_items": report.synced_items,
-            "bindings": report.bindings.len(),
-            "errors": report.errors.len(),
-        }),
         Err(error) => {
             tracing::warn!(
                 target: "rag_rat_core::papertrail",
@@ -552,7 +650,7 @@ fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
 /// holds the repo write lock (each account ingest is a short SQLite transaction) and every failure
 /// is folded into the report — a broken peer must never fail the git hook. The cadence watermark
 /// and the per-database session lock dedup the several triggers one git action fires.
-fn sync_hook_trigger(config: &Config) -> serde_json::Value {
+fn sync_hook_trigger(config: &Config) -> HookStepReport {
     use crate::commands::sync::{DeviceSyncOutcome, device_sync_run};
     // Re-open the migrated index for the account-log sync (the pass closed its own connection). A
     // Compatible store needs no migration, so this is cheap — the same shape autosync uses.
@@ -562,10 +660,10 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
     };
     match rag_rat_core::sync_driver::nudge_resident_host(db.connection()) {
         Ok(true) => {
-            return serde_json::json!({
-                "status": HookStatus::Nudged,
-                "reason": "the active MCP resident sync host will reconcile this database",
-            });
+            return HookStepReport::reason(
+                HookStatus::Nudged,
+                "the active MCP resident sync host will reconcile this database",
+            );
         },
         Ok(false) => {},
         Err(error) => tracing::warn!(
@@ -575,24 +673,21 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
         ),
     }
     match device_sync_run(config, db.connection()) {
-        Ok(DeviceSyncOutcome::Disabled) => serde_json::json!({
-            "status": HookStatus::Disabled,
-            "reason": "no local account, or this device is not roster-effective",
-        }),
-        Ok(DeviceSyncOutcome::Skipped) => serde_json::json!({
-            "status": HookStatus::Skipped,
-            "reason": "within push_interval_secs since the last device sync",
-        }),
-        Ok(DeviceSyncOutcome::Deferred) => serde_json::json!({
-            "status": HookStatus::Deferred,
-            "reason": "this database's node identity is busy (a serve peer or another sync)",
-        }),
-        Ok(DeviceSyncOutcome::Ran { peers, ok, errors }) => serde_json::json!({
-            "status": HookStatus::Ran,
-            "peers": peers,
-            "ok": ok,
-            "errors": errors,
-        }),
+        Ok(DeviceSyncOutcome::Disabled) => HookStepReport::reason(
+            HookStatus::Disabled,
+            "no local account, or this device is not roster-effective",
+        ),
+        Ok(DeviceSyncOutcome::Skipped) =>
+            HookStepReport::skipped("within push_interval_secs since the last device sync"),
+        Ok(DeviceSyncOutcome::Deferred) => HookStepReport::reason(
+            HookStatus::Deferred,
+            "this database's node identity is busy (a serve peer or another sync)",
+        ),
+        Ok(DeviceSyncOutcome::Ran { peers, ok, errors }) => HookStepReport {
+            status: HookStatus::Ran,
+            reason: None,
+            detail: HookStepDetail::DeviceSync { peers, ok, errors },
+        },
         Err(error) => {
             tracing::warn!(
                 target: "rag_rat_core::sync",
@@ -612,7 +707,7 @@ fn run_maintenance_pass(
     config: &Config,
     args: &MaintenanceArgs,
     trigger: &str,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<MaintenanceReport> {
     let max_seconds = args.max_seconds.unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
     let started = Instant::now();
 
@@ -636,11 +731,10 @@ fn run_maintenance_pass(
         Ok(db) => db,
         Err(err) if err.downcast_ref::<rag_rat_core::index::EmptyIndexRefused>().is_some() => {
             tracing::info!(target: "rag_rat_core::maintenance", "deferred: no discoverable files (first-time empty index)");
-            return Ok(serde_json::json!({
-                "trigger": trigger,
-                "status": HookStatus::Deferred,
-                "reason": "no discoverable files (first-time empty index)",
-            }));
+            return Ok(MaintenanceReport {
+                reason: Some("no discoverable files (first-time empty index)".to_owned()),
+                ..MaintenanceReport::new(trigger, HookStatus::Deferred)
+            });
         },
         Err(err) => return Err(err),
     };
@@ -794,39 +888,43 @@ fn run_maintenance_pass(
             tracing::debug!(target: "rag_rat_core::maintenance", error = %err, "wal checkpoint failed");
         })
         .ok();
-    Ok(serde_json::json!({
-        "trigger": trigger,
-        "status": HookStatus::Complete,
-        "old_head": args.old_head,
-        "new_head": args.new_head,
-        "branch_checkout": args.branch_checkout,
-        "max_seconds": max_seconds,
-        "elapsed_seconds": started.elapsed().as_secs_f64(),
-        "wal_checkpoint": wal_checkpoint,
-        "reconcile": reconcile_report,
-        // #312: rows the legacy-f32 → int8 re-encode converted this pass, or null when it was
-        // skipped (max_seconds == 0, or already done/the gate was set so the call returned 0 — note
-        // a gate-skip also reports {"converted": 0}) or errored. Lets a --json consumer see progress.
-        "vector_reencode": vector_reencode.map(|n| serde_json::json!({ "converted": n })),
-        "clone_graph": clone_graph_report,
-        "gc": gc_report,
-        "memory_validation": memory_validation,
-        "remaining_backlog": {
-            "model": embedding.model_id,
-            "current": artifacts.current,
-            "stale": artifacts.stale,
-            "failed": artifacts.failed,
-            "blocked": artifacts.blocked,
-            "total_chunks": artifacts.total_chunks,
-            // `missing` is intentionally OMITTED: `artifacts.missing` is `total - current - stale -
-            // failed - blocked` with policy-skipped chunks (generated / tiny) treated as zero, so it
-            // would report a PERMANENT backlog even after a clean reconcile (PR #380 review) — and the
-            // exact eligible-missing can't be computed without the O(repo) per-chunk scan. Coverage
-            // reads off `current`/`total_chunks`; `stale`/`failed`/`blocked` are exact remaining-work
-            // signals. The precise missing + per-policy `skipped` + by-priority breakdown live in
-            // `reconcile --plan`, along with the failed retryable/waiting split.
-        }
-    }))
+    Ok(MaintenanceReport {
+        old_head: Some(args.old_head.clone()),
+        new_head: Some(args.new_head.clone()),
+        branch_checkout: Some(args.branch_checkout.clone()),
+        completed: Some(CompletedMaintenance {
+            max_seconds,
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+            wal_checkpoint,
+            reconcile: reconcile_report,
+            // #312: rows the legacy-f32 → int8 re-encode converted this pass, or null when it was
+            // skipped (max_seconds == 0, or already done/the gate was set so the call returned 0 —
+            // note a gate-skip also reports {"converted": 0}) or errored. Lets a --json
+            // consumer see progress.
+            vector_reencode: vector_reencode.map(|converted| VectorReencodeReport { converted }),
+            clone_graph: clone_graph_report,
+            gc: gc_report,
+            memory_validation,
+            remaining_backlog: BacklogSummary {
+                model: embedding.model_id.clone(),
+                current: artifacts.current,
+                stale: artifacts.stale,
+                failed: artifacts.failed,
+                blocked: artifacts.blocked,
+                total_chunks: artifacts.total_chunks,
+                // `missing` is intentionally OMITTED: `artifacts.missing` is `total - current -
+                // stale - failed - blocked` with policy-skipped chunks (generated /
+                // tiny) treated as zero, so it would report a PERMANENT backlog
+                // even after a clean reconcile (PR #380 review) — and the
+                // exact eligible-missing can't be computed without the O(repo) per-chunk scan.
+                // Coverage reads off `current`/`total_chunks`;
+                // `stale`/`failed`/`blocked` are exact remaining-work signals. The
+                // precise missing + per-policy `skipped` + by-priority breakdown live in
+                // `reconcile --plan`, along with the failed retryable/waiting split.
+            },
+        }),
+        ..MaintenanceReport::new(trigger, HookStatus::Complete)
+    })
 }
 
 #[cfg(test)]
@@ -1094,6 +1192,7 @@ mod tests {
             new_head: None,
         };
         let report = super::run_maintenance_pass(&config, &args, "post-commit").unwrap();
+        let report = serde_json::to_value(report).unwrap();
 
         let checkpoint = &report["wal_checkpoint"];
         assert!(
@@ -1162,6 +1261,7 @@ mod tests {
             new_head: None,
         };
         let report = super::run_maintenance_pass(&config, &args, "post-commit").unwrap();
+        let report = serde_json::to_value(report).unwrap();
         let backlog = &report["remaining_backlog"];
 
         // Fields the cheap ACTIVE-model counts compute exactly.
