@@ -314,188 +314,10 @@ fn result_handler_calls_impl<'a>(
                 out.extend(handlers.iter().copied());
             }
         },
-        "block" => {
-            // Skip comments: tree-sitter exposes `line_comment`/`block_comment` as NAMED children,
-            // so a trailing comment would otherwise masquerade as the block's tail expression.
-            let children: Vec<Node<'a>> = named_children(node)
-                .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
-                .collect();
-            let Some((tail, statements)) = children.split_last() else {
-                return;
-            };
-            // Resolve `let` bindings in declaration order. Only a PLAIN `let x = value` maps `x` to
-            // its producer; a destructuring `let` (`let (a, b) = ..`, `let Out { x } = ..`) can't
-            // attribute which producer feeds which binding, so it INVALIDATES its names. (The arm
-            // has already been checked free of reassignment by `arm_rebinds_local`, so
-            // a binding's mapped value is final.)
-            let mut local = scope.clone();
-            for statement in statements {
-                if statement.kind() != "let_declaration" {
-                    continue; // a bare side-effect statement is not a handler source
-                }
-                let Some(pattern) = statement.child_by_field_name("pattern") else {
-                    continue;
-                };
-                if let Some(name) = simple_binding_name(pattern, text) {
-                    let mut handlers = Vec::new();
-                    if let Some(value) = statement.child_by_field_name("value") {
-                        result_handler_calls(value, text, &local, &mut handlers);
-                    }
-                    local.insert(name, handlers);
-                } else {
-                    let mut names = Vec::new();
-                    pattern_binding_names(pattern, text, &mut names);
-                    for name in names {
-                        local.remove(&name);
-                    }
-                }
-            }
-            let before = out.len();
-            if tail.kind() != "let_declaration" {
-                result_handler_calls(*tail, text, &local, out);
-            }
-            // EFFECT-ONLY fallback (#208, held feedback): a command/ack handler does its work in a
-            // `?`-propagated side-effecting call and returns a FIXED value (`{ self.diarize(..)?;
-            // Ok(Resp::Done) }`), so the value-trace above found nothing. Record the LAST `?`-stmt
-            // whose payload is a DIRECT delegate call (`<call>.await?` / `<call>?`). Recording the
-            // call DIRECTLY — not via scope-traced `result_handler_calls` — avoids resolving a
-            // `let`-bound `?` (`task?`) against the final block scope, which a later shadowing
-            // `let` could redirect to the wrong producer (#208 review round 11). The
-            // `?` gate + direct-call requirement excludes fire-and-forget side effects
-            // (`metrics::inc();`).
-            if out.len() == before {
-                for statement in children.iter().rev() {
-                    if statement.kind() == "expression_statement"
-                        && let Some(try_expr) = statement.named_child(0)
-                        && try_expr.kind() == "try_expression"
-                        && let Some(call) = unwrap_to_call(try_expr)
-                        && matches!(classify_call(call, text), CallRole::Delegate)
-                    {
-                        out.push(call);
-                        break;
-                    }
-                }
-            }
-        },
-        "if_expression" => {
-            // Branch RESULTS only — the `condition` field (a guard/scrutinee) is never a handler.
-            // EXCEPT an `if let Pat = value` condition: its payload bindings are projections of
-            // `value`, so the CONSEQUENCE inherits the value's handlers (like a match arm, #208).
-            let consequence_scope = match node.child_by_field_name("condition") {
-                Some(condition) if condition.kind() == "let_condition" => {
-                    let mut scrutinee_handlers = Vec::new();
-                    if let Some(value) = condition.child_by_field_name("value") {
-                        result_handler_calls(value, text, scope, &mut scrutinee_handlers);
-                    }
-                    let mut inner = scope.clone();
-                    if let Some(pattern) = condition.child_by_field_name("pattern") {
-                        let mut bound = Vec::new();
-                        pattern_binding_names(pattern, text, &mut bound);
-                        bound.sort();
-                        bound.dedup();
-                        match bound.as_slice() {
-                            [name] => {
-                                inner.insert(name.clone(), scrutinee_handlers);
-                            },
-                            _ =>
-                                for name in bound {
-                                    inner.remove(&name);
-                                },
-                        }
-                    }
-                    inner
-                },
-                _ => scope.clone(),
-            };
-            if let Some(consequence) = node.child_by_field_name("consequence") {
-                result_handler_calls(consequence, text, &consequence_scope, out);
-            }
-            if let Some(alternative) = node.child_by_field_name("alternative") {
-                result_handler_calls(alternative, text, scope, out);
-            }
-        },
-        "match_expression" => {
-            // Each arm's RESULT only — never the scrutinee directly. An arm's pattern bindings are
-            // projections of the SCRUTINEE, so they inherit the scrutinee's resolved handlers (a
-            // returned payload `match load()? { Some(v) => Ok(Wrap(v)) }` traces `v` back to
-            // `load`). This also overrides any outer `let` of the same name, so a
-            // payload `Some(value)` never resolves to an unrelated outer `let value`
-            // (#208 review).
-            let scrutinee_handlers = match node.child_by_field_name("value") {
-                Some(scrutinee) => {
-                    let mut handlers = Vec::new();
-                    result_handler_calls(scrutinee, text, scope, &mut handlers);
-                    handlers
-                },
-                None => Vec::new(),
-            };
-            if let Some(body) = node.child_by_field_name("body") {
-                for arm in named_children(body) {
-                    if arm.kind() == "match_arm"
-                        && let Some(value) = arm.child_by_field_name("value")
-                    {
-                        let mut arm_scope = scope.clone();
-                        if let Some(pattern) = arm.child_by_field_name("pattern") {
-                            let mut bound = Vec::new();
-                            pattern_binding_names(pattern, text, &mut bound);
-                            // An or-pattern repeats the same binding per alternative
-                            // (`Ok(v) | Err(v)`); dedup so it counts as the single projected
-                            // payload.
-                            bound.sort();
-                            bound.dedup();
-                            match bound.as_slice() {
-                                // A single payload binding IS the projected scrutinee value —
-                                // inherit its handlers. Multiple
-                                // bindings can't each be the whole scrutinee
-                                // (`(resp, _span)` would credit every binding with every producer),
-                                // so mask them (#208 review).
-                                [name] => {
-                                    arm_scope.insert(name.clone(), scrutinee_handlers.clone());
-                                },
-                                _ =>
-                                    for name in bound {
-                                        arm_scope.remove(&name);
-                                    },
-                            }
-                        }
-                        result_handler_calls(value, text, &arm_scope, out);
-                    }
-                }
-            }
-        },
-        "struct_expression" => {
-            // Trace field VALUES and shorthand reads (`Resp { vector }`), never field LABELS
-            // (`Resp { status: .. }` must not match a `status` local). ONLY when there is exactly
-            // one field value — a multi-field struct can't attribute which field is the
-            // returned response (`Resp { ok: handler(), metric: m() }`), so emit
-            // nothing (no false edge, #208 review).
-            let Some(fields) = named_children(node).find(|c| c.kind() == "field_initializer_list")
-            else {
-                return;
-            };
-            let values: Vec<Node<'a>> = named_children(fields)
-                .filter(|f| {
-                    matches!(
-                        f.kind(),
-                        "field_initializer"
-                            | "shorthand_field_initializer"
-                            | "base_field_initializer"
-                    )
-                })
-                .collect();
-            if let [field] = values.as_slice() {
-                match field.kind() {
-                    "field_initializer" =>
-                        if let Some(value) = field.child_by_field_name("value") {
-                            result_handler_calls(value, text, scope, out);
-                        },
-                    _ =>
-                        for inner in named_children(*field) {
-                            result_handler_calls(inner, text, scope, out);
-                        },
-                }
-            }
-        },
+        "block" => block_handler_calls(node, text, scope, out),
+        "if_expression" => if_handler_calls(node, text, scope, out),
+        "match_expression" => match_arm_handler_calls(node, text, scope, out),
+        "struct_expression" => struct_expression_handler_calls(node, text, scope, out),
         "index_expression" => {
             // A projection `r[i]` of a result — trace ONLY the indexed receiver (`r`), never the
             // index expression (`choose_index()` selects, it doesn't produce the response).
@@ -531,6 +353,209 @@ fn result_handler_calls_impl<'a>(
                 result_handler_calls(child, text, scope, out);
             },
         _ => {},
+    }
+}
+
+/// Skip comments: tree-sitter exposes `line_comment`/`block_comment` as NAMED children,
+/// so a trailing comment would otherwise masquerade as the block's tail expression.
+fn block_handler_calls<'a>(
+    node: Node<'a>,
+    text: &str,
+    scope: &std::collections::HashMap<String, Vec<Node<'a>>>,
+    out: &mut Vec<Node<'a>>,
+) {
+    let children: Vec<Node<'a>> = named_children(node)
+        .filter(|child| !matches!(child.kind(), "line_comment" | "block_comment"))
+        .collect();
+    let Some((tail, statements)) = children.split_last() else {
+        return;
+    };
+    // Resolve `let` bindings in declaration order. Only a PLAIN `let x = value` maps `x` to
+    // its producer; a destructuring `let` (`let (a, b) = ..`, `let Out { x } = ..`) can't
+    // attribute which producer feeds which binding, so it INVALIDATES its names. (The arm
+    // has already been checked free of reassignment by `arm_rebinds_local`, so
+    // a binding's mapped value is final.)
+    let mut local = scope.clone();
+    for statement in statements {
+        if statement.kind() != "let_declaration" {
+            continue; // a bare side-effect statement is not a handler source
+        }
+        let Some(pattern) = statement.child_by_field_name("pattern") else {
+            continue;
+        };
+        if let Some(name) = simple_binding_name(pattern, text) {
+            let mut handlers = Vec::new();
+            if let Some(value) = statement.child_by_field_name("value") {
+                result_handler_calls(value, text, &local, &mut handlers);
+            }
+            local.insert(name, handlers);
+        } else {
+            let mut names = Vec::new();
+            pattern_binding_names(pattern, text, &mut names);
+            for name in names {
+                local.remove(&name);
+            }
+        }
+    }
+    let before = out.len();
+    if tail.kind() != "let_declaration" {
+        result_handler_calls(*tail, text, &local, out);
+    }
+    // EFFECT-ONLY fallback (#208, held feedback): a command/ack handler does its work in a
+    // `?`-propagated side-effecting call and returns a FIXED value (`{ self.diarize(..)?;
+    // Ok(Resp::Done) }`), so the value-trace above found nothing. Record the LAST `?`-stmt
+    // whose payload is a DIRECT delegate call (`<call>.await?` / `<call>?`). Recording the
+    // call DIRECTLY — not via scope-traced `result_handler_calls` — avoids resolving a
+    // `let`-bound `?` (`task?`) against the final block scope, which a later shadowing
+    // `let` could redirect to the wrong producer (#208 review round 11). The
+    // `?` gate + direct-call requirement excludes fire-and-forget side effects
+    // (`metrics::inc();`).
+    if out.len() == before {
+        for statement in children.iter().rev() {
+            if statement.kind() == "expression_statement"
+                && let Some(try_expr) = statement.named_child(0)
+                && try_expr.kind() == "try_expression"
+                && let Some(call) = unwrap_to_call(try_expr)
+                && matches!(classify_call(call, text), CallRole::Delegate)
+            {
+                out.push(call);
+                break;
+            }
+        }
+    }
+}
+
+/// Branch RESULTS only — the `condition` field (a guard/scrutinee) is never a handler.
+/// EXCEPT an `if let Pat = value` condition: its payload bindings are projections of
+/// `value`, so the CONSEQUENCE inherits the value's handlers (like a match arm, #208).
+fn if_handler_calls<'a>(
+    node: Node<'a>,
+    text: &str,
+    scope: &std::collections::HashMap<String, Vec<Node<'a>>>,
+    out: &mut Vec<Node<'a>>,
+) {
+    let consequence_scope = match node.child_by_field_name("condition") {
+        Some(condition) if condition.kind() == "let_condition" => {
+            let mut scrutinee_handlers = Vec::new();
+            if let Some(value) = condition.child_by_field_name("value") {
+                result_handler_calls(value, text, scope, &mut scrutinee_handlers);
+            }
+            let mut inner = scope.clone();
+            if let Some(pattern) = condition.child_by_field_name("pattern") {
+                let mut bound = Vec::new();
+                pattern_binding_names(pattern, text, &mut bound);
+                bound.sort();
+                bound.dedup();
+                match bound.as_slice() {
+                    [name] => {
+                        inner.insert(name.clone(), scrutinee_handlers);
+                    },
+                    _ =>
+                        for name in bound {
+                            inner.remove(&name);
+                        },
+                }
+            }
+            inner
+        },
+        _ => scope.clone(),
+    };
+    if let Some(consequence) = node.child_by_field_name("consequence") {
+        result_handler_calls(consequence, text, &consequence_scope, out);
+    }
+    if let Some(alternative) = node.child_by_field_name("alternative") {
+        result_handler_calls(alternative, text, scope, out);
+    }
+}
+
+/// Each arm's RESULT only — never the scrutinee directly. An arm's pattern bindings are
+/// projections of the SCRUTINEE, so they inherit the scrutinee's resolved handlers (a
+/// returned payload `match load()? { Some(v) => Ok(Wrap(v)) }` traces `v` back to
+/// `load`). This also overrides any outer `let` of the same name, so a
+/// payload `Some(value)` never resolves to an unrelated outer `let value`
+/// (#208 review).
+fn match_arm_handler_calls<'a>(
+    node: Node<'a>,
+    text: &str,
+    scope: &std::collections::HashMap<String, Vec<Node<'a>>>,
+    out: &mut Vec<Node<'a>>,
+) {
+    let scrutinee_handlers = match node.child_by_field_name("value") {
+        Some(scrutinee) => {
+            let mut handlers = Vec::new();
+            result_handler_calls(scrutinee, text, scope, &mut handlers);
+            handlers
+        },
+        None => Vec::new(),
+    };
+    if let Some(body) = node.child_by_field_name("body") {
+        for arm in named_children(body) {
+            if arm.kind() == "match_arm"
+                && let Some(value) = arm.child_by_field_name("value")
+            {
+                let mut arm_scope = scope.clone();
+                if let Some(pattern) = arm.child_by_field_name("pattern") {
+                    let mut bound = Vec::new();
+                    pattern_binding_names(pattern, text, &mut bound);
+                    // An or-pattern repeats the same binding per alternative
+                    // (`Ok(v) | Err(v)`); dedup so it counts as the single projected
+                    // payload.
+                    bound.sort();
+                    bound.dedup();
+                    match bound.as_slice() {
+                        // A single payload binding IS the projected scrutinee value —
+                        // inherit its handlers. Multiple
+                        // bindings can't each be the whole scrutinee
+                        // (`(resp, _span)` would credit every binding with every producer),
+                        // so mask them (#208 review).
+                        [name] => {
+                            arm_scope.insert(name.clone(), scrutinee_handlers.clone());
+                        },
+                        _ =>
+                            for name in bound {
+                                arm_scope.remove(&name);
+                            },
+                    }
+                }
+                result_handler_calls(value, text, &arm_scope, out);
+            }
+        }
+    }
+}
+
+/// Trace field VALUES and shorthand reads (`Resp { vector }`), never field LABELS
+/// (`Resp { status: .. }` must not match a `status` local). ONLY when there is exactly
+/// one field value — a multi-field struct can't attribute which field is the
+/// returned response (`Resp { ok: handler(), metric: m() }`), so emit
+/// nothing (no false edge, #208 review).
+fn struct_expression_handler_calls<'a>(
+    node: Node<'a>,
+    text: &str,
+    scope: &std::collections::HashMap<String, Vec<Node<'a>>>,
+    out: &mut Vec<Node<'a>>,
+) {
+    let Some(fields) = named_children(node).find(|c| c.kind() == "field_initializer_list") else {
+        return;
+    };
+    let values: Vec<Node<'a>> = named_children(fields)
+        .filter(|f| {
+            matches!(
+                f.kind(),
+                "field_initializer" | "shorthand_field_initializer" | "base_field_initializer"
+            )
+        })
+        .collect();
+    if let [field] = values.as_slice() {
+        match field.kind() {
+            "field_initializer" =>
+                if let Some(value) = field.child_by_field_name("value") {
+                    result_handler_calls(value, text, scope, out);
+                },
+            _ =>
+                for inner in named_children(*field) {
+                    result_handler_calls(inner, text, scope, out);
+                },
+        }
     }
 }
 
