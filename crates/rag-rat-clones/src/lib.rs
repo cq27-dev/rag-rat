@@ -189,7 +189,7 @@ mod tests {
     use std::path::Path;
 
     use rag_rat_base::language::Language;
-    use rag_rat_core::index::{parser, symbols};
+    use rag_rat_core::index::parser;
 
     use super::*;
 
@@ -281,12 +281,12 @@ mod tests {
             "struct S {\n  let plain = 5\n}\n",
         )
         .expect("parse");
-        let symbols = symbols::from_parsed(&parsed.symbols);
+        let symbols = &parsed.symbols;
         let fingerprints = fingerprint_symbols(
             parsed.root(),
             "struct S {\n  let plain = 5\n}\n",
             Language::Swift,
-            &candidates_of(&symbols),
+            &candidates_of(symbols),
         );
         assert!(
             fingerprints.is_empty(),
@@ -414,7 +414,7 @@ mod tests {
             parsed.root(),
             big_object,
             Language::TypeScript,
-            &candidates_of(&symbols::from_parsed(&parsed.symbols)),
+            &candidates_of(&parsed.symbols),
         );
         assert!(
             fps.is_empty(),
