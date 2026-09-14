@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use path_slash::PathExt as _;
+
 /// `std::fs::canonicalize`, minus the Windows `\\?\` verbatim prefix wherever the plain spelling
 /// names the same file — THE canonicalization every subsystem resolves a filesystem path through.
 /// Identical to `std::fs::canonicalize` on Unix.
@@ -179,8 +181,6 @@ fn windows_utf16_len(s: &str) -> usize {
 /// The longest plain-spelled path the ANSI APIs accept, and the longest single component.
 const MAX_PLAIN_PATH_UNITS: usize = 260;
 const MAX_COMPONENT_UNITS: usize = 255;
-
-use path_slash::PathExt as _;
 
 /// The canonical `/`-separated rendering used everywhere a path is persisted or compared against
 /// the `files` table — Windows separators normalize so the same file hashes/joins identically on
