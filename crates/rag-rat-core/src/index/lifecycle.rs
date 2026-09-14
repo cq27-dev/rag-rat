@@ -785,6 +785,16 @@ impl IndexDatabase {
         CheckoutRef { commit_sha: &self.active_commit_sha, worktree_id: &self.active_worktree_id }
     }
 
+    /// Check the repo resolved by this connection's scope context, rather than the cached
+    /// `active_repo_id` field: a long-lived writer must observe the current context after removal.
+    /// Callers may use this as an early preflight, but writes must re-check inside their own
+    /// IMMEDIATE transaction so a concurrent purge cannot leave new rows behind (#767).
+    pub(crate) fn assert_active_repo_not_removed(&self) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        let repo_id = schema::active_repo_id(conn)?;
+        super::remove::assert_repo_not_removed(conn, &repo_id)
+    }
+
     /// Whether this connection is scoped to a LINKED-worktree overlay (a non-empty
     /// `active_worktree_id` that differs from the base checkout's own id, derived from
     /// `source_root`). The lazy heal paths (`heal_file`, `heal_index`) read file bytes from

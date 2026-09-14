@@ -16,8 +16,7 @@ impl IndexDatabase {
         // lives inside the findings sync's IMMEDIATE transaction (`findings::sync`), which
         // serializes with rm's purge on the SQLite write lock so a removal landing mid-run cannot
         // let the sync re-insert `dream_findings` rows for the removed `repo_id`.
-        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
+        self.assert_active_repo_not_removed()?;
         rag_rat_dream::dream_run(conn, opts)
     }
 
@@ -38,8 +37,7 @@ impl IndexDatabase {
         // IMMEDIATE write transaction (`rag_rat_dream::removal_guarded_write_tx`), so a removal
         // landing after this preflight still cannot leave `memory_reality`,
         // `memory_note_summaries`, or `memory_model_failures` rows behind.
-        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
+        self.assert_active_repo_not_removed()?;
         // #582 review: the model passes rank chunk_fts (evidence-pack probes) MID-RUN, after
         // model side effects — a blanket retry would replay them. PRE-FLIGHT the probe-and-heal
         // instead so the run starts on healthy mirrors; on a clean index the probe is four

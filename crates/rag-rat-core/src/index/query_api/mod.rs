@@ -622,9 +622,7 @@ impl IndexDatabase {
         // the tombstone inside their IMMEDIATE mutation transactions, which serialize with rm's
         // purge on the SQLite write lock (the heal path deliberately stays flock-free so it can
         // run alongside a mid-flight rebuild).
-        let conn = self.storage.connection();
-        let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
-        crate::index::remove::assert_repo_not_removed(conn, &active_repo_id)?;
+        self.assert_active_repo_not_removed()?;
         let indexed_files = self.indexed_files()?;
         let max_repairs = limit.map(usize::try_from).transpose()?.unwrap_or(usize::MAX);
         let mut report = HealIndexReport {
