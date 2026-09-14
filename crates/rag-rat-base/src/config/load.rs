@@ -55,7 +55,9 @@ impl Config {
             let raw: RawConfig = toml::from_str(&text).ok()?;
             // Targets are relative to the config's `[index].root` (a subdir layout puts the toml at
             // the worktree top with `root = "<subdir>"`); resolve + validate them there so the
-            // stored, root-relative directories match the base config's spelling exactly.
+            // stored, root-relative directories match the base config's spelling exactly. Not
+            // `resolve_index_root`: the stored directories are root-relative whatever the root's
+            // spelling, and a missing root fails target validation, degrading to base targets.
             let target_root = workdir.join(raw.index.root.as_deref().unwrap_or("."));
             resolve_targets(&target_root, raw.target_bindings, raw.target).ok()
         })();
@@ -110,13 +112,10 @@ impl Config {
         // to the caller (#427), never to decide anything (the seam is the sole source of truth for
         // governance). `None` on any parse/resolution failure; that is not a second error path,
         // just a diagnostic that stays silent when it cannot be computed.
-        let local_root_named: Option<PathBuf> = local_parse.as_ref().ok().and_then(|local_raw| {
-            config::normalize_existing_dir(
-                &local_config_dir
-                    .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
-            )
+        let local_root_named: Option<PathBuf> = local_parse
+            .as_ref()
             .ok()
-        });
+            .and_then(|local_raw| resolve_index_root(local_config_dir, &local_raw.index).ok());
 
         let GoverningConfig { mut raw, config_dir, root, target_validation_root } =
             resolve_governing_raw(path, local_config_dir, local_parse)?;
@@ -238,10 +237,7 @@ fn resolve_governing_raw(
                 }
                 // Re-derive root from MAIN's own config, exactly as loading it directly would (its
                 // root is already the main worktree — anchoring is identity).
-                let main_root = config::normalize_existing_dir(
-                    &main_config_dir
-                        .join(main_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
-                )?;
+                let main_root = resolve_index_root(&main_config_dir, &main_raw.index)?;
                 GoverningConfig {
                     raw: main_raw,
                     config_dir: main_config_dir,
@@ -260,10 +256,7 @@ fn resolve_governing_raw(
                 );
                 // Root stays anchored so the shared index still keys off the main checkout;
                 // targets validate against the local checkout where they exist (#219).
-                let local_root = config::normalize_existing_dir(
-                    &local_config_dir
-                        .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
-                )?;
+                let local_root = resolve_index_root(local_config_dir, &local_raw.index)?;
                 GoverningConfig {
                     raw: local_raw,
                     config_dir: local_config_dir.to_path_buf(),
@@ -278,10 +271,7 @@ fn resolve_governing_raw(
             // exotic `[index] root` pointing into a linked checkout (#218/#219) — an anchoring
             // concern, not a governance one.
             let local_raw = local_parse?;
-            let local_root = config::normalize_existing_dir(
-                &local_config_dir
-                    .join(local_raw.index.root.clone().unwrap_or_else(|| ".".to_string())),
-            )?;
+            let local_root = resolve_index_root(local_config_dir, &local_raw.index)?;
             GoverningConfig {
                 raw: local_raw,
                 config_dir: local_config_dir.to_path_buf(),
@@ -290,6 +280,12 @@ fn resolve_governing_raw(
             }
         },
     })
+}
+
+/// A config's `[index] root` (default `.`), resolved against the directory holding that config
+/// to the canonical, existing directory [`Config::root`] is built from.
+fn resolve_index_root(config_dir: &Path, index: &RawIndex) -> Result<PathBuf, ConfigError> {
+    config::normalize_existing_dir(&config_dir.join(index.root.as_deref().unwrap_or(".")))
 }
 
 /// The governing config's database location and the identity keys that decide it.
