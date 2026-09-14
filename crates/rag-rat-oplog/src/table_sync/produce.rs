@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Transaction, params};
 
-use super::apply;
+use super::apply::{self, RowKey};
 use super::registry::TableSpec;
 use super::row_op::{self, RowOp};
 use crate::stream::StreamId;
@@ -54,58 +54,50 @@ pub(crate) fn produce_row_ops(
         let row_pk = row_op::row_pk_string(&pk);
         live.insert(row_pk.clone());
         let hash = row_op::cells_hash(&cells);
-        let changed =
-            match apply::published_hash_on_stream(tx, stream, repo_id, spec.name, &row_pk)? {
-                // Published under THIS binary's column set: a differing hash is a real local
-                // change.
-                Some((published, version)) if version == spec.spec_version => published != hash,
-                // Published under a DIFFERENT column set: the two hashes cover different cell
-                // lists, so comparing them says nothing (they differ structurally
-                // whether or not the row changed). Resolve it against the op that
-                // actually established the row, projected under this spec — the
-                // only thing that CAN settle it.
-                //
-                // Reading the raw mismatch as a delta instead would re-author EVERY row of the
-                // table at a fresh winning lamport on EVERY upgrading device;
-                // ignoring it entirely (the #1001 conservatism this replaces) left
-                // the row permanently un-authorable, even when genuinely edited.
-                Some(_) =>
-                    match apply::stale_row_disposition(tx, spec, repo_id, stream, &pk, &cells)? {
-                        // Untouched since it landed: nothing to say, just restamp the bookkeeping
-                        // so the row is comparable again from here on.
-                        apply::StaleRow::Unchanged => {
-                            apply::record_published(
-                                tx,
-                                stream,
-                                repo_id,
-                                spec.name,
-                                &row_pk,
-                                &hash,
-                                spec.spec_version,
-                            )?;
-                            false
-                        },
-                        // A proven local change — author it. This is the exit from the frozen
-                        // state.
-                        apply::StaleRow::LocallyChanged => true,
-                        // Unprovable (the winning entry is gone, does not project here, or is not
-                        // this row's op). AUTHOR IT — the two readers of
-                        // this verdict must not both defer.
-                        // `row_has_unsent_local_change` reads `Unknown` as "there may be an unsent
-                        // edit, so refuse to replay over it"; if the producer also
-                        // declined, the row would be permanently unauthorable AND
-                        // would permanently block its own pending entries, silently
-                        // losing a genuine local edit with no way out and nothing to report it.
-                        // Authoring is the safe direction: at worst it re-emits a row that was
-                        // already correct (bounded churn, and the restamp
-                        // makes the next pass cheap), and at
-                        // best it publishes an edit that would otherwise have been lost. Not
-                        // authoring has no such floor.
-                        apply::StaleRow::Unknown => true,
+        let key = RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk };
+        let changed = match apply::published_hash_on_stream(tx, &key)? {
+            // Published under THIS binary's column set: a differing hash is a real local
+            // change.
+            Some((published, version)) if version == spec.spec_version => published != hash,
+            // Published under a DIFFERENT column set: the two hashes cover different cell
+            // lists, so comparing them says nothing (they differ structurally
+            // whether or not the row changed). Resolve it against the op that
+            // actually established the row, projected under this spec — the
+            // only thing that CAN settle it.
+            //
+            // Reading the raw mismatch as a delta instead would re-author EVERY row of the
+            // table at a fresh winning lamport on EVERY upgrading device;
+            // ignoring it entirely (the #1001 conservatism this replaces) left
+            // the row permanently un-authorable, even when genuinely edited.
+            Some(_) =>
+                match apply::stale_row_disposition(tx, spec, repo_id, stream, &pk, &cells)? {
+                    // Untouched since it landed: nothing to say, just restamp the bookkeeping
+                    // so the row is comparable again from here on.
+                    apply::StaleRow::Unchanged => {
+                        apply::record_published(tx, &key, &hash, spec.spec_version)?;
+                        false
                     },
-                // Never published: a genuinely new local row.
-                None => true,
-            };
+                    // A proven local change — author it. This is the exit from the frozen
+                    // state.
+                    apply::StaleRow::LocallyChanged => true,
+                    // Unprovable (the winning entry is gone, does not project here, or is not
+                    // this row's op). AUTHOR IT — the two readers of
+                    // this verdict must not both defer.
+                    // `row_has_unsent_local_change` reads `Unknown` as "there may be an unsent
+                    // edit, so refuse to replay over it"; if the producer also
+                    // declined, the row would be permanently unauthorable AND
+                    // would permanently block its own pending entries, silently
+                    // losing a genuine local edit with no way out and nothing to report it.
+                    // Authoring is the safe direction: at worst it re-emits a row that was
+                    // already correct (bounded churn, and the restamp
+                    // makes the next pass cheap), and at
+                    // best it publishes an edit that would otherwise have been lost. Not
+                    // authoring has no such floor.
+                    apply::StaleRow::Unknown => true,
+                },
+            // Never published: a genuinely new local row.
+            None => true,
+        };
         if changed {
             ops.push(RowOp::Upsert {
                 table: spec.name.to_string(),

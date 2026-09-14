@@ -2546,10 +2546,12 @@ mod tests {
             let stream = StreamId::from_bytes(route.stream_id);
             crate::table_sync::apply::record_published(
                 &tx,
-                stream,
-                "repo-a",
-                REPO_SPEC.name,
-                &row_pk,
+                &crate::table_sync::apply::RowKey {
+                    stream,
+                    repo_id: "repo-a",
+                    table: REPO_SPEC.name,
+                    row_pk: &row_pk,
+                },
                 &hash,
                 REPO_SPEC.spec_version,
             )
