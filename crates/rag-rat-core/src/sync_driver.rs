@@ -70,7 +70,6 @@ impl Drop for ResidentSyncHost {
 
 impl ResidentSyncHost {
     pub fn start(config: Config) -> anyhow::Result<Option<Self>> {
-        let database = config.database.clone();
         // The first open follows the same migration/compatibility gate as every active MCP path;
         // a raw storage open here could create an empty database or bypass a newer-schema refusal.
         let db = crate::IndexDatabase::open_config(&config)?;
@@ -87,68 +86,9 @@ impl ResidentSyncHost {
         let relay = relay_url(&config);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
-        let heartbeat_database = database.clone();
         let task =
             std::thread::Builder::new().name("rag-rat-sync".to_string()).spawn(move || {
-                // `WriteLock` records reentrancy per thread, so acquire and release it only on the
-                // worker that owns the endpoint. It stays held through the final network wait.
-                let session = match locks::WriteLock::acquire_sync_session_timeout(
-                    &database,
-                    LOCK_TIMEOUT,
-                ) {
-                    Ok(Some(session)) => session,
-                    Ok(None) => {
-                        let _ = ready_tx.send(Ok(ResidentHostReady::Unavailable));
-                        return;
-                    },
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error));
-                        return;
-                    },
-                };
-                let _session = session;
-                let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
-                let ready_for_runtime = ready_tx.clone();
-                let result: anyhow::Result<()> = match runtime {
-                    Ok(runtime) => runtime.block_on(async move {
-                        let endpoint =
-                            rag_rat_sync::build_endpoint(*secret, &relay).await.with_context(
-                                || format!("binding the sync endpoint over relay {relay}"),
-                            )?;
-                        let storage = IndexConnection::open(&database)?;
-                        heartbeat(storage.connection())?;
-                        drop(storage);
-                        ready_for_runtime
-                            .send(Ok(ResidentHostReady::Started))
-                            .map_err(|_| anyhow!("resident sync host startup was abandoned"))?;
-                        tokio::task::LocalSet::new()
-                            .run_until(resident_loop(
-                                config,
-                                endpoint,
-                                account,
-                                database,
-                                shutdown_rx,
-                            ))
-                            .await;
-                        Ok(())
-                    }),
-                    Err(error) => Err(error.into()),
-                };
-                match IndexConnection::open(&heartbeat_database) {
-                    Ok(storage) => {
-                        if let Err(error) =
-                            rag_rat_db::meta::delete_meta(storage.connection(), RESIDENT_HEARTBEAT)
-                        {
-                            tracing::warn!(%error, "could not clear the resident sync heartbeat");
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(%error, "could not open the resident sync store for heartbeat cleanup");
-                    },
-                }
-                if let Err(error) = result {
-                    let _ = ready_tx.send(Err(error));
-                }
+                resident_worker(config, account, secret, relay, shutdown_rx, ready_tx)
             })?;
         match ready_rx.recv()? {
             Ok(ResidentHostReady::Started) =>
@@ -162,6 +102,70 @@ impl ResidentSyncHost {
                 Err(error)
             },
         }
+    }
+}
+
+/// The resident host's worker thread: it holds the sync session lock, owns the endpoint and runs
+/// [`resident_loop`] until shutdown, reports startup through `ready`, and clears its heartbeat row
+/// on the way out.
+fn resident_worker(
+    config: Config,
+    account: rag_rat_oplog::AccountId,
+    secret: Zeroizing<[u8; 32]>,
+    relay: String,
+    shutdown: tokio::sync::oneshot::Receiver<()>,
+    ready: std::sync::mpsc::SyncSender<anyhow::Result<ResidentHostReady>>,
+) {
+    let database = config.database.clone();
+    // `WriteLock` records reentrancy per thread, so acquire and release it only on the worker that
+    // owns the endpoint. It stays held through the final network wait.
+    let session = match locks::WriteLock::acquire_sync_session_timeout(&database, LOCK_TIMEOUT) {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            let _ = ready.send(Ok(ResidentHostReady::Unavailable));
+            return;
+        },
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        },
+    };
+    let _session = session;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build();
+    let ready_for_runtime = ready.clone();
+    let loop_database = database.clone();
+    let result: anyhow::Result<()> = match runtime {
+        Ok(runtime) => runtime.block_on(async move {
+            let endpoint = rag_rat_sync::build_endpoint(*secret, &relay)
+                .await
+                .with_context(|| format!("binding the sync endpoint over relay {relay}"))?;
+            let storage = IndexConnection::open(&loop_database)?;
+            heartbeat(storage.connection())?;
+            drop(storage);
+            ready_for_runtime
+                .send(Ok(ResidentHostReady::Started))
+                .map_err(|_| anyhow!("resident sync host startup was abandoned"))?;
+            tokio::task::LocalSet::new()
+                .run_until(resident_loop(config, endpoint, account, loop_database, shutdown))
+                .await;
+            Ok(())
+        }),
+        Err(error) => Err(error.into()),
+    };
+    match IndexConnection::open(&database) {
+        Ok(storage) => {
+            if let Err(error) =
+                rag_rat_db::meta::delete_meta(storage.connection(), RESIDENT_HEARTBEAT)
+            {
+                tracing::warn!(%error, "could not clear the resident sync heartbeat");
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, "could not open the resident sync store for heartbeat cleanup");
+        },
+    }
+    if let Err(error) = result {
+        let _ = ready.send(Err(error));
     }
 }
 
@@ -206,7 +210,11 @@ pub fn device_sync_run(config: &Config, conn: &Connection) -> anyhow::Result<Dev
         reconcile(config, conn, &endpoint, account).await
     });
     record_sync(conn)?;
-    outcome.map(|(peers, ok, errors)| DeviceSyncOutcome::Ran { peers, ok, errors })
+    outcome.map(|pass| DeviceSyncOutcome::Ran {
+        peers: pass.peers,
+        ok: pass.converged,
+        errors: pass.peers - pass.converged,
+    })
 }
 
 async fn resident_loop(
@@ -818,7 +826,7 @@ async fn reconcile(
     conn: &Connection,
     endpoint: &iroh::Endpoint,
     account: rag_rat_oplog::AccountId,
-) -> anyhow::Result<(usize, usize, usize)> {
+) -> anyhow::Result<ReconcilePass> {
     let relay = relay_url(config);
     let (exchange, opener) = match discovery_fetch(config, conn, &relay)? {
         Some(fetch) => (
@@ -853,67 +861,128 @@ async fn reconcile(
         .into_iter()
         .filter(|(_, address)| !foreign_hosts.contains(&Ok(*address.id.as_bytes())))
         .collect();
-    let mut reached = vec![false; device_peers.len()];
-    for (index, (peer, address)) in device_peers.iter().enumerate() {
-        let mut store = OplogSyncStore::new(conn, account, time::now_ms);
-        match rag_rat_sync::connect_and_reconcile(
-            endpoint,
-            address.clone(),
-            rag_rat_sync::SyncAlpn::Account,
-            &mut store,
-            AuthPolicy::Closed,
-            time::now_ms,
-            rag_rat_sync::MAX_RECONCILE_ROUNDS,
-        )
-        .await
-        {
-            Ok(report) if report.converged => reached[index] = true,
-            Ok(_) => tracing::warn!(peer, "device sync account reconciliation did not converge"),
-            Err(error) => tracing::warn!(peer, %error, "device sync account reconciliation failed"),
-        }
-    }
+    // Every device peer is dialed by the first phase; one that fails or does not converge in a
+    // phase drops out of the phases after it.
+    let mut reached = vec![true; device_peers.len()];
+    reconcile_account_logs(
+        conn,
+        endpoint,
+        account,
+        &device_peers,
+        &mut reached,
+        "account reconciliation",
+    )
+    .await;
     ensure_founder_incarnations(conn)?;
     // A newly authored founder incarnation must reach peers before their table manifests run.
-    for (index, (peer, address)) in device_peers.iter().enumerate() {
-        if !reached[index] {
+    reconcile_account_logs(
+        conn,
+        endpoint,
+        account,
+        &device_peers,
+        &mut reached,
+        "incarnation propagation",
+    )
+    .await;
+    reconcile_content_and_tables(conn, endpoint, account, &device_peers, &reached).await?;
+    // Cross-account contribution (#1175): pull each foreign account this store depends on, so
+    // memories move on the same trigger as device sync — no command required. Failures are logged
+    // and retried on the next cadence; they never fail the device-sync pass.
+    if let Err(error) = pull_foreign_accounts(config, conn, endpoint, account).await {
+        tracing::warn!(%error, "cross-account pull pass failed; the next cadence retries");
+    }
+    // Resolve any anchors this run's table reconciliation pulled against the local index, so they
+    // surface as drive-by without waiting for the next index open (idempotent when nothing
+    // changed).
+    crate::resolve_synced_distill_anchors(conn)?;
+    Ok(ReconcilePass {
+        peers: reached.len() + resolved.unresolved_configured,
+        converged: reached.iter().filter(|reached| **reached).count(),
+    })
+}
+
+/// What one reconcile pass reached: every peer it tried (configured peers that never resolved
+/// count as tried), and how many of them converged.
+struct ReconcilePass {
+    peers: usize,
+    converged: usize,
+}
+
+/// One reconcile against `address` on this pass's clock and round cap.
+async fn dial_and_reconcile<S: rag_rat_sync::SyncStore + NodeAuth>(
+    endpoint: &iroh::Endpoint,
+    address: rag_rat_sync::EndpointAddr,
+    alpn: rag_rat_sync::SyncAlpn,
+    store: &mut S,
+    policy: AuthPolicy,
+) -> Result<rag_rat_sync::ReconcileReport, rag_rat_sync::SyncFailure> {
+    rag_rat_sync::connect_and_reconcile(
+        endpoint,
+        address,
+        alpn,
+        store,
+        policy,
+        time::now_ms,
+        rag_rat_sync::MAX_RECONCILE_ROUNDS,
+    )
+    .await
+}
+
+/// Reconcile this account's log with every device peer still `reached`, clearing `reached` for a
+/// peer that fails or does not converge. `phase` names the pass in its warnings.
+async fn reconcile_account_logs(
+    conn: &Connection,
+    endpoint: &iroh::Endpoint,
+    account: rag_rat_oplog::AccountId,
+    device_peers: &[(String, rag_rat_sync::EndpointAddr)],
+    reached: &mut [bool],
+    phase: &'static str,
+) {
+    for ((peer, address), reached) in device_peers.iter().zip(reached.iter_mut()) {
+        if !*reached {
             continue;
         }
         let mut store = OplogSyncStore::new(conn, account, time::now_ms);
-        match rag_rat_sync::connect_and_reconcile(
+        match dial_and_reconcile(
             endpoint,
             address.clone(),
             rag_rat_sync::SyncAlpn::Account,
             &mut store,
             AuthPolicy::Closed,
-            time::now_ms,
-            rag_rat_sync::MAX_RECONCILE_ROUNDS,
         )
         .await
         {
             Ok(report) if report.converged => {},
             Ok(_) => {
-                tracing::warn!(peer, "device sync incarnation propagation did not converge");
-                reached[index] = false;
+                tracing::warn!(peer, "device sync {phase} did not converge");
+                *reached = false;
             },
             Err(error) => {
-                tracing::warn!(peer, %error, "device sync incarnation propagation failed");
-                reached[index] = false;
+                tracing::warn!(peer, %error, "device sync {phase} failed");
+                *reached = false;
             },
         }
     }
-    for (index, (peer, address)) in device_peers.iter().enumerate() {
-        if !reached[index] {
-            continue;
-        }
+}
+
+/// Reconcile memory content, drain it into the local tables, then reconcile the synced tables,
+/// with every device peer whose account log converged. A failed leg is logged and the pass moves
+/// on; only the local drain can fail it.
+async fn reconcile_content_and_tables(
+    conn: &Connection,
+    endpoint: &iroh::Endpoint,
+    account: rag_rat_oplog::AccountId,
+    device_peers: &[(String, rag_rat_sync::EndpointAddr)],
+    reached: &[bool],
+) -> anyhow::Result<()> {
+    for ((peer, address), _) in device_peers.iter().zip(reached).filter(|(_, reached)| **reached) {
         let mut content = OplogContentSyncStore::new(conn, account, time::now_ms);
-        if let Err(error) = rag_rat_sync::connect_and_reconcile(
+        if let Err(error) = dial_and_reconcile(
             endpoint,
             address.clone(),
             rag_rat_sync::SyncAlpn::Content,
             &mut content,
             AuthPolicy::Closed,
-            time::now_ms,
-            rag_rat_sync::MAX_RECONCILE_ROUNDS,
         )
         .await
         {
@@ -934,19 +1003,7 @@ async fn reconcile(
             tracing::warn!(peer, %error, "device sync table reconciliation failed");
         }
     }
-    // Cross-account contribution (#1175): pull each foreign account this store depends on, so
-    // memories move on the same trigger as device sync — no command required. Failures are logged
-    // and retried on the next cadence; they never fail the device-sync pass.
-    if let Err(error) = pull_foreign_accounts(config, conn, endpoint, account).await {
-        tracing::warn!(%error, "cross-account pull pass failed; the next cadence retries");
-    }
-    // Resolve any anchors this run's table reconciliation pulled against the local index, so they
-    // surface as drive-by without waiting for the next index open (idempotent when nothing
-    // changed).
-    crate::resolve_synced_distill_anchors(conn)?;
-    let ok = reached.iter().filter(|reached| **reached).count();
-    let peers = reached.len() + resolved.unresolved_configured;
-    Ok((peers, ok, peers - ok))
+    Ok(())
 }
 
 /// The foreign accounts automatic sync must pull. Content is offered by AUTHOR, so each direction
@@ -1215,14 +1272,12 @@ pub async fn pull_account_via_peers(
         // the ReadWrite bootstrap fallback built for exactly this. Admission is not trust:
         // `account_ingest` / `content_ingest` re-verify every entry from scratch.
         let mut account_store = OplogSyncStore::new(conn, target, time::now_ms);
-        let account_report = match rag_rat_sync::connect_and_reconcile(
+        let account_report = match dial_and_reconcile(
             endpoint,
             addr.clone(),
             rag_rat_sync::SyncAlpn::Account,
             &mut account_store,
             AuthPolicy::PublicRead,
-            time::now_ms,
-            rag_rat_sync::MAX_RECONCILE_ROUNDS,
         )
         .await
         {
@@ -1271,14 +1326,12 @@ pub async fn pull_account_via_peers(
             continue;
         }
         let mut content_store = OplogContentSyncStore::new(conn, target, time::now_ms);
-        let content_report = match rag_rat_sync::connect_and_reconcile(
+        let content_report = match dial_and_reconcile(
             endpoint,
             addr.clone(),
             rag_rat_sync::SyncAlpn::Content,
             &mut content_store,
             AuthPolicy::PublicRead,
-            time::now_ms,
-            rag_rat_sync::MAX_RECONCILE_ROUNDS,
         )
         .await
         {
