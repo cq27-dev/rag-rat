@@ -173,8 +173,9 @@ impl OpenAiEmbedder {
                 )
             })?;
         // CONNECT auth comes from the env var NAMED by `auth_env` (the token never enters config).
-        let auth_header =
-            resolve_auth_header(cfg.auth_env.as_deref(), |var| std::env::var(var).ok())?;
+        let auth_header = crate::http::resolve_auth_header(cfg.auth_env.as_deref(), |var| {
+            std::env::var(var).ok()
+        })?;
         Ok(Self::build(BuildParams {
             endpoint,
             embed_path: cfg.backend.embed_path(),
@@ -196,11 +197,7 @@ impl OpenAiEmbedder {
     /// model identity (`selected_model_id` + `dim`) + transport knobs (server `model`, timeout,
     /// batch) come from the config the same way.
     pub fn from_provisioned(params: ProvisionedEmbedderParams<'_>) -> Self {
-        let auth_header = params
-            .auth_token
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|token| format!("Bearer {token}"));
+        let auth_header = crate::http::bearer_header(params.auth_token);
         Self::build(BuildParams {
             endpoint: params.endpoint.trim(),
             embed_path: params.embed_path,
@@ -398,27 +395,6 @@ fn validate_embeddings(
     }
 
     Ok(embeddings)
-}
-
-/// Resolve the `Authorization` header from the configured `auth_env` name, looking the value up
-/// through `lookup` (the env in production; a fake closure in tests). `None`/empty `auth_env` → no
-/// auth (`Ok(None)`); a named-but-missing/empty value → `Err` (the operator asked for auth but the
-/// token isn't there). Closure-injected so the env-mutation footgun (unsafe + flaky under nextest's
-/// parallel runner in Rust 2024) never enters the test path.
-pub fn resolve_auth_header(
-    auth_env: Option<&str>,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> anyhow::Result<Option<String>> {
-    let Some(var) = auth_env.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(None);
-    };
-    let token =
-        lookup(var).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "auth env var `{var}` is set in config but missing or empty in the environment"
-            )
-        })?;
-    Ok(Some(format!("Bearer {token}")))
 }
 
 impl Embedder for OpenAiEmbedder {
@@ -1379,36 +1355,6 @@ mod tests {
         cfg.endpoint = None;
         let err = build(&cfg, DIM).expect_err("missing endpoint errors");
         assert!(err.to_string().contains("endpoint"), "{err}");
-    }
-
-    #[test]
-    fn resolve_auth_header_none_when_auth_env_absent_or_empty() {
-        // Lookup must never run when there's no var name to resolve.
-        let lookup = |_: &str| -> Option<String> { panic!("lookup should not be called") };
-        assert_eq!(resolve_auth_header(None, lookup).unwrap(), None);
-        assert_eq!(resolve_auth_header(Some("  "), lookup).unwrap(), None);
-    }
-
-    #[test]
-    fn resolve_auth_header_errors_when_named_var_unset() {
-        // Closure-injected lookup — no process-env mutation, safe under nextest's parallel runner.
-        let err = resolve_auth_header(Some("OLLAMA_TOKEN"), |_| None)
-            .expect_err("named-but-unset var errors");
-        assert!(err.to_string().contains("auth env"), "{err}");
-    }
-
-    #[test]
-    fn resolve_auth_header_errors_when_named_var_empty() {
-        let err = resolve_auth_header(Some("OLLAMA_TOKEN"), |_| Some("   ".to_string()))
-            .expect_err("named-but-empty var errors");
-        assert!(err.to_string().contains("auth env"), "{err}");
-    }
-
-    #[test]
-    fn resolve_auth_header_builds_bearer_from_looked_up_token() {
-        let header =
-            resolve_auth_header(Some("OLLAMA_TOKEN"), |_| Some("sekret".to_string())).unwrap();
-        assert_eq!(header.as_deref(), Some("Bearer sekret"));
     }
 
     #[test]
