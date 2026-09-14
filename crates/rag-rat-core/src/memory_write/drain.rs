@@ -1101,9 +1101,9 @@ fn converge_bindings(
 /// rebind between two impls of one type keeps the binding's identity and kind — so a symbol row
 /// whose published kind or signature differs from what the author published for it last time
 /// (`previous`, from the last applied set; the row's own values when none was recorded) is marked
-/// [`rag_rat_query::memory::RETARGETED_REASON`], and an earlier mark still unanswered is kept.
-/// The validator, running scoped to a checkout of the memory's repo (which this drain, running for
-/// every repo, is not), then weighs the author's evidence above the handle.
+/// [`rag_rat_query::memory::RelocationReason::Retargeted`], and an earlier mark still unanswered is
+/// kept. The validator, running scoped to a checkout of the memory's repo (which this drain,
+/// running for every repo, is not), then weighs the author's evidence above the handle.
 ///
 /// The baseline is the author's last statement, not the row: the row's authored kind and signature
 /// are the author's too, but a row seeded from an older set, or converged on a foreign one, can
@@ -1132,7 +1132,7 @@ pub(crate) fn refresh_binding(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let retarget = rag_rat_query::memory::RETARGETED_REASON;
+    let retarget = rag_rat_query::memory::RelocationReason::Retargeted.as_db_str();
     let retargeted = matches!(anchor.binding_kind.as_str(), "symbol" | "logical_symbol")
         && held.is_some_and(|(kind, signature, reason)| {
             let previous = previous.unwrap_or(AppliedTarget {

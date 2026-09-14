@@ -31,10 +31,8 @@ pub use hydrate::{
 pub(crate) use hydrate::{
     attach_memory_children, binding_row, drive_by_memory, ids_to_memories, memory_row,
 };
-pub(crate) use moniker::{
-    MONIKER_MATCH_REASON, relocate_binding_by_moniker, validate_moniker_binding,
-};
 pub use moniker::{MonikerResolution, insert_auto_moniker_binding, resolve_moniker};
+pub(crate) use moniker::{relocate_binding_by_moniker, validate_moniker_binding};
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::time::now_ms;
 pub(crate) use resolve::{
@@ -50,10 +48,9 @@ pub use resolve::{
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 pub use validate::{
-    AppliedTarget, AppliedTargets, RETARGETED_REASON, decode_applied_targets,
-    encode_applied_targets, is_polymorphic_node_kind, memory_id, memory_input_hash,
-    validate_confidence, validate_edge_len, validate_kind, validate_len, validate_payload,
-    validate_source, validate_status,
+    AppliedTarget, AppliedTargets, decode_applied_targets, encode_applied_targets,
+    is_polymorphic_node_kind, memory_id, memory_input_hash, validate_confidence, validate_edge_len,
+    validate_kind, validate_len, validate_payload, validate_source, validate_status,
 };
 pub(crate) use validate::{effective_fs_root, fts_query, validate_binding};
 
@@ -76,7 +73,13 @@ pub(crate) fn memory_repo_scope_clause(scope: &Option<String>) -> String {
 /// that attaches, lists or searches filters through this, as do the typed-edge reads and the dream
 /// queues, so reclassifying a status is one edit here.
 pub fn live_memory_status_sql(alias: &str) -> String {
-    format!("{alias}.status IN ('active', 'stale')")
+    let live = <MemoryStatus as strum::VariantArray>::VARIANTS
+        .iter()
+        .filter(|status| status.is_live())
+        .map(|status| format!("'{}'", status.as_db_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{alias}.status IN ({live})")
 }
 
 /// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'`: the three special
@@ -301,6 +304,187 @@ impl AnchorStatus {
     /// Parse a persisted token, rejecting anything outside the closed set.
     pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
         value.parse().map_err(|_| anyhow::anyhow!("unknown anchor status `{value}`"))
+    }
+}
+
+/// The closed set of `repo_memories.kind` tokens: the variant names verbatim (PascalCase).
+///
+/// [`RepoMemory::kind`] — like its `status`, `confidence` and `source`, and a binding's
+/// `relocation_reason` — stays a string for the reason [`BindingKind`] gives: a memory replicates,
+/// so a peer on a newer build can deliver a token this one does not know, and that row must still
+/// load. These enums name what this build writes and compares; the `validate_*` gates reject any
+/// other token on the write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+pub enum MemoryKind {
+    Invariant,
+    Decision,
+    RejectedAlternative,
+    Risk,
+    BugPattern,
+    TestExpectation,
+    PerformanceNote,
+    SecurityNote,
+    FFIBoundary,
+    PlatformQuirk,
+    FollowUp,
+    OpenQuestion,
+    Obsolete,
+    // Polymorphic graph-node kinds (#465): legitimately unanchored (a Concept / standalone Task
+    // lives as a graph node with no code binding — see resolve_binding / #463).
+    Task,
+    Concept,
+}
+
+impl MemoryKind {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory kind `{value}`"))
+    }
+
+    /// The polymorphic graph-node kinds — `Task` and `Concept` (#463/#465). They ALONE may be
+    /// created UNANCHORED (no code binding) AND may carry a structured `payload_json`; every other
+    /// kind is a plain note (anchors to code, no payload). The SINGLE source of truth for the
+    /// unanchored-create gate (`create`/`update_memory`), the payload-kind gate
+    /// (`validate_payload`), and the dream verifier's `memory_unverifiable` exemption — they must
+    /// never drift, or a create the gate allows becomes self-inflicted dream noise, or an
+    /// off-contract payload/anchor slips through.
+    pub fn is_polymorphic_node(self) -> bool {
+        matches!(self, Self::Task | Self::Concept)
+    }
+}
+
+/// The closed set of `repo_memories.status` tokens (lowercase). A string on [`RepoMemory`] for the
+/// reason [`MemoryKind`] gives.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr, strum::VariantArray,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum MemoryStatus {
+    Active,
+    Stale,
+    Obsolete,
+    Rejected,
+}
+
+impl MemoryStatus {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory status `{value}`"))
+    }
+
+    /// Whether recall still surfaces a memory in this status — the set
+    /// [`live_memory_status_sql`] filters on. A `stale` memory is live (its anchor drifted, not its
+    /// memory), only `obsolete`/`rejected` are dead.
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Active | Self::Stale)
+    }
+}
+
+/// The closed set of `repo_memories.confidence` tokens (lowercase). A string on [`RepoMemory`] for
+/// the reason [`MemoryKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum MemoryConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+impl MemoryConfidence {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory confidence `{value}`"))
+    }
+}
+
+/// The closed set of `repo_memories.source` tokens (lowercase). A string on [`RepoMemory`] for the
+/// reason [`MemoryKind`] gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum MemorySource {
+    Agent,
+    Human,
+    Imported,
+    Generated,
+}
+
+impl MemorySource {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("invalid memory source `{value}`"))
+    }
+}
+
+/// The closed set of `repo_memory_bindings.relocation_reason` tokens (kebab-case) this build
+/// stamps. [`RepoMemoryBinding::relocation_reason`] stays a string for the reason [`MemoryKind`]
+/// gives; `NULL` means the anchor never relocated or relocated via the default
+/// qualified-name/content paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
+pub enum RelocationReason {
+    /// Why a moniker relocation succeeded — persisted on `repo_memory_bindings.relocation_reason`
+    /// so `doctor`/MCP output can distinguish a semantic-identity relocate from the default
+    /// qualified-name/content paths.
+    MonikerMatch,
+    /// Why a `scip_moniker` binding's own anchor string was rewritten: its live logical symbol got
+    /// a NEW moniker from the latest run (rust-analyzer monikers embed the Cargo package
+    /// version, so a routine version bump changes every string without changing any symbol
+    /// identity). The rebind is keyed off our own content-derived logical id, not fuzzy
+    /// matching.
+    MonikerRefresh,
+    /// The `relocation_reason` the synced-memory drain stamps on a symbol binding it moved IN PLACE
+    /// to a target another store published, when the published kind or signature differs from
+    /// the row's. Its cached ids may still name the target it left: a rebind between two impls
+    /// of one type keeps the binding's identity and kind, so only the signature says it moved.
+    ///
+    /// The validator weighs a recorded kind or signature against a live handle ONLY on a row so
+    /// marked. Any other row can disagree with its handle for reasons that name no other target
+    /// — a sibling device's `anchors/1` update carrying its own checkout's view, or values
+    /// recorded before the target's kind or signature changed here — and following them there
+    /// would hand the memory to any same-named sibling that has the old kind or signature.
+    ///
+    /// The mark stands until a validation lands on a target agreeing with the recorded kind and
+    /// signature. The row is shared by every checkout of the repo, and the one validating first may
+    /// not hold the author's target: on the raw-id arm, whose candidates are the validating
+    /// checkout's own, a linked worktree that edited the target leaves the mark for the
+    /// checkout that has it (the logical arm's candidates are repo-wide, so any checkout can
+    /// answer there). That works because relocation does not refresh a marked row's recorded
+    /// kind or signature until the mark is answered. An identity match answers it outright: the
+    /// content-hash fallback clears it and restates the kind and signature, and a moniker
+    /// relocation replaces the reason with its own. (An `anchors/1` row update also moves a
+    /// binding in place, but marks nothing.)
+    Retargeted,
+}
+
+impl RelocationReason {
+    /// The exact persisted token.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// Parse a persisted token, rejecting anything outside the closed set.
+    pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        value.parse().map_err(|_| anyhow::anyhow!("unknown relocation reason `{value}`"))
     }
 }
 
@@ -913,6 +1097,79 @@ mod tests {
         }
         assert!(BindingKind::from_db_str("repo").is_err());
         assert!(AnchorStatus::from_db_str("Current").is_err());
+    }
+
+    /// The memory-row and relocation tokens are persisted and replicate, so each variant's token is
+    /// pinned byte-for-byte: PascalCase kinds, lowercase status/confidence/source, kebab-case
+    /// relocation reasons.
+    #[test]
+    fn memory_row_and_relocation_tokens_are_exact_and_round_trip() {
+        for (kind, token) in [
+            (MemoryKind::Invariant, "Invariant"),
+            (MemoryKind::Decision, "Decision"),
+            (MemoryKind::RejectedAlternative, "RejectedAlternative"),
+            (MemoryKind::Risk, "Risk"),
+            (MemoryKind::BugPattern, "BugPattern"),
+            (MemoryKind::TestExpectation, "TestExpectation"),
+            (MemoryKind::PerformanceNote, "PerformanceNote"),
+            (MemoryKind::SecurityNote, "SecurityNote"),
+            (MemoryKind::FFIBoundary, "FFIBoundary"),
+            (MemoryKind::PlatformQuirk, "PlatformQuirk"),
+            (MemoryKind::FollowUp, "FollowUp"),
+            (MemoryKind::OpenQuestion, "OpenQuestion"),
+            (MemoryKind::Obsolete, "Obsolete"),
+            (MemoryKind::Task, "Task"),
+            (MemoryKind::Concept, "Concept"),
+        ] {
+            assert_eq!(kind.as_db_str(), token);
+            assert_eq!(MemoryKind::from_db_str(token).unwrap(), kind);
+            assert_eq!(kind.is_polymorphic_node(), matches!(token, "Task" | "Concept"));
+        }
+        for (status, token, live) in [
+            (MemoryStatus::Active, "active", true),
+            (MemoryStatus::Stale, "stale", true),
+            (MemoryStatus::Obsolete, "obsolete", false),
+            (MemoryStatus::Rejected, "rejected", false),
+        ] {
+            assert_eq!(status.as_db_str(), token);
+            assert_eq!(MemoryStatus::from_db_str(token).unwrap(), status);
+            assert_eq!(status.is_live(), live);
+        }
+        for (confidence, token) in [
+            (MemoryConfidence::High, "high"),
+            (MemoryConfidence::Medium, "medium"),
+            (MemoryConfidence::Low, "low"),
+        ] {
+            assert_eq!(confidence.as_db_str(), token);
+            assert_eq!(MemoryConfidence::from_db_str(token).unwrap(), confidence);
+        }
+        for (source, token) in [
+            (MemorySource::Agent, "agent"),
+            (MemorySource::Human, "human"),
+            (MemorySource::Imported, "imported"),
+            (MemorySource::Generated, "generated"),
+        ] {
+            assert_eq!(source.as_db_str(), token);
+            assert_eq!(MemorySource::from_db_str(token).unwrap(), source);
+        }
+        for (reason, token) in [
+            (RelocationReason::MonikerMatch, "moniker-match"),
+            (RelocationReason::MonikerRefresh, "moniker-refresh"),
+            (RelocationReason::Retargeted, "retargeted"),
+        ] {
+            assert_eq!(reason.as_db_str(), token);
+            assert_eq!(RelocationReason::from_db_str(token).unwrap(), reason);
+        }
+        assert!(MemoryKind::from_db_str("invariant").is_err());
+        assert!(MemoryStatus::from_db_str("Active").is_err());
+        assert!(!is_polymorphic_node_kind("task"));
+    }
+
+    /// The live-status predicate is derived from `MemoryStatus::is_live`, and the SQL every memory
+    /// read runs must stay the exact text it has always been.
+    #[test]
+    fn live_memory_status_sql_is_the_live_variants() {
+        assert_eq!(live_memory_status_sql("m"), "m.status IN ('active', 'stale')");
     }
 
     #[test]

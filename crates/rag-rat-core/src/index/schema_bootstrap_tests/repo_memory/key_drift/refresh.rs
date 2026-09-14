@@ -1856,7 +1856,7 @@ fn a_cached_id_that_contradicts_the_bindings_kind_is_not_trusted() {
             .execute(
                 "UPDATE repo_memory_bindings SET symbol_kind = 'impl', relocation_reason = ?2
                   WHERE memory_id = ?1",
-                params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
+                params![memory_id, rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()],
             )
             .unwrap();
 
@@ -1936,7 +1936,7 @@ fn a_kind_nothing_here_has_validates_the_held_back_row_live() {
             .execute(
                 "UPDATE repo_memory_bindings SET symbol_kind = 'impl', relocation_reason = ?2
                   WHERE memory_id = ?1",
-                params![memory_id, rag_rat_query::memory::RETARGETED_REASON],
+                params![memory_id, rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()],
             )
             .unwrap();
 
@@ -2376,7 +2376,7 @@ fn a_linked_checkout_without_the_authors_target_leaves_the_retarget_to_the_base(
     assert_eq!(signature.as_deref(), Some(beta_signature.as_str()), "the author's signature stays");
     assert_eq!(
         reason.as_deref(),
-        Some(rag_rat_query::memory::RETARGETED_REASON),
+        Some(rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()),
         "a checkout without the author's target leaves the retarget unanswered",
     );
     // A republish of the same set before any checkout answers keeps the mark.
@@ -2653,7 +2653,7 @@ fn memory_on_alpha(db: &IndexDatabase, alpha: i64, by_logical_handle: bool, titl
 #[test]
 fn a_published_rebind_between_identical_signature_twins_follows_the_scope() {
     use rag_rat_base::hash::hex_sha256;
-    use rag_rat_query::memory::RETARGETED_REASON;
+    use rag_rat_query::memory::RelocationReason;
 
     let root = unique_temp_root();
     let _ = fs::remove_dir_all(&root);
@@ -2695,7 +2695,11 @@ fn a_published_rebind_between_identical_signature_twins_follows_the_scope() {
         let gamma_hash = hex_sha256(b"Twin as Gamma");
         let (line, reason, status) = validated(&beta_hash, &gamma_hash);
         assert_eq!(line, Some(beta_line), "bound by {title}: a scope nothing here has keeps it");
-        assert_eq!(reason.as_deref(), Some(RETARGETED_REASON), "bound by {title}: mark waits");
+        assert_eq!(
+            reason.as_deref(),
+            Some(RelocationReason::Retargeted.as_db_str()),
+            "bound by {title}: mark waits"
+        );
         assert_ne!(status, "gone", "bound by {title}: the handle is validated live");
     }
 
@@ -2711,7 +2715,7 @@ fn a_published_rebind_between_identical_signature_twins_follows_the_scope() {
 #[test]
 fn a_linked_checkout_without_the_authors_twin_leaves_the_scope_retarget_to_the_base() {
     use rag_rat_base::hash::hex_sha256;
-    use rag_rat_query::memory::RETARGETED_REASON;
+    use rag_rat_query::memory::RelocationReason;
 
     let main = unique_temp_root();
     let _ = fs::remove_dir_all(&main);
@@ -2767,7 +2771,7 @@ fn a_linked_checkout_without_the_authors_twin_leaves_the_scope_retarget_to_the_b
         assert_eq!(line, Some(alpha_line), "linked pass {pass}: no Beta here, the handle stands");
         assert_eq!(
             reason.as_deref(),
-            Some(RETARGETED_REASON),
+            Some(RelocationReason::Retargeted.as_db_str()),
             "linked pass {pass}: the mark is left for the base checkout",
         );
         let (_, reason, _) = landed_binding(&db, &by_logical);

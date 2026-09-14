@@ -723,7 +723,7 @@ fn memory_logical_binding_relocates_across_files() {
                  binding_id        = 'src/gone.rs::logical_target',
                  relocation_reason = ?1
              WHERE binding_kind = 'logical_symbol'",
-            [rag_rat_query::memory::RETARGETED_REASON],
+            [rag_rat_query::memory::RelocationReason::Retargeted.as_db_str()],
         )
         .unwrap();
 
