@@ -413,10 +413,11 @@ fn retain_maximal(cover: CliqueCover, cancelled: &impl Fn() -> bool) -> Option<V
                 return None;
             }
             let mut is_subset = false;
+            // No poll per `other`: the member scan below polls on its first iteration, so every
+            // `other` actually compared is polled. Only the skipped (not larger) ones go unpolled —
+            // an O(1) length check each, at most ~31 groups × (MAX_SPLIT_GROUPS + 1) of them
+            // between two polls of the outer loop.
             for other in &groups {
-                if cancelled() {
-                    return None;
-                }
                 if other.len() <= g.len() {
                     continue;
                 }
