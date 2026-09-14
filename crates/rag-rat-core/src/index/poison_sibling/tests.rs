@@ -168,3 +168,64 @@ fn the_sibling_is_a_real_repo_on_a_git_fixture() {
     // appended because `primary_is_real`).
     assert_sibling_intact(conn);
 }
+
+/// Registry growth must require an explicit fixture decision, and a roster entry must be backed
+/// by both a real seeded row and an intact-row probe.
+#[test]
+fn every_registered_scoped_table_has_a_live_tripwire() {
+    let (_root, config) = poison_test_config("poison_coverage");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    let tripwires = super::assert::sibling_tripwires(conn).unwrap();
+    // No registered direct-scoped table is deliberately omitted. Content-addressed pools
+    // (name_strings, embedding_cache), chunk_fts, clone_edges and transitively scoped children
+    // do not belong to these direct-scoped lists; their exclusions are described in mod.rs.
+    let omitted: &[&str] = &[];
+    for table in rag_rat_db::schema::DIRECT_SCOPED_ADOPTION_TABLES
+        .iter()
+        .chain(rag_rat_db::schema::A5_PERIPHERY_DIRECT_SCOPED_TABLES)
+        // Protocol metadata is deliberately excluded from adoption; pin its sentinel separately.
+        .chain(&["sync_tombstone_statements"])
+    {
+        if omitted.contains(table) {
+            continue;
+        }
+        assert!(super::seed::SEEDED_TABLES.contains(table), "missing seed for {table}");
+        assert!(
+            tripwires
+                .iter()
+                .any(|(seeded, _)| seeded.strip_prefix("main.").unwrap_or(seeded) == *table),
+            "missing probe for {table}"
+        );
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM main.{table} WHERE repo_id = ?1"),
+                [POISON_REPO_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(count > 0, "no actual sentinel row in {table}");
+    }
+    assert_sibling_intact(conn);
+    // Re-seeding exercises the child-before-parent cleanup, too.
+    seed_sibling(conn).unwrap();
+    assert_sibling_intact(conn);
+}
+
+#[test]
+fn supplementary_tripwires_detect_unscoped_deletes() {
+    let (_root, config) = poison_test_config("poison_delete");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let conn = db.storage.connection();
+    for (table, _) in super::seed::direct_tripwires(conn).unwrap() {
+        conn.execute_batch("SAVEPOINT destructive_tripwire").unwrap();
+        conn.execute(&format!("DELETE FROM main.{table}"), []).unwrap();
+        let detected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_sibling_intact(conn);
+        }));
+        conn.execute_batch("ROLLBACK TO destructive_tripwire; RELEASE destructive_tripwire")
+            .unwrap();
+        assert!(detected.is_err(), "unscoped deletion escaped the {table} tripwire");
+    }
+    assert_sibling_intact(conn);
+}

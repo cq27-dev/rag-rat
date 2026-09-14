@@ -4,6 +4,64 @@ use rusqlite::{Connection, params};
 
 use super::*;
 
+/// Tables with explicit sentinel rows; coverage is checked against the schema registry.
+#[cfg(test)]
+pub(super) const SEEDED_TABLES: &[&str] = &[
+    "chunks",
+    "clone_graph_generations",
+    "clone_refinements",
+    "clone_token_df",
+    "docs",
+    "dream_findings",
+    "edge_oracle",
+    "edges_data",
+    "external_symbols",
+    "files",
+    "git_change_couplings",
+    "git_commits",
+    "git_file_changes",
+    "logical_symbol_members",
+    "logical_symbol_monikers",
+    "logical_symbols",
+    "memory_model_failures",
+    "memory_note_summaries",
+    "memory_reality",
+    "oracle_runs",
+    "packages",
+    "papertrail_closing_edges",
+    "papertrail_comments",
+    "papertrail_distill",
+    "papertrail_distill_alternatives",
+    "papertrail_distill_anchors",
+    "papertrail_distill_edges",
+    "papertrail_distill_evidence",
+    "papertrail_distill_fix_diffs",
+    "papertrail_distill_queue",
+    "papertrail_distill_record_commits",
+    "papertrail_distill_runs",
+    "papertrail_distill_sources",
+    "papertrail_distill_units",
+    "papertrail_distill_xrefs",
+    "papertrail_fts",
+    "papertrail_item_tags",
+    "papertrail_items",
+    "papertrail_refs",
+    "papertrail_sync_cursor",
+    "parser_failures",
+    "reconcile_attempts",
+    "repo_memories",
+    "repo_memory_bindings",
+    "repo_memory_fts",
+    "repo_memory_parked_baselines",
+    "repo_memory_tags",
+    "repo_meta",
+    "repo_node_edges",
+    "repo_roots",
+    "repos",
+    "symbols",
+    "sync_tombstone_statements",
+];
+
 /// Clear then insert the full tripwire row set for the poison sibling. Runs under `foreign_keys =
 /// ON` (the live rebuild connection), so inserts are parent→child and clears child→parent.
 /// Deliberately touches NO registry table (`repos`/`repo_roots`/`repo_meta`) — see the module docs.
@@ -563,6 +621,7 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         ])?;
     }
 
+    seed_direct_tripwires(conn)?;
     Ok(())
 }
 
@@ -601,6 +660,7 @@ fn primary_collision_path(conn: &Connection) -> anyhow::Result<String> {
 /// Remove every poison-sibling row, child→parent, so [`seed_sibling`] is idempotent across repeated
 /// rebuilds on one DB. Explicit child-first order works whether or not the FK cascades fire.
 fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
+    clear_direct_tripwires(conn)?;
     conn.execute_batch(&format!(
         "DELETE FROM logical_symbol_monikers WHERE logical_symbol_id = {POISON_LOGICAL_ID};
          DELETE FROM logical_symbol_members WHERE logical_symbol_id = {POISON_LOGICAL_ID};
@@ -650,4 +710,178 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM repos WHERE repo_id = '{POISON_REPO_ID}';"
     ))?;
     Ok(())
+}
+
+// These directly scoped tables have no FK ordering between their tripwire rows. Each tuple
+// keeps the insert and intact-row predicate beside the table name; parameters are always the
+// poison repo and marker. The predicate pins every explicitly seeded column.
+const DIRECT_TRIPWIRES: &[(&str, &str, &str)] = &[
+    (
+        "papertrail_distill",
+        "INSERT INTO papertrail_distill (repo_id, tracker, project, item_kind, item_key, \
+         distill_input_hash, pipeline_version, fix_edge_source, thread_shape, distilled_at_ms) \
+         VALUES (?1, 'github', ?2, 'issue', ?2, ?2, 1, 'provider', 'issue_only', 0)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND distill_input_hash = ?2 AND pipeline_version = 1 AND fix_edge_source = \
+         'provider' AND thread_shape = 'issue_only' AND distilled_at_ms = 0",
+    ),
+    (
+        "papertrail_distill_evidence",
+        "INSERT INTO papertrail_distill_evidence (repo_id, tracker, project, item_kind, item_key, \
+         ordinal, field, source_kind, source_part, source_id, byte_start, byte_end, quote) VALUES \
+         (?1, 'github', ?2, 'issue', ?2, 0, 'root_cause', 'item', 'body', ?2, 0, 1, ?2)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND ordinal = 0 AND field = 'root_cause' AND source_kind = 'item' AND \
+         source_part = 'body' AND source_id = ?2 AND byte_start = 0 AND byte_end = 1 AND quote = \
+         ?2",
+    ),
+    (
+        "papertrail_distill_anchors",
+        "INSERT INTO papertrail_distill_anchors (repo_id, tracker, project, item_kind, item_key, \
+         candidate_ordinal, anchor_kind, name, resolved, selected) VALUES (?1, 'github', ?2, \
+         'issue', ?2, 0, 'file', ?2, 0, 0)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND candidate_ordinal = 0 AND anchor_kind = 'file' AND name = ?2 AND \
+         resolved = 0 AND selected = 0",
+    ),
+    (
+        "papertrail_distill_alternatives",
+        "INSERT INTO papertrail_distill_alternatives (repo_id, tracker, project, item_kind, \
+         item_key, ordinal, alternative) VALUES (?1, 'github', ?2, 'issue', ?2, 0, ?2)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND ordinal = 0 AND alternative = ?2",
+    ),
+    (
+        "papertrail_distill_record_commits",
+        "INSERT INTO papertrail_distill_record_commits (repo_id, tracker, project, item_kind, \
+         item_key, commit_sha, created_at_ms) VALUES (?1, 'github', ?2, 'issue', ?2, ?2, 0)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND commit_sha = ?2 AND created_at_ms = 0",
+    ),
+    (
+        "papertrail_distill_edges",
+        "INSERT INTO papertrail_distill_edges (repo_id, tracker, project, src_item_kind, \
+         src_item_key, dst_item_kind, dst_item_key, edge_kind, created_at_ms) VALUES (?1, \
+         'github', ?2, 'issue', ?2, 'pull_request', ?2, 'fixes', 0)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND src_item_kind = 'issue' AND \
+         src_item_key = ?2 AND dst_item_kind = 'pull_request' AND dst_item_key = ?2 AND edge_kind \
+         = 'fixes' AND created_at_ms = 0",
+    ),
+    (
+        "papertrail_distill_queue",
+        "INSERT INTO papertrail_distill_queue (repo_id, tracker, project, item_kind, item_key, \
+         enqueued_at_ms) VALUES (?1, 'github', ?2, 'issue', ?2, 0)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND enqueued_at_ms = 0",
+    ),
+    (
+        "papertrail_distill_runs",
+        "INSERT INTO papertrail_distill_runs (repo_id, run_at_ms, stats_json) VALUES (?1, 0, \
+         json_object('marker', ?2))",
+        "repo_id = ?1 AND run_at_ms = 0 AND stats_json = json_object('marker', ?2)",
+    ),
+    (
+        "papertrail_distill_sources",
+        "INSERT INTO papertrail_distill_sources (repo_id, tracker, project, item_kind, item_key, \
+         source_ordinal, role, source_item_kind, source_item_key, source_kind, source_part, \
+         source_id, exact_text) VALUES (?1, 'github', ?2, 'issue', ?2, 0, 'primary', 'issue', ?2, \
+         'item', 'body', ?2, ?2)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND source_ordinal = 0 AND role = 'primary' AND source_item_kind = 'issue' \
+         AND source_item_key = ?2 AND source_kind = 'item' AND source_part = 'body' AND source_id \
+         = ?2 AND exact_text = ?2",
+    ),
+    (
+        "papertrail_distill_units",
+        "INSERT INTO papertrail_distill_units (repo_id, tracker, project, item_kind, item_key, \
+         unit_ordinal, source_ordinal, byte_start, byte_end) VALUES (?1, 'github', ?2, 'issue', \
+         ?2, 0, 0, 0, 1)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND unit_ordinal = 0 AND source_ordinal = 0 AND byte_start = 0 AND \
+         byte_end = 1",
+    ),
+    (
+        "papertrail_distill_fix_diffs",
+        "INSERT INTO papertrail_distill_fix_diffs (repo_id, tracker, project, item_kind, \
+         item_key, commit_sha, path, patch) VALUES (?1, 'github', ?2, 'issue', ?2, ?2, ?2, ?2)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND commit_sha = ?2 AND path = ?2 AND patch = ?2",
+    ),
+    (
+        "papertrail_distill_xrefs",
+        "INSERT INTO papertrail_distill_xrefs (repo_id, tracker, project, item_kind, item_key, \
+         xref_ordinal, target_tracker, target_project, target_item_key, ref_kind, title, opening) \
+         VALUES (?1, 'github', ?2, 'issue', ?2, 0, 'github', ?2, ?2, 'mentions', ?2, ?2)",
+        "repo_id = ?1 AND tracker = 'github' AND project = ?2 AND item_kind = 'issue' AND \
+         item_key = ?2 AND xref_ordinal = 0 AND target_tracker = 'github' AND target_project = ?2 \
+         AND target_item_key = ?2 AND ref_kind = 'mentions' AND title = ?2 AND opening = ?2",
+    ),
+    (
+        "git_change_couplings",
+        "INSERT INTO git_change_couplings (repo_id, path_a, path_b, co_change_count, \
+         path_a_change_count, path_b_change_count, window_commit_count, last_co_change_at_s, \
+         computed_at_ms) VALUES (?1, ?2, ?2 || 'second.rs', 1, 1, 1, 1, 0, 0)",
+        "repo_id = ?1 AND path_a = ?2 AND path_b = ?2 || 'second.rs' AND co_change_count = 1 AND \
+         path_a_change_count = 1 AND path_b_change_count = 1 AND window_commit_count = 1 AND \
+         last_co_change_at_s = 0 AND computed_at_ms = 0",
+    ),
+    (
+        "external_symbols",
+        "INSERT INTO external_symbols (repo_id, tool, tool_version, commit_sha, worktree_id, \
+         moniker, kind, display_name, signature_text, signature_language, documentation, \
+         deprecated, computed_at_ms) VALUES (?1, 'poison', '1', ?2, '', ?2, 'function', ?2, ?2, \
+         'rust', ?2, 0, 0)",
+        "repo_id = ?1 AND tool = 'poison' AND tool_version = '1' AND commit_sha = ?2 AND \
+         worktree_id = '' AND moniker = ?2 AND kind = 'function' AND display_name = ?2 AND \
+         signature_text = ?2 AND signature_language = 'rust' AND documentation = ?2 AND \
+         deprecated = 0 AND computed_at_ms = 0",
+    ),
+    (
+        "repo_memory_parked_baselines",
+        "INSERT INTO repo_memory_parked_baselines (repo_id, memory_id, source_text_hash) VALUES \
+         (?1, ?2, ?2)",
+        "repo_id = ?1 AND memory_id = ?2 AND source_text_hash = ?2",
+    ),
+    // V127 protocol metadata is not adopted with derived rows, but its repo dimension still
+    // needs a sibling-preservation tripwire. It has no parent-row foreign keys.
+    (
+        "sync_tombstone_statements",
+        "INSERT INTO sync_tombstone_statements (stream_id, repo_id, table_name, row_pk, \
+         device_fingerprint, lamport) VALUES (zeroblob(32), ?1, 'repo_memories', json_array(?2), \
+         lower(hex(zeroblob(32))), 0)",
+        "repo_id = ?1 AND stream_id = zeroblob(32) AND table_name = 'repo_memories' AND row_pk = \
+         json_array(?2) AND device_fingerprint = lower(hex(zeroblob(32))) AND lamport = 0",
+    ),
+];
+
+fn seed_direct_tripwires(conn: &Connection) -> anyhow::Result<()> {
+    for (table, insert, _) in DIRECT_TRIPWIRES {
+        if rag_rat_db::schema::table_exists(conn, table)? {
+            conn.execute(insert, params![POISON_REPO_ID, POISON_PREFIX])?;
+        }
+    }
+    Ok(())
+}
+
+fn clear_direct_tripwires(conn: &Connection) -> anyhow::Result<()> {
+    for (table, _, _) in DIRECT_TRIPWIRES {
+        if rag_rat_db::schema::table_exists(conn, table)? {
+            conn.execute(&format!("DELETE FROM {table} WHERE repo_id = ?1"), [POISON_REPO_ID])?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn direct_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'static str, String)>> {
+    // The existing intact-row checker consumes SQL predicates. These two inputs are fixed
+    // sentinel constants, quoted here so every fixture predicate stays safe if a marker changes.
+    let repo = format!("'{}'", POISON_REPO_ID.replace('\'', "''"));
+    let marker = format!("'{}'", POISON_PREFIX.replace('\'', "''"));
+    let mut rows = Vec::new();
+    for (table, _, predicate) in DIRECT_TRIPWIRES {
+        if rag_rat_db::schema::table_exists(conn, table)? {
+            rows.push((*table, predicate.replace("?1", &repo).replace("?2", &marker)));
+        }
+    }
+    Ok(rows)
 }

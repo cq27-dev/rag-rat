@@ -37,9 +37,10 @@
 //! memories and their maintenance records. Transitively scoped children are reached through
 //! their owning files, logical symbols or memories.
 //!
-//! The [`seed_sibling`] and [`sibling_tripwires`] rosters must track that scope: the former
-//! installs tripwire rows, and the latter checks that each survives. Tables without a repo
-//! dimension — content-addressed pools such
+//! The `every_registered_scoped_table_has_a_live_tripwire` test ties the seed and probe
+//! rosters to the schema registry. The [`seed_sibling`] and [`sibling_tripwires`] rosters track
+//! that scope: the former installs tripwire rows, and the latter checks that each survives. Tables
+//! without a repo dimension — content-addressed pools such
 //! as `name_strings` / `embedding_cache`, FTS-derived `chunk_fts`, and `clone_edges`/postings
 //! scoped by globally unique `build_generation` — are deliberately absent: seeding them would
 //! manufacture a false tripwire against a legitimately shared store.

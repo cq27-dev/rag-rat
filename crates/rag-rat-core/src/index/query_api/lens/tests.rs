@@ -869,8 +869,12 @@ fn file_enrichments_scope_memories_and_order_coupling() {
     ])
     .unwrap();
     assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM git_change_couplings", [], |row| row.get::<_, i64>(0))
-            .unwrap(),
+        conn.query_row(
+            "SELECT COUNT(*) FROM git_change_couplings WHERE repo_id = ?1",
+            [&db.active_repo_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
         0,
         "the read-only fallback must be exercised before the lazy table is materialized"
     );
