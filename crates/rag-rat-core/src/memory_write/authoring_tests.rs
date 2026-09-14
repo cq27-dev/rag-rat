@@ -805,7 +805,7 @@ fn reconcile_is_idempotent_and_a_clean_repo_authors_nothing() {
 /// Abort the queue-clear DELETE for `stream`, poisoning its settle so an inline barrier settle
 /// cannot clear the mark — the row's refold debt is retained and the barrier stays tripped.
 fn poison_owner_stream_settle(conn: &Connection, stream: StreamId) {
-    let hex: String = stream.to_bytes().iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = rag_rat_base::hash::hex_lower(&stream.to_bytes());
     conn.execute_batch(&format!(
         "CREATE TRIGGER poison_owner_queue_clear
              BEFORE DELETE ON content_streams_pending_refold

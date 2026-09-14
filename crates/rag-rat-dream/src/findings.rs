@@ -186,7 +186,7 @@ pub fn rederive_finding_ids(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn hex16(bytes: &[u8]) -> String {
-    bytes.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    rag_rat_base::hash::hex_lower(&bytes[..bytes.len().min(8)])
 }
 
 /// `coverage_gap`: the most load-bearing symbols with no memory binding (load-bearing code with no

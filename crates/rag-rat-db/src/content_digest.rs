@@ -96,14 +96,8 @@ pub fn fold_row(state: &mut DigestState, hash: &DigestState, add: bool) {
 /// `content_digest_state.state` column stores. SQL never does arithmetic on this, sidestepping
 /// SQLite's i64-overflow-to-REAL promotion; all wrapping happens in Rust.
 pub fn encode_state(state: &DigestState) -> String {
-    let mut out = String::with_capacity(64);
-    for lane in state {
-        for byte in lane.to_le_bytes() {
-            use fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-        }
-    }
-    out
+    let bytes: Vec<u8> = state.iter().flat_map(|lane| lane.to_le_bytes()).collect();
+    rag_rat_base::hash::hex_lower(&bytes)
 }
 
 /// Decode a 64-hex `state` back to four LE `u64` lanes. Errs (fail-closed) on any length other than

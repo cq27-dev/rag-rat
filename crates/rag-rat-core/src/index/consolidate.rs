@@ -990,9 +990,7 @@ fn child_slice_digest(
                     },
                     rusqlite::types::ValueRef::Blob(v) => {
                         line.push_str(&format!("|b{}", v.len()));
-                        line.push_str(
-                            &v.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-                        );
+                        line.push_str(&rag_rat_base::hash::hex_lower(v));
                     },
                 }
             }
@@ -1230,7 +1228,7 @@ fn remapped_memory_id(repo_id: &str, original_id: &str) -> String {
     hasher.update(repo_id.as_bytes());
     hasher.update([0u8]);
     hasher.update(original_id.as_bytes());
-    let hex: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = rag_rat_base::hash::hex_lower(&hasher.finalize());
     format!("mem_{}_{}", &hex[..13], &hex[13..25])
 }
 

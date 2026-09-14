@@ -432,7 +432,7 @@ mod tests {
     use crate::cbor;
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        rag_rat_base::hash::hex_lower(bytes)
     }
 
     #[test]

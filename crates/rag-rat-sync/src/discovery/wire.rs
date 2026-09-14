@@ -397,7 +397,7 @@ mod tests {
     use super::*;
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        rag_rat_base::hash::hex_lower(bytes)
     }
 
     fn unhex(s: &str) -> Vec<u8> {

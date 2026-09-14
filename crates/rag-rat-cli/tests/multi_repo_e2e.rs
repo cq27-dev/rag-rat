@@ -173,7 +173,7 @@ fn sync_catch_up_reports_scoped_idempotent_counts_and_clear_input_failures() {
             row.get(0)
         })
         .unwrap();
-    let fingerprint: String = fingerprint.iter().map(|byte| format!("{byte:02x}")).collect();
+    let fingerprint: String = rag_rat_base::hash::hex_lower(&fingerprint);
 
     let first =
         run_ok(&root, &data_dir, &model_cache, &["--json", "sync", "catch-up", &fingerprint]);

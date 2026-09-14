@@ -105,10 +105,9 @@ impl RetryHold {
 /// Short sha256 fingerprint so the key never holds a copy of the secret. Eight bytes of digest
 /// are plenty to tell two tokens apart in an in-process map.
 fn token_fingerprint(token: Option<&str>) -> String {
-    use sha2::{Digest, Sha256};
     match token.map(str::trim).filter(|t| !t.is_empty()) {
         None => "anonymous".to_string(),
-        Some(token) => rag_rat_base::hash::hex_lower(&Sha256::digest(token.as_bytes())[..8]),
+        Some(token) => rag_rat_base::hash::hex_sha256_prefix(token.as_bytes(), 8),
     }
 }
 

@@ -1445,9 +1445,7 @@ fn default_matches_sql(declared: DefaultValue, physical: Option<&str>) -> bool {
             .is_some_and(|hex| {
                 hex.len() == bytes.len() * 2
                     && hex.bytes().all(|b| b.is_ascii_hexdigit())
-                    && hex.eq_ignore_ascii_case(
-                        &bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                    )
+                    && hex.eq_ignore_ascii_case(&rag_rat_base::hash::hex_lower(bytes))
             }),
     }
 }

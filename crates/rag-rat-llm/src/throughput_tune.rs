@@ -23,7 +23,6 @@ use rag_rat_base::time::now_ms;
 use rag_rat_db::meta::{read_meta, set_meta};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::providers::{Embedder, OpenAiEmbedder, ProvisionedEmbedderParams};
 
@@ -651,8 +650,7 @@ fn tune_cache_key(k: TuneKey<'_>) -> String {
         k.max_embedding_chars,
         k.request_timeout_s,
     );
-    let digest = Sha256::digest(raw.as_bytes());
-    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
+    rag_rat_base::hash::hex_sha256_prefix(raw.as_bytes(), 16)
 }
 
 fn read_cache(conn: &Connection) -> TuneCacheFile {

@@ -799,7 +799,7 @@ mod tests {
     use crate::device::{DeviceSecret, DeviceX25519Secret};
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        rag_rat_base::hash::hex_lower(bytes)
     }
 
     fn ed25519() -> [u8; 32] {
