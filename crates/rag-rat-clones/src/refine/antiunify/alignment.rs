@@ -73,37 +73,25 @@ pub(super) fn align_to_anchor_with_budget(
             aligned[m_idx] = true;
             continue;
         }
-        // Degraded-anchor path: nothing can be aligned bounded → all-gap, mark sampled.
-        if anchor_too_long {
-            col_map.push(vec![None; spine_len]);
-            member_inserts.push(BTreeMap::new());
-            sampled = true;
-            continue;
-        }
-        // Defensive member cap (loader already bounds to MAX_MEMBERS): align only the first
-        // LCS_MEMBER_SAMPLE members; the rest get an empty (all-gap) map so they read as gaps
-        // rather than panic. The slice is canonical-sorted, so the sample is deterministic.
-        if m_idx >= align::LCS_MEMBER_SAMPLE {
-            col_map.push(vec![None; spine_len]);
-            member_inserts.push(BTreeMap::new());
-            sampled = true;
-            continue;
-        }
-        // Per-member length guard: a member whose seq exceeds the cap would force the
-        // `(spine_len+1)·(member_len+1)` DP allocation — skip it (all-gap, excluded from the
-        // aligned set) and mark sampled. No exact `lcs_align` runs on a pair past the cap.
-        if member.seq.len() > align::LCS_MAX_SEQ_TOKENS {
-            col_map.push(vec![None; spine_len]);
-            member_inserts.push(BTreeMap::new());
-            sampled = true;
-            continue;
-        }
-        // Aggregate cell budget: reserve `|anchor|·|member|` BEFORE the exact DP. The member whose
-        // charge crosses the shared budget, AND every remaining member, take the skip-and-sample
-        // path — same all-gap / `aligned[m]=false` / `sampled` machinery as the per-member length
-        // skip, so the rest of the pipeline (fixedness / indel / recover) excludes them. Only the
-        // crossing member is charged; the ones after it are not.
-        if !budget.reserve((spine_len as u64) * (member.seq.len() as u64)) {
+        // Every guard skips a member the same way: an all-gap map, no inserts, `aligned[m]` left
+        // `false` (so fixedness / indel / recover exclude it), and `sampled` set (so the class is
+        // never reported exact). The `||` order is load-bearing: it decides whether
+        // `budget.reserve` is reached, and so where the budget truncates.
+        let skipped =
+            // Degraded anchor: nothing can be aligned bounded.
+            anchor_too_long
+            // Defensive member cap (the loader already bounds to MAX_MEMBERS): only the first
+            // LCS_MEMBER_SAMPLE members align. The slice is canonical-sorted, so the sample is
+            // deterministic.
+            || m_idx >= align::LCS_MEMBER_SAMPLE
+            // Per-member length guard: a seq past the cap would force the
+            // `(spine_len+1)·(member_len+1)` DP allocation.
+            || member.seq.len() > align::LCS_MAX_SEQ_TOKENS
+            // Aggregate cell budget, reserved BEFORE the exact DP: the member whose charge crosses
+            // the shared budget, and every member after it, is skipped; only the crossing member is
+            // charged.
+            || !budget.reserve((spine_len as u64) * (member.seq.len() as u64));
+        if skipped {
             col_map.push(vec![None; spine_len]);
             member_inserts.push(BTreeMap::new());
             sampled = true;
