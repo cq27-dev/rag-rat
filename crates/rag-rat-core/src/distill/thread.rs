@@ -34,6 +34,85 @@ impl ThreadKey {
     }
 }
 
+/// Which thread a snapshotted source belongs to (`papertrail_distill_sources.role`): the record's
+/// own thread or a coalesced partner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceRole {
+    Primary,
+    Partner,
+}
+
+impl SourceRole {
+    pub(super) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Partner => "partner",
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "shared parser for snapshot hydration"))]
+    pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "partner" => Ok(Self::Partner),
+            other => anyhow::bail!("unknown distill source role `{other}`"),
+        }
+    }
+}
+
+/// What a snapshotted source is (`papertrail_distill_sources.source_kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourceKind {
+    Item,
+    Comment,
+}
+
+impl SourceKind {
+    pub(super) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Item => "item",
+            Self::Comment => "comment",
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "shared parser for snapshot hydration"))]
+    pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "item" => Ok(Self::Item),
+            "comment" => Ok(Self::Comment),
+            other => anyhow::bail!("unknown distill source kind `{other}`"),
+        }
+    }
+}
+
+/// Which part of its item a snapshotted source holds (`papertrail_distill_sources.source_part`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SourcePart {
+    Title,
+    Body,
+    Comment,
+}
+
+impl SourcePart {
+    pub(super) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Title => "title",
+            Self::Body => "body",
+            Self::Comment => "comment",
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code, reason = "shared parser for snapshot hydration"))]
+    pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "title" => Ok(Self::Title),
+            "body" => Ok(Self::Body),
+            "comment" => Ok(Self::Comment),
+            other => anyhow::bail!("unknown distill source part `{other}`"),
+        }
+    }
+}
+
 /// Delete the model-owned junction rows (evidence, alternatives) of one thread.
 pub(crate) fn clear_model_junctions(
     conn: &Connection,
