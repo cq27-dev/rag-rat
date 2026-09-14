@@ -105,8 +105,8 @@ impl ParserBackend for Rust {
         for attribute in attribute_items(text, node) {
             if attribute.contains("uniffi::export") || attribute.contains("::uniffi::export") {
                 facts.push(ParsedSymbolFact {
-                    kind: "rust_attr".to_string(),
-                    value: "uniffi_export".to_string(),
+                    kind: rag_rat_db::SymbolFactKind::RustAttr.as_db_str().to_string(),
+                    value: rag_rat_db::SymbolFactValue::UniffiExport.as_db_str().to_string(),
                 });
             }
         }

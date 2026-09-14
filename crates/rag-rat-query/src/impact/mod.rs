@@ -610,8 +610,8 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
             LEFT JOIN name_strings qn ON qn.id = symbols.qualified_name_id
             JOIN symbol_facts
               ON symbol_facts.symbol_id = symbols.id
-             AND symbol_facts.fact_kind = 'rust_attr'
-             AND symbol_facts.fact_value = 'uniffi_export'
+             AND symbol_facts.fact_kind = ?2
+             AND symbol_facts.fact_value = ?3
             WHERE files.language = 'rust'
               AND symbols.kind IN ('function', 'method', 'impl', 'struct', 'enum', 'trait')
         ),
@@ -626,8 +626,8 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
             JOIN files ON files.id = impls.file_id
             JOIN symbol_facts
               ON symbol_facts.symbol_id = impls.id
-             AND symbol_facts.fact_kind = 'rust_attr'
-             AND symbol_facts.fact_value = 'uniffi_export'
+             AND symbol_facts.fact_kind = ?2
+             AND symbol_facts.fact_value = ?3
             JOIN symbols AS members
               ON members.file_id = impls.file_id
              AND members.start_byte > impls.start_byte
@@ -664,18 +664,25 @@ pub fn ffi_surface(conn: &Connection, limit: u32) -> anyhow::Result<Vec<ImpactIt
         ",
     )?;
     Ok(stmt
-        .query_map([limit], |row| {
-            let reason: String = row.get(4)?;
-            Ok(ImpactItem {
-                path: row.get(0)?,
-                language: row.get(1)?,
-                kind: row.get(2)?,
-                symbol: row.get(3)?,
-                category: ImpactCategory::ProbableTextual.as_str().to_string(),
-                reason: reason.clone(),
-                evidence: ffi_surface_evidence(&reason),
-            })
-        })?
+        .query_map(
+            rusqlite::params![
+                limit,
+                rag_rat_db::SymbolFactKind::RustAttr.as_db_str(),
+                rag_rat_db::SymbolFactValue::UniffiExport.as_db_str()
+            ],
+            |row| {
+                let reason: String = row.get(4)?;
+                Ok(ImpactItem {
+                    path: row.get(0)?,
+                    language: row.get(1)?,
+                    kind: row.get(2)?,
+                    symbol: row.get(3)?,
+                    category: ImpactCategory::ProbableTextual.as_str().to_string(),
+                    reason: reason.clone(),
+                    evidence: ffi_surface_evidence(&reason),
+                })
+            },
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
