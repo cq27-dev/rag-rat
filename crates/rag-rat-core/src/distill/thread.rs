@@ -50,7 +50,6 @@ impl SourceRole {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code, reason = "shared parser for snapshot hydration"))]
     pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
         match value {
             "primary" => Ok(Self::Primary),
@@ -75,7 +74,6 @@ impl SourceKind {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code, reason = "shared parser for snapshot hydration"))]
     pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
         match value {
             "item" => Ok(Self::Item),
@@ -102,7 +100,6 @@ impl SourcePart {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code, reason = "shared parser for snapshot hydration"))]
     pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
         match value {
             "title" => Ok(Self::Title),
