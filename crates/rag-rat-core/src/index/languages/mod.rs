@@ -26,6 +26,20 @@ mod typescript;
 
 pub(super) type SymbolMatch<'tree> = (&'static str, Node<'tree>);
 
+/// Multi-binding declarations need one symbol/chunk per name, so each name supplies its
+/// own span. A single binding retains the complete declaration span and signature.
+pub(super) fn emit_bindings<'tree>(
+    node: Node<'tree>,
+    kind: &'static str,
+    names: Vec<Node<'tree>>,
+    emit: &mut dyn FnMut(Node<'tree>, SymbolMatch<'tree>),
+) {
+    let multiple = names.len() > 1;
+    for name in names {
+        emit(if multiple { name } else { node }, (kind, name));
+    }
+}
+
 /// Grammar-specific declaration and scope recognition for one node visited by the shared parser
 /// walk.
 pub(super) trait ParserBackend: Sync {

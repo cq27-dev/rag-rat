@@ -68,20 +68,11 @@ impl ParserBackend for Swift {
             let mut cursor = node.walk();
             let patterns = node.children_by_field_name("name", &mut cursor).collect::<Vec<_>>();
             let bindings = patterns.into_iter().flat_map(property_names).collect::<Vec<_>>();
-            let multiple_bindings = bindings.len() > 1;
-            for name in bindings {
-                // A multi-binding declaration needs one symbol/chunk per binding. Use the bound
-                // identifier as its unique span; single-binding properties retain the complete
-                // declaration span and the caller always takes its signature from there.
-                emit(if multiple_bindings { name } else { node }, ("property", name));
-            }
+            super::emit_bindings(node, "property", bindings, emit);
         } else if node.kind() == "enum_entry" {
             let mut cursor = node.walk();
             let names = node.children_by_field_name("name", &mut cursor).collect::<Vec<_>>();
-            let multiple_cases = names.len() > 1;
-            for name in names {
-                emit(if multiple_cases { name } else { node }, ("enum_case", name));
-            }
+            super::emit_bindings(node, "enum_case", names, emit);
         } else if let Some(symbol) = self.symbol_node(node, text) {
             emit(node, symbol);
         }

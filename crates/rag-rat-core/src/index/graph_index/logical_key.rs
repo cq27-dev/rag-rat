@@ -22,8 +22,8 @@ pub(in crate::index) struct LogicalSymbolKey {
     pub(in crate::index) signature: Option<String>,
 }
 
-impl LogicalSymbolKey {
-    pub(in crate::index) fn from(row: &LogicalSymbolMemberRow) -> Self {
+impl From<&LogicalSymbolMemberRow> for LogicalSymbolKey {
+    fn from(row: &LogicalSymbolMemberRow) -> Self {
         Self {
             language: row.language.clone(),
             path: row.path.clone(),
@@ -34,7 +34,9 @@ impl LogicalSymbolKey {
             signature: row.signature.clone(),
         }
     }
+}
 
+impl LogicalSymbolKey {
     /// Deterministic logical-symbol id derived from the key AND its owning `repo_id`, so it is
     /// **stable across reindex** (the table is fully rebuilt each pass; an autoincrement rowid
     /// would churn the id every time, breaking any cached id or logical-symbol-bound memory)

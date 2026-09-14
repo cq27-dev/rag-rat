@@ -573,6 +573,15 @@ fn a_graph_heal_does_not_rewrite_a_sibling_worktrees_edges() {
         "the repo summary stays pending while a sibling row is owed"
     );
 
+    // Re-enter the current active scope while its sibling still owes both phases. The
+    // no-work gate must preserve both scopes and must not advance the shared summary.
+    db.ensure_graph_index_current().unwrap();
+    assert_eq!(edge_ids(&db, base_id), base_edge_ids_after);
+    assert_eq!(edge_ids(&db, overlay_id), overlay_edge_ids_before);
+    assert_eq!(file_scope_version(&db, overlay_id), 0);
+    assert_eq!(file_graph_version(&db, overlay_id), 0);
+    assert_ne!(db.repo_meta("graph_index_version").unwrap().as_deref(), Some(GRAPH_INDEX_VERSION));
+
     let mut linked_config = source_config(linked.to_path_buf(), Language::Rust);
     linked_config.database = config.database.clone();
     drop(db);

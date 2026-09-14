@@ -80,8 +80,7 @@ fn receiver_type_identity<'a>(
     };
     let original_path =
         original_hint.map(str::trim).filter(|hint| !hint.is_empty()).map(degeneric_path);
-    let original_root =
-        original_path.as_deref().map(|hint| hint.split_once("::").map_or(hint, |(root, _)| root));
+    let original_root = original_path.as_deref().map(scope_grammar::path_root);
     let resolved_path = resolved_hint.map(degeneric_path);
     if original_root.is_some_and(|root| {
         import_scope.is_glob_import_bound(file_id, root, ref_byte)
@@ -94,8 +93,7 @@ fn receiver_type_identity<'a>(
     }
     let identity = ReceiverTypeIdentity::classify(resolved_hint, |resolved_root| {
         let resolved_path = degeneric_path(resolved_root);
-        let resolved_root =
-            resolved_path.split_once("::").map_or(resolved_path.as_str(), |(root, _)| root);
+        let resolved_root = scope_grammar::path_root(&resolved_path);
         receiver_root_origin(
             import_scope,
             index,
@@ -115,7 +113,7 @@ fn receiver_type_identity<'a>(
 
 /// The package a receiver hint is confined to, or `None` when it may name a type from anywhere.
 ///
-/// The ROOT is the only segment an import can bind, and lexical qualification encodes no more crate
+/// Lexical qualification encodes no more crate
 /// identity than a bare name does: two crates each declaring `inner::Worker` store one key. So a
 /// qualified hint is restricted too unless a `use` says where it came from — `crate`/`self`/`super`
 /// are never import bindings, and they mean THIS crate, so they restrict as well.
@@ -130,7 +128,7 @@ fn receiver_package(
         return None;
     }
     let structural = degeneric_path(hint);
-    let root = structural.split_once("::").map_or(structural.as_str(), |(root, _)| root);
+    let root = scope_grammar::path_root(&structural);
     if import_scope.is_import_bound(file_id, root, ref_byte) {
         None
     } else {
@@ -154,7 +152,7 @@ struct ImportAliasResolveRequest<'a> {
 /// `use crate::Worker as Alias;` makes `Alias` the only spelling the source has, but the method is
 /// stored under `Worker::run` — so the written hint probes a scope that cannot exist, and because a
 /// present receiver type also closes the bare-name fallback it takes the call's last chance with
-/// it. Only the ROOT segment can be an import binding, so only that is rewritten. Unlike a bare
+/// it. Only the root is rewritten (see [`scope_grammar::path_root`]). Unlike a bare
 /// name rebind, the complete imported owner remains unambiguous when its leaf is defined in this
 /// file — that is the normal shape of an alias for an inline module.
 fn alias_resolved_receiver_hint(
@@ -164,10 +162,7 @@ fn alias_resolved_receiver_hint(
     ref_byte: usize,
 ) -> Option<String> {
     let hint = hint?.trim();
-    let (root, rest) = match hint.split_once("::") {
-        Some((root, rest)) => (root, Some(rest)),
-        None => (hint, None),
-    };
+    let (root, rest) = scope_grammar::split_path_root(hint);
     let target = import_scope.import_alias_target(file_id, root, ref_byte)?;
     if target == root {
         return None;
@@ -217,6 +212,28 @@ struct ReferenceInputs<'a> {
     ref_byte: usize,
 }
 
+/// Keep unresolved confidence and visibility identical for incremental and full rebuilds.
+fn unresolved_verdict(
+    source_language: Option<&str>,
+    edge_kind: EdgeKind,
+    evidence: Option<&str>,
+    current: EdgeConfidence,
+) -> (EdgeConfidence, EdgeResolution) {
+    let suppressed = crate::index::languages::resolver_policy_for_name(source_language)
+        .is_some_and(|policy| {
+            (policy.unresolved_disposition)(edge_kind, evidence)
+                == crate::index::languages::UnresolvedDisposition::Suppress
+        });
+    let confidence = if current == EdgeConfidence::Ambiguous {
+        EdgeConfidence::Ambiguous
+    } else {
+        EdgeConfidence::NameOnly
+    };
+    let resolution =
+        if suppressed { EdgeResolution::Suppressed } else { EdgeResolution::Unresolved };
+    (confidence, resolution)
+}
+
 fn resolve_reference<'s>(
     reference: ReferenceInputs<'_>,
     import_scope: &ImportScope,
@@ -250,6 +267,8 @@ fn resolve_reference<'s>(
     let aliased_receiver_type =
         alias_resolved_receiver_hint(import_scope, file_id, receiver_type_hint, ref_byte);
     let receiver_alias_bound = receiver_type_hint.is_some_and(|hint| {
+        // Preserve the legacy probe: generic receiver aliases are not degenericized here.
+        // Changing this gate also changes which receiver fallback paths may bind.
         let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
         import_scope.has_import_alias(file_id, root, ref_byte)
     });
@@ -618,6 +637,9 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
     ) in rows
     {
         let edge_kind = EdgeKind::from_db_str(&edge_kind)?;
+        // Unknown stored bands historically re-resolve as name-only, not a read failure.
+        let current_confidence =
+            EdgeConfidence::from_db_str(&current_confidence).unwrap_or(EdgeConfidence::NameOnly);
         // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, NOT a
         // real call target — resolving it would bind a bogus `to_symbol_id` to any same-named
         // symbol, and synthesis reads only the fact's `from_symbol_id`. Leave it
@@ -656,21 +678,13 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             &index,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
-            let suppressed =
-                crate::index::languages::resolver_policy_for_name(Some(&source_language))
-                    .is_some_and(|policy| {
-                        (policy.unresolved_disposition)(edge_kind, evidence.as_deref())
-                            == crate::index::languages::UnresolvedDisposition::Suppress
-                    });
-            let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_db_str() {
-                EdgeConfidence::Ambiguous
-            } else {
-                EdgeConfidence::NameOnly
-            };
-            // prepare_cached: one UPDATE per edge; cache the statement so the SQL compiles once per
-            // connection instead of on every call.
-            let resolution =
-                if suppressed { EdgeResolution::Suppressed } else { EdgeResolution::Unresolved };
+            let (confidence, resolution) = unresolved_verdict(
+                Some(&source_language),
+                edge_kind,
+                evidence.as_deref(),
+                current_confidence,
+            );
+            // Cache the per-edge UPDATE so SQL compiles once per connection.
             let confidence_id = interner.get(conn, confidence.as_db_str())?;
             let resolution_id = interner.get(conn, resolution.as_db_str())?;
             conn.prepare_cached(
@@ -692,6 +706,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             continue;
         };
         let confidence_id = interner.get(conn, confidence.as_db_str())?;
+        let reason = EdgeResolution::Reason(reason);
         let resolution_id = interner.get(conn, reason.as_db_str())?;
         conn.prepare_cached(
             "UPDATE edges_data
@@ -712,7 +727,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             resolution_id,
             // A re-resolved candidate un-hides (a previously suppressed Swift macro candidate
             // whose target appears later); a resolved dispatch_handle FACT stays hidden.
-            edge_hidden_flag(edge_kind, EdgeResolution::Reason(reason)),
+            edge_hidden_flag(edge_kind, reason),
         ])?;
     }
     // #200: now that the dispatch FACT rows are resolved (handlers bound to symbols), synthesize
@@ -877,29 +892,13 @@ pub(crate) fn resolve_and_insert_edges(
                     EdgeResolution::Reason(reason),
                 ),
                 None => {
-                    let suppressed = crate::index::languages::resolver_policy_for_name(
+                    let (confidence, reason) = unresolved_verdict(
                         file_language.get(file_id).map(String::as_str),
-                    )
-                    .is_some_and(|policy| {
-                        (policy.unresolved_disposition)(candidate.edge_kind, evidence)
-                            == crate::index::languages::UnresolvedDisposition::Suppress
-                    });
-                    let confidence = if candidate.confidence == EdgeConfidence::Ambiguous {
-                        EdgeConfidence::Ambiguous
-                    } else {
-                        EdgeConfidence::NameOnly
-                    };
-                    (
-                        None,
-                        confidence,
-                        None,
-                        None,
-                        if suppressed {
-                            EdgeResolution::Suppressed
-                        } else {
-                            EdgeResolution::Unresolved
-                        },
-                    )
+                        candidate.edge_kind,
+                        evidence,
+                        candidate.confidence,
+                    );
+                    (None, confidence, None, None, reason)
                 },
             };
         // NULL when the sentinel marks an absent callee range; see

@@ -236,6 +236,18 @@ pub(crate) fn segments(path: &str) -> Vec<&str> {
     out
 }
 
+/// The root is the only segment an import can bind. Callers that need an import name
+/// degeneric the path first; borrowing here preserves the remaining owner spelling.
+pub(crate) fn path_root(path: &str) -> &str {
+    segments(path)[0]
+}
+
+/// Split only the root from its remaining owner path, ignoring nested separators.
+pub(crate) fn split_path_root(path: &str) -> (&str, Option<&str>) {
+    let root = path_root(path);
+    (root, path.get(root.len() + 2..))
+}
+
 /// The owner half of a `Type as Trait` scope segment, or the whole segment when it carries no
 /// marker. The split is on a TOP-LEVEL ` as `, so a cast inside the owner — `[u8; N as usize]` —
 /// is not mistaken for the marker.
@@ -469,5 +481,12 @@ mod tests {
         assert_eq!(strip_receiver_wrappers("&mut W"), "W");
         assert_eq!(strip_receiver_wrappers("*const W"), "W");
         assert_eq!(strip_receiver_wrappers("W"), "W");
+    }
+    #[test]
+    fn path_roots_ignore_nested_separators() {
+        assert_eq!(path_root(&degeneric("Map<K::V>::get")), "Map");
+        assert_eq!(split_path_root("Map<K::V>::get"), ("Map<K::V>", Some("get")));
+        assert_eq!(split_path_root("Worker"), ("Worker", None));
+        assert_eq!(split_path_root("::Worker"), ("", Some("Worker")));
     }
 }

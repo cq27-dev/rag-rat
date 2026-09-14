@@ -3038,3 +3038,14 @@ fn test_scope_degeneric_resolution() {
     assert_eq!(confidence, "Syntactic");
     assert_eq!(resolution, "scope_degeneric");
 }
+
+#[test]
+fn unknown_stored_confidence_remains_tolerant_when_unresolved() {
+    let conn = seeded_conn();
+    let file = add_file(&conn, "caller.rs", NEW);
+    let edge = add_edge(&conn, file, "missing", "missing");
+    conn.execute("UPDATE edges SET confidence = 'FutureBand' WHERE id = ?1", [edge]).unwrap();
+    crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
+    resolve_all_edges(&conn).unwrap();
+    assert_eq!(edge_state(&conn, edge), (None, "NameOnly".into(), "unresolved".into()));
+}

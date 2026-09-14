@@ -18,6 +18,19 @@ fn chunk_part_suffix(symbol_path: &str) -> &str {
     }
 }
 
+enum GraphHealGate {
+    AlreadyCurrent,
+    MarkCurrentOnly,
+    Heal { scope_rows_newer: bool },
+}
+
+#[derive(Default)]
+struct GraphHealTally {
+    unverified: usize,
+    unrefreshed: usize,
+    edge_rewrite_staged: bool,
+}
+
 impl IndexDatabase {
     pub(in crate::index) fn resolve_edges(&self) -> anyhow::Result<()> {
         edges::resolve_all_edges(self.storage.connection())
@@ -140,22 +153,31 @@ impl IndexDatabase {
         Ok(())
     }
 
-    fn ensure_graph_index_current_inner(&self) -> anyhow::Result<()> {
+    fn graph_heal_gate(&self) -> anyhow::Result<GraphHealGate> {
         let graph_current =
             self.repo_meta("graph_index_version")?.as_deref() == Some(GRAPH_INDEX_VERSION);
         let active_derivation_owed = self.active_derivation_rows_owed()?;
         let scope_rows_newer = self.scope_rows_newer()?;
         if scope_rows_newer && !self.active_graph_rows_owed()? {
-            return Ok(());
+            return Ok(GraphHealGate::AlreadyCurrent);
         }
         if !active_derivation_owed {
             // A sibling checkout may still owe rows this scope cannot read. The active graph is
             // safe to serve; once the final sibling heals, that opener advances the repo summary.
             if !graph_current && !self.graph_rows_owed()? {
-                self.mark_graph_index_current()?;
+                return Ok(GraphHealGate::MarkCurrentOnly);
             }
-            return Ok(());
+            return Ok(GraphHealGate::AlreadyCurrent);
         }
+        Ok(GraphHealGate::Heal { scope_rows_newer })
+    }
+
+    fn ensure_graph_index_current_inner(&self) -> anyhow::Result<()> {
+        let scope_rows_newer = match self.graph_heal_gate()? {
+            GraphHealGate::AlreadyCurrent => return Ok(()),
+            GraphHealGate::MarkCurrentOnly => return self.mark_graph_index_current(),
+            GraphHealGate::Heal { scope_rows_newer } => scope_rows_newer,
+        };
         let Some(root) = self.storage.source_root().map(Path::to_path_buf) else {
             return Ok(());
         };
@@ -186,91 +208,24 @@ impl IndexDatabase {
             // A skipped row keeps its old per-file versions, so the checkout that owns those bytes
             // can resume both derivations later without forcing this scope to parse them again.
             // Rows the row reader could not name are uncovered exactly like an unreadable file.
-            let mut unverified = unreadable;
-            let mut unrefreshed = 0usize;
-            let mut edge_rewrite_staged = false;
+            let mut tally = GraphHealTally { unverified: unreadable, ..Default::default() };
             for file in files {
                 let full_path = root.join(&file.path);
                 let Ok(text) = fs::read_to_string(full_path) else {
-                    unverified += 1;
+                    tally.unverified += 1;
                     continue;
                 };
                 if rag_rat_base::hash::hex_sha256(text.as_bytes()) != file.sha256 {
-                    unverified += 1;
+                    tally.unverified += 1;
                     continue;
                 }
-                // Above the parse limit there are no persisted symbols to refresh at all
-                // (`prepare_index_content_from_text` skips the same bound), so the scope shape
-                // is vacuously current for this file.
-                // Rust because a scope-affecting key bump changed what its impl scopes ARE. Any
-                // other language because the scope entered the key at all: `scope_path` landed
-                // nullable with no backfill, so a row indexed before it reads as `''` here while a
-                // fresh index hashes a real enclosing scope. Left alone, those rows would take the
-                // new stamp holding a key no fresh index produces, and nested same-named symbols
-                // would stay collapsed with no later pass owing them a re-derivation.
-                let scope_needs_refresh = file.scope_owed
-                    && file.kind != TargetKind::Generated
-                    && file.language != Language::Markdown
-                    && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
-                    && (file.language == Language::Rust
-                        || self.file_has_unscoped_symbols(file.id)?);
-                if file.scope_owed && !scope_rows_newer {
-                    if !scope_needs_refresh {
-                        self.mark_file_scope_current(file.id)?;
-                    } else if self.refresh_symbol_scopes(
-                        file.id,
-                        Path::new(&file.path),
-                        &text,
-                        file.language,
-                    )? {
-                        self.stage_edge_rewrite_inedge_sources(
-                            &file.path,
-                            &self.active_repo_id,
-                            self.active_generation,
-                        )?;
-                        self.stage_edge_rewrite_file(file.id)?;
-                        edge_rewrite_staged = true;
-                        self.mark_file_scope_current(file.id)?;
-                    } else {
-                        unrefreshed += 1;
-                    }
-                }
-                if !file.graph_owed {
-                    continue;
-                }
-                if file.kind == TargetKind::Generated
-                    || file.language == Language::Markdown
-                    || text.len() > edges::MAX_GRAPH_PARSE_BYTES
-                {
-                    self.mark_file_graph_current(file.id)?;
-                    continue;
-                }
-                // Wipe exactly the row being re-derived, immediately before re-deriving it.
-                // A repo-wide DELETE up front is what turned an unreadable or diverged row into
-                // silent edge LOSS: nothing repopulates a row this loop skips. Per-row, the wipe
-                // removes precisely the set the insert below replaces, and a skipped row keeps
-                // the edges it already has — which `resolve_edges` will NOT revisit on a scoped
-                // open (it writes only rows the connection's `files` view admits), so leaving
-                // them in place is the difference between stale and absent.
-                self.storage
-                    .connection()
-                    .prepare_cached("DELETE FROM edges_data WHERE source_file_id = ?1")?
-                    .execute([file.id])?;
-                edges::index_file_edges(
-                    self.storage.connection(),
-                    file.id,
-                    Path::new(&file.path),
-                    file.language,
-                    &text,
-                )?;
-                self.stage_edge_rewrite_file(file.id)?;
-                edge_rewrite_staged = true;
-                self.mark_file_graph_current(file.id)?;
+                self.heal_file_scope(&file, &text, scope_rows_newer, &mut tally)?;
+                self.heal_file_graph(&file, &text, &mut tally)?;
             }
-            if unverified > 0 || unrefreshed > 0 {
+            if tally.unverified > 0 || tally.unrefreshed > 0 {
                 tracing::warn!(
-                    unverified,
-                    unrefreshed,
+                    unverified = tally.unverified,
+                    unrefreshed = tally.unrefreshed,
                     "graph heal skipped file rows this checkout could not vouch for; their \
                      per-file provenance remains owed for a later checkout (#1014)"
                 );
@@ -281,7 +236,7 @@ impl IndexDatabase {
             // `logical_symbols` rows — edge resolution never reads that table). What is
             // load-bearing is that the refresh loop above completed for every row this checkout
             // can advance first; their relative order here is free.
-            if edge_rewrite_staged {
+            if tally.edge_rewrite_staged {
                 self.resolve_changed_edges()?;
             }
             if !scope_rows_newer
@@ -303,6 +258,93 @@ impl IndexDatabase {
         }
         result?;
         self.storage.execute_batch("COMMIT")?;
+        Ok(())
+    }
+
+    fn heal_file_scope(
+        &self,
+        file: &GraphReindexFile,
+        text: &str,
+        scope_rows_newer: bool,
+        tally: &mut GraphHealTally,
+    ) -> anyhow::Result<()> {
+        // A file needs its scopes re-derived: Rust because a scope-affecting key bump
+        // changed what its impl scopes ARE. Any
+        // other language because the scope entered the key at all: `scope_path` landed
+        // nullable with no backfill, so a row indexed before it reads as `''` here while a
+        // fresh index hashes a real enclosing scope. Left alone, those rows would take the
+        // new stamp holding a key no fresh index produces, and nested same-named symbols
+        // would stay collapsed with no later pass owing them a re-derivation.
+        let scope_needs_refresh = file.scope_owed
+                    && file.kind != TargetKind::Generated
+                    && file.language != Language::Markdown
+                // Above the parse limit there are no persisted symbols to refresh at all
+                // (`prepare_index_content_from_text` skips the same bound), so the scope shape
+                // is vacuously current for this file.
+                    && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
+                    && (file.language == Language::Rust
+                        || self.file_has_unscoped_symbols(file.id)?);
+        if file.scope_owed && !scope_rows_newer {
+            if !scope_needs_refresh {
+                self.mark_file_scope_current(file.id)?;
+            } else if self.refresh_symbol_scopes(
+                file.id,
+                Path::new(&file.path),
+                text,
+                file.language,
+            )? {
+                self.stage_edge_rewrite_inedge_sources(
+                    &file.path,
+                    &self.active_repo_id,
+                    self.active_generation,
+                )?;
+                self.stage_edge_rewrite_file(file.id)?;
+                tally.edge_rewrite_staged = true;
+                self.mark_file_scope_current(file.id)?;
+            } else {
+                tally.unrefreshed += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn heal_file_graph(
+        &self,
+        file: &GraphReindexFile,
+        text: &str,
+        tally: &mut GraphHealTally,
+    ) -> anyhow::Result<()> {
+        if !file.graph_owed {
+            return Ok(());
+        }
+        if file.kind == TargetKind::Generated
+            || file.language == Language::Markdown
+            || text.len() > edges::MAX_GRAPH_PARSE_BYTES
+        {
+            self.mark_file_graph_current(file.id)?;
+            return Ok(());
+        }
+        // Wipe exactly the row being re-derived, immediately before re-deriving it.
+        // A repo-wide DELETE up front is what turned an unreadable or diverged row into
+        // silent edge LOSS: nothing repopulates a row this loop skips. Per-row, the wipe
+        // removes precisely the set the insert below replaces, and a skipped row keeps
+        // the edges it already has — which `resolve_edges` will NOT revisit on a scoped
+        // open (it writes only rows the connection's `files` view admits), so leaving
+        // them in place is the difference between stale and absent.
+        self.storage
+            .connection()
+            .prepare_cached("DELETE FROM edges_data WHERE source_file_id = ?1")?
+            .execute([file.id])?;
+        edges::index_file_edges(
+            self.storage.connection(),
+            file.id,
+            Path::new(&file.path),
+            file.language,
+            text,
+        )?;
+        self.stage_edge_rewrite_file(file.id)?;
+        tally.edge_rewrite_staged = true;
+        self.mark_file_graph_current(file.id)?;
         Ok(())
     }
 

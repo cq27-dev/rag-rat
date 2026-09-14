@@ -1,5 +1,4 @@
 //! C and C++ graph-edge extraction for the shared structural edge walk.
-use rag_rat_db::EdgeConfidence;
 
 use crate::index::edges::*;
 
@@ -16,41 +15,16 @@ pub(in crate::index::languages) fn c_like_edges(
                 .trim_matches(['<', '>', '"'])
                 .to_string();
             if !include.is_empty() {
-                out.push(file_edge(
-                    path,
-                    node,
-                    text,
-                    include,
-                    EdgeKind::Imports,
-                    EdgeConfidence::NameOnly,
-                ));
+                out.push(file_edge(path, node, text, include, EdgeKind::Imports));
             }
         },
         "call_expression" => {
             let function = node.child_by_field_name("function").unwrap_or(node);
             let identifiers = IdentifierPath::under(function, text);
-            if let Some(name) = identifiers
-                .last_text()
-                .map(ToOwned::to_owned)
-                .or_else(|| call_target_name(node, text))
+            if let Some(edge) =
+                qualified_call_edge(locator, node, text, &identifiers, EdgeKind::CallsName)
             {
-                out.push(symbol_edge_with_context(
-                    locator,
-                    node,
-                    text,
-                    name,
-                    EdgeKind::CallsName,
-                    EdgeConfidence::NameOnly,
-                    EdgeContext {
-                        target_qualified_name: identifiers.qualified_name(),
-                        receiver_hint: identifiers
-                            .first_text()
-                            .filter(|_| identifiers.len() > 1)
-                            .map(ToOwned::to_owned),
-                        ..Default::default()
-                    },
-                    identifiers.last_node().map(CalleeRange::of_node),
-                ));
+                out.push(edge);
             }
         },
         "type_identifier" | "qualified_identifier" | "namespace_identifier" => {
@@ -60,7 +34,6 @@ pub(in crate::index::languages) fn c_like_edges(
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             }
