@@ -1,0 +1,7 @@
+name: Bound the runner build cache
+description: Trim this job's persistent Cargo target after tests and uploads finish.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "$GITHUB_ACTION_PATH/../../../tools/runner-cache-cleanup.sh"

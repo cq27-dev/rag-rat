@@ -49,6 +49,12 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      - name: Test runner cache cleanup safeguards
+        run: python3 tools/test-runner-cache-cleanup.py
+
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
 
   clippy:
     name: clippy
@@ -64,6 +70,10 @@ jobs:
       # This lints the cfg(not(feature = ...)) branches; the feature-gated code is linted by the
       # clippy-all-features job below.
       - run: cargo clippy --workspace --all-targets --no-default-features --locked -- -D warnings
+
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
 
   clippy-all-features:
     name: clippy (all features)
@@ -81,6 +91,10 @@ jobs:
       # Lints fastembed, model2vec, and eval — the feature-gated code the --no-default-features
       # clippy job never compiles.
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
 
   test:
     name: test
@@ -106,6 +120,10 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
+
   build-full:
     name: build (fastembed + model2vec)
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
@@ -124,6 +142,10 @@ jobs:
       # Compile the default feature set (re-downloads the ONNX runtime) so the released binary's
       # embedding paths never break silently.
       - run: cargo build --workspace --locked
+
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
 
   coverage:
     name: coverage
@@ -160,6 +182,10 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
+
   lens-extension:
     name: vscode lens extension
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
@@ -180,3 +206,7 @@ jobs:
       # dependencies (both Node and web bundles are pre-built by `vscode:prepublish`).
       - run: npx --yes @vscode/vsce package --no-dependencies --out /tmp/rag-rat-lens.vsix
         working-directory: editors/vscode
+
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
