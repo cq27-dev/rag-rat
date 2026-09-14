@@ -138,23 +138,12 @@ impl IndexDatabase {
             return Ok(());
         };
         self.set_context(checkout.borrowed())?;
-        self.storage.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> anyhow::Result<()> {
+        self.in_immediate_txn(|| {
             self.refresh_packages(&source_root)?;
             self.resolve_overlay_edges(&checkout.worktree_id)?;
             self.bump_lens_revisions(&[rag_rat_db::meta::LENS_SYMBOLS_REVISION_META])?;
             Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                self.storage.execute_batch("COMMIT")?;
-                Ok(())
-            },
-            Err(err) => {
-                let _ = self.storage.execute_batch("ROLLBACK");
-                Err(err)
-            },
-        }
+        })
     }
 
     /// The post-write finalize tail of `index_worktree_overlay`, run INSIDE its transaction — ONLY
@@ -326,8 +315,7 @@ impl IndexDatabase {
         if self.repo_meta(OVERLAY_LOGICAL_REBUILD_PENDING_META)?.is_none() {
             return Ok(false);
         }
-        self.storage.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> anyhow::Result<bool> {
+        self.in_immediate_txn(|| {
             // RE-CHECK under the write transaction: a concurrent tail (another watcher/hook
             // process) may have rebuilt and cleared the marker between the read above and
             // BEGIN IMMEDIATE — proceeding blind would pay a second wholesale rebuild for
@@ -341,17 +329,7 @@ impl IndexDatabase {
             // so the obligation survives for the next pass to retry.
             self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
             Ok(true)
-        })();
-        match result {
-            Ok(ran) => {
-                self.storage.execute_batch("COMMIT")?;
-                Ok(ran)
-            },
-            Err(err) => {
-                let _ = self.storage.execute_batch("ROLLBACK");
-                Err(err)
-            },
-        }
+        })
     }
 
     /// The Inline entry-point exit settle (#819 review): every overlay indexing entry point

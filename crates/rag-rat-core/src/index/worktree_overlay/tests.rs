@@ -63,3 +63,64 @@ fn checkout_probes_isolate_base_and_linked_rows() {
     assert!(!db.overlay_tombstone_exists(path, branch.borrowed()).unwrap());
     crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
 }
+
+/// A deferred FK fails at COMMIT, after the refresh body has completed successfully.
+fn inject_deferred_commit_failure(conn: &rusqlite::Connection, operation: &str, key: &str) {
+    conn.execute_batch(&format!(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE commit_failure_parent(id INTEGER PRIMARY KEY);
+         CREATE TABLE commit_failure_child(parent_id INTEGER REFERENCES commit_failure_parent(id) \
+         DEFERRABLE INITIALLY DEFERRED);
+         CREATE TEMP TRIGGER fail_refresh_commit AFTER {operation} ON main.repo_meta
+         WHEN {}.key = '{key}' BEGIN INSERT INTO commit_failure_child VALUES (1); END;",
+        if operation == "DELETE" { "OLD" } else { "NEW" },
+    ))
+    .unwrap();
+}
+
+#[test]
+fn pending_rebuild_commit_failure_rolls_back_and_preserves_obligation() {
+    let (_root, config) =
+        crate::index::schema_bootstrap_tests::poison_test_config("commit_rollback");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    db.set_repo_meta_if_changed(OVERLAY_LOGICAL_REBUILD_PENDING_META, "1").unwrap();
+    let conn = db.storage.connection();
+    inject_deferred_commit_failure(conn, "DELETE", OVERLAY_LOGICAL_REBUILD_PENDING_META);
+    let err = db.apply_pending_logical_rebuild().unwrap_err();
+    assert!(err.to_string().contains("FOREIGN KEY"), "{err:#}");
+    assert!(conn.is_autocommit(), "failed COMMIT must not strand an open transaction");
+    assert_eq!(db.repo_meta(OVERLAY_LOGICAL_REBUILD_PENDING_META).unwrap().as_deref(), Some("1"));
+    conn.execute_batch("DROP TRIGGER fail_refresh_commit").unwrap();
+    assert!(db.apply_pending_logical_rebuild().unwrap());
+    crate::index::poison_sibling::assert_sibling_intact(conn);
+}
+
+#[test]
+fn overlay_package_commit_failure_rolls_back_and_allows_retry() {
+    let (_root, config) =
+        crate::index::schema_bootstrap_tests::poison_test_config("package_rollback");
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let linked_parent = tempfile::tempdir().unwrap();
+    let linked = linked_parent.path().join("linked");
+    rag_rat_base::test_git::run(&config.root, &[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "package-linked",
+        linked.to_str().unwrap(),
+    ]);
+    let key = rag_rat_db::meta::LENS_SYMBOLS_REVISION_META;
+    // Force the bump down its INSERT path so one trigger covers the failure seam.
+    rag_rat_db::meta::delete_repo_meta(db.storage.connection(), &db.active_repo_id, key).unwrap();
+    inject_deferred_commit_failure(db.storage.connection(), "INSERT", key);
+    let err = db.refresh_worktree_overlay_packages(&config, &linked).unwrap_err();
+    assert!(err.to_string().contains("FOREIGN KEY"), "{err:#}");
+    assert!(
+        db.storage.connection().is_autocommit(),
+        "failed COMMIT must not strand an open transaction"
+    );
+    db.storage.connection().execute_batch("DROP TRIGGER fail_refresh_commit").unwrap();
+    db.refresh_worktree_overlay_packages(&config, &linked).unwrap();
+    crate::index::poison_sibling::assert_sibling_intact(db.storage.connection());
+}
