@@ -398,7 +398,7 @@ fn ensure_checkout_matches_corpus(
     let mut actual: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for target in &config.targets {
         actual
-            .entry(target.language.as_str().to_string())
+            .entry(target.language.as_db_str().to_string())
             .or_default()
             .extend(target.directories.iter().map(|dir| dir.to_string_lossy().into_owned()));
     }
@@ -430,7 +430,7 @@ fn ensure_checkout_matches_corpus(
              `oracle report --corpus {}` requires the corpus's plain bindings (default filters) \
              so the report's profile hash matches the file population it measured",
             target.name,
-            target.language.as_str(),
+            target.language.as_db_str(),
             target.include,
             target.exclude,
             profile.corpus_id,

@@ -409,7 +409,7 @@ pub(crate) fn resolve_targets(
         let language = Language::from_str(&language_name)?;
         let kind =
             if language == Language::Markdown { TargetKind::Docs } else { TargetKind::Source };
-        let name = language.as_str().to_string();
+        let name = language.as_db_str().to_string();
         push_target(root, &mut names, &mut targets, ResolvedTarget {
             include: language.default_include_globs(),
             exclude: Vec::new(),

@@ -405,7 +405,7 @@ fn source_config_dirs(root: PathBuf, language: Language, dirs: &[&str]) -> Confi
         database: root.join(".rag-rat/index.sqlite"),
         root,
         targets: vec![ResolvedTarget {
-            name: language.as_str().to_string(),
+            name: language.as_db_str().to_string(),
             language,
             directories: dirs.iter().map(PathBuf::from).collect(),
             include: dirs.iter().map(|dir| format!("{dir}/")).collect(),

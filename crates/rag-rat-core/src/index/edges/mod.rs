@@ -356,7 +356,7 @@ impl IndexedSymbol {
             .map(|(idx, symbol)| IndexedSymbol {
                 id: idx as i64,
                 file_id: 0,
-                language: language.as_str().to_string(),
+                language: language.as_db_str().to_string(),
                 name: symbol.name.clone(),
                 qualified_name: symbol.qualified_name.clone(),
                 scope_path: symbol.scope_path.clone(),
@@ -569,7 +569,7 @@ impl FullRebuildGraph {
         let compact = CompactSymbol {
             id,
             file_id,
-            language: self.arena.intern(language.as_str()),
+            language: self.arena.intern(language.as_db_str()),
             name: self.arena.intern(&symbol.name),
             qualified_name: self.arena.intern(&symbol.qualified_name),
             scope_path: self.arena.intern(&symbol.scope_path),
@@ -737,7 +737,8 @@ pub(crate) fn qualified_scope_path<'a>(
     path: &'a str,
     language: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
-    if language != Some(Language::Rust.as_str()) || (!path.contains('<') && !path.contains(" as "))
+    if language != Some(Language::Rust.as_db_str())
+        || (!path.contains('<') && !path.contains(" as "))
     {
         return std::borrow::Cow::Borrowed(path);
     }
@@ -755,7 +756,7 @@ pub(crate) fn receiver_scope_path<'a>(
     path: &'a str,
     language: Option<&str>,
 ) -> std::borrow::Cow<'a, str> {
-    if language != Some(Language::Rust.as_str())
+    if language != Some(Language::Rust.as_db_str())
         || (!path.contains('<')
             && !path.contains(" as ")
             && !path.contains('&')
@@ -795,7 +796,7 @@ mod scope_surface_tests {
     /// `impl Neg for &W`, and a `W` receiver hint must reach all four pointer shapes.
     #[test]
     fn the_qualified_surface_keeps_the_wrapper_the_receiver_surface_peels() {
-        let rust = Some(Language::Rust.as_str());
+        let rust = Some(Language::Rust.as_db_str());
         for (scope, qualified, receiver) in [
             ("W as Neg::neg", "W::neg", "W::neg"),
             ("&W as Neg::neg", "&W::neg", "W::neg"),
@@ -812,7 +813,7 @@ mod scope_surface_tests {
     /// so — the `contains` prefilter lets shapes through that fold to themselves.
     #[test]
     fn an_unchanged_fold_borrows() {
-        let rust = Some(Language::Rust.as_str());
+        let rust = Some(Language::Rust.as_db_str());
         for path in ["<W as a::Runs>::run", "[u8; N as usize]::run", "plain::run"] {
             assert!(
                 matches!(qualified_scope_path(path, rust), std::borrow::Cow::Borrowed(_)),

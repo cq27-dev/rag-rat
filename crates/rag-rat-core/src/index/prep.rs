@@ -587,7 +587,7 @@ pub(crate) fn prepare_index_content_from_text(
     // gate classifies chunk spans against the shared tree (one parse per file, #516).
     let chunks = prepare_chunks(
         relative_path,
-        language.as_str(),
+        language.as_db_str(),
         kind.as_db_str(),
         chunks,
         text,

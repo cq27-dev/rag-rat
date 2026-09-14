@@ -400,6 +400,6 @@ mod tests {
         // Assert
         assert_eq!(kind, ParserKind::Go);
         assert!(parser::grammar_for(kind).is_some());
-        assert_eq!(Language::Go.as_str(), "go");
+        assert_eq!(Language::Go.as_db_str(), "go");
     }
 }

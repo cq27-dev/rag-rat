@@ -437,7 +437,7 @@ fn whole_root_c_config(root: PathBuf) -> Config {
         database: config_root.join(".rag-rat/index.sqlite"),
         root: config_root,
         targets: vec![ResolvedTarget {
-            name: Language::C.as_str().to_string(),
+            name: Language::C.as_db_str().to_string(),
             language: Language::C,
             directories: vec![PathBuf::from(".")],
             include: Language::C.default_include_globs(),

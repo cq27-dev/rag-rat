@@ -99,7 +99,7 @@ pub(super) fn render_indexing(f: &mut Frame, area: Rect, state: &mut WizardState
             theme::base()
         };
         spans.push(Span::styled(
-            format!("{}{} {}  ", if *on { "[x]" } else { "[ ]" }, l.as_str(), ""),
+            format!("{}{} {}  ", if *on { "[x]" } else { "[ ]" }, l.as_db_str(), ""),
             style,
         ));
     }
@@ -237,7 +237,7 @@ fn render_dir_tree(
     let visible = tree.flatten(&items);
     let selected =
         visible.iter().position(|item| item.identifier == tree.selected()).map_or(0, |i| i + 1);
-    let title = format!("Directories: {}  {}/{}", lang.as_str(), selected, visible.len());
+    let title = format!("Directories: {}  {}/{}", lang.as_db_str(), selected, visible.len());
     let widget = Tree::new(&items)
         .expect("directory tree paths are unique")
         .style(theme::base())
@@ -527,7 +527,7 @@ pub(super) fn validate_indexing(state: &WizardState) -> CheckResult {
         for d in dirs {
             let abs = if d.is_absolute() { d.clone() } else { state.draft.root_abs.join(d) };
             if !abs.exists() {
-                missing.push(format!("{}: {}", l.as_str(), d.display()));
+                missing.push(format!("{}: {}", l.as_db_str(), d.display()));
             }
         }
     }

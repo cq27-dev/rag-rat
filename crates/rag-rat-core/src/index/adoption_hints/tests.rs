@@ -35,7 +35,7 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         database: config_root.join(".rag-rat/index.sqlite"),
         root: config_root,
         targets: vec![ResolvedTarget {
-            name: language.as_str().to_string(),
+            name: language.as_db_str().to_string(),
             language,
             directories: vec![PathBuf::from("src")],
             include: vec!["src/".to_string()],

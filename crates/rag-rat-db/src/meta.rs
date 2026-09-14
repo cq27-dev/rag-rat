@@ -82,7 +82,7 @@ pub fn target_scope_fingerprint(targets: &[ResolvedTarget]) -> String {
         input.push_str("target\0");
         input.push_str(&target.name);
         input.push('\0');
-        input.push_str(target.language.as_str());
+        input.push_str(target.language.as_db_str());
         input.push('\0');
         input.push_str(target.kind.as_db_str());
         input.push('\0');

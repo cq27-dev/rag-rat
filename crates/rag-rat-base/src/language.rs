@@ -1,12 +1,24 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[repr(u8)]
+/// A source language rag-rat indexes. [`Language::as_db_str`] is the persisted token (the
+/// `files.language` / `symbols.language` / `parser_failures.language` column value and the config
+/// spelling); the variant name, lowercased, IS that token.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
+#[strum(serialize_all = "lowercase")]
 pub enum Language {
     Rust,
     TypeScript,
@@ -19,100 +31,31 @@ pub enum Language {
     Markdown,
 }
 
+/// Per-language static metadata beyond the name: the alternate spellings config accepts and the
+/// extensions each detection mode claims.
 #[derive(Debug, Clone, Copy)]
 struct LanguageSpec {
-    language: Language,
-    name: &'static str,
     aliases: &'static [&'static str],
     simple_extensions: &'static [&'static str],
     target_extensions: &'static [&'static str],
 }
 
-const LANGUAGE_SPECS: [LanguageSpec; 9] = [
-    LanguageSpec {
-        language: Language::Rust,
-        name: "rust",
-        aliases: &["rs"],
-        simple_extensions: &["rs"],
-        target_extensions: &["rs"],
-    },
-    LanguageSpec {
-        language: Language::TypeScript,
-        name: "typescript",
-        aliases: &["ts", "tsx"],
-        simple_extensions: &["ts", "tsx"],
-        target_extensions: &["ts", "tsx"],
-    },
-    LanguageSpec {
-        language: Language::Kotlin,
-        name: "kotlin",
-        aliases: &["kt"],
-        simple_extensions: &["kt", "kts"],
-        target_extensions: &["kt", "kts"],
-    },
-    LanguageSpec {
-        language: Language::C,
-        name: "c",
-        aliases: &[],
-        simple_extensions: &["c", "h"],
-        target_extensions: &["c", "h"],
-    },
-    LanguageSpec {
-        language: Language::Cpp,
-        name: "cpp",
-        aliases: &["c++", "cc", "cxx"],
-        simple_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
-        target_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "h"],
-    },
-    LanguageSpec {
-        language: Language::Python,
-        name: "python",
-        aliases: &["py"],
-        simple_extensions: &["py", "pyi"],
-        target_extensions: &["py", "pyi"],
-    },
-    LanguageSpec {
-        language: Language::Swift,
-        name: "swift",
-        aliases: &[],
-        simple_extensions: &["swift"],
-        target_extensions: &["swift"],
-    },
-    LanguageSpec {
-        language: Language::Go,
-        name: "go",
-        aliases: &["golang"],
-        simple_extensions: &["go"],
-        target_extensions: &["go"],
-    },
-    LanguageSpec {
-        language: Language::Markdown,
-        name: "markdown",
-        aliases: &["md"],
-        simple_extensions: &["md", "markdown"],
-        target_extensions: &["md", "markdown"],
-    },
-];
-
 impl Language {
-    pub const ALL: [Self; 9] = [
-        Self::Rust,
-        Self::TypeScript,
-        Self::Kotlin,
-        Self::C,
-        Self::Cpp,
-        Self::Python,
-        Self::Swift,
-        Self::Go,
-        Self::Markdown,
-    ];
-
+    /// Every language, in declaration order.
     pub fn all() -> &'static [Self] {
-        &Self::ALL
+        <Self as strum::VariantArray>::VARIANTS
     }
 
-    pub fn as_str(self) -> &'static str {
-        self.spec().name
+    /// The persisted token for this language. Stable wire string — never rename a variant without
+    /// a migration.
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+
+    /// The exact inverse of [`Self::as_db_str`]; `None` for any other text, aliases included (they
+    /// are config spellings, never stored).
+    pub fn from_db_str(token: &str) -> Option<Self> {
+        Self::all().iter().copied().find(|language| language.as_db_str() == token)
     }
 
     /// Extensions used for **bare** language detection ([`Self::from_path`]) — the unambiguous
@@ -169,13 +112,59 @@ impl Language {
     }
 
     fn spec(self) -> &'static LanguageSpec {
-        &LANGUAGE_SPECS[self as usize]
+        match self {
+            Self::Rust => &LanguageSpec {
+                aliases: &["rs"],
+                simple_extensions: &["rs"],
+                target_extensions: &["rs"],
+            },
+            Self::TypeScript => &LanguageSpec {
+                aliases: &["ts", "tsx"],
+                simple_extensions: &["ts", "tsx"],
+                target_extensions: &["ts", "tsx"],
+            },
+            Self::Kotlin => &LanguageSpec {
+                aliases: &["kt"],
+                simple_extensions: &["kt", "kts"],
+                target_extensions: &["kt", "kts"],
+            },
+            Self::C => &LanguageSpec {
+                aliases: &[],
+                simple_extensions: &["c", "h"],
+                target_extensions: &["c", "h"],
+            },
+            Self::Cpp => &LanguageSpec {
+                aliases: &["c++", "cc", "cxx"],
+                simple_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
+                target_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "h"],
+            },
+            Self::Python => &LanguageSpec {
+                aliases: &["py"],
+                simple_extensions: &["py", "pyi"],
+                target_extensions: &["py", "pyi"],
+            },
+            Self::Swift => &LanguageSpec {
+                aliases: &[],
+                simple_extensions: &["swift"],
+                target_extensions: &["swift"],
+            },
+            Self::Go => &LanguageSpec {
+                aliases: &["golang"],
+                simple_extensions: &["go"],
+                target_extensions: &["go"],
+            },
+            Self::Markdown => &LanguageSpec {
+                aliases: &["md"],
+                simple_extensions: &["md", "markdown"],
+                target_extensions: &["md", "markdown"],
+            },
+        }
     }
 }
 
 impl fmt::Display for Language {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(self.as_db_str())
     }
 }
 
@@ -183,11 +172,15 @@ impl FromStr for Language {
     type Err = LanguageError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Config input: trimmed and case-insensitive, and the aliases are accepted too.
         let normalized = value.trim().to_ascii_lowercase();
-        LANGUAGE_SPECS
+        Self::all()
             .iter()
-            .find(|spec| spec.name == normalized || spec.aliases.contains(&normalized.as_str()))
-            .map(|spec| spec.language)
+            .copied()
+            .find(|language| {
+                language.as_db_str() == normalized
+                    || language.spec().aliases.contains(&normalized.as_str())
+            })
             .ok_or(LanguageError::Unknown(normalized))
     }
 }
@@ -204,33 +197,57 @@ mod tests {
     use std::path::Path;
     use std::str::FromStr;
 
-    use super::{LANGUAGE_SPECS, Language};
+    use super::Language;
+
+    /// The persisted tokens, pinned byte-for-byte: they are column values in every index.
+    #[test]
+    fn db_tokens_are_pinned_and_round_trip() {
+        let expected = [
+            (Language::Rust, "rust"),
+            (Language::TypeScript, "typescript"),
+            (Language::Kotlin, "kotlin"),
+            (Language::C, "c"),
+            (Language::Cpp, "cpp"),
+            (Language::Python, "python"),
+            (Language::Swift, "swift"),
+            (Language::Go, "go"),
+            (Language::Markdown, "markdown"),
+        ];
+        assert_eq!(expected.map(|(language, _)| language).as_slice(), Language::all());
+        for (language, token) in expected {
+            assert_eq!(language.as_db_str(), token);
+            assert_eq!(language.to_string(), token);
+            assert_eq!(Language::from_db_str(token), Some(language));
+        }
+        assert_eq!(Language::from_db_str("Rust"), None, "the DB side is exact");
+        assert_eq!(Language::from_db_str("rs"), None, "aliases are config spellings only");
+    }
 
     #[test]
-    fn language_registry_is_complete_unique_and_round_trips_every_name() {
-        assert_eq!(
-            LANGUAGE_SPECS.iter().map(|spec| spec.language).collect::<Vec<_>>(),
-            Language::all()
-        );
+    fn language_registry_is_unique_and_parses_every_name_and_alias() {
         let mut names = HashSet::new();
-        for spec in LANGUAGE_SPECS {
+        for &language in Language::all() {
+            let spec = language.spec();
+            let name = language.as_db_str();
+            assert!(names.insert(name), "duplicate canonical language name: {name}");
+            assert_eq!(Language::from_str(name).unwrap(), language);
             assert_eq!(
-                spec.language.as_str(),
-                spec.name,
-                "Language discriminant/spec order drifted"
+                Language::from_str(&format!(" {} ", name.to_uppercase())).unwrap(),
+                language
             );
-            assert!(names.insert(spec.name), "duplicate canonical language name: {}", spec.name);
-            assert_eq!(Language::from_str(spec.name).unwrap(), spec.language);
             for alias in spec.aliases {
                 assert!(names.insert(alias), "duplicate language name or alias: {alias}");
-                assert_eq!(Language::from_str(alias).unwrap(), spec.language);
+                assert_eq!(Language::from_str(alias).unwrap(), language);
             }
             assert!(
                 spec.simple_extensions.iter().all(|ext| spec.target_extensions.contains(ext)),
-                "target extensions must include every simple extension for {}",
-                spec.name
+                "target extensions must include every simple extension for {name}"
             );
         }
+        assert_eq!(
+            Language::from_str(" Nope ").unwrap_err().to_string(),
+            "unknown language `nope`"
+        );
     }
 
     #[test]

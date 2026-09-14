@@ -1083,7 +1083,7 @@ mod tests {
         // declines as ambiguous.
         for scope in &scopes {
             assert_eq!(
-                crate::index::edges::receiver_scope_path(scope, Some(Language::Rust.as_str()))
+                crate::index::edges::receiver_scope_path(scope, Some(Language::Rust.as_db_str()))
                     .as_ref(),
                 "W::neg",
                 "{scope} must still answer to the plain receiver surface"
@@ -1748,7 +1748,7 @@ mod tests {
                 "the marker must stay ONE ::-segment, got {scope}"
             );
             let folded =
-                crate::index::edges::receiver_scope_path(&scope, Some(Language::Rust.as_str()));
+                crate::index::edges::receiver_scope_path(&scope, Some(Language::Rust.as_db_str()));
             assert_eq!(folded.as_ref(), "Worker::run", "{source} folded to {folded}");
         }
     }

@@ -64,7 +64,7 @@ impl ReviewModel {
         } else {
             for (lang, dirs) in &draft.bindings {
                 let dir_list: Vec<&str> = dirs.iter().filter_map(|p| p.to_str()).collect();
-                summary.push(format!("  {:10}  {}", lang.as_str(), dir_list.join(", ")));
+                summary.push(format!("  {:10}  {}", lang.as_db_str(), dir_list.join(", ")));
             }
         }
 

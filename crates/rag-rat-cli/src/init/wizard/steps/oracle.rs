@@ -75,7 +75,7 @@ pub(super) fn render_oracle(f: &mut Frame, area: Rect, state: &WizardState) {
             Span::styled(
                 format!(
                     "— {}",
-                    m.languages.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(", ")
+                    m.languages.iter().map(|l| l.as_db_str()).collect::<Vec<_>>().join(", ")
                 ),
                 theme::muted(),
             ),

@@ -36,7 +36,7 @@ impl IndexDatabase {
         self.storage.connection().execute(
             "INSERT OR REPLACE INTO parser_failures(repo_id, path, language, message)
              VALUES (?1, ?2, ?3, ?4)",
-            params![self.active_repo_id, path_string(path), language.as_str(), message],
+            params![self.active_repo_id, path_string(path), language.as_db_str(), message],
         )?;
         Ok(())
     }
@@ -77,7 +77,7 @@ impl IndexDatabase {
         self.storage.connection().execute(
             "INSERT OR REPLACE INTO temp.rebuild_parser_failures(path, language, message)
              VALUES (?1, ?2, ?3)",
-            params![path_string(path), language.as_str(), message],
+            params![path_string(path), language.as_db_str(), message],
         )?;
         Ok(())
     }

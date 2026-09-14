@@ -352,7 +352,7 @@ fn indexing_allows_preserved_rich_targets_without_simple_bindings() {
 fn indexing_blocks_simple_binding_names_that_conflict_with_preserved_rich_targets() {
     let mut state = empty_state();
     state.draft.has_rich_targets = true;
-    state.draft.rich_target_names.insert(Language::Rust.as_str().to_string());
+    state.draft.rich_target_names.insert(Language::Rust.as_db_str().to_string());
     state.draft.bindings.insert(Language::Rust, Vec::new());
 
     let check = validate_indexing(&state);

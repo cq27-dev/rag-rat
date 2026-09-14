@@ -277,7 +277,7 @@ pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
         "clone_fingerprints": clone_fingerprints,
         "targets": config.targets.iter().map(|target| serde_json::json!({
             "name": target.name,
-            "language": target.language.as_str(),
+            "language": target.language.as_db_str(),
             "directories": target.directories,
             "kind": target.kind.as_db_str(),
         })).collect::<Vec<_>>(),

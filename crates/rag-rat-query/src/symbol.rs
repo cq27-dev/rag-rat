@@ -384,7 +384,7 @@ fn lookup_name(
     let fuzzy = format!("%{name}%");
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(language) = language {
-        stmt.query_map(params![name, fuzzy, language.as_str(), limit], symbol_hit_row)?
+        stmt.query_map(params![name, fuzzy, language.as_db_str(), limit], symbol_hit_row)?
     } else {
         stmt.query_map(params![name, fuzzy, limit], symbol_hit_row)?
     };
@@ -564,7 +564,7 @@ fn lookup_symbol_path(
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = if let Some(language) = language {
-        stmt.query_map(params![symbol_path, language.as_str(), limit], symbol_hit_row)?
+        stmt.query_map(params![symbol_path, language.as_db_str(), limit], symbol_hit_row)?
     } else {
         stmt.query_map(params![symbol_path, limit], symbol_hit_row)?
     };
