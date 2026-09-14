@@ -416,3 +416,24 @@ fn a_pattern_that_is_not_a_legal_glob_claims_nothing() {
     // On the exclude side an uncompilable pattern excludes nothing, so the include still stands.
     assert!(glob_target(&["**/*.rs"], &["oops\\"]).globs_claim("src/lib.rs"));
 }
+
+/// `files.kind` holds these tokens: pinned byte-for-byte, and `as_db_str` round-trips. `test` is a
+/// config-only alias — it parses to `tests` and is never written back.
+#[test]
+fn target_kind_tokens_are_pinned_and_round_trip() {
+    use std::str::FromStr;
+    for (kind, token) in [
+        (TargetKind::Source, "source"),
+        (TargetKind::Generated, "generated"),
+        (TargetKind::Docs, "docs"),
+        (TargetKind::Tests, "tests"),
+    ] {
+        assert_eq!(kind.as_db_str(), token);
+        assert_eq!(TargetKind::from_str(token).unwrap(), kind);
+    }
+    assert_eq!(TargetKind::from_str(" Test ").unwrap(), TargetKind::Tests);
+    assert_eq!(
+        TargetKind::from_str(" Deleted ").unwrap_err().to_string(),
+        "unknown target kind `deleted`"
+    );
+}

@@ -50,7 +50,7 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
 
     text.push_str("[llm.embedding]\n");
     text.push_str(&format!("# {}\n", backend_label(plan.backend)));
-    text.push_str(&format!("model = {}\n\n", toml_string(plan.backend.as_str())));
+    text.push_str(&format!("model = {}\n\n", toml_string(plan.backend.as_config_str())));
 
     text.push_str(
         "# Embedding runtime tuning (defaults shown; uncomment to override).\n# \

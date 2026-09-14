@@ -93,9 +93,13 @@ impl Tracker {
     pub fn as_db_str(self) -> &'static str {
         self.into()
     }
+    /// Exact: a stored provider key is written only by [`Self::as_db_str`], so any other spelling
+    /// is a corrupt row, not a variant. This is why `Tracker` does not take strum's
+    /// `ascii_case_insensitive` and keeps its own lenient [`Self::parse_config`] beside it.
     pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
         value.parse().map_err(|_| anyhow::anyhow!("unknown tracker token `{value}`"))
     }
+    /// Lenient: `provider = "..."` is user input, trimmed and case-insensitive.
     pub(crate) fn parse_config(s: &str) -> Option<Self> {
         s.trim().to_ascii_lowercase().parse().ok()
     }
@@ -159,7 +163,7 @@ pub struct MemoryConfig {
 /// behind a one-line marker naming the expand call. Persisted only in config (no DB column):
 /// `as_db_str` is its stable config token.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
-#[strum(serialize_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum MemorySurface {
     /// Title + compacted summary + verdict marker. The default — a body over the summary envelope
     /// is deferred to `memory show`, one already inside it is shown whole.
@@ -174,12 +178,6 @@ impl MemorySurface {
     /// The stable config string (matches the toml `surface = "..."` value).
     pub fn as_db_str(self) -> &'static str {
         self.into()
-    }
-
-    /// Parse a `surface = "..."` value (case-insensitive). `None` for an unrecognized value — the
-    /// config layer turns that into `ConfigError::UnknownMemorySurface`.
-    pub(crate) fn parse_config(s: &str) -> Option<Self> {
-        s.trim().to_ascii_lowercase().parse().ok()
     }
 }
 
@@ -419,7 +417,7 @@ impl Default for WatchConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
-#[strum(serialize_all = "lowercase")]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum LogLevel {
     Off,
     Error,
@@ -430,27 +428,31 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    pub(crate) fn parse_config(s: &str) -> Option<Self> {
-        s.trim().to_ascii_lowercase().parse().ok()
-    }
-
     /// The EnvFilter directive string for this level.
     pub fn as_filter_str(self) -> &'static str {
         self.into()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString)]
-#[strum(serialize_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "lowercase", ascii_case_insensitive)]
 pub enum LogFormat {
     Text,
     Json,
 }
 
 impl LogFormat {
-    pub(crate) fn parse_config(s: &str) -> Option<Self> {
-        s.trim().to_ascii_lowercase().parse().ok()
+    /// The stable config string (matches the toml `format = "..."` value).
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
     }
+}
+
+/// Parse a config token (`level`, `format`, `surface`, `backend`, …) for an enum whose strum
+/// `FromStr` is `ascii_case_insensitive`: trimmed, any case. `None` for an unrecognized value — the
+/// caller turns that into its section's named `ConfigError`.
+pub(crate) fn parse_config_token<T: FromStr>(s: &str) -> Option<T> {
+    s.trim().parse().ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,8 +590,9 @@ impl EmbeddingBackend {
     }
 
     /// The toml selector for this backend — the model_id (the HF path `init` renders back into
-    /// `rag-rat.toml`), or `"none"` for the embeddings-off choice.
-    pub fn as_str(self) -> &'static str {
+    /// `rag-rat.toml`), or `"none"` for the embeddings-off choice. A config spelling, not a DB
+    /// token: what is persisted is [`Self::model_id`].
+    pub fn as_config_str(self) -> &'static str {
         match self.0 {
             Some(spec) => spec.model_id,
             None => "none",
@@ -692,7 +695,7 @@ impl RemoteBackend {
     /// Parse a config `backend = "..."` value (case-insensitive). `None` for an unknown value — the
     /// config layer turns that into `ConfigError::RemoteBackendUnknown`.
     pub fn from_db_str(s: &str) -> Option<Self> {
-        s.trim().parse().ok()
+        parse_config_token(s)
     }
 
     /// The HTTP path (appended to the endpoint) of this backend's embeddings route. The
@@ -1091,7 +1094,7 @@ impl ResolvedTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr, strum::VariantArray)]
 #[strum(serialize_all = "lowercase")]
 pub enum TargetKind {
     Source,
@@ -1110,13 +1113,18 @@ impl TargetKind {
 impl FromStr for TargetKind {
     type Err = ConfigError;
 
+    /// Trimmed and case-insensitive, over the [`Self::as_db_str`] tokens plus the config-only
+    /// alias `test` for `tests` — so `as_db_str` round-trips, and `test` parses without ever being
+    /// written back.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "source" => Ok(Self::Source),
-            "generated" => Ok(Self::Generated),
-            "docs" => Ok(Self::Docs),
-            "tests" | "test" => Ok(Self::Tests),
-            other => Err(ConfigError::UnknownTargetKind(other.to_string())),
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized == "test" {
+            return Ok(Self::Tests);
         }
+        <Self as strum::VariantArray>::VARIANTS
+            .iter()
+            .copied()
+            .find(|kind| kind.as_db_str() == normalized)
+            .ok_or(ConfigError::UnknownTargetKind(normalized))
     }
 }
