@@ -64,12 +64,7 @@ pub(super) fn render_oracle(f: &mut Frame, area: Rect, state: &WizardState) {
         let m = ToolManifest::for_tool(*tool);
         let relevant = m.languages.iter().any(|l| detected.contains(l));
         let style = if relevant { theme::accent() } else { theme::muted() };
-        let name = format!("{:?}", tool)
-            .replace("RustAnalyzer", "rust-analyzer")
-            .replace("ScipClang", "scip-clang")
-            .replace("ScipPython", "scip-python")
-            .replace("ScipTypescript", "scip-typescript")
-            .replace("ScipJava", "scip-java");
+        let name = tool.as_db_str();
         lines.push(Line::from(vec![
             Span::styled(format!(" {} {} ", if relevant { "▶" } else { " " }, name), style),
             Span::styled(

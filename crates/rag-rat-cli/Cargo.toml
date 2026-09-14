@@ -16,6 +16,7 @@ name = "rag-rat"
 path = "src/main.rs"
 
 [dependencies]
+strum.workspace = true
 rag-rat-base.workspace = true
 rag-rat-db.workspace = true
 rag-rat-dream.workspace = true

@@ -34,39 +34,39 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
     let git = git_paths(&config.root)?;
     match args.action {
         HookAction::Install => {
-            fs::create_dir_all(&git.hooks_dir)?;
+            fs::create_dir_all(git.hooks_dir())?;
             let mut installed = Vec::new();
-            for hook in MANAGED_HOOKS {
-                install_hook(&git.hooks_dir, hook)?;
-                installed.push(*hook);
+            for &hook in MANAGED_HOOKS {
+                install_hook(git.hooks_dir(), hook)?;
+                installed.push(hook.as_trigger());
             }
             print_output(&serde_json::json!({
                 "status": "installed",
-                "repo_root": git.worktree_root,
-                "git_dir": git.git_dir,
-                "git_common_dir": git.git_common_dir,
-                "hooks_dir": git.hooks_dir,
+                "repo_root": git.worktree_root(),
+                "git_dir": git.git_dir(),
+                "git_common_dir": git.git_common_dir(),
+                "hooks_dir": git.hooks_dir(),
                 "hooks": installed,
             }))
         },
         HookAction::Uninstall => {
             let mut removed = Vec::new();
             let mut kept = Vec::new();
-            for hook in MANAGED_HOOKS {
-                let path = git.hooks_dir.join(hook);
+            for &hook in MANAGED_HOOKS {
+                let path = git.hooks_dir().join(hook.as_trigger());
                 if !path.exists() {
                     continue;
                 }
                 if is_rag_rat_hook(&path)? {
                     fs::remove_file(&path)?;
-                    removed.push(*hook);
+                    removed.push(hook.as_trigger());
                 } else {
-                    kept.push(*hook);
+                    kept.push(hook.as_trigger());
                 }
             }
             print_output(&serde_json::json!({
                 "status": "uninstalled",
-                "hooks_dir": git.hooks_dir,
+                "hooks_dir": git.hooks_dir(),
                 "removed": removed,
                 "kept_unmanaged": kept,
             }))
@@ -75,10 +75,10 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
             let hooks = MANAGED_HOOKS
                 .iter()
                 .map(|hook| {
-                    let path = git.hooks_dir.join(hook);
+                    let path = git.hooks_dir().join(hook.as_trigger());
                     let managed = is_rag_rat_hook(&path).unwrap_or(false);
                     serde_json::json!({
-                        "name": hook,
+                        "name": hook.as_trigger(),
                         "path": path,
                         "exists": path.exists(),
                         "managed": managed,
@@ -86,10 +86,10 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                 })
                 .collect::<Vec<_>>();
             print_output(&serde_json::json!({
-                "repo_root": git.worktree_root,
-                "git_dir": git.git_dir,
-                "git_common_dir": git.git_common_dir,
-                "hooks_dir": git.hooks_dir,
+                "repo_root": git.worktree_root(),
+                "git_dir": git.git_dir(),
+                "git_common_dir": git.git_common_dir(),
+                "hooks_dir": git.hooks_dir(),
                 "hooks": hooks,
             }))
         },

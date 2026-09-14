@@ -1,0 +1,8 @@
+{
+  "trigger": "post-checkout",
+  "status": "skipped",
+  "reason": "file checkout",
+  "old_head": "old",
+  "new_head": null,
+  "branch_checkout": "0"
+}

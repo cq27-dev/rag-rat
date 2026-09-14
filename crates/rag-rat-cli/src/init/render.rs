@@ -1,4 +1,9 @@
-use super::*;
+use std::path::{Path, PathBuf};
+
+use rag_rat_base::language::Language;
+
+use super::InitPlan;
+use super::scan::backend_label;
 
 /// Render a complete, commented `rag-rat.toml`. The lines that reflect *this* repo's choices —
 /// root, the language bindings, the chosen embedding model, the oracle opt-in — are active; every

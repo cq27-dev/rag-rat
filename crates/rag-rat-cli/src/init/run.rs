@@ -1,5 +1,21 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::{env, fs};
+
+use dialoguer::Confirm;
+use rag_rat_base::config::Config;
+use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID};
+use rag_rat_base::language::Language;
+use rag_rat_core::IndexDatabase;
+use rag_rat_core::index::ai::ReconcileOptions;
+
+use super::render::{config_root_value, render_config, supported_languages};
+use super::scan::{estimated_chunks, recommend_backend, resolved_bindings, scan_repo};
 use super::wizard::{self, HookConflict, WizardResult, render_chained_hook};
-use super::*;
+use super::{InitOptions, InitPlan, RepoScan, TerminalResetGuard};
+use crate::commands::apply_embedding_runtime_env;
+use crate::hooks_support::git_paths;
+use crate::render::{render_index_progress, render_reconcile_progress};
 use crate::{hook_script, install_hook, is_rag_rat_hook, make_executable, write_atomic};
 
 pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Result<()> {
@@ -233,12 +249,12 @@ fn apply_git_hooks(
         eprintln!("init: skipped git hooks (conflict aborted)");
         return Ok(());
     }
-    fs::create_dir_all(&git.hooks_dir)?;
+    fs::create_dir_all(git.hooks_dir())?;
     let mut installed = Vec::new();
     for &hook in crate::MANAGED_HOOKS {
-        let path = git.hooks_dir.join(hook);
+        let path = git.hooks_dir().join(hook.as_trigger());
         let foreign = path.exists() && !is_rag_rat_hook(&path)?;
-        match conflicts.get(hook).copied() {
+        match conflicts.get(hook.as_trigger()).copied() {
             // A foreign file with an explicit resolution.
             Some(HookConflict::Skip) | Some(HookConflict::UninstallRagRatOnly) => {
                 // Leave the foreign hook in place; install nothing for this slot.
@@ -246,13 +262,13 @@ fn apply_git_hooks(
             Some(HookConflict::Overwrite) => {
                 write_atomic(&path, hook_script(hook).as_bytes())?;
                 make_executable(&path)?;
-                installed.push(hook);
+                installed.push(hook.as_trigger());
             },
             Some(HookConflict::Chain) => {
                 let original = fs::read_to_string(&path).unwrap_or_default();
-                write_atomic(&path, render_chained_hook(&original, hook).as_bytes())?;
+                write_atomic(&path, render_chained_hook(&original, hook.as_trigger()).as_bytes())?;
                 make_executable(&path)?;
-                installed.push(hook);
+                installed.push(hook.as_trigger());
             },
             Some(HookConflict::Abort) => unreachable!("handled above"),
             // No conflict recorded: a clean slot, or one already managed by rag-rat.
@@ -266,13 +282,13 @@ fn apply_git_hooks(
                     );
                 } else {
                     // `install_hook` is safe here: the slot is empty or already a rag-rat hook.
-                    install_hook(&git.hooks_dir, hook)?;
-                    installed.push(hook);
+                    install_hook(git.hooks_dir(), hook)?;
+                    installed.push(hook.as_trigger());
                 }
             },
         }
     }
-    eprintln!("init: installed git hooks in {} ({:?})", git.hooks_dir.display(), installed);
+    eprintln!("init: installed git hooks in {} ({:?})", git.hooks_dir().display(), installed);
     Ok(())
 }
 pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
@@ -466,11 +482,11 @@ pub(crate) fn offer_hooks_install(config: &Config, assume_yes: bool) -> anyhow::
         return Ok(());
     }
     let git = git_paths(&config.root)?;
-    fs::create_dir_all(&git.hooks_dir)?;
-    for hook in crate::MANAGED_HOOKS {
-        crate::install_hook(&git.hooks_dir, hook)?;
+    fs::create_dir_all(git.hooks_dir())?;
+    for &hook in crate::MANAGED_HOOKS {
+        crate::install_hook(git.hooks_dir(), hook)?;
     }
-    eprintln!("init: installed hooks in {}", git.hooks_dir.display());
+    eprintln!("init: installed hooks in {}", git.hooks_dir().display());
     Ok(())
 }
 #[cfg(test)]
@@ -478,6 +494,7 @@ mod default_plan_tests {
     use std::path::Path;
 
     use super::*;
+    use crate::init::scan::add_file_to_dir_counts;
 
     #[test]
     fn wizard_git_hook_install_skips_non_git_roots() {

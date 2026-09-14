@@ -3,23 +3,14 @@ mod run;
 mod scan;
 mod wizard;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::{env, fs, io};
+#[cfg(unix)]
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
-use dialoguer::Confirm;
-use rag_rat_base::config::{Config, EmbeddingBackend};
-use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID};
+use rag_rat_base::config::EmbeddingBackend;
 use rag_rat_base::language::Language;
-use rag_rat_core::IndexDatabase;
-use rag_rat_core::index::ai::ReconcileOptions;
-use rag_rat_core::index::ignore_rules::{IgnoreMatcher, is_virtualenv_dir};
-pub(crate) use render::*;
-pub(crate) use run::*;
-pub(crate) use scan::*;
-
-use crate::{
-    apply_embedding_runtime_env, git_paths, render_index_progress, render_reconcile_progress,
-};
+pub(crate) use run::run;
 
 const SKIPPED_DIRS: &[&str] = &[
     ".git",
@@ -276,6 +267,13 @@ impl TerminalResetGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use rag_rat_base::config::Config;
+
+    use super::render::{config_root_value, render_config};
+    use super::run::default_plan;
+    use super::scan::{candidate_dirs, estimated_chunks, recommend_backend};
     use super::*;
 
     #[test]

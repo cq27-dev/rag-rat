@@ -1,5 +1,5 @@
-//! Small shared step widgets — a single-select option list and a help/info paragraph — used by the
-//! Papertrail and Distill steps, whose mode-gated forms share the same look.
+//! Shared step widgets: option lists and help paragraphs for Papertrail and Distill, and
+//! cursor lists for Embedding.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -11,7 +11,7 @@ use super::super::theme;
 
 /// A bordered single-select list: `*` marks the selected row; when the zone is focused the selected
 /// row is highlighted and the border brightens. `options` carries a per-row base style so callers
-/// can accent the relevant/detected row (the Oracle tool-list convention).
+/// can accent the relevant/detected row.
 pub(super) fn option_list(
     f: &mut Frame,
     area: Rect,

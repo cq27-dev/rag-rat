@@ -4981,6 +4981,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "strum",
  "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

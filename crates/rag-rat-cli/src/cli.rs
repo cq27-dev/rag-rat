@@ -25,8 +25,8 @@ pub(crate) struct Cli {
 
     /// Emit JSON instead of the default TOON (Token-Oriented Object Notation). TOON is denser for
     /// LLM consumers; pass --json when a JSON parser must read the output. For commands that print
-    /// a human summary by default (`reconcile --plan`, `eval`, `memory doctor`), --json also
-    /// selects their structured output.
+    /// a human result view by default, --json selects its structured output. Command-specific
+    /// fixed text formats retain their documented representation.
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -351,7 +351,7 @@ pub(crate) enum SyncCommand {
     Grant {
         /// The 64-hex account id to grant, from the grantee's `rag-rat sync whoami`.
         #[arg(value_name = "ACCOUNT_ID")]
-        account: String,
+        account: AccountIdInput,
     },
     /// Print a one-time ticket that grants write access to this repo's shared memories.
     #[command(long_about = "Mints a single-use, TTL'd writer invite for the active repo's \
@@ -377,6 +377,7 @@ pub(crate) enum SyncCommand {
                             trusted — its holder can backdate forgeries behind any watermark. \
                             --keep-until carves one device's prefix back into a compromised \
                             revoke, but only as far as this store has accepted.")]
+    // The grantee may be an unambiguous prefix, so it remains a String.
     Revoke {
         /// The grantee's 64-hex account id, or an unambiguous prefix of an open grantee
         /// (see `sync grants`).
@@ -384,12 +385,12 @@ pub(crate) enum SyncCommand {
         account: String,
         /// Why: departed | rotated | superseded (soft — prior accepted work stays) or
         /// compromised (hard — everything quarantined).
-        #[arg(long)]
-        reason: String,
+        #[arg(long, value_parser = parse_revoke_reason)]
+        reason: rag_rat_oplog::RevokeReason,
         /// With --reason compromised only: keep one device's prefix, `<seq>@<device-hex>`,
         /// bounded by what this store has accepted.
         #[arg(long, value_name = "SEQ@DEVICE")]
-        keep_until: Option<String>,
+        keep_until: Option<KeepUntil>,
     },
     /// List who holds access to this repo's shared memories.
     Grants,
@@ -399,6 +400,7 @@ pub(crate) enum SyncCommand {
                             owner via this account's Writer grant. The owner must first `sync \
                             grant` this account (its id from `sync whoami`) and this store must \
                             sync the owner's log; contributing targets a published (public) repo.")]
+    // Accepts either an invite ticket or an account id.
     Contribute {
         /// A writer invite ticket from the owner's `rag-rat sync invite-writer` (the one-step
         /// flow), or the owner's 64-hex account id from `rag-rat sync whoami` (the manual flow —
@@ -478,8 +480,8 @@ pub(crate) enum SyncCommand {
                             database's node identity.")]
     Pull {
         /// The 64-hex account id to fetch, from that side's `rag-rat sync whoami`.
-        #[arg(value_name = "ACCOUNT_ID")]
-        account: String,
+        #[arg(value_name = "ACCOUNT_ID", value_parser = parse_account_id)]
+        account: rag_rat_oplog::AccountId,
         /// Node id of the peer serving that account. Defaults to the configured
         /// `[sync] server_peers`.
         #[arg(long, value_name = "NODE_ID")]
@@ -572,6 +574,22 @@ pub(crate) struct QueryArgs {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct OrientationFilterArgs {
+    /// Include generated files.
+    #[arg(long)]
+    pub include_generated: bool,
+    /// Omit drive-by repo memories.
+    #[arg(long)]
+    pub no_memories: bool,
+}
+
+impl OrientationFilterArgs {
+    pub(crate) fn include_memories(&self) -> bool {
+        !self.no_memories
+    }
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct BriefArgs {
     /// Brief mode: spine, churn, god_modules, ownership.
     #[arg(long)]
@@ -579,12 +597,8 @@ pub(crate) struct BriefArgs {
     /// Max rows to return.
     #[arg(long)]
     pub limit: Option<u32>,
-    /// Include generated files.
-    #[arg(long)]
-    pub include_generated: bool,
-    /// Omit drive-by repo memories.
-    #[arg(long)]
-    pub no_memories: bool,
+    #[command(flatten)]
+    pub filters: OrientationFilterArgs,
 }
 
 #[derive(Debug, Args)]
@@ -719,12 +733,8 @@ pub(crate) struct ClustersArgs {
     /// Minimum cluster size.
     #[arg(long)]
     pub min_cluster_size: Option<u32>,
-    /// Include generated files.
-    #[arg(long)]
-    pub include_generated: bool,
-    /// Omit drive-by repo memories.
-    #[arg(long)]
-    pub no_memories: bool,
+    #[command(flatten)]
+    pub filters: OrientationFilterArgs,
 }
 
 #[derive(Debug, Args)]
@@ -912,6 +922,65 @@ pub(crate) struct BenchmarkEmbeddingArgs {
 fn parse_remote_backend(s: &str) -> Result<rag_rat_base::config::RemoteBackend, String> {
     rag_rat_base::config::RemoteBackend::from_db_str(s)
         .ok_or_else(|| format!("unknown backend `{s}` (expected ollama, infinity, or vllm)"))
+}
+
+pub(crate) fn parse_revoke_reason(value: &str) -> Result<rag_rat_oplog::RevokeReason, String> {
+    rag_rat_oplog::RevokeReason::from_db_str(value).map_err(|err| err.to_string())
+}
+
+/// A validated account id plus the exact operator spelling echoed by `sync grant`.
+#[derive(Debug, Clone)]
+pub(crate) struct AccountIdInput {
+    pub id: rag_rat_oplog::AccountId,
+    pub original: String,
+}
+
+impl std::str::FromStr for AccountIdInput {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self { id: parse_account_id(value)?, original: value.to_owned() })
+    }
+}
+
+pub(crate) fn parse_account_id(value: &str) -> Result<rag_rat_oplog::AccountId, String> {
+    rag_rat_oplog::AccountId::from_hex(value).map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeepUntil {
+    pub seq: u64,
+    pub device: rag_rat_oplog::DeviceFingerprint,
+}
+
+impl KeepUntil {
+    fn parse_parts(value: &str) -> anyhow::Result<(&str, u64)> {
+        use anyhow::Context as _;
+        let (seq, device) = value.split_once('@').context(
+            "--keep-until takes <seq>@<device-hex> — the seq, an @, then the 64-hex device \
+             fingerprint",
+        )?;
+        Ok((device, seq.trim().parse::<u64>().context("--keep-until's seq is a number")?))
+    }
+
+    fn from_parts((device, seq): (&str, u64)) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        Ok(Self {
+            seq,
+            device: device
+                .trim()
+                .parse()
+                .context("--keep-until takes <seq>@<64-hex device fingerprint>")?,
+        })
+    }
+}
+
+impl std::str::FromStr for KeepUntil {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_parts(Self::parse_parts(value)?)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -1221,7 +1290,7 @@ mod tests {
             Cli::try_parse_from(["rag-rat", "sync", "grant", &"ab".repeat(32)]).expect("parse");
         match grant.command {
             Command::Sync(SyncArgs { command: SyncCommand::Grant { account } }) =>
-                assert_eq!(account, "ab".repeat(32)),
+                assert_eq!(account.original, "ab".repeat(32)),
             other => panic!("expected sync grant, got {other:?}"),
         }
     }
@@ -1263,8 +1332,8 @@ mod tests {
                 command: SyncCommand::Revoke { account, reason, keep_until },
             }) => {
                 assert_eq!(account, "abcd1234");
-                assert_eq!(reason, "compromised");
-                assert_eq!(keep_until.as_deref(), Some(format!("3@{}", "cd".repeat(32)).as_str()));
+                assert_eq!(reason, rag_rat_oplog::RevokeReason::Compromised);
+                assert_eq!(keep_until, Some(format!("3@{}", "cd".repeat(32)).parse().unwrap()));
             },
             other => panic!("expected sync revoke, got {other:?}"),
         }
@@ -1739,5 +1808,46 @@ mod tests {
             },
             other => panic!("expected oracle report, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_validation_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_sync_arguments_fail_at_the_clap_boundary() {
+        for args in [
+            vec!["rag-rat", "sync", "grant", "broken"],
+            vec!["rag-rat", "sync", "pull", "broken"],
+            vec!["rag-rat", "sync", "revoke", "prefix", "--reason", "departd"],
+            vec![
+                "rag-rat",
+                "sync",
+                "revoke",
+                "prefix",
+                "--reason",
+                "compromised",
+                "--keep-until",
+                "3@broken",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(&args).is_err(),
+                "{args:?} must fail before config or DB access"
+            );
+        }
+    }
+
+    #[test]
+    fn grant_preserves_original_account_spelling() {
+        let original = format!("  {}  ", "AB".repeat(32));
+        let cli = Cli::try_parse_from(["rag-rat", "sync", "grant", &original]).unwrap();
+        let Command::Sync(SyncArgs { command: SyncCommand::Grant { account } }) = cli.command
+        else {
+            panic!("expected grant");
+        };
+        assert_eq!(account.original, original);
+        assert_eq!(account.id, rag_rat_oplog::AccountId::from_hex(&original).unwrap());
     }
 }

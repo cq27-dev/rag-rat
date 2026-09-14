@@ -4,8 +4,7 @@
 use rag_rat_base::config::Config;
 
 use crate::cli::{ClonesArgs, ClonesForArgs};
-use crate::open_index;
-use crate::render::print_output;
+use crate::{open_index, render};
 
 pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
     // `--precompute`: the WRITER path — build/refresh the persisted clone-edge graph (#286) under a
@@ -15,7 +14,7 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
         let db = open_index(config)?;
         let report: rag_rat_core::index::CloneEdgeReport =
             db.precompute_clone_graph(args.max_seconds)?;
-        return print_output(&report);
+        return render::print_output(&report);
     }
 
     let db = open_index(config)?;
@@ -45,16 +44,15 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
 
     // `--explain <CLASS_KEY>`: print a human-readable refinement breakdown for one class from the
     // SAME result set (so the explained class went through the same refine pass as the listing),
-    // instead of the JSON/TOON listing.
+    // with structured output under the global --json flag.
     if let Some(key) = &args.explain {
         let Some(class) = result.classes.iter().find(|c| &c.class_key == key) else {
             anyhow::bail!("no clone class with key `{key}` in results");
         };
-        print_clone_explain(class);
-        return Ok(());
+        return render::print_output_or(class, || print_clone_explain(class));
     }
 
-    print_output(&result)
+    render::print_output(&result)
 }
 
 /// A canonical, cross-build-STABLE recall signature of the clone classes — one line per class
@@ -205,14 +203,14 @@ pub(crate) fn clones_for(config: &Config, args: &ClonesForArgs) -> anyhow::Resul
     // The result always carries eligibility flags + completeness; a miss serializes with
     // `class: null` (symbol unique, not eligible, or unresolved) — never an error.
     let result = db.clones_for_symbol(selector)?;
-    print_output(&result)
+    render::print_output(&result)
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::config::{ResolvedTarget, TargetKind};
     use rag_rat_base::language::Language;
     use rag_rat_core::IndexDatabase;
 
@@ -258,7 +256,14 @@ mod tests {
         // Plant two identical functions in separate files → struct_hash fast path produces a clone
         // class. Validates that the `clones` command handler wires find_clones and prints output
         // without panicking.
-        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-clones");
+        let (root, config) = crate::test_support::scratch_config("cli-clones", ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["src/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        });
         std::fs::create_dir_all(root.join("src")).unwrap();
         let clone_body =
             "pub fn cloned_helper(x: i32, y: i32) -> i32 {\n    x + y + 42\n}\n".to_string();
@@ -267,33 +272,6 @@ mod tests {
         std::fs::write(root.join("src/a.rs"), &clone_body).unwrap();
         std::fs::write(root.join("src/b.rs"), &clone_body).unwrap();
 
-        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
-        let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
-            database_key_pinned: true,
-            database: config_root.join(".rag-rat/index.sqlite"),
-            root: config_root,
-            targets: vec![ResolvedTarget {
-                name: "rust".to_string(),
-                language: Language::Rust,
-                directories: vec![PathBuf::from("src")],
-                include: vec!["src/".to_string()],
-                exclude: Vec::new(),
-                kind: TargetKind::Source,
-            }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
-        };
         IndexDatabase::rebuild(&config).unwrap();
 
         let args = ClonesArgs {

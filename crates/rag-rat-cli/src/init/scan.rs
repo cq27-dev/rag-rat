@@ -1,4 +1,12 @@
-use super::*;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
+
+use rag_rat_base::config::EmbeddingBackend;
+use rag_rat_base::language::Language;
+use rag_rat_core::index::ignore_rules::{IgnoreMatcher, is_virtualenv_dir};
+
+use super::render::display_rel;
+use super::{DirCandidate, RepoScan, SKIPPED_DIRS};
 
 /// Very rough chunk-count estimate from total indexable source bytes (~500 chars per chunk after
 /// policy skips). Used only to *recommend* an embedding backend at init time.

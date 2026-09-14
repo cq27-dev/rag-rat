@@ -1,0 +1,15 @@
+{
+  "trigger": "post-commit",
+  "status": "skipped",
+  "reason": "another maintenance pass is in flight (coalesced, #267)",
+  "old_head": "old",
+  "new_head": null,
+  "papertrail": {
+    "status": "disabled",
+    "reason": "no tracker bindings"
+  },
+  "device_sync": {
+    "status": "disabled",
+    "reason": "no local account, or this device is not roster-effective"
+  }
+}

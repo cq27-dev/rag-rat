@@ -13,7 +13,7 @@ pub(crate) mod hooks;
 
 mod dispatch;
 mod distillation;
-mod embedding;
+pub(super) mod embedding;
 mod indexing;
 mod integration;
 mod oracle;

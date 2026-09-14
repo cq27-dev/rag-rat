@@ -15,8 +15,9 @@ use rag_rat_sync::{
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
-use crate::cli::{SyncArgs, SyncCommand};
-use crate::{open_index, print_output};
+use crate::cli::{AccountIdInput, KeepUntil, SyncArgs, SyncCommand};
+use crate::open_index;
+use crate::render::print_output;
 
 /// How long `serve` waits for the database-scoped session lock before refusing to start — kept
 /// short so a second `serve` (or a running device sync) fails fast rather than hanging.
@@ -45,7 +46,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         SyncCommand::Contribute { account }
             if rag_rat_sync::InviteTicket::from_ticket_string(account).is_ok() =>
             contribute_with_ticket(config, account),
-        SyncCommand::Pull { account, peer } => pull(config, account, peer.as_deref()),
+        SyncCommand::Pull { account, peer } => pull(config, *account, peer.as_deref()),
         SyncCommand::Enable => with_repo_db(config, enable),
         SyncCommand::Publish { seed } => with_repo_db(config, |db| publish(db, seed.as_deref())),
         SyncCommand::CatchUp { target } => with_repo_db(config, |db| catch_up(db, *target)),
@@ -58,7 +59,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         }),
         SyncCommand::Grant { account } => with_repo_db(config, |db| grant(db, account)),
         SyncCommand::Revoke { account, reason, keep_until } =>
-            with_repo_db(config, |db| revoke(db, account, reason, keep_until.as_deref())),
+            with_repo_db(config, |db| revoke(db, account, *reason, *keep_until)),
         SyncCommand::Grants => with_repo_db(config, grants),
         SyncCommand::Contribute { account } => with_repo_db(config, |db| contribute(db, account)),
         SyncCommand::Subscribe { account } =>
@@ -135,12 +136,12 @@ fn whoami(db: &IndexDatabase) -> anyhow::Result<()> {
     }))
 }
 
-fn grant(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
-    let grant_id = db.sync_grant(account)?;
+fn grant(db: &IndexDatabase, account: &AccountIdInput) -> anyhow::Result<()> {
+    let grant_id = db.sync_grant(account.id)?;
     print_output(&serde_json::json!({
         "status": "granted",
         "repo_id": db.active_repo_id,
-        "grantee_account_id": account,
+        "grantee_account_id": account.original,
         "grant_id": grant_id,
         "role": "writer",
         "note": "the grantee may now author memories into this repo once it holds this account's log — its automatic sync pulls it when this host is in its [sync] server_peers; `sync revoke` closes it",
@@ -150,19 +151,11 @@ fn grant(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
 fn revoke(
     db: &IndexDatabase,
     account: &str,
-    reason: &str,
-    keep_until: Option<&str>,
+    reason: rag_rat_oplog::RevokeReason,
+    keep_until: Option<KeepUntil>,
 ) -> anyhow::Result<()> {
-    let keep_until = keep_until
-        .map(|value| -> anyhow::Result<(&str, u64)> {
-            let (seq, device) = value.split_once('@').context(
-                "--keep-until takes <seq>@<device-hex> — the seq, an @, then the 64-hex device \
-                 fingerprint",
-            )?;
-            Ok((device, seq.trim().parse::<u64>().context("--keep-until's seq is a number")?))
-        })
-        .transpose()?;
-    let (report, nodes_removed) = db.sync_revoke(account, reason, keep_until)?;
+    let (report, nodes_removed) =
+        db.sync_revoke(account, reason, keep_until.map(|cut| (cut.device, cut.seq)))?;
     print_output(&serde_json::json!({
         "status": "revoked",
         "repo_id": db.active_repo_id,
@@ -219,6 +212,28 @@ const UNCONTRIBUTE_NOTE: &str =
      conflict, and write nothing. Indexing, search and reconcile are unaffected. Publish the repo \
      with `sync publish`, re-run `sync contribute`, or index it in a separate database";
 
+const SUBSCRIBE_NOTE_PREFIX: &str =
+    "this repo's memories now mirror the owner's stream instead of its own — nothing is authored \
+     back, and this store's own memories are untouched. But exactly one stream materializes a \
+     repo, so the next drain REMOVES the memories this account's other devices had synced here; \
+     `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made \
+     on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the \
+     anchors its author published).";
+const SUBSCRIBE_NOTE_ROUTED: &str = "The locator's peers are recorded, so automatic sync pulls \
+                                     the owner's log without any [sync] server_peers; run";
+const SUBSCRIBE_NOTE_UNROUTED: &str = "This store needs the owner's log and no routing was \
+                                       supplied: automatic sync pulls it once the owner's host is \
+                                       in [sync] server_peers, or run";
+
+fn subscribe_note(owner: &str, routed: bool) -> String {
+    let tail = if routed {
+        format!("{SUBSCRIBE_NOTE_ROUTED} `{}` to fetch it now", subscribe_pull_hint(owner, false))
+    } else {
+        format!("{SUBSCRIBE_NOTE_UNROUTED} `{}` now", subscribe_pull_hint(owner, true))
+    };
+    format!("{SUBSCRIBE_NOTE_PREFIX} {tail}")
+}
+
 fn contribute(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
     db.sync_contribute(account)?;
     let effects = rag_rat_core::drain_synced_memory(db.connection())?;
@@ -274,20 +289,7 @@ fn subscribe(config: &Config, db: &IndexDatabase, account: Option<&str>) -> anyh
         "read_only": true,
         "memories_added": effects.nodes_written,
         "memories_removed": effects.nodes_removed,
-        "note": if locator.as_ref().is_some_and(|l| !l.peers.is_empty()) {
-            format!(
-                "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). The locator's peers are recorded, so automatic sync pulls the \
-                 owner's log without any [sync] server_peers; run `{}` to fetch it now",
-                subscribe_pull_hint(&owner, false),
-            )
-        } else {
-            format!(
-                "this repo's memories now mirror the owner's stream instead of its own — nothing is authored back, and this store's own memories are untouched. But exactly one stream materializes a repo, so the next drain REMOVES the memories this account's other devices had synced here; `sync unsubscribe` restores them, except for local binding work — a `memory rebind` you made on a synced memory, and any local edge onto it, go with the row (a re-drain seeds only the anchors its author published). This store needs the owner's log and no routing was supplied: \
-                 automatic sync pulls it once the owner's host is in [sync] server_peers, \
-                 or run `{}` now",
-                subscribe_pull_hint(&owner, true),
-            )
-        },
+        "note": subscribe_note(&owner, locator.as_ref().is_some_and(|l| !l.peers.is_empty())),
     }))
 }
 
@@ -317,8 +319,6 @@ fn uncontribute(db: &IndexDatabase) -> anyhow::Result<()> {
     }))
 }
 
-/// The relay this invocation binds: `RAG_RAT_SYNC_RELAY` (ops/tests) overrides the configured
-/// `[sync] relay_url`, which itself defaults to the shipped relay.
 /// Where a subscribe reads `.rag-rat-stream`: the git root of the ACTIVE checkout, provided that
 /// checkout belongs to the repository the config names.
 ///
@@ -353,6 +353,8 @@ fn subscribe_pull_hint(owner: &str, needs_peer: bool) -> String {
     }
 }
 
+/// The relay this invocation binds: `RAG_RAT_SYNC_RELAY` (ops/tests) overrides the configured
+/// `[sync] relay_url`, which itself defaults to the shipped relay.
 fn effective_relay_url(config: &Config) -> String {
     match std::env::var("RAG_RAT_SYNC_RELAY") {
         Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -401,28 +403,24 @@ fn invite_writer(config: &Config, ttl: Duration) -> anyhow::Result<()> {
     serve_with(config, false, Some(ServeMint::Writer { ttl }))
 }
 
-/// Shared machinery behind [`serve`] and [`init`]: acquire the session lock, open the index, bind
-/// the endpoint, and run the ALPN-dispatching accept loop. When `mint` is set (`sync init`), a
-/// one-time invite is minted AFTER the endpoint binds and the roster gate passes — so a bind
-/// failure never strands the candidate reservation the mint makes — and its ticket is printed on
-/// the startup line. Minting enforces founder/owner authority, so a non-owner `init` fails there.
-fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::Result<()> {
-    let relay = effective_relay_url(config);
+fn sync_session_and_repo_lock(
+    config: &Config,
+    repo_wait: Duration,
+    session_tail: &str,
+    busy_tail: &str,
+) -> anyhow::Result<(locks::WriteLock, locks::WriteLock, IndexDatabase)> {
     // Hold a database-scoped session lock for the SERVER'S WHOLE LIFETIME. `sync_node_secret` is
     // store-global, so a second `serve` (or a colocated device-side sync) on the same database
     // would bind a SECOND endpoint advertising the same iroh node id — the two would race relay
     // registration and inbound connections. This rejects that. Crucially it does NOT block the
     // watcher / indexing / GC (they take the per-repo write lock, not this one), so only other sync
     // ENDPOINTS are excluded — exactly the collision to prevent.
-    let _serve_lock = locks::WriteLock::acquire_sync_session_timeout(
+    let session = locks::WriteLock::acquire_sync_session_timeout(
         &config.database,
         SERVE_SESSION_LOCK_TIMEOUT,
     )?
     .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a `serve` peer or \
-             a device sync is running); only one endpoint may run at a time"
-        )
+        anyhow!("another sync session already holds this database's node identity {session_tail}")
     })?;
     // Startup WRITES — the schema migration, the account read, and the first-run node-key mint —
     // under the per-repo write lock, BOUNDED here because the global session lock is already held
@@ -432,12 +430,27 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
     // before the accept loop so the watcher / GC aren't blocked for the server's life; the loop's
     // own ingests rely on SQLite's writer serialization instead.
     let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock =
-        locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SERVE_INIT_LOCK_TIMEOUT)?
-            .ok_or_else(|| {
-            anyhow!("the index write lock is busy (another writer is mid-pass); retry `sync serve`")
+    let repo = locks::WriteLock::acquire_timeout(&config.database, &lock_repo, repo_wait)?
+        .ok_or_else(|| {
+            anyhow!("the index write lock is busy (another writer is mid-pass); {busy_tail}")
         })?;
     let db = crate::open_index(config)?;
+    Ok((session, repo, db))
+}
+
+/// Shared machinery behind [`serve`] and [`init`]: acquire the session lock, open the index, bind
+/// the endpoint, and run the ALPN-dispatching accept loop. When `mint` is set (`sync init`), a
+/// one-time invite is minted AFTER the endpoint binds and the roster gate passes — so a bind
+/// failure never strands the candidate reservation the mint makes — and its ticket is printed on
+/// the startup line. Minting enforces founder/owner authority, so a non-owner `init` fails there.
+fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::Result<()> {
+    let relay = effective_relay_url(config);
+    let (_serve_lock, repo_lock, db) = sync_session_and_repo_lock(
+        config,
+        SERVE_INIT_LOCK_TIMEOUT,
+        "(a `serve` peer or a device sync is running); only one endpoint may run at a time",
+        "retry `sync serve`",
+    )?;
     let (account_id, node_key) = {
         let conn = db.connection();
         (existing_account_or_hint(conn)?, node_secret(conn)?)
@@ -534,7 +547,7 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
             listening["invite_role"] = serde_json::json!(role);
             listening["invite_expires_at_ms"] = serde_json::json!(ticket.expires_at_ms);
         }
-        crate::print_output(&listening)?;
+        print_output(&listening)?;
 
         // The database-scoped session lock taken at startup is still held for this whole loop
         // (released only when serve exits), keeping this database's node identity singular. A
@@ -684,23 +697,12 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
     // must share a relay to meet, and the ticket names where the inviter is reachable. `sync init`
     // minted the ticket with the relay IT is serving on.
     let relay = ticket.relay_url.clone();
-    let _session = locks::WriteLock::acquire_sync_session_timeout(
-        &config.database,
-        SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a `serve` peer or \
-             a device sync is running); stop it before joining"
-        )
-    })?;
-    let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock =
-        locks::WriteLock::acquire_timeout(&config.database, &lock_repo, SERVE_INIT_LOCK_TIMEOUT)?
-            .ok_or_else(|| {
-            anyhow!("the index write lock is busy (another writer is mid-pass); retry `sync join`")
-        })?;
-    let db = crate::open_index(config)?;
+    let (_session, repo_lock, db) = sync_session_and_repo_lock(
+        config,
+        SERVE_INIT_LOCK_TIMEOUT,
+        "(a `serve` peer or a device sync is running); stop it before joining",
+        "retry `sync join`",
+    )?;
     let node_key = {
         let conn = db.connection();
         // A store already bound to a DIFFERENT account cannot adopt this ticket — enrollment would
@@ -867,7 +869,7 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         // dial the wrong relay unless the operator also points `relay_url` at the inviter's.
         let inviter = rag_rat_sync::node_id_to_string(&ticket.inviter_node_id)
             .unwrap_or_else(|_| hash::hex_lower(&ticket.inviter_node_id));
-        crate::print_output(&serde_json::json!({
+        print_output(&serde_json::json!({
             "status": "joined",
             "account_id": hash::hex_lower(&account_id.to_bytes()),
             "account_entries_restored": account_report.entries_newly_stored,
@@ -886,17 +888,6 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
     })
 }
 
-/// Fetch a DIFFERENT account's log and content from a peer, then materialize them locally.
-///
-/// The escape hatch behind automatic sync (#1174): the resident host runs this same shape after a
-/// HEAD change, and an operator reaches for the command when automation is off. Cross-account
-/// contribution needs it in both directions — a contributor fetches the owner's memories, and an
-/// owner collects a contributor's — because a contribution first leaves its author through the
-/// author's own account. Once the owner has accepted it, the owner's sessions relay it with the
-/// contributor's log (#1280), so everyone else reaches it by syncing the owner alone.
-///
-/// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
-/// private account data, pinned `Closed`), and no founder-incarnation repair.
 /// Redeem a writer invite (`sync contribute <ticket>`): dial the owner named by the ticket, have
 /// it author the grant for THIS store's account, pull the owner's log over the same route so the
 /// grant fact folds locally, verify it, and configure contribution — the whole flow the two-paste
@@ -908,24 +899,12 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
 
     // Same endpoint discipline as `pull`: the session lock keeps this database's node identity
     // singular for the whole exchange.
-    let _session = locks::WriteLock::acquire_sync_session_timeout(
-        &config.database,
+    let (_session, repo_lock, db) = sync_session_and_repo_lock(
+        config,
         SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a resident MCP \
-             host, a `serve` peer, or a device sync is running); stop it and retry"
-        )
-    })?;
-    let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock = locks::WriteLock::acquire_timeout(
-        &config.database,
-        &lock_repo,
-        SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
-    let db = crate::open_index(config)?;
+        "(a resident MCP host, a `serve` peer, or a device sync is running); stop it and retry",
+        "retry",
+    )?;
     // Refuse a subscribed repo HERE, before the redemption. `sync_contribute` refuses it too, but
     // that call is the last step of this flow: by then the owner has authored a grant for this
     // account, and bailing would leave it live for a store that will never contribute. Same
@@ -1021,7 +1000,7 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
         db.sync_contribute(&owner_hex)?;
         let effects = rag_rat_core::drain_synced_memory(conn)?;
         db.fold_wal();
-        crate::print_output(&serde_json::json!({
+        print_output(&serde_json::json!({
             "status": "contributing",
             "repo_id": db.active_repo_id,
             "owner_account_id": owner_hex,
@@ -1035,8 +1014,22 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
     })
 }
 
-fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyhow::Result<()> {
-    let target = rag_rat_oplog::AccountId::from_hex(account_hex)?;
+/// Fetch a DIFFERENT account's log and content from a peer, then materialize them locally.
+///
+/// The escape hatch behind automatic sync (#1174): the resident host runs this same shape after a
+/// HEAD change, and an operator reaches for the command when automation is off. Cross-account
+/// contribution needs it in both directions — a contributor fetches the owner's memories, and an
+/// owner collects a contributor's — because a contribution first leaves its author through the
+/// author's own account. Once the owner has accepted it, the owner's sessions relay it with the
+/// contributor's log (#1280), so everyone else reaches it by syncing the owner alone.
+///
+/// Deliberately NOT a `sync join`: no enrollment, no `/5` table restore (foreign table streams are
+/// private account data, pinned `Closed`), and no founder-incarnation repair.
+fn pull(
+    config: &Config,
+    target: rag_rat_oplog::AccountId,
+    peer_override: Option<&str>,
+) -> anyhow::Result<()> {
     let relay = effective_relay_url(config);
 
     // The per-database SESSION lock, held for the whole pull. Any process that opens an iroh
@@ -1045,26 +1038,13 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
     // registration and inbound sessions. A resident MCP host or `sync serve` holds this for its
     // lifetime, which is exactly the common case here — an operator reaching for `pull` while the
     // resident is up.
-    let _session = locks::WriteLock::acquire_sync_session_timeout(
-        &config.database,
+    let (_session, repo_lock, db) = sync_session_and_repo_lock(
+        config,
         SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "another sync session already holds this database's node identity (a resident MCP \
-             host, a `serve` peer, or a device sync is running); stop it and retry — it cannot \
-             pull a foreign account on your behalf"
-        )
-    })?;
-
-    let lock_repo = locks::write_lock_repo_id(config);
-    let repo_lock = locks::WriteLock::acquire_timeout(
-        &config.database,
-        &lock_repo,
-        SERVE_SESSION_LOCK_TIMEOUT,
-    )?
-    .ok_or_else(|| anyhow!("the index write lock is busy (another writer is mid-pass); retry"))?;
-    let db = crate::open_index(config)?;
+        "(a resident MCP host, a `serve` peer, or a device sync is running); stop it and retry — \
+         it cannot pull a foreign account on your behalf",
+        "retry",
+    )?;
     let node_key = {
         let conn = db.connection();
         // Pulling your OWN account is device sync, not a cross-account fetch — say so rather than
@@ -1172,7 +1152,7 @@ fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyh
         } else {
             "already up to date with this account"
         };
-        crate::print_output(&serde_json::json!({
+        print_output(&serde_json::json!({
             "status": "pulled",
             "account_id": hash::hex_lower(&target.to_bytes()),
             "peer": peer_id,
@@ -1455,7 +1435,11 @@ mod tests {
                 .unwrap_or_else(|err| panic!("`{hint}` must parse: {err}"));
             match cli.command {
                 Command::Sync(SyncArgs { command: SyncCommand::Pull { account, .. } }) =>
-                    assert_eq!(account, owner, "and it fetches the subscribed owner"),
+                    assert_eq!(
+                        account,
+                        rag_rat_oplog::AccountId::from_hex(&owner).unwrap(),
+                        "and it fetches the subscribed owner"
+                    ),
                 other => panic!("`{hint}` parsed as something other than a pull: {other:?}"),
             }
         }
@@ -1653,5 +1637,35 @@ mod tests {
     fn decode_node_secret_rejects_wrong_length_and_non_hex() {
         assert!(decode_node_secret("abcd").is_err(), "too short is rejected");
         assert!(decode_node_secret(&"zz".repeat(32)).is_err(), "non-hex chars are rejected");
+    }
+}
+
+#[cfg(test)]
+mod subscribe_note_tests {
+    #[test]
+    fn subscription_notes_preserve_operator_text() {
+        assert_eq!(
+            super::subscribe_note("owner", true),
+            "this repo's memories now mirror the owner's stream instead of its own — nothing is \
+             authored back, and this store's own memories are untouched. But exactly one stream \
+             materializes a repo, so the next drain REMOVES the memories this account's other \
+             devices had synced here; `sync unsubscribe` restores them, except for local binding \
+             work — a `memory rebind` you made on a synced memory, and any local edge onto it, go \
+             with the row (a re-drain seeds only the anchors its author published). The locator's \
+             peers are recorded, so automatic sync pulls the owner's log without any [sync] \
+             server_peers; run `rag-rat sync pull owner` to fetch it now"
+        );
+        assert_eq!(
+            super::subscribe_note("owner", false),
+            "this repo's memories now mirror the owner's stream instead of its own — nothing is \
+             authored back, and this store's own memories are untouched. But exactly one stream \
+             materializes a repo, so the next drain REMOVES the memories this account's other \
+             devices had synced here; `sync unsubscribe` restores them, except for local binding \
+             work — a `memory rebind` you made on a synced memory, and any local edge onto it, go \
+             with the row (a re-drain seeds only the anchors its author published). This store \
+             needs the owner's log and no routing was supplied: automatic sync pulls it once the \
+             owner's host is in [sync] server_peers, or run `rag-rat sync pull owner --peer \
+             <NODE_ID>` now"
+        );
     }
 }

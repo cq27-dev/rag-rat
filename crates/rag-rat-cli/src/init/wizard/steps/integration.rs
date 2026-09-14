@@ -98,14 +98,14 @@ pub(super) fn validate_hooks(state: &WizardState) -> CheckResult {
         );
     };
     for &hook in MANAGED_HOOKS {
-        let path = gp.hooks_dir.join(hook);
+        let path = gp.hooks_dir().join(hook.as_trigger());
         if path.exists()
             && !is_rag_rat_hook(&path).unwrap_or(false)
-            && !state.hook_conflicts.contains_key(hook)
+            && !state.hook_conflicts.contains_key(hook.as_trigger())
         {
             return CheckResult::block(format!(
                 "resolve foreign hook `{}` before saving or disable git hooks",
-                hook
+                hook.as_trigger()
             ));
         }
     }

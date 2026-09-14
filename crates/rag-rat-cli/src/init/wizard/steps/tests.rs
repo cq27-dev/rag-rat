@@ -430,7 +430,7 @@ fn embedding_mode_switch_resets_mode_specific_concurrency_default() {
 
     if let Some(StepState::Embedding { focus, mode_cursor, .. }) = &mut state.step {
         *focus = EmbedFocus::Mode;
-        *mode_cursor = 1;
+        *mode_cursor = super::embedding::RemoteModeChoice::Connect;
     }
     step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
 
@@ -439,7 +439,7 @@ fn embedding_mode_switch_resets_mode_specific_concurrency_default() {
     assert_eq!(remote.concurrency, RemoteEmbeddingConfig::omitted_concurrency_default(true));
 
     if let Some(StepState::Embedding { mode_cursor, .. }) = &mut state.step {
-        *mode_cursor = 2;
+        *mode_cursor = super::embedding::RemoteModeChoice::Ephemeral;
     }
     step_handle_key(StepId::Embedding, key(KeyCode::Char(' ')), &mut state);
 
@@ -1288,9 +1288,9 @@ fn integration_blocks_unresolved_foreign_hook_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     rag_rat_base::test_git::run(dir.path(), &["init", "-q"]);
     let gp = git_paths(dir.path()).unwrap();
-    std::fs::create_dir_all(&gp.hooks_dir).unwrap();
-    let hook = MANAGED_HOOKS[0];
-    std::fs::write(gp.hooks_dir.join(hook), "#!/bin/sh\necho custom\n").unwrap();
+    std::fs::create_dir_all(gp.hooks_dir()).unwrap();
+    let hook = MANAGED_HOOKS[0].as_trigger();
+    std::fs::write(gp.hooks_dir().join(hook), "#!/bin/sh\necho custom\n").unwrap();
     let scan = scan_repo(dir.path()).unwrap();
     let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     draft.hooks.git = true;

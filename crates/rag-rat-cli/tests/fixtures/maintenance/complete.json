@@ -1,0 +1,49 @@
+{
+  "trigger": "manual",
+  "status": "complete",
+  "old_head": "old",
+  "new_head": null,
+  "branch_checkout": null,
+  "max_seconds": 0,
+  "elapsed_seconds": 0.0,
+  "wal_checkpoint": {
+    "wal_bytes_before": 0,
+    "attempted": false,
+    "truncated": false
+  },
+  "reconcile": null,
+  "vector_reencode": null,
+  "clone_graph": null,
+  "gc": {
+    "files_pruned": 0,
+    "chunks_pruned": 0,
+    "files_remaining": 1,
+    "chunks_remaining": 1,
+    "skipped": false
+  },
+  "memory_validation": {
+    "checked": 0,
+    "current": 0,
+    "relocated": 0,
+    "stale": 0,
+    "gone": 0,
+    "pending": 0,
+    "unverified": 0
+  },
+  "remaining_backlog": {
+    "model": "embedding-hash",
+    "current": 0,
+    "stale": 0,
+    "failed": 0,
+    "blocked": 0,
+    "total_chunks": 1
+  },
+  "papertrail": {
+    "status": "skipped",
+    "reason": "papertrail auto-sync rides git-hook triggers only; run `rag-rat papertrail sync` for an explicit mirror pass"
+  },
+  "device_sync": {
+    "status": "skipped",
+    "reason": "device-side sync rides git-hook triggers only"
+  }
+}

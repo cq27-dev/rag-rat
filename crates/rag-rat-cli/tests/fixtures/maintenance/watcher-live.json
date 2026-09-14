@@ -1,0 +1,15 @@
+{
+  "trigger": "post-merge",
+  "status": "skipped",
+  "reason": "watcher live — deferring to the watcher's pass",
+  "old_head": "old",
+  "new_head": null,
+  "papertrail": {
+    "status": "disabled",
+    "reason": "no tracker bindings"
+  },
+  "device_sync": {
+    "status": "disabled",
+    "reason": "no local account, or this device is not roster-effective"
+  }
+}

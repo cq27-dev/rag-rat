@@ -246,6 +246,8 @@ pub(crate) fn memory(config: &Config, args: &MemoryArgs) -> anyhow::Result<()> {
                      --symbol-id <id>, --path <path>, --chunk <id>, or --dir <dir>"
                 );
             };
+            // Match the MCP rebind path: no repo flock; SQLite serializes the short memory-write
+            // transaction independently of the watcher’s index pass.
             print_output(&db.memory_rebind(memory_id, bind)?)
         },
         MemoryCommand::List { kind } => {

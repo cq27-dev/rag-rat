@@ -1277,16 +1277,19 @@ fn sync_grant_requires_publish_then_authors_a_writer_grant() {
     let grantee = "ab".repeat(32);
 
     // Granting before publish is refused (v1: public streams only).
-    let before = db.sync_grant(&grantee).unwrap_err().to_string();
+    let before = db
+        .sync_grant(rag_rat_oplog::AccountId::from_hex(&grantee).unwrap())
+        .unwrap_err()
+        .to_string();
     assert!(before.contains("published"), "grant requires a published repo: {before}");
 
     // Publish, then grant returns the grant id as hex.
     assert!(db.sync_publish().unwrap());
-    let grant_id = db.sync_grant(&grantee).unwrap();
+    let grant_id = db.sync_grant(rag_rat_oplog::AccountId::from_hex(&grantee).unwrap()).unwrap();
     assert_eq!(grant_id.len(), 64, "the grant id is returned as hex");
 
     // A malformed account id is rejected.
-    assert!(db.sync_grant("not-a-valid-hex-account-id").is_err());
+    assert!(rag_rat_oplog::AccountId::from_hex("not-a-valid-hex-account-id").is_err());
 }
 
 /// `sync pull` (#1174) must hold the per-database SESSION lock for its whole run. Every process

@@ -1,0 +1,13 @@
+{
+  "trigger": "manual",
+  "status": "deferred",
+  "reason": "no discoverable files (first-time empty index)",
+  "papertrail": {
+    "status": "skipped",
+    "reason": "papertrail auto-sync rides git-hook triggers only; run `rag-rat papertrail sync` for an explicit mirror pass"
+  },
+  "device_sync": {
+    "status": "skipped",
+    "reason": "device-side sync rides git-hook triggers only"
+  }
+}

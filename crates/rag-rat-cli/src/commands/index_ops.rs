@@ -162,6 +162,8 @@ fn surface_adoption_warnings(config: &Config) -> anyhow::Result<()> {
 }
 
 pub(crate) fn reconcile(config: &Config, args: &ReconcileArgs) -> anyhow::Result<()> {
+    // Deliberately no repo flock: holding it for the bulk embed budget would starve the watcher;
+    // SQLite writer serialization covers the short per-batch commits.
     let db = open_index(config)?;
     // INVARIANT (#312): this `--plan` early-return MUST stay ABOVE the `--reencode-vectors`
     // mutation below. `--plan` is a READ-ONLY dry run; returning here first is what keeps
@@ -353,10 +355,113 @@ enum HookStatus {
     Error,
 }
 
+/// Omission is separate from JSON null: checkout metadata is absent on deferred passes.
+#[derive(serde::Serialize)]
+struct MaintenanceReport {
+    trigger: String,
+    status: HookStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_head: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_head: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch_checkout: Option<Option<String>>,
+    #[serde(flatten)]
+    completed: Option<CompletedMaintenance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    papertrail: Option<HookStepReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_sync: Option<HookStepReport>,
+}
+
+impl MaintenanceReport {
+    fn new(trigger: &str, status: HookStatus) -> Self {
+        Self {
+            trigger: trigger.to_owned(),
+            status,
+            reason: None,
+            old_head: None,
+            new_head: None,
+            branch_checkout: None,
+            completed: None,
+            papertrail: None,
+            device_sync: None,
+        }
+    }
+
+    fn print(&self) -> anyhow::Result<()> {
+        // Preserve the json! report boundary for both output formats. Field declaration order
+        // mirrors the former literals, including the nested core report objects.
+        print_output(&serde_json::to_value(self)?)
+    }
+}
+
+#[derive(serde::Serialize)]
+struct CompletedMaintenance {
+    max_seconds: u64,
+    elapsed_seconds: f64,
+    wal_checkpoint: Option<rag_rat_core::index::WalCheckpointReport>,
+    reconcile: Option<rag_rat_core::index::ai::ReconcileReport>,
+    vector_reencode: Option<VectorReencodeReport>,
+    clone_graph: Option<rag_rat_core::index::CloneEdgeReport>,
+    gc: Option<rag_rat_core::index::GcReport>,
+    memory_validation: Option<rag_rat_query::memory::RepoMemoryValidationReport>,
+    remaining_backlog: BacklogSummary,
+}
+
+#[derive(serde::Serialize)]
+struct VectorReencodeReport {
+    converted: usize,
+}
+
+#[derive(serde::Serialize)]
+struct BacklogSummary {
+    model: String,
+    current: u64,
+    stale: u64,
+    failed: u64,
+    blocked: u64,
+    total_chunks: u64,
+}
+
+#[derive(serde::Serialize)]
+struct HookStepReport {
+    status: HookStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(flatten)]
+    detail: HookStepDetail,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum HookStepDetail {
+    Empty {},
+    Error { error: String },
+    Papertrail { synced_items: usize, bindings: usize, errors: usize },
+    DeviceSync { peers: usize, ok: usize, errors: usize },
+}
+
+impl HookStepReport {
+    fn reason(status: HookStatus, reason: &str) -> Self {
+        Self { status, reason: Some(reason.to_owned()), detail: HookStepDetail::Empty {} }
+    }
+
+    fn skipped(reason: &str) -> Self {
+        Self::reason(HookStatus::Skipped, reason)
+    }
+}
+
 /// The report for a hook step that failed. The failure is folded into the report rather than
 /// returned: a broken mirror or peer must never fail the git hook.
-fn hook_error(error: &impl std::fmt::Display) -> serde_json::Value {
-    serde_json::json!({"status": HookStatus::Error, "error": error.to_string()})
+fn hook_error(error: &impl std::fmt::Display) -> HookStepReport {
+    HookStepReport {
+        status: HookStatus::Error,
+        reason: None,
+        detail: HookStepDetail::Error { error: error.to_string() },
+    }
 }
 
 #[cfg(test)]
@@ -389,17 +494,20 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // run must stay bounded by its index budget — a mirror flight can start a full backfill or
     // wait on provider rate limits, far past `--max-seconds`. Explicit mirroring is
     // `rag-rat papertrail sync`.
-    let hook_trigger = crate::MANAGED_HOOKS.contains(&trigger.as_str());
+    let hook_trigger = crate::hooks_support::ManagedHook::from_trigger(&trigger).is_some();
 
-    if trigger == "post-checkout" && branch_checkout.as_deref() == Some("0") {
-        print_output(&serde_json::json!({
-            "trigger": trigger,
-            "status": HookStatus::Skipped,
-            "reason": "file checkout",
-            "old_head": old_head,
-            "new_head": new_head,
-            "branch_checkout": branch_checkout,
-        }))?;
+    if crate::hooks_support::ManagedHook::from_trigger(&trigger)
+        == Some(crate::hooks_support::ManagedHook::PostCheckout)
+        && branch_checkout.as_deref() == Some("0")
+    {
+        MaintenanceReport {
+            reason: Some("file checkout".to_owned()),
+            old_head: Some(old_head),
+            new_head: Some(new_head),
+            branch_checkout: Some(branch_checkout),
+            ..MaintenanceReport::new(&trigger, HookStatus::Skipped)
+        }
+        .print()?;
         return Ok(());
     }
 
@@ -409,7 +517,8 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // doubles the work + memory pressure. Defer to the watcher; the query-path heal covers the
     // brief staleness gap. post-commit / post-rewrite touch only git metadata, which the
     // file-watcher can't see, so those still run (and are cheap — no file content changed).
-    if matches!(trigger.as_str(), "post-checkout" | "post-merge")
+    if crate::hooks_support::ManagedHook::from_trigger(&trigger)
+        .is_some_and(crate::hooks_support::ManagedHook::changes_files)
         && crate::agent_hook::watcher_state(config).0
     {
         // The git action is still a tracker-change signal even when the index pass is the
@@ -418,15 +527,15 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         // hook triggers (post-checkout / post-merge).
         let papertrail = papertrail_hook_trigger(config);
         let device_sync = sync_hook_trigger(config);
-        print_output(&serde_json::json!({
-            "trigger": trigger,
-            "status": HookStatus::Skipped,
-            "reason": "watcher live — deferring to the watcher's pass",
-            "old_head": old_head,
-            "new_head": new_head,
-            "papertrail": papertrail,
-            "device_sync": device_sync,
-        }))?;
+        MaintenanceReport {
+            reason: Some("watcher live — deferring to the watcher's pass".to_owned()),
+            old_head: Some(old_head),
+            new_head: Some(new_head),
+            papertrail: Some(papertrail),
+            device_sync: Some(device_sync),
+            ..MaintenanceReport::new(&trigger, HookStatus::Skipped)
+        }
+        .print()?;
         return Ok(());
     }
 
@@ -452,22 +561,21 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
         Ok(rag_rat_base::single_flight::Step::Ran(run_maintenance_pass(config, args, &trigger)?))
     })? {
         rag_rat_base::single_flight::FlightOutcome::Coalesced => {
-            let mut skip_report = serde_json::json!({
-                "trigger": trigger,
-                "status": HookStatus::Skipped,
-                "reason": "another maintenance pass is in flight (coalesced, #267)",
-                "old_head": old_head,
-                "new_head": new_head,
-            });
+            let mut skip_report = MaintenanceReport {
+                reason: Some("another maintenance pass is in flight (coalesced, #267)".to_owned()),
+                old_head: Some(old_head),
+                new_head: Some(new_head),
+                ..MaintenanceReport::new(&trigger, HookStatus::Skipped)
+            };
             // A HOOK trigger still fires its own papertrail request: the in-flight maintenance
             // holder may be a manual/cron run that never triggers papertrail, so relying on it
             // would drop this trigger's change signal. The flight lock and pending marker dedup
             // this against any flight the holder (or the watcher) does run.
             if hook_trigger {
-                skip_report["papertrail"] = papertrail_hook_trigger(config);
-                skip_report["device_sync"] = sync_hook_trigger(config);
+                skip_report.papertrail = Some(papertrail_hook_trigger(config));
+                skip_report.device_sync = Some(sync_hook_trigger(config));
             }
-            return print_output(&skip_report);
+            return skip_report.print();
         },
         rag_rat_base::single_flight::FlightOutcome::Ran(Some(report)) => report,
         // `run` was given an initial payload, so it runs at least one pass; maintenance never stops
@@ -480,11 +588,10 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     let papertrail = if hook_trigger {
         papertrail_hook_trigger(config)
     } else {
-        serde_json::json!({
-            "status": HookStatus::Skipped,
-            "reason": "papertrail auto-sync rides git-hook triggers only; run `rag-rat \
-                       papertrail sync` for an explicit mirror pass",
-        })
+        HookStepReport::skipped(
+            "papertrail auto-sync rides git-hook triggers only; run `rag-rat papertrail sync` for \
+             an explicit mirror pass",
+        )
     };
     // Device-side sync likewise rides git-hook triggers only (a manual/cron `maintenance` stays
     // bounded by its index budget); the cadence watermark keeps it to at most one dial per
@@ -492,16 +599,11 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     let device_sync = if hook_trigger {
         sync_hook_trigger(config)
     } else {
-        serde_json::json!({
-            "status": HookStatus::Skipped,
-            "reason": "device-side sync rides git-hook triggers only",
-        })
+        HookStepReport::skipped("device-side sync rides git-hook triggers only")
     };
-    if let Some(report) = report.as_object_mut() {
-        report.insert("papertrail".to_string(), papertrail);
-        report.insert("device_sync".to_string(), device_sync);
-    }
-    print_output(&report)
+    report.papertrail = Some(papertrail);
+    report.device_sync = Some(device_sync);
+    report.print()
 }
 
 /// Best-effort papertrail auto-sync riding the git trigger (#592): runs AFTER ordinary
@@ -510,27 +612,29 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
 /// into the report; a broken mirror must never fail the git hook. Per-binding failure and
 /// staleness detail is persisted as binding health inside the flight and retried by the
 /// scheduling policy on later triggers.
-fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
+fn papertrail_hook_trigger(config: &Config) -> HookStepReport {
     use rag_rat_core::index::papertrail_autosync as autosync;
     use rag_rat_papertrail::AutosyncRequest;
     match autosync::run(config, AutosyncRequest::Incremental) {
-        Ok(autosync::AutosyncOutcome::Disabled) => {
-            serde_json::json!({"status": HookStatus::Disabled, "reason": "no tracker bindings"})
+        Ok(autosync::AutosyncOutcome::Disabled) =>
+            HookStepReport::reason(HookStatus::Disabled, "no tracker bindings"),
+        Ok(autosync::AutosyncOutcome::NotIndexed) => HookStepReport::reason(
+            HookStatus::Deferred,
+            "repo is not indexed yet; automatic sync starts after the first index pass",
+        ),
+        Ok(autosync::AutosyncOutcome::Coalesced) => HookStepReport::reason(
+            HookStatus::Coalesced,
+            "another papertrail flight is in the air; request queued",
+        ),
+        Ok(autosync::AutosyncOutcome::Ran(report)) => HookStepReport {
+            status: HookStatus::Ran,
+            reason: None,
+            detail: HookStepDetail::Papertrail {
+                synced_items: report.synced_items,
+                bindings: report.bindings.len(),
+                errors: report.errors.len(),
+            },
         },
-        Ok(autosync::AutosyncOutcome::NotIndexed) => serde_json::json!({
-            "status": HookStatus::Deferred,
-            "reason": "repo is not indexed yet; automatic sync starts after the first index pass",
-        }),
-        Ok(autosync::AutosyncOutcome::Coalesced) => serde_json::json!({
-            "status": HookStatus::Coalesced,
-            "reason": "another papertrail flight is in the air; request queued",
-        }),
-        Ok(autosync::AutosyncOutcome::Ran(report)) => serde_json::json!({
-            "status": HookStatus::Ran,
-            "synced_items": report.synced_items,
-            "bindings": report.bindings.len(),
-            "errors": report.errors.len(),
-        }),
         Err(error) => {
             tracing::warn!(
                 target: "rag_rat_core::papertrail",
@@ -548,7 +652,7 @@ fn papertrail_hook_trigger(config: &Config) -> serde_json::Value {
 /// holds the repo write lock (each account ingest is a short SQLite transaction) and every failure
 /// is folded into the report — a broken peer must never fail the git hook. The cadence watermark
 /// and the per-database session lock dedup the several triggers one git action fires.
-fn sync_hook_trigger(config: &Config) -> serde_json::Value {
+fn sync_hook_trigger(config: &Config) -> HookStepReport {
     use crate::commands::sync::{DeviceSyncOutcome, device_sync_run};
     // Re-open the migrated index for the account-log sync (the pass closed its own connection). A
     // Compatible store needs no migration, so this is cheap — the same shape autosync uses.
@@ -558,10 +662,10 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
     };
     match rag_rat_core::sync_driver::nudge_resident_host(db.connection()) {
         Ok(true) => {
-            return serde_json::json!({
-                "status": HookStatus::Nudged,
-                "reason": "the active MCP resident sync host will reconcile this database",
-            });
+            return HookStepReport::reason(
+                HookStatus::Nudged,
+                "the active MCP resident sync host will reconcile this database",
+            );
         },
         Ok(false) => {},
         Err(error) => tracing::warn!(
@@ -571,24 +675,21 @@ fn sync_hook_trigger(config: &Config) -> serde_json::Value {
         ),
     }
     match device_sync_run(config, db.connection()) {
-        Ok(DeviceSyncOutcome::Disabled) => serde_json::json!({
-            "status": HookStatus::Disabled,
-            "reason": "no local account, or this device is not roster-effective",
-        }),
-        Ok(DeviceSyncOutcome::Skipped) => serde_json::json!({
-            "status": HookStatus::Skipped,
-            "reason": "within push_interval_secs since the last device sync",
-        }),
-        Ok(DeviceSyncOutcome::Deferred) => serde_json::json!({
-            "status": HookStatus::Deferred,
-            "reason": "this database's node identity is busy (a serve peer or another sync)",
-        }),
-        Ok(DeviceSyncOutcome::Ran { peers, ok, errors }) => serde_json::json!({
-            "status": HookStatus::Ran,
-            "peers": peers,
-            "ok": ok,
-            "errors": errors,
-        }),
+        Ok(DeviceSyncOutcome::Disabled) => HookStepReport::reason(
+            HookStatus::Disabled,
+            "no local account, or this device is not roster-effective",
+        ),
+        Ok(DeviceSyncOutcome::Skipped) =>
+            HookStepReport::skipped("within push_interval_secs since the last device sync"),
+        Ok(DeviceSyncOutcome::Deferred) => HookStepReport::reason(
+            HookStatus::Deferred,
+            "this database's node identity is busy (a serve peer or another sync)",
+        ),
+        Ok(DeviceSyncOutcome::Ran { peers, ok, errors }) => HookStepReport {
+            status: HookStatus::Ran,
+            reason: None,
+            detail: HookStepDetail::DeviceSync { peers, ok, errors },
+        },
         Err(error) => {
             tracing::warn!(
                 target: "rag_rat_core::sync",
@@ -608,7 +709,7 @@ fn run_maintenance_pass(
     config: &Config,
     args: &MaintenanceArgs,
     trigger: &str,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<MaintenanceReport> {
     let max_seconds = args.max_seconds.unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
     let started = Instant::now();
 
@@ -623,51 +724,12 @@ fn run_maintenance_pass(
     let _lock = crate::repo_write_lock(config)?;
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "lock_acquired", elapsed_ms = started.elapsed().as_millis() as u64, "write lock acquired");
 
-    // #427: the core refuses a first-time-empty registration (a post-commit/checkout hook on a repo
-    // with no `[target_bindings]` or no matching files). The hook-driven maintenance pass treats
-    // that as "nothing to index yet" and DEFERS — a later pass registers once content appears —
-    // rather than surfacing an error into the git hook. A recorded root going empty still prunes
-    // (it is not first-time, so the core does not refuse it).
-    let mut db = match IndexDatabase::index_discover_with_progress(config, render_index_progress) {
+    let mut db = match discover_or_defer(config, trigger)? {
         Ok(db) => db,
-        Err(err) if err.downcast_ref::<rag_rat_core::index::EmptyIndexRefused>().is_some() => {
-            tracing::info!(target: "rag_rat_core::maintenance", "deferred: no discoverable files (first-time empty index)");
-            return Ok(serde_json::json!({
-                "trigger": trigger,
-                "status": HookStatus::Deferred,
-                "reason": "no discoverable files (first-time empty index)",
-            }));
-        },
-        Err(err) => return Err(err),
+        Err(report) => return Ok(*report),
     };
     tracing::debug!(target: "rag_rat_core::maintenance", phase = "index_discover", elapsed_ms = started.elapsed().as_millis() as u64, "phase complete");
-    // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
-    // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
-    // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
-    // Format-only (decode f32 → encode int8), so it's cheap — no model inference.
-    //
-    // BUDGETED, and only gets a SHARE of the budget: skipped entirely when `max_seconds == 0` (the
-    // "no embedding work" cap, mirroring `budget` below), and otherwise bounded by `started +
-    // max_seconds/2` — only HALF the window. Giving it the full window would let a multi-pass
-    // conversion consume the whole budget every pass, so `budget.next_options()` returns None and
-    // new/changed chunks go un-embedded (BM25-only) for the whole window. With the half cap the
-    // embedding reconcile always gets the rest; and `max_seconds == 1` → `max_seconds/2 == 0` → an
-    // already-expired deadline → the re-encode does nothing this pass (the embedding reconcile
-    // wins), which is correct. Resumes from the persisted cursor across passes until complete.
-    let vector_reencode = if max_seconds > 0 {
-        let deadline = started + std::time::Duration::from_secs(max_seconds / 2);
-        match db.reencode_legacy_vectors_if_needed(Some(deadline)) {
-            Ok(converted) => Some(converted),
-            Err(e) => {
-                // Don't swallow it: the gate is set only on success, so a persistent error
-                // (SQLITE_BUSY, disk full) would otherwise retry-and-fail invisibly every pass.
-                eprintln!("rag-rat: vector re-encode pass failed (will retry): {e}");
-                None
-            },
-        }
-    } else {
-        None
-    };
+    let vector_reencode = reencode_vectors_within_half_budget(&db, started, max_seconds);
     // ONE time budget for the whole pass — the per-overlay embedding reconciles AND the base
     // reconcile below — measured from `started` so discovery already counts against it. Without a
     // shared budget each overlay (each call starts its own `max_seconds` timer) plus the base could
@@ -726,6 +788,122 @@ fn run_maintenance_pass(
     // Prune index rows for git contexts that are no longer live (worktree-safe; keeps every
     // live worktree's HEAD). Cheap and bounded, so it runs every maintenance pass.
     let gc_report = db.garbage_collect().ok();
+    let CloneGraphRefresh { delta: clone_delta, report: clone_graph_report } =
+        refresh_clone_graph(&db, budget.as_ref());
+    // Re-anchor repo memories: post-checkout/merge/rewrite/commit are exactly when files move,
+    // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
+    // leaving stale anchors until a manual memory_validate.
+    let memory_validation = db.memory_validate().ok();
+    tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_delta = clone_delta.as_ref().map_or("error", |d| d.status.as_db_str()), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
+    let backlog = remaining_backlog(&db)?;
+    tracing::info!(
+        target: "rag_rat_core::maintenance",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        model = %backlog.model,
+        current = backlog.current,
+        stale = backlog.stale,
+        total_chunks = backlog.total_chunks,
+        "maintenance pass complete (remaining backlog is unscoped/cross-worktree, #360)"
+    );
+    // #573: give the git-hook write path a WAL-checkpoint owner. On a hooks/MCP-only machine (no
+    // long-lived foreground watcher) nothing else truncates the shared global `-wal`, so it grows
+    // unbounded. Size-gated by the same threshold the watcher's pass-terminal checkpoint uses
+    // (`WAL_CHECKPOINT_MIN_BYTES`); best-effort — a busy/failed checkpoint just rides the next pass
+    // and never fails maintenance. Runs under the write lock this pass already holds.
+    let wal_checkpoint = db
+        .checkpoint_wal_if_oversized(rag_rat_core::index::WAL_CHECKPOINT_MIN_BYTES)
+        .inspect_err(|err| {
+            tracing::debug!(target: "rag_rat_core::maintenance", error = %err, "wal checkpoint failed");
+        })
+        .ok();
+    Ok(MaintenanceReport {
+        old_head: Some(args.old_head.clone()),
+        new_head: Some(args.new_head.clone()),
+        branch_checkout: Some(args.branch_checkout.clone()),
+        completed: Some(CompletedMaintenance {
+            max_seconds,
+            elapsed_seconds: started.elapsed().as_secs_f64(),
+            wal_checkpoint,
+            reconcile: reconcile_report,
+            // #312: rows the legacy-f32 → int8 re-encode converted this pass, or null when it was
+            // skipped (max_seconds == 0, or already done/the gate was set so the call returned 0 —
+            // note a gate-skip also reports {"converted": 0}) or errored. Lets a --json
+            // consumer see progress.
+            vector_reencode: vector_reencode.map(|converted| VectorReencodeReport { converted }),
+            clone_graph: clone_graph_report,
+            gc: gc_report,
+            memory_validation,
+            remaining_backlog: backlog,
+        }),
+        ..MaintenanceReport::new(trigger, HookStatus::Complete)
+    })
+}
+
+fn discover_or_defer(
+    config: &Config,
+    trigger: &str,
+) -> anyhow::Result<Result<IndexDatabase, Box<MaintenanceReport>>> {
+    // #427: the core refuses a first-time-empty registration (a post-commit/checkout hook on a repo
+    // with no `[target_bindings]` or no matching files). The hook-driven maintenance pass treats
+    // that as "nothing to index yet" and DEFERS — a later pass registers once content appears —
+    // rather than surfacing an error into the git hook. A recorded root going empty still prunes
+    // (it is not first-time, so the core does not refuse it).
+    match IndexDatabase::index_discover_with_progress(config, render_index_progress) {
+        Ok(db) => Ok(Ok(db)),
+        Err(err) if err.downcast_ref::<rag_rat_core::index::EmptyIndexRefused>().is_some() => {
+            tracing::info!(target: "rag_rat_core::maintenance", "deferred: no discoverable files (first-time empty index)");
+            Ok(Err(Box::new(MaintenanceReport {
+                reason: Some("no discoverable files (first-time empty index)".to_owned()),
+                ..MaintenanceReport::new(trigger, HookStatus::Deferred)
+            })))
+        },
+        Err(err) => Err(err),
+    }
+}
+
+fn reencode_vectors_within_half_budget(
+    db: &IndexDatabase,
+    started: Instant,
+    max_seconds: u64,
+) -> Option<usize> {
+    // One-time on upgrade: re-encode any legacy f32 vector blobs to the compact int8 format (#312).
+    // Meta-gated, so this runs once and then skips the table scan cheaply on every later pass; run
+    // on the BASE index (not per-overlay) before the worktree refresh re-scopes the connection.
+    // Format-only (decode f32 → encode int8), so it's cheap — no model inference.
+    //
+    // BUDGETED, and only gets a SHARE of the budget: skipped entirely when `max_seconds == 0` (the
+    // "no embedding work" cap, mirroring `budget` below), and otherwise bounded by `started +
+    // max_seconds/2` — only HALF the window. Giving it the full window would let a multi-pass
+    // conversion consume the whole budget every pass, so `budget.next_options()` returns None and
+    // new/changed chunks go un-embedded (BM25-only) for the whole window. With the half cap the
+    // embedding reconcile always gets the rest; and `max_seconds == 1` → `max_seconds/2 == 0` → an
+    // already-expired deadline → the re-encode does nothing this pass (the embedding reconcile
+    // wins), which is correct. Resumes from the persisted cursor across passes until complete.
+    if max_seconds > 0 {
+        let deadline = started + std::time::Duration::from_secs(max_seconds / 2);
+        match db.reencode_legacy_vectors_if_needed(Some(deadline)) {
+            Ok(converted) => Some(converted),
+            Err(e) => {
+                // Don't swallow it: the gate is set only on success, so a persistent error
+                // (SQLITE_BUSY, disk full) would otherwise retry-and-fail invisibly every pass.
+                eprintln!("rag-rat: vector re-encode pass failed (will retry): {e}");
+                None
+            },
+        }
+    } else {
+        None
+    }
+}
+
+struct CloneGraphRefresh {
+    delta: Option<rag_rat_core::index::CloneDeltaReport>,
+    report: Option<rag_rat_core::index::CloneEdgeReport>,
+}
+
+fn refresh_clone_graph(
+    db: &IndexDatabase,
+    budget: Option<&rag_rat_core::watch::ReconcileBudget>,
+) -> CloneGraphRefresh {
     // Clone-edge graph (#286/#473): try the cheap IN-PLACE delta first — it settles an ordinary
     // commit's changes on this very hook pass. The FULL rebuild runs only when the delta could
     // not settle freshness (absent generation, normalizer bump, cap crossing, huge delta, error)
@@ -744,18 +922,17 @@ fn run_maintenance_pass(
             .clone_graph_rebuild_due(rag_rat_core::watch::CLONE_GRAPH_QUIET_MS, true)
             .unwrap_or(false)
     {
-        match budget.as_ref().and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
+        match budget.and_then(rag_rat_core::watch::ReconcileBudget::next_options) {
             Some(options) => db.reconcile_clone_edges_with_budget(options.max_seconds).ok(),
             None => None,
         }
     } else {
         None
     };
-    // Re-anchor repo memories: post-checkout/merge/rewrite/commit are exactly when files move,
-    // rename, or change, so relocate symbol/chunk bindings (or flag them) here rather than
-    // leaving stale anchors until a manual memory_validate.
-    let memory_validation = db.memory_validate().ok();
-    tracing::debug!(target: "rag_rat_core::maintenance", phase = "gc_clone_memory", gc = gc_report.is_some(), clone_delta = clone_delta.as_ref().map_or("error", |d| d.status.as_db_str()), clone_graph = clone_graph_report.is_some(), memory_validated = memory_validation.is_some(), "post-reconcile phases complete");
+    CloneGraphRefresh { delta: clone_delta, report: clone_graph_report }
+}
+
+fn remaining_backlog(db: &IndexDatabase) -> anyhow::Result<BacklogSummary> {
     // Remaining backlog for the ACTIVE embedding model from the CHEAP persisted counts
     // (`status.embedding` / `status.artifacts`, #285), NOT `reconcile_plan` — which rebuilds +
     // re-hashes EVERY chunk's embedding input (O(repo)) on every hook pass. #378 measured that plan
@@ -770,59 +947,23 @@ fn run_maintenance_pass(
     let status = db.llm_status()?;
     let embedding = &status.embedding;
     let artifacts = &status.artifacts;
-    tracing::info!(
-        target: "rag_rat_core::maintenance",
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        model = %embedding.model_id,
-        current = artifacts.current,
-        stale = artifacts.stale,
-        total_chunks = artifacts.total_chunks,
-        "maintenance pass complete (remaining backlog is unscoped/cross-worktree, #360)"
-    );
-    // #573: give the git-hook write path a WAL-checkpoint owner. On a hooks/MCP-only machine (no
-    // long-lived foreground watcher) nothing else truncates the shared global `-wal`, so it grows
-    // unbounded. Size-gated by the same threshold the watcher's pass-terminal checkpoint uses
-    // (`WAL_CHECKPOINT_MIN_BYTES`); best-effort — a busy/failed checkpoint just rides the next pass
-    // and never fails maintenance. Runs under the write lock this pass already holds.
-    let wal_checkpoint = db
-        .checkpoint_wal_if_oversized(rag_rat_core::index::WAL_CHECKPOINT_MIN_BYTES)
-        .inspect_err(|err| {
-            tracing::debug!(target: "rag_rat_core::maintenance", error = %err, "wal checkpoint failed");
-        })
-        .ok();
-    Ok(serde_json::json!({
-        "trigger": trigger,
-        "status": HookStatus::Complete,
-        "old_head": args.old_head,
-        "new_head": args.new_head,
-        "branch_checkout": args.branch_checkout,
-        "max_seconds": max_seconds,
-        "elapsed_seconds": started.elapsed().as_secs_f64(),
-        "wal_checkpoint": wal_checkpoint,
-        "reconcile": reconcile_report,
-        // #312: rows the legacy-f32 → int8 re-encode converted this pass, or null when it was
-        // skipped (max_seconds == 0, or already done/the gate was set so the call returned 0 — note
-        // a gate-skip also reports {"converted": 0}) or errored. Lets a --json consumer see progress.
-        "vector_reencode": vector_reencode.map(|n| serde_json::json!({ "converted": n })),
-        "clone_graph": clone_graph_report,
-        "gc": gc_report,
-        "memory_validation": memory_validation,
-        "remaining_backlog": {
-            "model": embedding.model_id,
-            "current": artifacts.current,
-            "stale": artifacts.stale,
-            "failed": artifacts.failed,
-            "blocked": artifacts.blocked,
-            "total_chunks": artifacts.total_chunks,
-            // `missing` is intentionally OMITTED: `artifacts.missing` is `total - current - stale -
-            // failed - blocked` with policy-skipped chunks (generated / tiny) treated as zero, so it
-            // would report a PERMANENT backlog even after a clean reconcile (PR #380 review) — and the
-            // exact eligible-missing can't be computed without the O(repo) per-chunk scan. Coverage
-            // reads off `current`/`total_chunks`; `stale`/`failed`/`blocked` are exact remaining-work
-            // signals. The precise missing + per-policy `skipped` + by-priority breakdown live in
-            // `reconcile --plan`, along with the failed retryable/waiting split.
-        }
-    }))
+    Ok(BacklogSummary {
+        model: embedding.model_id.clone(),
+        current: artifacts.current,
+        stale: artifacts.stale,
+        failed: artifacts.failed,
+        blocked: artifacts.blocked,
+        total_chunks: artifacts.total_chunks,
+        // `missing` is intentionally OMITTED: `artifacts.missing` is `total - current -
+        // stale - failed - blocked` with policy-skipped chunks (generated /
+        // tiny) treated as zero, so it would report a PERMANENT backlog
+        // even after a clean reconcile (PR #380 review) — and the
+        // exact eligible-missing can't be computed without the O(repo) per-chunk scan.
+        // Coverage reads off `current`/`total_chunks`;
+        // `stale`/`failed`/`blocked` are exact remaining-work signals. The
+        // precise missing + per-policy `skipped` + by-priority breakdown live in
+        // `reconcile --plan`, along with the failed retryable/waiting split.
+    })
 }
 
 #[cfg(test)]
@@ -838,36 +979,17 @@ mod tests {
     /// `db_file_health`; this pins the CLI wiring — dispatch → open_config → VACUUM → report.)
     #[test]
     fn doctor_vacuum_runs_and_leaves_no_freelist() {
-        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-vacuum");
+        let (root, config) = crate::test_support::scratch_config("cli-vacuum", ResolvedTarget {
+            name: "markdown".to_string(),
+            language: Language::Markdown,
+            directories: vec![PathBuf::from("docs")],
+            include: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Docs,
+        });
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("docs/a.md"), "# Title\nalpha token\n").unwrap();
-        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
-        let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
-            database_key_pinned: true,
-            database: config_root.join(".rag-rat/index.sqlite"),
-            root: config_root,
-            targets: vec![ResolvedTarget {
-                name: "markdown".to_string(),
-                language: Language::Markdown,
-                directories: vec![PathBuf::from("docs")],
-                include: vec!["**/*.md".to_string()],
-                exclude: Vec::new(),
-                kind: TargetKind::Docs,
-            }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
-        };
+
         IndexDatabase::rebuild(&config).unwrap();
 
         super::doctor(&config, &crate::cli::DoctorArgs { vacuum: true }).unwrap();
@@ -900,10 +1022,6 @@ mod tests {
         git(&main, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(main.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -915,15 +1033,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -932,6 +1043,12 @@ mod tests {
         std::fs::write(linked.join("src/a.rs"), "pub fn linked_fn() {}\n").unwrap();
         git(&linked, &["add", "-A"]);
         git(&linked, &["commit", "-qm", "branch"]);
+
+        let sibling = root.join("sibling");
+        git(&main, &["worktree", "add", "-q", "-b", "sibling", sibling.to_str().unwrap()]);
+        std::fs::write(sibling.join("src/a.rs"), "pub fn sibling_fn() {}\n").unwrap();
+        git(&sibling, &["add", "-A"]);
+        git(&sibling, &["commit", "-qm", "sibling"]);
 
         // Run the actual CLI maintenance command (the hook entry point).
         let args = super::MaintenanceArgs {
@@ -954,6 +1071,26 @@ mod tests {
         );
 
         drop(db);
+
+        // Refresh one changed checkout again; the base and the unchanged sibling must survive.
+        std::fs::write(linked.join("src/a.rs"), "pub fn updated_linked_fn() {}\n").unwrap();
+        git(&linked, &["add", "-A"]);
+        git(&linked, &["commit", "-qm", "updated branch"]);
+        super::maintenance(&config, &args).unwrap();
+        let mut db = IndexDatabase::open_config(&config).unwrap();
+        for (checkout, expected) in
+            [(&config.root, "base_fn"), (&linked, "updated_linked_fn"), (&sibling, "sibling_fn")]
+        {
+            db.use_worktree_scope(&config.root, Some(checkout)).unwrap();
+            let names: Vec<_> =
+                db.symbols("", None, 100).unwrap().into_iter().map(|hit| hit.name).collect();
+            assert!(names.iter().any(|name| name == expected), "{checkout:?}: {names:?}");
+            for foreign in ["base_fn", "updated_linked_fn", "sibling_fn"] {
+                if foreign != expected {
+                    assert!(!names.iter().any(|name| name == foreign), "{checkout:?}: {names:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -979,10 +1116,6 @@ mod tests {
         git(&main, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(main.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -994,15 +1127,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1055,10 +1181,6 @@ mod tests {
         git(&root, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1070,15 +1192,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1090,6 +1205,7 @@ mod tests {
             new_head: None,
         };
         let report = super::run_maintenance_pass(&config, &args, "post-commit").unwrap();
+        let report = serde_json::to_value(report).unwrap();
 
         let checkpoint = &report["wal_checkpoint"];
         assert!(
@@ -1123,10 +1239,6 @@ mod tests {
         git(&root, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1138,15 +1250,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1158,6 +1263,7 @@ mod tests {
             new_head: None,
         };
         let report = super::run_maintenance_pass(&config, &args, "post-commit").unwrap();
+        let report = serde_json::to_value(report).unwrap();
         let backlog = &report["remaining_backlog"];
 
         // Fields the cheap ACTIVE-model counts compute exactly.
@@ -1192,10 +1298,6 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1207,15 +1309,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1265,10 +1360,6 @@ mod tests {
         .unwrap();
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1280,15 +1371,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1354,9 +1438,7 @@ mod papertrail_hook_tests {
                 auth: None,
                 tags: Vec::new(),
             }],
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
+
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1368,15 +1450,8 @@ mod papertrail_hook_tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         }
     }
 

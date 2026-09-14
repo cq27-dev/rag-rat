@@ -10,7 +10,8 @@ use rag_rat_base::config::Config;
 use rag_rat_core::IndexDatabase;
 
 use crate::cli::{OracleArgs, OracleCommand, OracleReportArgs, OracleRunArgs, OracleStatusArgs};
-use crate::{open_index, print_output};
+use crate::open_index;
+use crate::render::print_output;
 
 pub(crate) fn oracle(config: &Config, args: &OracleArgs) -> anyhow::Result<()> {
     match &args.command {
@@ -103,36 +104,12 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
         return print_output(&rag_rat_oracle::OracleRunOutcome::Blocked { tool, program, hint });
     }
 
-    // Snapshot the indexed shas BEFORE spawning (#83). The query itself is a cheap read, but
-    // `open_index` may upgrade a stale graph index (a WRITE — `ensure_graph_index_current`
-    // rebuilds `edges`), so the snapshot takes the write lock briefly and releases it before the
-    // subprocess spawns (#88 review). The join later requires every verdict's documents to still
-    // carry these shas, so a file the watcher reindexes ANYWHERE in the spawn → join window —
-    // including DURING the subprocess, which the post-exit `production_sha` snapshot cannot see —
-    // is skipped, never mis-joined. A reindex slipping in between this lock release and the spawn
-    // is detected by the same gate.
-    // Stamp `started_at` INSIDE the same write-lock as the pre-spawn snapshot, so no watcher
-    // reindex can land between reading the indexed state and recording the start. Under the lock,
-    // started_at corresponds exactly to the indexed state this run covers: ≥ that indexed_at (so a
-    // run covering fresh state isn't falsely judged stale even after a long lock wait) yet before
-    // any mid-run reindex (so a run that misses one IS judged stale). (#145 + #146 review)
-    let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
-        Ok((rag_rat_base::time::now_ms(), db.oracle_pre_spawn_snapshot()?))
-    })?;
-    let scip_output = config
-        .database
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(std::env::temp_dir)
-        .join(format!("rag-rat-oracle-{}.scip", std::process::id()));
-    let production = rag_rat_oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
-    let _ = fs::remove_file(&scip_output);
-    match production? {
-        rag_rat_oracle::ScipProduction::Blocked { tool, program, hint } => {
+    match produce_scip_outside_lock(config, tool, "rag-rat-oracle")? {
+        ScipHandoff::Blocked { tool, program, hint } => {
             eprintln!("oracle: {hint}");
             print_output(&rag_rat_oracle::OracleRunOutcome::Blocked { tool, program, hint })
         },
-        rag_rat_oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+        ScipHandoff::Produced { started_at_ms, pre_spawn_sha, version, bytes, production_sha } => {
             // The join's content gate revalidates against current disk bytes under the lock;
             // `production_sha` (per-document disk hashes captured the instant the subprocess
             // finished) pins the `.scip` to the content it was built against (#82 TOCTOU); and
@@ -160,6 +137,59 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
             }))
         },
     }
+}
+
+pub(crate) enum ScipHandoff {
+    Blocked {
+        tool: String,
+        program: String,
+        hint: String,
+    },
+    Produced {
+        started_at_ms: i64,
+        pre_spawn_sha: std::collections::HashMap<String, String>,
+        version: String,
+        bytes: Vec<u8>,
+        production_sha: std::collections::HashMap<String, String>,
+    },
+}
+
+/// Snapshot under the writer lock, produce outside it, and hand both content pins to the join.
+pub(crate) fn produce_scip_outside_lock(
+    config: &Config,
+    tool: rag_rat_oracle::OracleTool,
+    stem: &str,
+) -> anyhow::Result<ScipHandoff> {
+    // Snapshot the indexed shas BEFORE spawning (#83). The query itself is a cheap read, but
+    // `open_index` may upgrade a stale graph index (a WRITE — `ensure_graph_index_current`
+    // rebuilds `edges`), so the snapshot takes the write lock briefly and releases it before the
+    // subprocess spawns (#88 review). The join later requires every verdict's documents to still
+    // carry these shas, so a file the watcher reindexes ANYWHERE in the spawn → join window —
+    // including DURING the subprocess, which the post-exit `production_sha` snapshot cannot see —
+    // is skipped, never mis-joined. A reindex slipping in between this lock release and the spawn
+    // is detected by the same gate.
+    // Stamp `started_at` INSIDE the same write-lock as the pre-spawn snapshot, so no watcher
+    // reindex can land between reading the indexed state and recording the start. Under the lock,
+    // started_at corresponds exactly to the indexed state this run covers: ≥ that indexed_at (so a
+    // run covering fresh state isn't falsely judged stale even after a long lock wait) yet before
+    // any mid-run reindex (so a run that misses one IS judged stale). (#145 + #146 review)
+    let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
+        Ok((rag_rat_base::time::now_ms(), db.oracle_pre_spawn_snapshot()?))
+    })?;
+    let scip_output = config
+        .database
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("{stem}-{}.scip", std::process::id()));
+    let production = rag_rat_oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
+    let _ = fs::remove_file(&scip_output);
+    Ok(match production? {
+        rag_rat_oracle::ScipProduction::Blocked { tool, program, hint } =>
+            ScipHandoff::Blocked { tool, program, hint },
+        rag_rat_oracle::ScipProduction::Produced { version, bytes, production_sha } =>
+            ScipHandoff::Produced { started_at_ms, pre_spawn_sha, version, bytes, production_sha },
+    })
 }
 
 /// `rag-rat oracle status` — verdict counts for the latest run in this checkout, plus whether the
@@ -305,22 +335,17 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
         {
             anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
         }
-        let (started_at_ms, pre_spawn_sha) = with_oracle_write_lock(config, |db| {
-            Ok((rag_rat_base::time::now_ms(), db.oracle_pre_spawn_snapshot()?))
-        })?;
-        let scip_output = config
-            .database
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(std::env::temp_dir)
-            .join(format!("rag-rat-oracle-report-{}.scip", std::process::id()));
-        let production = rag_rat_oracle::produce_scip_with_tool(tool, &config.root, &scip_output);
-        let _ = fs::remove_file(&scip_output);
-        match production? {
-            rag_rat_oracle::ScipProduction::Blocked { hint, .. } => {
+        match produce_scip_outside_lock(config, tool, "rag-rat-oracle-report")? {
+            ScipHandoff::Blocked { hint, .. } => {
                 anyhow::bail!("oracle tool for corpus `{}` unavailable: {hint}", profile.corpus_id);
             },
-            rag_rat_oracle::ScipProduction::Produced { version, bytes, production_sha } => {
+            ScipHandoff::Produced {
+                started_at_ms,
+                pre_spawn_sha,
+                version,
+                bytes,
+                production_sha,
+            } => {
                 let provenance = rag_rat_oracle::RunProvenance {
                     // Fold the pinned-toolchain fingerprint into the probed `--version` so a
                     // lockfile bump that changes the indexer's output breaks Δ
@@ -476,37 +501,19 @@ mod tests {
     use crate::cli::{OracleArgs, OracleCommand, OracleRunArgs, OracleToolArg};
 
     fn temp_config() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
-        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-oracle-lock");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
-            .unwrap();
-        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
-        let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
-            database_key_pinned: true,
-            database: config_root.join(".rag-rat/index.sqlite"),
-            root: config_root,
-            targets: vec![ResolvedTarget {
+        let (root, config) =
+            crate::test_support::scratch_config("cli-oracle-lock", ResolvedTarget {
                 name: "rust".to_string(),
                 language: Language::Rust,
                 directories: vec![PathBuf::from("src")],
                 include: vec!["src/".to_string()],
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
-            }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
-        };
+            });
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
+            .unwrap();
+
         (root, config)
     }
 
@@ -536,10 +543,6 @@ mod tests {
         // A target carrying the SAME default filters the simple `[target_bindings]` form renders
         // (`include = ["**/*.rs"]`, no exclude), so the bindings-match check accepts it.
         let config_with = |include: Vec<String>, exclude: Vec<String>| Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             root: PathBuf::from("/x"),
             database: PathBuf::from("/x/db"),
@@ -551,15 +554,8 @@ mod tests {
                 exclude,
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         let config = config_with(vec!["**/*.rs".to_string()], Vec::new());
         let profile = |dirs: &[&str]| {
