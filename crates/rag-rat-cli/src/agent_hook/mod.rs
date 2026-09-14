@@ -1184,9 +1184,7 @@ fn format_clone_warning(matches: &[TextCloneMatch]) -> Option<String> {
 /// - `Err(_)` → treat as not live (conservative).
 pub fn watcher_state(config: &Config) -> (bool /* live */, bool /* enabled */) {
     let enabled = config.watch.enabled && std::env::var_os("RAG_RAT_NO_WATCH").is_none();
-    let base_dir =
-        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
-    let election_path = locks::election_lock_path(&base_dir, &config.root);
+    let election_path = locks::election_lock_path_for(config);
     // try_acquire: Ok(None) means the lock is held (watcher is live).
     let live = matches!(locks::FileLock::try_acquire(&election_path), Ok(None));
     (live, enabled)
