@@ -174,8 +174,7 @@ pub(super) fn run_verdict_pass(
     if queue.is_empty() {
         return Ok(());
     }
-    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
+    let (scope, repo_id) = failure::pass_repo_scope(conn)?;
     // Informational only: the commit the index is currently at, recorded so a note describing
     // unmerged in-flight work is reviewable rather than looking arbitrarily stale.
     let checked_against_commit = indexed_commit(conn, &scope)?;
@@ -188,15 +187,8 @@ pub(super) fn run_verdict_pass(
         let pack = evidence_pack(conn, &entry.memory_id)?;
         let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
         let content_hash = verify::note_content_hash(&entry.title, &entry.body);
-        let failure_stamp = FailureStamp {
-            memory_id: &entry.memory_id,
-            repo_id,
-            pass: DreamModelPass::Verify,
-            content_hash: &content_hash,
-            checked_inputs_hash: Some(&inputs_hash),
-            prompt_version: PROMPT_VERSION,
-            model_id: pass.model.model_id(),
-        };
+        let failure_stamp =
+            failure_stamp(&entry, &repo_id, &content_hash, &inputs_hash, pass.model.model_id());
         if failure::blocking_failure_is_current(conn, &failure_stamp)? {
             continue;
         }
@@ -212,7 +204,7 @@ pub(super) fn run_verdict_pass(
             super::removal_guarded_write_tx(conn, &scope, |tx| {
                 record_uncitable(tx, Uncitable {
                     memory_id: &entry.memory_id,
-                    repo_id,
+                    repo_id: &repo_id,
                     title: &entry.title,
                     body: &entry.body,
                     checked_inputs_hash: &inputs_hash,
@@ -248,7 +240,7 @@ pub(super) fn run_verdict_pass(
         super::removal_guarded_write_tx(conn, &scope, |tx| {
             record_verdict(tx, RecordVerdict {
                 memory_id: &entry.memory_id,
-                repo_id,
+                repo_id: &repo_id,
                 title: &entry.title,
                 body: &entry.body,
                 accepted: &accepted,
@@ -277,8 +269,7 @@ pub(super) fn verification_pending(
     budget: usize,
     model_id: &str,
 ) -> anyhow::Result<bool> {
-    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
+    let (scope, repo_id) = failure::pass_repo_scope(conn)?;
     let mut considered = 0usize;
     for entry in verification_queue(conn, now_ms)? {
         if considered >= budget {
@@ -286,15 +277,7 @@ pub(super) fn verification_pending(
         }
         let inputs_hash = verify::checked_inputs_hash(conn, &entry.memory_id, &scope)?;
         let content_hash = verify::note_content_hash(&entry.title, &entry.body);
-        let failure_stamp = FailureStamp {
-            memory_id: &entry.memory_id,
-            repo_id,
-            pass: DreamModelPass::Verify,
-            content_hash: &content_hash,
-            checked_inputs_hash: Some(&inputs_hash),
-            prompt_version: PROMPT_VERSION,
-            model_id,
-        };
+        let failure_stamp = failure_stamp(&entry, &repo_id, &content_hash, &inputs_hash, model_id);
         if failure::blocking_failure_is_current(conn, &failure_stamp)? {
             continue;
         }
@@ -304,6 +287,27 @@ pub(super) fn verification_pending(
         }
     }
     Ok(false)
+}
+
+/// The verify pass's failure stamp for one queued entry — keyed on the note's content hash AND its
+/// checked-inputs hash under the verdict [`PROMPT_VERSION`]. The runner and its zero-work probe
+/// both build it here, so they gate on the same stamp shape.
+fn failure_stamp<'a>(
+    entry: &'a VerificationQueueEntry,
+    repo_id: &'a str,
+    content_hash: &'a str,
+    inputs_hash: &'a str,
+    model_id: &'a str,
+) -> FailureStamp<'a> {
+    FailureStamp {
+        memory_id: &entry.memory_id,
+        repo_id,
+        pass: DreamModelPass::Verify,
+        content_hash,
+        checked_inputs_hash: Some(inputs_hash),
+        prompt_version: PROMPT_VERSION,
+        model_id,
+    }
 }
 
 /// Ask the model once, parse, and run the fabrication guard: EVERY EVIDENCE line must appear in the

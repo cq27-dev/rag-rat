@@ -74,8 +74,7 @@ pub(super) fn run_compact_pass(
     if queue.is_empty() {
         return Ok(());
     }
-    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
+    let (scope, repo_id) = failure::pass_repo_scope(conn)?;
 
     let mut processed = 0usize;
     for entry in queue {
@@ -83,15 +82,7 @@ pub(super) fn run_compact_pass(
             break;
         }
         let content_hash = super::verify::note_content_hash(&entry.title, &entry.body);
-        let failure_stamp = FailureStamp {
-            memory_id: &entry.memory_id,
-            repo_id,
-            pass: DreamModelPass::Compact,
-            content_hash: &content_hash,
-            checked_inputs_hash: None,
-            prompt_version: COMPACT_PROMPT_VERSION,
-            model_id: pass.model.model_id(),
-        };
+        let failure_stamp = failure_stamp(&entry, &repo_id, &content_hash, pass.model.model_id());
         if failure::blocking_failure_is_current(conn, &failure_stamp)? {
             continue;
         }
@@ -115,7 +106,7 @@ pub(super) fn run_compact_pass(
         super::removal_guarded_write_tx(conn, &scope, |tx| {
             record_summary(tx, RecordSummary {
                 memory_id: &entry.memory_id,
-                repo_id,
+                repo_id: &repo_id,
                 title: &entry.title,
                 body: &entry.body,
                 summary: &summary,
@@ -200,25 +191,36 @@ pub(super) fn compaction_pending(
     if budget == 0 {
         return Ok(false);
     }
-    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
+    let (_scope, repo_id) = failure::pass_repo_scope(conn)?;
     for entry in compaction_queue(conn)? {
         let content_hash = super::verify::note_content_hash(&entry.title, &entry.body);
-        let failure_stamp = FailureStamp {
-            memory_id: &entry.memory_id,
-            repo_id,
-            pass: DreamModelPass::Compact,
-            content_hash: &content_hash,
-            checked_inputs_hash: None,
-            prompt_version: COMPACT_PROMPT_VERSION,
-            model_id,
-        };
+        let failure_stamp = failure_stamp(&entry, &repo_id, &content_hash, model_id);
         if failure::blocking_failure_is_current(conn, &failure_stamp)? {
             continue;
         }
         return Ok(true);
     }
     Ok(false)
+}
+
+/// The compact pass's failure stamp for one queued entry — keyed on the note's content hash alone
+/// (compaction reads no evidence, so no checked-inputs hash) under [`COMPACT_PROMPT_VERSION`]. The
+/// runner and its zero-work probe both build it here, so they gate on the same stamp shape.
+fn failure_stamp<'a>(
+    entry: &'a CompactionEntry,
+    repo_id: &'a str,
+    content_hash: &'a str,
+    model_id: &'a str,
+) -> FailureStamp<'a> {
+    FailureStamp {
+        memory_id: &entry.memory_id,
+        repo_id,
+        pass: DreamModelPass::Compact,
+        content_hash,
+        checked_inputs_hash: None,
+        prompt_version: COMPACT_PROMPT_VERSION,
+        model_id,
+    }
 }
 
 /// Ask the model once, strip any think block, and run the deterministic acceptance guards. On a
