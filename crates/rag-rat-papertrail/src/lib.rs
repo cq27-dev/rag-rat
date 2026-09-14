@@ -210,8 +210,24 @@ pub struct PapertrailSyncError {
     pub tracker: Tracker,
     pub project: String,
     pub item_key: String,
-    pub status: String,
+    pub status: SyncErrorStatus,
     pub error: String,
+}
+
+/// Why an entry landed in [`PapertrailSyncReport::errors`]; serialized as the entry's `status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncErrorStatus {
+    /// The binding's provider has no native mirror client yet.
+    ProviderClientPending,
+    /// The binding's client could not be built (credential resolution or transport setup).
+    AuthenticationOrTransport,
+    /// The mirror walk, or a reference-driven fetch, failed.
+    Failed,
+    /// The item mirror landed but the attested-closers walk failed.
+    AttestedWalkFailed,
+    /// A reference-driven fetch found no such item.
+    NotFound,
 }
 
 #[derive(Debug, Clone)]
@@ -1077,6 +1093,29 @@ mod token_tests {
                 PapertrailErrorClass::from_db_str(rejected).is_err(),
                 "must reject `{rejected}`"
             );
+        }
+    }
+
+    #[test]
+    fn report_tokens_serialize_exactly() {
+        // Both ride the sync report JSON: the derived serde tokens are the persisted spelling.
+        for (reason, token) in [
+            (transport::PauseReason::RetryAfter, "retry_after"),
+            (transport::PauseReason::QuotaReserve, "quota_reserve"),
+            (transport::PauseReason::RequestBudget, "request_budget"),
+            (transport::PauseReason::PassBudget, "pass_budget"),
+        ] {
+            assert_eq!(serde_json::to_value(reason).unwrap(), token);
+            assert_eq!(reason.as_str(), token);
+        }
+        for (status, token) in [
+            (SyncErrorStatus::ProviderClientPending, "provider_client_pending"),
+            (SyncErrorStatus::AuthenticationOrTransport, "authentication_or_transport"),
+            (SyncErrorStatus::Failed, "failed"),
+            (SyncErrorStatus::AttestedWalkFailed, "attested_walk_failed"),
+            (SyncErrorStatus::NotFound, "not_found"),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), token);
         }
     }
 

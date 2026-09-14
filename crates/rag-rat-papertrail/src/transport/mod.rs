@@ -13,6 +13,7 @@ mod governor;
 
 pub(crate) use auth::*;
 pub(crate) use client::*;
+pub use governor::PauseReason;
 pub(crate) use governor::*;
 
 // Not test-gated: the engine crate's autosync tests drive mirror flights through this stub, so
