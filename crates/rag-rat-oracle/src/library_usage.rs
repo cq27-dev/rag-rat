@@ -11,6 +11,8 @@
 //! Surfacing-not-asserting for non-deterministic drift is the deliberate design, mirroring the
 //! issue's guidance.
 
+use std::collections::HashMap;
+
 use rag_rat_base::checkout::CheckoutRef;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -216,7 +218,8 @@ pub fn check_library_usage(
 /// scanned WITHOUT contract text, monikers are ranked on the cheap `(deprecated, call_count)`
 /// fields, and only the surviving top-`limit` monikers materialize their doc/signature. So a symbol
 /// called thousands of times with a large docstring never repeats that docstring per call, and the
-/// `limit` bounds the doc/signature payload (not the whole dependency surface).
+/// `limit` bounds the doc/signature payload (not the whole dependency surface). The phases are the
+/// three calls below; the ranking and the truncation sit between the second and third on purpose.
 fn check_library_usage_inner(
     conn: &Connection,
     checkout: CheckoutRef<'_>,
@@ -227,30 +230,85 @@ fn check_library_usage_inner(
         return Ok(LibraryUsageReport::empty(LibraryUsageStatus::NoOracleRun));
     }
 
-    let package_filter = opts.package.as_deref().map(str::trim).filter(|pkg| !pkg.is_empty());
-
-    // LIGHTWEIGHT rank/coverage index: `moniker -> deprecated` flag, NO doc/signature text.
-    // Presence means a contract exists; the value is the asserted verdict. Loading only the
-    // flag keeps the scan + ranking cheap — the heavy doc/signature bodies are fetched below
-    // for SURVIVING entries only, so the payload is bounded by `limit`, not by the dependency
-    // surface. Monikers are tool-unique (the SCIP scheme names the tool), so merging tools is
-    // collision-free. An EMPTY index means the indexer emitted no `index.external_symbols` (the
-    // `no_external_symbols` diagnostic) — but we still scan the call sites so the coverage
-    // counts reflect the real gap.
-    let mut flags: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    for (tool, _) in &runs {
-        for (moniker, deprecated) in load_contract_flags(conn, *tool, checkout)? {
-            flags.insert(moniker, deprecated);
-        }
-    }
+    let flags = contract_flag_index(conn, &runs, checkout)?;
     let no_contracts = flags.is_empty();
+    let (agg, counts) = aggregate_call_sites(conn, &runs, checkout, opts, &flags)?;
 
-    // Group external call sites by moniker — counts + (deterministically capped) locations only.
-    let mut agg: std::collections::HashMap<String, MonikerAgg> = std::collections::HashMap::new();
-    let mut total = 0usize;
-    let mut without_info = 0usize;
-    let mut deprecated_sites = 0usize;
-    for (tool, tool_version) in &runs {
+    let distinct_monikers = agg.len();
+    // Rank on the cheap fields (deprecated first — the actionable ones — then most-called, then
+    // moniker for stability) and truncate to `limit` BEFORE any doc/signature is loaded (`0` yields
+    // no entries; the summary counts above still cover the full pre-limit set).
+    let mut ranked: Vec<(String, MonikerAgg)> = agg.into_iter().collect();
+    ranked.sort_by(|(a_mon, a), (b_mon, b)| {
+        b.deprecated.cmp(&a.deprecated).then(b.call_count.cmp(&a.call_count)).then(a_mon.cmp(b_mon))
+    });
+    ranked.truncate(opts.limit);
+
+    let entries = materialize_entries(conn, &runs, checkout, ranked)?;
+
+    // `no_external_symbols` when the indexer emitted no contracts (the useful diagnostic), else
+    // `ok`. Either way the coverage counts above are populated from the real call-site scan — so a
+    // repo whose indexer omits `index.external_symbols` still sees HOW MANY external calls have no
+    // contract (`total_external_call_sites` / `call_sites_without_signature_info`), not a bare
+    // zero.
+    let status =
+        if no_contracts { LibraryUsageStatus::NoExternalSymbols } else { LibraryUsageStatus::Ok };
+
+    Ok(LibraryUsageReport {
+        note: note_for(&status),
+        status,
+        total_external_call_sites: counts.total,
+        distinct_monikers,
+        deprecated_call_sites: counts.deprecated_sites,
+        call_sites_without_signature_info: counts.without_info,
+        entries,
+    })
+}
+
+/// The coverage tallies [`aggregate_call_sites`] takes over the FULL pre-limit call-site set.
+#[derive(Default)]
+struct CoverageCounts {
+    /// External call sites that passed the filters.
+    total: usize,
+    /// Of those, the ones whose moniker has no contract.
+    without_info: usize,
+    /// Of those, the ones whose contract is deprecated.
+    deprecated_sites: usize,
+}
+
+/// Phase one: the LIGHTWEIGHT rank/coverage index, `moniker -> deprecated` flag with NO
+/// doc/signature text. Presence means a contract exists; the value is the asserted verdict.
+/// Loading only the flag keeps the scan + ranking cheap — the heavy doc/signature bodies are
+/// fetched in [`materialize_entries`] for SURVIVING entries only, so the payload is bounded by
+/// `limit`, not by the dependency surface. Monikers are tool-unique (the SCIP scheme names the
+/// tool), so merging tools is collision-free. An EMPTY index means the indexer emitted no
+/// `index.external_symbols` (the `no_external_symbols` diagnostic) — but the call sites are still
+/// scanned so the coverage counts reflect the real gap.
+fn contract_flag_index(
+    conn: &Connection,
+    runs: &[(OracleTool, String)],
+    checkout: CheckoutRef<'_>,
+) -> anyhow::Result<HashMap<String, bool>> {
+    let mut flags = HashMap::new();
+    for (tool, _) in runs {
+        flags.extend(load_contract_flags(conn, *tool, checkout)?);
+    }
+    Ok(flags)
+}
+
+/// Phase two: group external call sites by moniker — counts + (deterministically capped)
+/// locations only, no contract text — and tally coverage over every site the filters admit.
+fn aggregate_call_sites(
+    conn: &Connection,
+    runs: &[(OracleTool, String)],
+    checkout: CheckoutRef<'_>,
+    opts: &LibraryUsageOptions,
+    flags: &HashMap<String, bool>,
+) -> anyhow::Result<(HashMap<String, MonikerAgg>, CoverageCounts)> {
+    let package_filter = opts.package.as_deref().map(str::trim).filter(|pkg| !pkg.is_empty());
+    let mut agg: HashMap<String, MonikerAgg> = HashMap::new();
+    let mut counts = CoverageCounts::default();
+    for (tool, tool_version) in runs {
         for site in external_call_sites(conn, *tool, tool_version, checkout, opts)? {
             // The package filter is applied here (not in SQL) because the package component is
             // extracted by `scip::symbol::parse_symbol`, not a stored column.
@@ -265,13 +323,13 @@ fn check_library_usage_inner(
             if opts.deprecated_only && deprecated != Some(true) {
                 continue;
             }
-            total += 1;
+            counts.total += 1;
             let Some(deprecated) = deprecated else {
-                without_info += 1;
+                counts.without_info += 1;
                 continue;
             };
             if deprecated {
-                deprecated_sites += 1;
+                counts.deprecated_sites += 1;
             }
             let entry = agg.entry(site.moniker).or_insert_with(|| MonikerAgg {
                 call_count: 0,
@@ -293,31 +351,27 @@ fn check_library_usage_inner(
             entry.call_count += 1;
         }
     }
+    Ok((agg, counts))
+}
 
-    let distinct_monikers = agg.len();
-    // Rank on the cheap fields (deprecated first — the actionable ones — then most-called, then
-    // moniker for stability) and truncate to `limit` BEFORE any doc/signature is loaded (`0` yields
-    // no entries; the summary counts above still cover the full pre-limit set).
-    let mut ranked: Vec<(String, MonikerAgg)> = agg.into_iter().collect();
-    ranked.sort_by(|(a_mon, a), (b_mon, b)| {
-        b.deprecated.cmp(&a.deprecated).then(b.call_count.cmp(&a.call_count)).then(a_mon.cmp(b_mon))
-    });
-    ranked.truncate(opts.limit);
-
-    // NOW fetch the heavy contract bodies — for the SURVIVING monikers only — so the doc/signature
-    // payload materialized is bounded by `limit`, not by the whole dependency surface.
+/// Phase three: NOW fetch the heavy contract bodies — for the SURVIVING (ranked + truncated)
+/// monikers only — so the doc/signature payload materialized is bounded by `limit`, not by the
+/// whole dependency surface, and assemble one entry per survivor.
+fn materialize_entries(
+    conn: &Connection,
+    runs: &[(OracleTool, String)],
+    checkout: CheckoutRef<'_>,
+    ranked: Vec<(String, MonikerAgg)>,
+) -> anyhow::Result<Vec<LibraryUsageEntry>> {
     let survivors: Vec<&str> = ranked.iter().map(|(moniker, _)| moniker.as_str()).collect();
-    let mut contracts: std::collections::HashMap<String, Contract> =
-        std::collections::HashMap::new();
+    let mut contracts: HashMap<String, Contract> = HashMap::new();
     if !survivors.is_empty() {
-        for (tool, _) in &runs {
-            for (moniker, contract) in load_contracts_for(conn, *tool, checkout, &survivors)? {
-                contracts.insert(moniker, contract);
-            }
+        for (tool, _) in runs {
+            contracts.extend(load_contracts_for(conn, *tool, checkout, &survivors)?);
         }
     }
 
-    let entries = ranked
+    Ok(ranked
         .into_iter()
         .map(|(moniker, agg)| {
             let contract = contracts.get(&moniker).expect("survivor monikers all carry a contract");
@@ -334,25 +388,7 @@ fn check_library_usage_inner(
                 call_sites: agg.call_sites,
             }
         })
-        .collect();
-
-    // `no_external_symbols` when the indexer emitted no contracts (the useful diagnostic), else
-    // `ok`. Either way the coverage counts above are populated from the real call-site scan — so a
-    // repo whose indexer omits `index.external_symbols` still sees HOW MANY external calls have no
-    // contract (`total_external_call_sites` / `call_sites_without_signature_info`), not a bare
-    // zero.
-    let status =
-        if no_contracts { LibraryUsageStatus::NoExternalSymbols } else { LibraryUsageStatus::Ok };
-
-    Ok(LibraryUsageReport {
-        note: note_for(&status),
-        status,
-        total_external_call_sites: total,
-        distinct_monikers,
-        deprecated_call_sites: deprecated_sites,
-        call_sites_without_signature_info: without_info,
-        entries,
-    })
+        .collect())
 }
 
 /// The LIGHTWEIGHT rank/coverage index for `(tool, checkout, repo)` — `moniker` + the `deprecated`
