@@ -1628,7 +1628,7 @@ fn corrupt_accepted_wrap_aborts_prepared_plaintext_authoring_without_sealed_cont
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         let wraps = secrets::mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW).unwrap();
         tx.commit().unwrap();
-        let [wrap_hash] = wraps[..] else { panic!("this fixture's roster fits one op: {wraps:?}") };
+        let [wrap_hash] = wraps[..] else { panic!("this fixture's roster fits one op") };
         wrap_hash
     };
     conn.execute("UPDATE account_entries SET signed_bytes = X'00' WHERE entry_hash = ?1", [

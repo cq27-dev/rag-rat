@@ -1042,11 +1042,7 @@ fn memory_rebind_reanchors_and_refreshes_hash() {
 
     // The returned binding must be current and the memory hash must match the new chunk.
     assert_eq!(rebound.bindings.len(), 1);
-    assert_eq!(
-        rebound.bindings[0].anchor_status, "current",
-        "rebound binding must be current, got: {}",
-        rebound.bindings[0].anchor_status
-    );
+    assert!(rebound.bindings[0].anchor_status == "current", "rebound binding must be current");
     assert_eq!(
         rebound.source_text_hash.as_deref(),
         Some(dst_chunk_text_hash.as_str()),

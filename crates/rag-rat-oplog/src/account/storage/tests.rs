@@ -512,15 +512,15 @@ fn enrollment_bootstrap_staging_defers_projection_until_finish() {
     let mut pending: Vec<&Vec<u8>> = fixture.account_entries.iter().collect();
     let mut resolved = HashMap::new();
     while !pending.is_empty() {
-        let index = pending
-            .iter()
-            .position(|bytes| {
+        // Extract the first causal candidate without an indexed-removal panic diagnostic.
+        let bytes = pending
+            .extract_if(.., |bytes| {
                 let signed = envelope::decode_account_signed(bytes).unwrap();
                 resolved.contains_key(&signed.header.device_fingerprint)
                     || self_certifies_signer(&signed.header, &signed.payload)
             })
+            .next()
             .expect("candidate snapshot has a causal authentication root");
-        let bytes = pending.remove(index);
         let signed = envelope::decode_account_signed(bytes).unwrap();
         let signer = resolved.get(&signed.header.device_fingerprint).copied();
         stage_enrollment_bootstrap_entry_in_tx(&tx, bytes, signer, NOW + 1).unwrap();
@@ -839,15 +839,15 @@ fn enrollment_bootstrap_finish_leaves_parked_rows_for_post_commit_retry() {
     let mut pending: Vec<&Vec<u8>> = fixture.account_entries.iter().collect();
     let mut resolved = HashMap::new();
     while !pending.is_empty() {
-        let index = pending
-            .iter()
-            .position(|bytes| {
+        // Extract the first causal candidate without an indexed-removal panic diagnostic.
+        let bytes = pending
+            .extract_if(.., |bytes| {
                 let signed = envelope::decode_account_signed(bytes).unwrap();
                 resolved.contains_key(&signed.header.device_fingerprint)
                     || self_certifies_signer(&signed.header, &signed.payload)
             })
+            .next()
             .expect("candidate snapshot has a causal authentication root");
-        let bytes = pending.remove(index);
         let signed = envelope::decode_account_signed(bytes).unwrap();
         let signer = resolved.get(&signed.header.device_fingerprint).copied();
         stage_enrollment_bootstrap_entry_in_tx(&tx, bytes, signer, NOW + 1).unwrap();
@@ -2741,7 +2741,7 @@ fn a_garbage_annex_manifest_is_refused_at_ingest() {
     let outcome = account_ingest(&conn, &garbage.signed_bytes, NOW + 1).unwrap();
     assert!(
         matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("annex op payload")),
-        "a structurally invalid manifest is rejected, not stored: {outcome:?}",
+        "a structurally invalid manifest is rejected, not stored",
     );
     assert_eq!(status(&conn, &garbage.entry_hash.into()), None, "and it never became a chain link");
 
@@ -2938,7 +2938,7 @@ fn a_sealed_snapshot_is_refused_rather_than_retained() {
     let outcome = account_ingest(&conn, &sealed.signed_bytes, NOW + 1).unwrap();
     assert!(
         matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("plaintext-signed")),
-        "a sealed snapshot is rejected: {outcome:?}",
+        "a sealed snapshot is rejected",
     );
     assert_eq!(status(&conn, &sealed.entry_hash.into()), None, "and never became a chain link");
 
@@ -2954,7 +2954,7 @@ fn a_sealed_snapshot_is_refused_rather_than_retained() {
     let outcome = account_ingest(&conn, &future_version.signed_bytes, NOW + 2).unwrap();
     assert!(
         matches!(&outcome, IngestOutcome::Rejected(err) if err.contains("plaintext-signed")),
-        "a sealed snapshot at a future op_version is refused too: {outcome:?}",
+        "a sealed snapshot at a future op_version is refused too",
     );
 
     // The rejection is scoped to the SNAPSHOT tag, not the annex log: a future annex artifact
@@ -3125,7 +3125,7 @@ fn an_authored_snapshot_verifies_and_is_selected_through_production_code() {
     tx.commit().unwrap();
 
     let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
-        panic!("the local founder is an open owner with history: {outcome:?}");
+        panic!("the local founder is an open owner with history");
     };
 
     // The claim the author made is one the verifier independently reproduces from the same
@@ -3369,7 +3369,7 @@ fn a_snapshot_parents_the_canonical_genesis_not_a_lower_hashed_impostor() {
         snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 3).unwrap();
     tx.commit().unwrap();
     let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
-        panic!("the account still folds Live despite the impostor: {outcome:?}");
+        panic!("the account still folds Live despite the impostor");
     };
 
     let stored = load_candidates(&conn, account_id)
@@ -3450,7 +3450,7 @@ fn a_snapshot_binds_the_total_tombstone_set_so_a_deep_removal_still_bars_re_enro
         snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 20).unwrap();
     tx.commit().unwrap();
     let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
-        panic!("the local founder is an open owner of a live account: {outcome:?}");
+        panic!("the local founder is an open owner of a live account");
     };
     assert_eq!(
         verify_stored_snapshots(&conn, account_id).unwrap(),
@@ -5076,10 +5076,7 @@ fn a_malformed_op_payload_is_rejected_not_stored() {
     };
     let signed = sign_account_entry(&founder.secret, &header, &[0xff, 0xff, 0xff]).unwrap();
     let out = account_ingest(&conn, &signed.signed_bytes, NOW).unwrap();
-    assert!(
-        matches!(out, IngestOutcome::Rejected(_)),
-        "a malformed op payload is rejected: {out:?}"
-    );
+    assert!(matches!(out, IngestOutcome::Rejected(_)), "a malformed op payload is rejected");
     assert_eq!(status(&conn, &signed.entry_hash.into()), None, "and is never stored");
 }
 

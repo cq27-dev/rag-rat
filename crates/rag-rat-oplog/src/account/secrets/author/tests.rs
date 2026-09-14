@@ -41,7 +41,7 @@ fn mint_committed(conn: &Connection, stream: StreamId) -> AccountEntryHash {
     // These fixtures have small rosters, so the fan-out is one op. Asserted rather than
     // indexed, so a future fixture that grows past one envelope fails here instead of silently
     // testing only its first chunk.
-    let [hash] = hashes[..] else { panic!("expected a single wrap op: {hashes:?}") };
+    let [hash] = hashes[..] else { panic!("expected a single wrap op") };
     hash
 }
 
@@ -814,7 +814,7 @@ fn a_nonzero_epoch_mint_round_trips_through_the_op() {
     let hashes = author_stream_key_wrap_in_tx(&tx, stream, &key, 7, NOW).expect("mint at epoch 7");
     tx.commit().unwrap();
 
-    let [hash] = hashes[..] else { panic!("expected a single wrap op: {hashes:?}") };
+    let [hash] = hashes[..] else { panic!("expected a single wrap op") };
     let wrap = stored_wrap(&conn, &hash);
     assert_eq!(wrap.key_epoch, 7, "the op carries the requested nonzero epoch");
     let device = local_device(&conn, NOW).unwrap();
@@ -974,7 +974,7 @@ fn ensure_rotates_for_an_owner_then_reports_current() {
     let RotationOutcome::Rotated(rotated) = ensure_committed(&conn, stream) else {
         panic!("an owner with a stale current-wrap recipient rotates");
     };
-    let [rotated] = rotated[..] else { panic!("expected a single wrap op: {rotated:?}") };
+    let [rotated] = rotated[..] else { panic!("expected a single wrap op") };
     assert_eq!(stored_wrap(&conn, &rotated).key_epoch, 1, "ensure rotated to epoch 1");
     assert_eq!(status(&conn, &rotated), Some(("accepted".to_string(), None)));
 
@@ -1133,7 +1133,7 @@ fn rotate_committed(conn: &Connection, stream: StreamId) -> AccountEntryHash {
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
     let hashes = rotate_stream_key_in_tx(&tx, stream, NOW).expect("rotate");
     tx.commit().unwrap();
-    let [hash] = hashes[..] else { panic!("expected a single wrap op: {hashes:?}") };
+    let [hash] = hashes[..] else { panic!("expected a single wrap op") };
     hash
 }
 

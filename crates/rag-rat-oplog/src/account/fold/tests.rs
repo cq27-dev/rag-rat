@@ -3195,7 +3195,7 @@ fn a_device_remove_installs_a_queryable_secrets_register() {
             AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
             "owner_secrets_authority device_boundary reflects the secrets register",
         ),
-        other => panic!("expected an effective owner-secrets authority, got {other:?}"),
+        _ => panic!("expected an effective owner-secrets authority"),
     }
 }
 
@@ -3226,7 +3226,7 @@ fn an_owner_demote_secrets_cut_bounds_the_incarnation() {
             AuthorityBoundary::Cut { seq: 0, hash: AccountEntryHash::from_bytes(s0) },
             "owner_secrets_authority incarnation_boundary reflects the secrets register",
         ),
-        other => panic!("expected an effective owner-secrets authority, got {other:?}"),
+        _ => panic!("expected an effective owner-secrets authority"),
     }
 }
 
