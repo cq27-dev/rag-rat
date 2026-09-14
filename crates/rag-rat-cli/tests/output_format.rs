@@ -68,11 +68,16 @@ fn cli_defaults_to_toon_and_json_flag_flips_to_json() {
 
 /// Every read command that prints structured output through `print_output` must honor the global
 /// format: TOON object by default (not JSON-parseable), valid JSON under `--json`. Covers the
-/// per-handler output branches (`doctor`/`brief`/`clusters`) the format flag threads through.
+/// per-handler output branches, including the human query explanation.
 #[test]
 fn read_commands_honor_global_format() {
     let (_root, config_path) = build_index();
-    for args in [&["doctor"][..], &["brief"][..], &["clusters"][..]] {
+    for args in [
+        &["doctor"][..],
+        &["brief"][..],
+        &["clusters"][..],
+        &["query", "database", "--explain"][..],
+    ] {
         let toon = run(&config_path, false, args);
         assert!(
             serde_json::from_str::<serde_json::Value>(&toon).is_err(),
@@ -93,4 +98,26 @@ fn memory_list_json_flag_emits_json() {
     let parsed: serde_json::Value = serde_json::from_str(&json)
         .unwrap_or_else(|err| panic!("`memory list --json` is not valid JSON ({err}):\n{json}"));
     assert!(parsed.is_array(), "expected a JSON array of memory summaries, got:\n{json}");
+}
+
+#[test]
+fn clone_explain_honors_json_and_preserves_the_human_view() {
+    let (root, config_path) = build_index();
+    let body = "pub fn cloned_helper(x: i32, y: i32) -> i32 {\n    x + y + 42\n}\n";
+    fs::write(root.join("src/lib.rs"), format!("{body}pub mod a;\npub mod b;\n")).unwrap();
+    fs::write(root.join("src/a.rs"), body).unwrap();
+    fs::write(root.join("src/b.rs"), body).unwrap();
+    let config = Config::load(&config_path).unwrap();
+    drop(rag_rat_core::IndexDatabase::rebuild(&config).unwrap());
+    let listed: serde_json::Value =
+        serde_json::from_str(&run(&config_path, true, &["clones", "--min-similarity", "0.5"]))
+            .unwrap();
+    let class = &listed["classes"][0];
+    let key = class["class_key"].as_str().expect("planted clone class");
+    let args = ["clones", "--min-similarity", "0.5", "--explain", key];
+    assert!(run(&config_path, false, &args).starts_with("Clone class: "));
+    let output = run(&config_path, true, &args);
+    let explained: serde_json::Value = serde_json::from_str(&output)
+        .unwrap_or_else(|err| panic!("clone explanation is not JSON ({err}): {output}"));
+    assert_eq!(&explained, class);
 }

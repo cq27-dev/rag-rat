@@ -4,8 +4,7 @@
 use rag_rat_base::config::Config;
 
 use crate::cli::{BriefArgs, ClustersArgs, ImportantSymbolsArgs, QueryArgs};
-use crate::open_index;
-use crate::render::{print_output, print_query_explain};
+use crate::{open_index, render};
 
 pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
     let query = args.query.join(" ");
@@ -15,8 +14,7 @@ pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     if args.explain {
         let explanation = db.search_explain(&query, 10, false)?;
-        print_query_explain(&explanation);
-        return Ok(());
+        return render::print_output_or(&explanation, || render::print_query_explain(&explanation));
     }
     // Attach the drive-by distilled decision records here — the same enrichment the semantic_search
     // MCP handler runs — so `rag-rat query <q> --json` surfaces them (the shared `search` does not,
@@ -24,13 +22,13 @@ pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
     // almost every hit stays unchanged.
     let mut hits = db.search(&query, 10, false)?;
     db.attach_distilled_records_to_search_hits(&mut hits)?;
-    print_output(&hits)
+    render::print_output(&hits)
 }
 
 pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
     let mode = rag_rat_query::repo_brief::RepoBriefMode::parse(args.mode.as_deref())?;
-    print_output(&db.repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
+    render::print_output(&db.repo_brief(rag_rat_query::repo_brief::RepoBriefOptions {
         mode,
         limit: args.limit.unwrap_or(10),
         include_generated: args.include_generated,
@@ -40,7 +38,7 @@ pub(crate) fn brief(config: &Config, args: &BriefArgs) -> anyhow::Result<()> {
 
 pub(crate) fn clusters(config: &Config, args: &ClustersArgs) -> anyhow::Result<()> {
     let db = open_index(config)?;
-    print_output(&db.repo_clusters(rag_rat_core::query::clusters::RepoClustersOptions {
+    render::print_output(&db.repo_clusters(rag_rat_core::query::clusters::RepoClustersOptions {
         limit: args.limit.unwrap_or(10),
         include_generated: args.include_generated,
         include_memories: !args.no_memories,
@@ -61,7 +59,7 @@ pub(crate) fn important_symbols(
         auto_seed_from_diff: false,
     })?;
     apply_auto_run_ranking_hint(&mut result, config);
-    print_output(&result)
+    render::print_output(&result)
 }
 
 /// Swap the heuristic-ranking nudge to the background-oracle wording when `[oracle] auto_run` is on

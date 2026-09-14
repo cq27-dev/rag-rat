@@ -4,8 +4,7 @@
 use rag_rat_base::config::Config;
 
 use crate::cli::{ClonesArgs, ClonesForArgs};
-use crate::open_index;
-use crate::render::print_output;
+use crate::{open_index, render};
 
 pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
     // `--precompute`: the WRITER path — build/refresh the persisted clone-edge graph (#286) under a
@@ -15,7 +14,7 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
         let db = open_index(config)?;
         let report: rag_rat_core::index::CloneEdgeReport =
             db.precompute_clone_graph(args.max_seconds)?;
-        return print_output(&report);
+        return render::print_output(&report);
     }
 
     let db = open_index(config)?;
@@ -45,16 +44,15 @@ pub(crate) fn clones(config: &Config, args: &ClonesArgs) -> anyhow::Result<()> {
 
     // `--explain <CLASS_KEY>`: print a human-readable refinement breakdown for one class from the
     // SAME result set (so the explained class went through the same refine pass as the listing),
-    // instead of the JSON/TOON listing.
+    // with structured output under the global --json flag.
     if let Some(key) = &args.explain {
         let Some(class) = result.classes.iter().find(|c| &c.class_key == key) else {
             anyhow::bail!("no clone class with key `{key}` in results");
         };
-        print_clone_explain(class);
-        return Ok(());
+        return render::print_output_or(class, || print_clone_explain(class));
     }
 
-    print_output(&result)
+    render::print_output(&result)
 }
 
 /// A canonical, cross-build-STABLE recall signature of the clone classes — one line per class
@@ -205,7 +203,7 @@ pub(crate) fn clones_for(config: &Config, args: &ClonesForArgs) -> anyhow::Resul
     // The result always carries eligibility flags + completeness; a miss serializes with
     // `class: null` (symbol unique, not eligible, or unresolved) — never an error.
     let result = db.clones_for_symbol(selector)?;
-    print_output(&result)
+    render::print_output(&result)
 }
 
 #[cfg(test)]

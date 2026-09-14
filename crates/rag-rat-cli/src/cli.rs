@@ -25,8 +25,8 @@ pub(crate) struct Cli {
 
     /// Emit JSON instead of the default TOON (Token-Oriented Object Notation). TOON is denser for
     /// LLM consumers; pass --json when a JSON parser must read the output. For commands that print
-    /// a human summary by default (`reconcile --plan`, `eval`, `memory doctor`), --json also
-    /// selects their structured output.
+    /// a human result view by default, --json selects its structured output. Command-specific
+    /// fixed text formats retain their documented representation.
     #[arg(long, global = true)]
     pub json: bool,
 
