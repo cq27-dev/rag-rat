@@ -3,7 +3,6 @@
 //! and relative imports.
 use std::path::Path;
 
-use rag_rat_db::EdgeConfidence;
 use tree_sitter::Node;
 
 use crate::index::edges::*;
@@ -40,7 +39,7 @@ fn python_from_import_edges(text: &str, node: Node<'_>, path: &Path, out: &mut E
     if let Some(module) = module
         && let Some(name) = last_identifier_text(module, text)
     {
-        out.push(file_edge(path, module, text, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+        out.push(file_edge(path, module, text, name, EdgeKind::Imports));
     }
     // Record an alias for the rebind ONLY when the from-import is BOTH module-bound AND
     // RELATIVE (`from .compat import X as Y`). Two gates:
@@ -102,10 +101,9 @@ fn python_call_edges(
         out.push(symbol_edge_with_context(
             locator,
             node,
-            text,
+            Some(text),
             name,
             EdgeKind::CallsName,
-            EdgeConfidence::NameOnly,
             EdgeContext {
                 target_qualified_name: identifiers.qualified_name(),
                 receiver_hint: identifiers
@@ -161,14 +159,7 @@ fn python_class_edges(
         {
             let callee =
                 last_identifier_node(head).map(final_segment_node).map(CalleeRange::of_node);
-            out.push(symbol_edge(
-                locator,
-                base,
-                name,
-                EdgeKind::Implements,
-                EdgeConfidence::NameOnly,
-                callee,
-            ));
+            out.push(symbol_edge(locator, base, name, EdgeKind::Implements, callee));
         }
         emit_python_type_refs(base, locator, text, out);
     }
@@ -199,10 +190,9 @@ fn python_decorator_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         name,
         EdgeKind::CallsName,
-        EdgeConfidence::NameOnly,
         EdgeContext {
             target_qualified_name: identifiers.qualified_name(),
             receiver_hint: identifiers
@@ -249,7 +239,6 @@ fn emit_python_type_refs(
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             },
@@ -270,10 +259,9 @@ fn emit_python_type_refs(
                 out.push(symbol_edge_with_context(
                     locator,
                     node,
-                    "",
+                    None,
                     name,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     EdgeContext {
                         receiver_hint: receiver,
                         target_qualified_name: identifiers.qualified_name(),
@@ -568,7 +556,6 @@ fn python_import_target(
             target,
             Some(alias),
             EdgeKind::Imports,
-            EdgeConfidence::NameOnly,
             Some(scope),
         ));
         return;
@@ -581,7 +568,7 @@ fn python_import_target(
     if let Some(target) = target
         && let Some(name) = last_identifier_text(target, text)
     {
-        out.push(file_edge(path, target, text, name, EdgeKind::Imports, EdgeConfidence::NameOnly));
+        out.push(file_edge(path, target, text, name, EdgeKind::Imports));
     }
 }
 
@@ -633,7 +620,7 @@ mod python_edge_tests {
         assert_eq!(call.receiver_hint.as_deref(), Some("http"));
         // The heuristic must NOT claim exact resolution for a member call — that's the oracle's
         // job.
-        assert_eq!(call.confidence, EdgeConfidence::NameOnly);
+        assert_eq!(call.confidence, rag_rat_db::EdgeConfidence::NameOnly);
     }
 
     #[test]
@@ -646,7 +633,7 @@ mod python_edge_tests {
             .iter()
             .find(|c| c.edge_kind == EdgeKind::CallsName && c.to_name == "ClientSession")
             .expect("alias call edge");
-        assert_eq!(call.confidence, EdgeConfidence::NameOnly);
+        assert_eq!(call.confidence, rag_rat_db::EdgeConfidence::NameOnly);
     }
 
     #[test]

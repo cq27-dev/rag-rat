@@ -1,5 +1,4 @@
 //! C and C++ graph-edge extraction for the shared structural edge walk.
-use rag_rat_db::EdgeConfidence;
 
 use crate::index::edges::*;
 
@@ -16,14 +15,7 @@ pub(in crate::index::languages) fn c_like_edges(
                 .trim_matches(['<', '>', '"'])
                 .to_string();
             if !include.is_empty() {
-                out.push(file_edge(
-                    path,
-                    node,
-                    text,
-                    include,
-                    EdgeKind::Imports,
-                    EdgeConfidence::NameOnly,
-                ));
+                out.push(file_edge(path, node, text, include, EdgeKind::Imports));
             }
         },
         "call_expression" => {
@@ -37,10 +29,9 @@ pub(in crate::index::languages) fn c_like_edges(
                 out.push(symbol_edge_with_context(
                     locator,
                     node,
-                    text,
+                    Some(text),
                     name,
                     EdgeKind::CallsName,
-                    EdgeConfidence::NameOnly,
                     EdgeContext {
                         target_qualified_name: identifiers.qualified_name(),
                         receiver_hint: identifiers
@@ -60,7 +51,6 @@ pub(in crate::index::languages) fn c_like_edges(
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             }

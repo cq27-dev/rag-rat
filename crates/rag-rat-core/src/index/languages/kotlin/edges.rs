@@ -1,5 +1,4 @@
 //! Kotlin graph-edge extraction for the shared structural edge walk.
-use rag_rat_db::EdgeConfidence;
 
 use crate::index::edges::*;
 
@@ -10,14 +9,7 @@ pub(in crate::index::languages) fn kotlin_edges(
     match node.kind() {
         "import" | "import_header" | "import_directive" => {
             for name in identifiers_under(node, text) {
-                out.push(file_edge(
-                    path,
-                    node,
-                    text,
-                    name,
-                    EdgeKind::Imports,
-                    EdgeConfidence::NameOnly,
-                ));
+                out.push(file_edge(path, node, text, name, EdgeKind::Imports));
             }
         },
         "call_expression" => {
@@ -30,10 +22,9 @@ pub(in crate::index::languages) fn kotlin_edges(
                 out.push(symbol_edge_with_context(
                     locator,
                     node,
-                    text,
+                    Some(text),
                     name,
                     EdgeKind::CallsName,
-                    EdgeConfidence::NameOnly,
                     EdgeContext {
                         target_qualified_name: identifiers.qualified_name(),
                         receiver_hint: identifiers
@@ -53,7 +44,6 @@ pub(in crate::index::languages) fn kotlin_edges(
                     node,
                     receiver,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     identifiers
                         .first_node()
                         .filter(|_| identifiers.len() > 1)
@@ -73,16 +63,14 @@ pub(in crate::index::languages) fn kotlin_edges(
                     node,
                     constructor.clone(),
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     constructor_range,
                 ));
                 out.push(symbol_edge_with_context(
                     locator,
                     node,
-                    text,
+                    Some(text),
                     constructor,
                     EdgeKind::Constructs,
-                    EdgeConfidence::NameOnly,
                     EdgeContext::default(),
                     constructor_range,
                 ));
@@ -95,7 +83,6 @@ pub(in crate::index::languages) fn kotlin_edges(
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             },
@@ -106,7 +93,6 @@ pub(in crate::index::languages) fn kotlin_edges(
                     node,
                     name,
                     EdgeKind::Implements,
-                    EdgeConfidence::NameOnly,
                     last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             }

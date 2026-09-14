@@ -53,7 +53,6 @@ fn rust_use_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter
                 name,
                 Some(evidence),
                 EdgeKind::Imports,
-                EdgeConfidence::NameOnly,
                 Some(scope),
             ));
         }
@@ -61,14 +60,7 @@ fn rust_use_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter
     if is_reexport {
         for name in identifiers_under(node, text) {
             if !is_rust_path_keyword(&name) {
-                out.push(file_edge(
-                    path,
-                    node,
-                    text,
-                    name,
-                    EdgeKind::Exports,
-                    EdgeConfidence::NameOnly,
-                ));
+                out.push(file_edge(path, node, text, name, EdgeKind::Exports));
             }
         }
     }
@@ -89,7 +81,6 @@ fn rust_mod_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter
         name,
         Some(edge_evidence(node, text)),
         EdgeKind::Imports,
-        EdgeConfidence::NameOnly,
         scope,
     ));
 }
@@ -104,10 +95,9 @@ fn rust_call_edges(
         out.push(symbol_edge_with_context(
             locator,
             node,
-            text,
+            Some(text),
             name,
             EdgeKind::CallsName,
-            EdgeConfidence::NameOnly,
             EdgeContext {
                 target_qualified_name: target_qualified_name(node, text),
                 receiver_hint: scoped_receiver_name(node, text),
@@ -129,7 +119,6 @@ fn rust_call_edges(
             node,
             receiver,
             EdgeKind::ReferencesType,
-            EdgeConfidence::NameOnly,
             // The type is the receiver — the LEADING `::` segment (`Foo` in `Foo::bar()`)
             // — so anchor the range on the function path's first
             // identifier, not its tail.
@@ -213,10 +202,9 @@ fn rust_macro_edges(
         out.push(symbol_edge_with_context(
             locator,
             node,
-            text,
+            Some(text),
             name,
             EdgeKind::UsesMacro,
-            EdgeConfidence::NameOnly,
             EdgeContext::default(),
             first_identifier_node(node).map(CalleeRange::of_node),
         ));
@@ -235,7 +223,6 @@ fn rust_type_reference_edges(
             node,
             name,
             EdgeKind::ReferencesType,
-            EdgeConfidence::NameOnly,
             last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
         ));
     }
@@ -280,7 +267,6 @@ pub(super) fn rust_impl_edges(
             node,
             type_name.clone(),
             EdgeKind::ReferencesType,
-            EdgeConfidence::NameOnly,
             // `type_name` is string-split from the impl header, not a located node — no range
             // (#67).
             None,

@@ -60,14 +60,7 @@ pub(in crate::index::languages) fn swift_edges(
 fn swift_import_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter<'_>) {
     let identifiers = swift_import_identifiers(node, text);
     if !identifiers.is_empty() {
-        out.push(file_edge(
-            path,
-            node,
-            text,
-            identifiers.join("::"),
-            EdgeKind::Imports,
-            EdgeConfidence::NameOnly,
-        ));
+        out.push(file_edge(path, node, text, identifiers.join("::"), EdgeKind::Imports));
     }
 }
 
@@ -94,10 +87,9 @@ fn swift_inheritance_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         name,
         edge_kind,
-        EdgeConfidence::NameOnly,
         swift_edge_context(&identifiers),
         identifier_nodes.last().copied().map(CalleeRange::of_node),
     ));
@@ -121,10 +113,9 @@ fn swift_user_type_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         name,
         EdgeKind::ReferencesType,
-        EdgeConfidence::NameOnly,
         swift_edge_context(&identifiers),
         Some(CalleeRange::of_node(type_node)),
     ));
@@ -142,7 +133,6 @@ fn swift_type_identifier_edges(
         node,
         name,
         EdgeKind::ReferencesType,
-        EdgeConfidence::NameOnly,
         Some(CalleeRange::of_node(node)),
     ));
 }
@@ -167,7 +157,6 @@ fn swift_operator_or_shorthand_case_edges(
             node,
             node_text(case_name, text),
             EdgeKind::CallsName,
-            EdgeConfidence::NameOnly,
             Some(CalleeRange::of_node(case_name)),
         ));
         return;
@@ -185,7 +174,6 @@ fn swift_operator_or_shorthand_case_edges(
         node,
         node_text(operation, text),
         EdgeKind::UsesOperator,
-        EdgeConfidence::NameOnly,
         Some(CalleeRange::of_node(operation)),
     ));
     out.push(symbol_edge(
@@ -193,7 +181,6 @@ fn swift_operator_or_shorthand_case_edges(
         node,
         node_text(operation, text),
         EdgeKind::CallsName,
-        EdgeConfidence::NameOnly,
         Some(CalleeRange::of_node(operation)),
     ));
 }
@@ -221,10 +208,9 @@ fn swift_qualified_case_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         node_text(case_name, text),
         EdgeKind::CallsName,
-        EdgeConfidence::NameOnly,
         swift_edge_context(&identifiers),
         Some(CalleeRange::of_node(case_name)),
     ));
@@ -302,10 +288,9 @@ fn emit_swift_call_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         name.clone(),
         if constructs { EdgeKind::Constructs } else { EdgeKind::CallsName },
-        EdgeConfidence::NameOnly,
         if constructs {
             swift_edge_context(&identifiers)
         } else {
@@ -317,10 +302,9 @@ fn emit_swift_call_edges(
         out.push(symbol_edge_with_context(
             locator,
             node,
-            text,
+            Some(text),
             name,
             EdgeKind::ReferencesType,
-            EdgeConfidence::NameOnly,
             swift_edge_context(&identifiers),
             callee_range,
         ));
@@ -346,7 +330,6 @@ fn swift_macro_edges(
         node,
         node_text(name_node, text),
         EdgeKind::UsesMacro,
-        EdgeConfidence::NameOnly,
         Some(CalleeRange::of_node(name_node)),
     ));
 }
@@ -383,10 +366,9 @@ fn swift_attribute_macro_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         name.clone(),
         EdgeKind::UsesMacro,
-        EdgeConfidence::NameOnly,
         swift_edge_context(&identifiers),
         Some(CalleeRange::of_node(name_node)),
     ));
@@ -396,10 +378,9 @@ fn swift_attribute_macro_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         name,
         EdgeKind::ReferencesType,
-        EdgeConfidence::NameOnly,
         swift_edge_context(&identifiers),
         Some(CalleeRange::of_node(name_node)),
     ));
@@ -419,7 +400,6 @@ fn swift_precedence_group_edges(
         node,
         node_text(group, text),
         EdgeKind::UsesPrecedenceGroup,
-        EdgeConfidence::NameOnly,
         Some(CalleeRange::of_node(group)),
     ));
 }
@@ -445,7 +425,6 @@ fn swift_precedence_group_relation_edges(
             node,
             node_text(*dependency, text),
             EdgeKind::UsesPrecedenceGroup,
-            EdgeConfidence::NameOnly,
             Some(CalleeRange::of_node(*dependency)),
         );
         if !out.iter().any(|existing| {

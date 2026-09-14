@@ -1,5 +1,4 @@
 //! TypeScript graph-edge extraction for the shared structural edge walk.
-use rag_rat_db::EdgeConfidence;
 
 use crate::index::edges::*;
 
@@ -10,25 +9,11 @@ pub(in crate::index::languages) fn typescript_edges(
     match node.kind() {
         "import_statement" =>
             for name in identifiers_under(node, text) {
-                out.push(file_edge(
-                    path,
-                    node,
-                    text,
-                    name,
-                    EdgeKind::Imports,
-                    EdgeConfidence::NameOnly,
-                ));
+                out.push(file_edge(path, node, text, name, EdgeKind::Imports));
             },
         "export_statement" =>
             for name in identifiers_under(node, text) {
-                out.push(file_edge(
-                    path,
-                    node,
-                    text,
-                    name,
-                    EdgeKind::Exports,
-                    EdgeConfidence::NameOnly,
-                ));
+                out.push(file_edge(path, node, text, name, EdgeKind::Exports));
             },
         "call_expression" | "new_expression" => {
             let function = node.child_by_field_name("function").unwrap_or(node);
@@ -46,10 +31,9 @@ pub(in crate::index::languages) fn typescript_edges(
                 out.push(symbol_edge_with_context(
                     locator,
                     node,
-                    text,
+                    Some(text),
                     name,
                     edge_kind,
-                    EdgeConfidence::NameOnly,
                     EdgeContext {
                         target_qualified_name: identifiers.qualified_name(),
                         receiver_hint: identifiers
@@ -69,7 +53,6 @@ pub(in crate::index::languages) fn typescript_edges(
                     node,
                     receiver,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     // The type is the receiver — the FIRST segment, matching
                     // `identifiers.first()`.
                     identifiers
@@ -86,7 +69,6 @@ pub(in crate::index::languages) fn typescript_edges(
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     first_identifier_node(node).map(CalleeRange::of_node),
                 ));
             }
@@ -98,7 +80,6 @@ pub(in crate::index::languages) fn typescript_edges(
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    EdgeConfidence::NameOnly,
                     // `node` is itself the `type_identifier` token — its range is the callee
                     // range.
                     Some(CalleeRange::of_node(node)),

@@ -19,7 +19,6 @@
 
 use std::path::Path;
 
-use rag_rat_db::EdgeConfidence;
 use tree_sitter::Node;
 
 use super::super::{ReceiverFallback, ResolutionPolicy};
@@ -49,7 +48,7 @@ fn go_import_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitte
     let Some(package) = go_import_path(node, text) else {
         return;
     };
-    out.push(file_edge(path, node, text, package, EdgeKind::Imports, EdgeConfidence::NameOnly));
+    out.push(file_edge(path, node, text, package, EdgeKind::Imports));
 }
 
 /// The unquoted import path of an `import_spec`.
@@ -106,10 +105,9 @@ fn go_call_edges(
     out.push(symbol_edge_with_context(
         locator,
         node,
-        text,
+        Some(text),
         name,
         EdgeKind::CallsName,
-        EdgeConfidence::NameOnly,
         EdgeContext { target_qualified_name: None, receiver_hint, receiver_type_hint: None },
         Some(CalleeRange::of_node(name_node)),
     ));
@@ -152,7 +150,6 @@ fn go_type_reference_edges(
         node,
         name,
         EdgeKind::ReferencesType,
-        EdgeConfidence::NameOnly,
         Some(CalleeRange::of_node(node)),
     ));
 }

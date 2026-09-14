@@ -381,7 +381,6 @@ pub(crate) fn file_edge(
     text: &str,
     to_name: String,
     edge_kind: EdgeKind,
-    confidence: EdgeConfidence,
 ) -> EdgeCandidate {
     EdgeCandidate {
         from_symbol_id: None,
@@ -396,7 +395,9 @@ pub(crate) fn file_edge(
         callee_span: None,
         import_scope: None,
         edge_kind,
-        confidence,
+        // Language walks emit name-level confidence; containment and resolution supply stronger
+        // tiers.
+        confidence: EdgeConfidence::NameOnly,
     }
 }
 /// `file_edge` with caller-supplied evidence and an optional module-aware import scope, for the
@@ -404,14 +405,12 @@ pub(crate) fn file_edge(
 /// text (so the crate-aware scope re-parses every braced leaf, #97) plus the enclosing scope range
 /// and module id in the DEDICATED `import_scope_*` / `import_mod_id` columns — never the `callee_*`
 /// columns, which stay NULL on file-level edges so the oracle join is unaffected.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn file_edge_scoped(
     path: &Path,
     node: Node<'_>,
     to_name: String,
     evidence: Option<String>,
     edge_kind: EdgeKind,
-    confidence: EdgeConfidence,
     import_scope: Option<ImportScopeRange>,
 ) -> EdgeCandidate {
     EdgeCandidate {
@@ -426,7 +425,9 @@ pub(crate) fn file_edge_scoped(
         callee_span: None,
         import_scope,
         edge_kind,
-        confidence,
+        // Language walks emit name-level confidence; containment and resolution supply stronger
+        // tiers.
+        confidence: EdgeConfidence::NameOnly,
     }
 }
 /// The module-aware scope of a Rust `use_declaration` (#61): walk ancestors to the nearest body
@@ -481,28 +482,24 @@ pub(crate) fn symbol_edge(
     node: Node<'_>,
     to_name: String,
     edge_kind: EdgeKind,
-    confidence: EdgeConfidence,
     callee_span: Option<CalleeRange>,
 ) -> EdgeCandidate {
     symbol_edge_with_context(
         locator,
         node,
-        "",
+        None,
         to_name,
         edge_kind,
-        confidence,
         EdgeContext::default(),
         callee_span,
     )
 }
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn symbol_edge_with_context(
     locator: &SymbolLocator<'_>,
     node: Node<'_>,
-    text: &str,
+    evidence: Option<&str>,
     to_name: String,
     edge_kind: EdgeKind,
-    confidence: EdgeConfidence,
     context: EdgeContext,
     // Byte range of the callee identifier token (the final `::`/`.` segment), or `None` when no
     // clean identifier node is available. `node` here is the whole call/reference expression, so
@@ -517,14 +514,16 @@ pub(crate) fn symbol_edge_with_context(
         from_name: source.map(|symbol| symbol.qualified_name.clone()),
         to_name,
         target_qualified_name: context.target_qualified_name,
-        evidence: (!text.is_empty()).then(|| edge_evidence(node, text)),
+        evidence: evidence.filter(|text| !text.is_empty()).map(|text| edge_evidence(node, text)),
         receiver_hint: context.receiver_hint,
         receiver_type_hint: context.receiver_type_hint,
         source_span: span_for_node(node),
         callee_span,
         import_scope: None,
         edge_kind,
-        confidence,
+        // Language walks emit name-level confidence; containment and resolution supply stronger
+        // tiers.
+        confidence: EdgeConfidence::NameOnly,
     }
 }
 
