@@ -14,7 +14,8 @@ pub(crate) fn query(config: &Config, args: &QueryArgs) -> anyhow::Result<()> {
     }
     let db = open_index(config)?;
     if args.explain {
-        print_query_explain(&db.search_explain(&query, 10, false)?);
+        let explanation = db.search_explain(&query, 10, false)?;
+        print_query_explain(&explanation);
         return Ok(());
     }
     // Attach the drive-by distilled decision records here — the same enrichment the semantic_search
