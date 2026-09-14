@@ -324,7 +324,10 @@ impl ProjectLayout {
 /// `build/`. Only trees that cannot hold this checkout's own database are excluded — VCS
 /// internals, rag-rat's own state, clangd's index, and vendored dependencies.
 fn is_searchable_for_marker(path: &Path, name: &str) -> bool {
-    if matches!(name, "node_modules" | ".git" | ".rag-rat" | ".hg" | ".svn") {
+    if matches!(
+        name,
+        "node_modules" | ".git" | rag_rat_base::data_dir::WORKSPACE_DIR | ".hg" | ".svn"
+    ) {
         return false;
     }
     // Only clangd's OWN index is off-limits under `.cache`, not every build artifact there: a

@@ -58,7 +58,7 @@ use crate::index::git_history;
 /// `.gitignore`, but the floor guarantees them even when they don't.
 const FLOOR_DIRS: &[&str] = &[
     ".git",
-    ".rag-rat",
+    rag_rat_base::data_dir::WORKSPACE_DIR,
     ".claude",
     ".codex",
     ".omx",

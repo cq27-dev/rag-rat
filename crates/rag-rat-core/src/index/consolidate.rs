@@ -190,7 +190,7 @@ fn run_inner(config: &Config, config_path: Option<&Path>) -> anyhow::Result<Cons
         ControlFlow::Continue(source) => source,
         ControlFlow::Break(outcome) => return Ok(outcome),
     };
-    let imported = imported_marker(&source);
+    let imported = rag_rat_base::data_dir::imported_marker_path(&source);
 
     // Resolve the repo identity FIRST: the per-repo write locks are keyed by the id this run
     // registers and writes under (the A6 lock-matches-written-id rule).
@@ -361,7 +361,10 @@ fn resolve_consolidation_source(
     let mut pinned_at_target = false;
     if source == target {
         let legacy = config::default_legacy_database_path(&config.root);
-        if legacy != target && legacy.exists() && !imported_marker(&legacy).exists() {
+        if legacy != target
+            && legacy.exists()
+            && !rag_rat_base::data_dir::imported_marker_path(&legacy).exists()
+        {
             source = legacy;
             pinned_at_target = true;
         } else {
@@ -386,7 +389,7 @@ fn resolve_consolidation_source(
         anyhow::bail!("{}", pinned_refusal_message(&source, &default_legacy));
     }
 
-    let imported = imported_marker(&source);
+    let imported = rag_rat_base::data_dir::imported_marker_path(&source);
     if !source.exists() {
         return Ok(ControlFlow::Break(if imported.exists() {
             ConsolidateOutcome::AlreadyImported { imported }
@@ -483,13 +486,6 @@ fn source_registered_repo_ids(source: &Path) -> Vec<String> {
     stmt.query_map([], |row| row.get::<_, String>(0))
         .map(|rows| rows.flatten().collect())
         .unwrap_or_default()
-}
-
-/// `<source>.imported` — the marker the legacy file is renamed to after a successful import.
-fn imported_marker(source: &Path) -> PathBuf {
-    let mut name = source.as_os_str().to_os_string();
-    name.push(".imported");
-    PathBuf::from(name)
 }
 
 /// Resolve the identity consolidate registers and locks under. A non-git root with no pinned
