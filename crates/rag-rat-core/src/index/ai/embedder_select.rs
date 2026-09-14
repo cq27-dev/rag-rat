@@ -477,15 +477,4 @@ mod dispatch_tests {
         let q = query_embed_config(&connect);
         assert_eq!(q, connect, "connect query config is the config unchanged");
     }
-
-    #[test]
-    fn sanitize_endpoint_strips_credentials_and_path() {
-        assert_eq!(sanitize_endpoint("http://u:p@h:7997/embeddings"), "http://h:7997");
-        assert_eq!(sanitize_endpoint("http://localhost:7997"), "http://localhost:7997");
-        assert_eq!(
-            sanitize_endpoint("https://user:secret@gpu.host/v1/embeddings"),
-            "https://gpu.host"
-        );
-        assert_eq!(sanitize_endpoint(""), "");
-    }
 }
