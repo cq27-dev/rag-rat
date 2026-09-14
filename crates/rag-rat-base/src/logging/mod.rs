@@ -7,6 +7,7 @@
 //! span context propagating across threads/tasks. Growth is bounded by [`retention`] at init (age,
 //! count, size); size-rolling a live file within one long session is a deferred extension.
 
+use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,22 +30,34 @@ pub enum Role {
 
 impl Role {
     /// Human-facing role tag (`mcp` | `hook` | `cli:<subcommand>`).
-    pub fn as_str(&self) -> String {
+    pub fn as_str(&self) -> Cow<'static, str> {
         match self {
-            Role::Mcp => "mcp".to_string(),
-            Role::Hook => "hook".to_string(),
-            Role::Cli(sub) => format!("cli:{sub}"),
+            Role::Mcp => Cow::Borrowed("mcp"),
+            Role::Hook => Cow::Borrowed("hook"),
+            Role::Cli(sub) => Cow::Owned(format!("cli:{sub}")),
         }
     }
 
     /// Filesystem-safe file-name stem (no `:` — `cli-<subcommand>`).
-    fn file_stem(&self) -> String {
+    fn file_stem(&self) -> Cow<'static, str> {
         match self {
-            Role::Mcp => "mcp".to_string(),
-            Role::Hook => "hook".to_string(),
-            Role::Cli(sub) => format!("cli-{sub}"),
+            Role::Mcp => Cow::Borrowed("mcp"),
+            Role::Hook => Cow::Borrowed("hook"),
+            Role::Cli(sub) => Cow::Owned(format!("cli-{sub}")),
         }
     }
+
+    /// Whether `name` starts with some role's [`Self::file_stem`] plus its `-` separator — the
+    /// ownership test the retention sweep uses to stay off other apps' `*.log` files. Lives beside
+    /// `file_stem` so a new role updates both; `Cli`'s payload makes its prefix `cli-`.
+    fn owns_log_name(name: &str) -> bool {
+        ["mcp-", "hook-", "cli-"].iter().any(|prefix| name.starts_with(prefix))
+    }
+}
+
+/// A per-process log file name, `<role>-<pid>-<start_ms>.log`.
+fn log_file_name(role: &Role, pid: u32, start_ms: u128) -> String {
+    format!("{}-{pid}-{start_ms}.log", role.file_stem())
 }
 
 /// Returned by [`init_logging`] and held by the caller (`main`). Writes are BLOCKING (synchronous
@@ -94,7 +107,7 @@ fn try_init(config: &Config, role: &Role, env: Option<String>) -> anyhow::Result
 
     let pid = std::process::id();
     let start_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let file_name = format!("{}-{}-{}.log", role.file_stem(), pid, start_ms);
+    let file_name = log_file_name(role, pid, start_ms);
 
     // One file per process (no date suffix). BLOCKING writes (the appender is its own `MakeWriter`,
     // no `non_blocking` worker): every record is synchronously on disk, so nothing is buffered to
@@ -124,7 +137,7 @@ fn try_init(config: &Config, role: &Role, env: Option<String>) -> anyhow::Result
 
 #[cfg(test)]
 mod tests {
-    use super::{Role, init_logging};
+    use super::{Role, init_logging, log_file_name, retention};
     use crate::config::{Config, LogConfig};
 
     fn test_config(dir: &std::path::Path, enabled: bool) -> Config {
@@ -143,6 +156,20 @@ mod tests {
         assert_eq!(Role::Mcp.as_str(), "mcp");
         assert_eq!(Role::Hook.as_str(), "hook");
         assert_eq!(Role::Cli("reconcile".into()).as_str(), "cli:reconcile");
+    }
+
+    /// Every role's log file is one the retention sweep recognizes as ours — otherwise that role's
+    /// logs are never pruned nor counted against `max_files`, and grow without bound.
+    #[test]
+    fn the_retention_sweep_owns_every_roles_log_file() {
+        for role in [Role::Mcp, Role::Hook, Role::Cli("reconcile".into())] {
+            // Adding a variant fails to compile here: list it above too.
+            match role {
+                Role::Mcp | Role::Hook | Role::Cli(_) => {},
+            }
+            let name = log_file_name(&role, 1234, 5678);
+            assert_eq!(retention::rag_rat_log_pid(&name), Some(1234), "{name}");
+        }
     }
 
     #[test]
