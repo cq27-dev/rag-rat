@@ -125,6 +125,11 @@ pub enum SessionError {
     /// The peer opened with something other than a hello, or named a different account.
     #[error("sync session protocol violation: {0}")]
     Protocol(String),
+    /// The peer made no progress within the idle window: it sent no frame, took none of ours, or
+    /// did not let the stream close. Distinct from [`SessionError::Protocol`] — a silent peer
+    /// violated nothing, and a caller can tell a stall from a malformed frame.
+    #[error("sync session peer made no progress within {after:?}")]
+    Timeout { after: Duration },
     /// Authentication admitted the peer for reads, but it attempted to push entries.
     #[error("read-only peer attempted to push sync entries")]
     UnauthorizedPush,
@@ -369,7 +374,7 @@ async fn send_ack_and_finish<W: AsyncWrite + Unpin>(
     write_frame_before(send, &Frame::Ack, idle_timeout).await?;
     // On iroh this maps to QUIC FIN. The acceptor remains alive until the dialer closes, while the
     // dialer does not close until it has read the acceptor's acknowledgement.
-    auth::within(idle_timeout, send.shutdown(), || stalled(idle_timeout))
+    auth::within(idle_timeout, send.shutdown(), || SessionError::Timeout { after: idle_timeout })
         .await?
         .map_err(|e| SessionError::Codec(CodecError::Io(e)))
 }
@@ -383,15 +388,11 @@ async fn write_frame_before<W: AsyncWrite + Unpin>(
     frame: &Frame,
     idle_timeout: Duration,
 ) -> Result<(), SessionError> {
-    auth::within(idle_timeout, codec::write_frame(send, frame), || stalled(idle_timeout))
-        .await?
-        .map_err(SessionError::Codec)
-}
-
-fn stalled(idle_timeout: Duration) -> SessionError {
-    SessionError::Protocol(format!(
-        "peer took no data within {idle_timeout:?} — session aborted as stalled"
-    ))
+    auth::within(idle_timeout, codec::write_frame(send, frame), || SessionError::Timeout {
+        after: idle_timeout,
+    })
+    .await?
+    .map_err(SessionError::Codec)
 }
 
 async fn read_ack_before<R: AsyncRead + Unpin>(
@@ -413,10 +414,8 @@ async fn read_frame_before<R: AsyncRead + Unpin>(
     recv: &mut R,
     idle_timeout: Duration,
 ) -> Result<Frame, SessionError> {
-    let read = auth::within(idle_timeout, codec::read_frame(recv), || {
-        SessionError::Protocol(format!(
-            "peer sent no frame within {idle_timeout:?} — session aborted as idle"
-        ))
+    let read = auth::within(idle_timeout, codec::read_frame(recv), || SessionError::Timeout {
+        after: idle_timeout,
     });
     match read.await? {
         Ok(frame) => Ok(frame),
@@ -753,7 +752,7 @@ mod tests {
         .await
         .expect("the session must give up on a peer that stops reading, not wait on it");
         assert!(
-            matches!(result, Err(SessionError::Protocol(ref message)) if message.contains("stalled")),
+            matches!(result, Err(SessionError::Timeout { after }) if after == Duration::from_millis(50)),
             "{result:?}",
         );
         drop(peer_send);
@@ -953,7 +952,9 @@ mod tests {
         .await;
         drop(peer_send); // keep the stream alive until after the timeout fired
         match result {
-            Err(SessionError::Protocol(m)) => assert!(m.contains("idle"), "{m}"),
+            Err(SessionError::Timeout { after }) => {
+                assert_eq!(after, std::time::Duration::from_millis(50));
+            },
             other => panic!("expected an idle-timeout abort: {other:?}"),
         }
     }
