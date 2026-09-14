@@ -228,6 +228,9 @@ pub(crate) fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
 
+/// Quotes individual words joined by OR for historical evidence.
+/// See `super::fts_phrase_query` for whole phrases and memory evidence’s
+/// `fts_token_query` for tokenized phrases; their matching semantics differ.
 pub(crate) fn fts_escape(query: &str) -> String {
     query
         .split_whitespace()
@@ -235,26 +238,6 @@ pub(crate) fn fts_escape(query: &str) -> String {
         .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(" OR ")
-}
-
-pub(crate) fn rows_to_items(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<ImpactItem>>,
-) -> anyhow::Result<Vec<ImpactItem>> {
-    let mut items = Vec::new();
-    for row in rows {
-        items.push(row?);
-    }
-    Ok(items)
-}
-
-pub(crate) fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> anyhow::Result<Vec<T>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

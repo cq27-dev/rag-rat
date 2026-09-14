@@ -1162,6 +1162,8 @@ fn text_search_target(ident: &str) -> &str {
 /// of `target`, in order, inside ONE quoted phrase (`"clone edges"`). Every token is kept, even a
 /// 1-char one — dropping an interior token would break the adjacency the phrase relies on. `None`
 /// when the target yields no token (so it can't be in the FTS index — the probe is skipped).
+/// Builds a tokenized phrase. See `crate::impact::fts_phrase_query` for whole phrases
+/// and impact historical’s `fts_escape` for OR-ed words.
 fn fts_token_query(target: &str) -> Option<String> {
     let tokens: Vec<&str> =
         target.split(|c: char| !c.is_ascii_alphanumeric()).filter(|t| !t.is_empty()).collect();

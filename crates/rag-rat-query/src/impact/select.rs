@@ -50,7 +50,7 @@ pub(crate) fn exact_symbols(conn: &Connection, query: &str) -> anyhow::Result<Ve
                 qualified_name: row.get(6)?,
             })
         })?;
-        let rows = collect_rows(rows)?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         if !qualified_candidate && !is_high_signal_symbol_candidate(&rows) {
             continue;
         }

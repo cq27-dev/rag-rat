@@ -249,7 +249,7 @@ pub(crate) fn section_like_items(
             evidence: vec![format!("{match_kind} for `{needle}`")],
         })
     })?;
-    rows_to_items(rows)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub(crate) fn git_commit_items(

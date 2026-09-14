@@ -791,6 +791,8 @@ fn memory_counts_by_path(
     conn: &Connection,
     _paths: &[String],
 ) -> anyhow::Result<BTreeMap<String, RepoBriefMemoryCounts>> {
+    // `_paths` is unused by design: unlike `symbol_kind_counts_by_path`, this computes the
+    // repo-wide per-path map in one query, and the caller looks its own paths up in it.
     // Scoped to the active repo (V042): the join is by `repo_memory_bindings.path`, so a sibling
     // repo's path-bound memory whose path collides with one of ours (the same-path poison tripwire)
     // would attribute its counts to our file without this predicate. `{repo_clause}` empty pre-A5.
