@@ -36,6 +36,7 @@ pub mod test_support;
 #[cfg(test)]
 mod tests;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -932,5 +933,62 @@ pub struct OracleReport {
     /// `SymbolInformation` the `.scip` carried in `index.external_symbols` (#114). The dependency
     /// contract `check_library_usage` reads.
     pub external_symbols_written: u64,
-    pub status: String,
+    pub status: RunStatus,
+}
+
+/// How an oracle pass ended — persisted as `oracle_runs.status` and serialized into `stats_json`.
+///
+/// The six closed outcomes serialize as their strum tokens; `Aborted` carries the operator-facing
+/// reason and renders as `Aborted: {reason}`. The read-back of historical rows stays a raw string
+/// ([`OracleStatus::last_run_status`]), so an unknown stored token never fails a status read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+pub enum RunStatus {
+    /// The pass ran its work to the end and recorded a run. The batch pass's only outcome, and
+    /// the value a report starts from before a live pass sets its own.
+    #[default]
+    Completed,
+    /// The live server was (back) in its project load; the worklist rides the backlog.
+    Warming,
+    /// A live pass migrated prior-version verdicts to the session's version and wrote none itself.
+    VersionMigrated,
+    /// A live version migration would have collided with a sibling checkout's content key, so the
+    /// pass processed nothing.
+    VersionMigrationBlocked,
+    /// A live pass finished its worklist without writing a verdict (no run recorded).
+    NoVerdicts,
+    /// The live request budget ran out before the worklist did.
+    BudgetExhausted,
+    /// A live pass ended early: the server died or wedged, or the checkout's layout moved. The
+    /// reason is operator-facing text, not something to branch on — see [`LivePassAbort`].
+    Aborted(String),
+}
+
+impl RunStatus {
+    pub fn as_db_str(&self) -> Cow<'_, str> {
+        match self {
+            Self::Aborted(reason) => Cow::Owned(format!("Aborted: {reason}")),
+            closed => Cow::Borrowed(closed.into()),
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        if let Some(reason) = value.strip_prefix("Aborted: ") {
+            return Some(Self::Aborted(reason.to_string()));
+        }
+        // A bare `Aborted` is not a token this crate writes; strum would parse it to an empty
+        // reason.
+        value.parse().ok().filter(|status| !matches!(status, Self::Aborted(_)))
+    }
+}
+
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.as_db_str())
+    }
+}
+
+impl Serialize for RunStatus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.as_db_str())
+    }
 }

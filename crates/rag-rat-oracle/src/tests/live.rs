@@ -113,7 +113,7 @@ fn live_pass_upgrades_a_name_only_edge_and_records_the_run() {
     assert_eq!(report.rows_written, 1);
     assert_eq!(report.upgraded, 1);
     assert_eq!(report.requests_used, 1);
-    assert_eq!(report.status, "Completed");
+    assert_eq!(report.status, RunStatus::Completed);
     assert!(report.run_recorded);
     assert!(!report.refinements_invalidated);
     let (kind, resolved, symbol) = h.verdict(edge).expect("verdict persisted");
@@ -158,7 +158,7 @@ fn live_pass_defers_the_whole_worklist_while_the_server_is_warming() {
 
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-    assert_eq!(report.status, "Warming");
+    assert_eq!(report.status, RunStatus::Warming);
     assert_eq!(report.requests_used, 0);
     assert_eq!(report.rows_written, 0);
     assert_eq!(report.unfinished_paths, worklist);
@@ -211,7 +211,7 @@ fn live_pass_discards_a_definition_batch_when_readiness_regresses() {
 
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-    assert_eq!(report.status, "Warming");
+    assert_eq!(report.status, RunStatus::Warming);
     assert_eq!(report.requests_used, 1);
     assert_eq!(report.rows_written, 0);
     assert_eq!(report.unresolved, 0);
@@ -473,7 +473,7 @@ fn live_pass_records_no_run_when_the_server_resolves_nothing() {
 
     assert_eq!(report.unresolved, 1);
     assert_eq!(report.rows_written, 0);
-    assert_eq!(report.status, "NoVerdicts");
+    assert_eq!(report.status, RunStatus::NoVerdicts);
     assert_eq!(live_run_count(&h.conn), 0);
 }
 
@@ -497,7 +497,7 @@ fn live_pass_budget_defers_whole_files_to_the_next_pass() {
     assert_eq!(report.files_resolved, 1);
     assert_eq!(report.rows_written, 1);
     assert_eq!(report.unfinished_paths, vec!["b.rs".to_string()]);
-    assert_eq!(report.status, "BudgetExhausted");
+    assert_eq!(report.status, RunStatus::BudgetExhausted);
 }
 
 /// The budget binds WITHIN a file too: a file with more callees than the budget is truncated,
@@ -530,7 +530,7 @@ fn live_pass_budget_continuation_resumes_within_a_file() {
     assert_eq!(report.requests_used, 1, "covered callees don't spend the budget");
     assert_eq!(report.rows_written, 1);
     assert!(report.unfinished_paths.is_empty(), "the file drains this pass");
-    assert_eq!(report.status, "Completed");
+    assert_eq!(report.status, RunStatus::Completed);
 }
 
 /// A `rust-analyzer` upgrade between sessions must not strand prior verdicts: the first pass
@@ -577,7 +577,7 @@ fn live_pass_migrates_prior_verdicts_across_a_version_change() {
 
     assert!(report.version_migrated);
     assert!(report.refinements_invalidated, "the evidence changed hands");
-    assert_eq!(report.status, "VersionMigrated");
+    assert_eq!(report.status, RunStatus::VersionMigrated);
     assert_eq!(version_of(LIVE_VERSION), 1, "old-version rows remain for sibling currency");
     assert_eq!(version_of("ra-test-2"), 1, "rows are copied under the new version");
     // The migrated verdict survives with its content + symbol intact.
@@ -831,7 +831,7 @@ fn live_version_migration_blocks_a_different_content_destination_collision() {
     let mut session = LiveOracleSession::from_client(client, "ra-test-2", &uri);
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &[], 100)).unwrap();
 
-    assert_eq!(report.status, "VersionMigrationBlocked");
+    assert_eq!(report.status, RunStatus::VersionMigrationBlocked);
     assert!(!report.version_migrated);
     assert_eq!(
         crate::store::latest_run_tool_version(&h.conn, OracleTool::RaLsp, CHECKOUT)
@@ -979,7 +979,7 @@ fn live_pass_aborts_best_effort_when_the_server_dies_mid_pass() {
     // Never an `Err` — the maintenance pass must survive a dead server (#535 hardens further).
     let report = live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-    assert!(report.status.starts_with("Aborted:"), "{}", report.status);
+    assert!(matches!(report.status, RunStatus::Aborted(_)), "{}", report.status);
     // A dead server is reported as the SERVER's abort, not the checkout's: the layout is exactly
     // what it was, so the paths a session skipped as unconfigurable are as unresolvable as before
     // and the watcher must not requeue them off the back of this.
@@ -1102,7 +1102,7 @@ mod typescript {
         let report =
             live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-        assert_eq!(report.status, "Warming");
+        assert_eq!(report.status, RunStatus::Warming);
         assert_eq!(report.unfinished_paths, worklist, "the work rides to the next pass");
         assert_eq!(report.requests_used, 0);
         // The warm-up is notification-only, so a synchronous round trip is what proves the
@@ -1138,7 +1138,7 @@ mod typescript {
         let report =
             live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-        assert_eq!(report.status, "Completed");
+        assert_eq!(report.status, RunStatus::Completed);
         assert_eq!(report.rows_written, 1);
         assert_eq!(report.upgraded, 1);
         let (kind, resolved, symbol) = h.verdict(edge).expect("verdict persisted");
@@ -1173,7 +1173,7 @@ mod typescript {
         let report =
             live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-        assert_eq!(report.status, "Warming");
+        assert_eq!(report.status, RunStatus::Warming);
         assert_eq!(report.rows_written, 0, "a batch that straddled a load must write nothing");
         assert!(h.verdict(edge).is_none(), "no verdict may survive the discarded batch");
         assert_eq!(report.unfinished_paths, worklist, "the file retries once the load settles");
@@ -1298,7 +1298,7 @@ mod typescript {
         let report =
             live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-        assert_eq!(report.status, "Warming");
+        assert_eq!(report.status, RunStatus::Warming);
         session.barrier();
         let sent = sent.lock().unwrap();
         assert!(
@@ -1331,7 +1331,7 @@ mod typescript {
         let report =
             live_oracle_pass(&h.conn, &mut session, &pass_input(&h, &worklist, 100)).unwrap();
 
-        assert_eq!(report.status, "Warming");
+        assert_eq!(report.status, RunStatus::Warming);
         session.barrier();
         let opened: Vec<String> = sent
             .lock()
@@ -1584,7 +1584,7 @@ mod clangd {
         // abort but requeues the paths it could not configure for THIS one only, and a status
         // string is operator-facing text nobody should be parsing to tell those apart.
         assert_eq!(report.abort, Some(LivePassAbort::LayoutChanged));
-        assert!(report.status.starts_with("Aborted:"), "{}", report.status);
+        assert!(matches!(report.status, RunStatus::Aborted(_)), "{}", report.status);
         assert_eq!(report.unfinished_paths, worklist, "the whole worklist rides the next pass");
         assert_eq!(report.rows_written, 0);
         assert_eq!(report.requests_used, 0);
@@ -1631,7 +1631,7 @@ mod clangd {
         assert_eq!(report.rows_written, 1);
         assert_eq!(report.upgraded, 1);
         assert_eq!(report.requests_used, 1, "only the configured file's callee is asked about");
-        assert_eq!(report.status, "Completed");
+        assert_eq!(report.status, RunStatus::Completed);
         assert_eq!(clangd_run_count(&h.conn), 1);
         assert_eq!(
             h.verdict(resolvable).expect("the configured file still resolves").1,

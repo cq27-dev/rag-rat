@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use super::join::{self, JoinInput};
 use super::scip::{self, ScipIndex};
 use super::store::{self, CALL_EDGE_KIND, EdgeOracleRow};
-use super::{OracleReport, OracleResolutionKind, OracleTool};
+use super::{OracleReport, OracleResolutionKind, OracleTool, RunStatus};
 
 /// Inputs for one oracle pass.
 pub struct OracleRunInput<'a> {
@@ -298,14 +298,14 @@ pub(crate) fn run_in_tx(
         &resolve_symbol,
     )?;
 
-    report.status = "Completed".to_string();
+    report.status = RunStatus::Completed;
     store::record_oracle_run_at(
         conn,
         input.tool,
         input.tool_version,
         input.checkout,
         input.started_at_ms,
-        &report.status,
+        &report.status.as_db_str(),
         &serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string()),
     )?;
 

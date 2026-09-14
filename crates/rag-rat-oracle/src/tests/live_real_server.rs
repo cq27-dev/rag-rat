@@ -103,7 +103,7 @@ fn real_typescript_server_warms_before_it_resolves_an_imported_callee() {
     // The FIRST pass must not resolve anything: the server has not loaded its project, so every
     // answer it would give is a warm-up artifact.
     let first = live_oracle_pass(&h.conn, &mut session, &input).unwrap();
-    assert_eq!(first.status, "Warming", "a cold server must not be asked for definitions");
+    assert_eq!(first.status, RunStatus::Warming, "a cold server must not be asked for definitions");
     assert_eq!(first.rows_written, 0);
     assert_eq!(first.requests_used, 0);
     assert!(h.verdict(edge).is_none(), "no verdict may be written before the project loads");
@@ -112,7 +112,7 @@ fn real_typescript_server_warms_before_it_resolves_an_imported_callee() {
     let deadline = Instant::now() + WARMUP_BUDGET;
     let report = loop {
         let report = live_oracle_pass(&h.conn, &mut session, &input).unwrap();
-        if report.status != "Warming" {
+        if !report.is_warming() {
             break report;
         }
         assert!(
@@ -122,7 +122,7 @@ fn real_typescript_server_warms_before_it_resolves_an_imported_callee() {
         std::thread::sleep(Duration::from_millis(250));
     };
 
-    assert_eq!(report.status, "Completed", "{report:?}");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
     assert_eq!(report.rows_written, 1, "{report:?}");
     let (kind, resolved, symbol) = h.verdict(edge).expect("a verdict once the server is ready");
     assert_eq!(kind, "upgrade");
@@ -179,11 +179,11 @@ fn a_file_its_ancestor_config_excludes_still_warms_the_server() {
         started_at_ms: 1_000,
     };
 
-    assert_eq!(live_oracle_pass(&h.conn, &mut session, &input).unwrap().status, "Warming");
+    assert_eq!(live_oracle_pass(&h.conn, &mut session, &input).unwrap().status, RunStatus::Warming);
     let deadline = Instant::now() + WARMUP_BUDGET;
     let report = loop {
         let report = live_oracle_pass(&h.conn, &mut session, &input).unwrap();
-        if report.status != "Warming" {
+        if !report.is_warming() {
             break report;
         }
         assert!(
@@ -194,7 +194,7 @@ fn a_file_its_ancestor_config_excludes_still_warms_the_server() {
         std::thread::sleep(Duration::from_millis(250));
     };
 
-    assert_eq!(report.status, "Completed", "{report:?}");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
     assert_eq!(h.verdict(edge).expect("a verdict").1, Some(target));
     session.shutdown();
 }
@@ -261,14 +261,14 @@ fn real_clangd_resolves_a_call_into_another_translation_unit() {
     let deadline = Instant::now() + WARMUP_BUDGET;
     let report = loop {
         let report = live_oracle_pass(&h.conn, &mut session, &input).unwrap();
-        if report.status != "Warming" {
+        if !report.is_warming() {
             break report;
         }
         assert!(Instant::now() < deadline, "clangd never reported a completed index load");
         std::thread::sleep(Duration::from_millis(250));
     };
 
-    assert_eq!(report.status, "Completed", "{report:?}");
+    assert_eq!(report.status, RunStatus::Completed, "{report:?}");
     let (kind, resolved, symbol) = h.verdict(edge).expect("a verdict once clangd is ready");
     assert_eq!(kind, "upgrade");
     assert_eq!(
