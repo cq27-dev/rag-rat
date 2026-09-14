@@ -18,6 +18,75 @@ const SCOPE: CheckoutRef<'static> = CheckoutRef { commit_sha: COMMIT, worktree_i
 const TOOL: &str = "rust-analyzer";
 const TOOL_VERSION: &str = "ra 1.0";
 
+/// `forward_visibility_filter` decides which callees an agent sees. Pin it with a truth table: a
+/// synthetic edge for every (kind, resolution, method-name) class, and for each of the eight flag
+/// combinations exactly the classes it admits — each flag withholds one population: unresolved
+/// targets, macro invocations, and unresolved calls to a common std method name.
+#[test]
+fn forward_visibility_filter_admits_exactly_its_truth_table() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY, edge_kind TEXT NOT NULL, to_name TEXT,
+                            to_symbol_id INTEGER, confidence TEXT, target_qualified_name TEXT)",
+    )
+    .unwrap();
+    let resolutions = [
+        ("resolved", Some(1), "Exact", Some("a::t")),
+        ("qualified", None, "Syntactic", Some("a::t")),
+        ("name_only", None, "NameOnly", None),
+    ];
+    let mut classes = Vec::new();
+    for kind in ["calls_name", "constructs", "uses_operator", "uses_macro", "references_type"] {
+        for (resolution, to_symbol_id, confidence, target) in resolutions {
+            for (name_class, to_name) in [("common", "clone"), ("plain", "frobnicate")] {
+                conn.execute(
+                    "INSERT INTO edges(edge_kind, to_name, to_symbol_id, confidence,
+                                       target_qualified_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![kind, to_name, to_symbol_id, confidence, target],
+                )
+                .unwrap();
+                classes.push((conn.last_insert_rowid(), kind, resolution, name_class));
+            }
+        }
+    }
+    for flags in 0..8_u8 {
+        let options = GraphTraversalOptions {
+            include_unresolved: flags & 1 != 0,
+            include_macros: flags & 2 != 0,
+            include_common_methods: flags & 4 != 0,
+            ..GraphTraversalOptions::default()
+        };
+        let admitted = conn
+            .prepare(&format!(
+                "SELECT id FROM edges WHERE ({})",
+                forward_visibility_filter(&options)
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()
+            .unwrap();
+        for &(id, kind, resolution, name_class) in &classes {
+            let resolved_target = match kind {
+                "calls_name" => resolution != "name_only",
+                "constructs" | "uses_operator" => resolution == "resolved",
+                _ => true,
+            };
+            let common_method_call =
+                kind == "calls_name" && name_class == "common" && resolution != "resolved";
+            let expected = (options.include_unresolved || resolved_target)
+                && (options.include_macros || kind != "uses_macro")
+                && (options.include_common_methods || !common_method_call);
+            assert_eq!(
+                admitted.contains(&id),
+                expected,
+                "{kind}/{resolution}/{name_class} under {options:?}"
+            );
+        }
+    }
+}
+
 fn scoped_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     schema::apply(&conn, &rag_rat_core::index::migration_hooks()).unwrap();
