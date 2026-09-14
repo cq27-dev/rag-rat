@@ -302,14 +302,13 @@ impl CookbookProvisioner {
     fn provision_cancellable(
         cookbook: &str,
         input: &CookbookInput,
-        provision_timeout: Duration,
         cancel: impl Fn() -> bool,
     ) -> anyhow::Result<ProvisionedBox> {
         Self::provision_with_command_cancellable(
             cookbook_command(cookbook),
             cookbook,
             input,
-            provision_timeout,
+            provision_deadline(input),
             cancel,
         )
     }
@@ -566,7 +565,8 @@ fn teardown_timed_out_cookbook(child: &mut Child) {
     clear_active_child_pid(child.id());
 }
 
-/// The Rust-side handshake deadline for [`CookbookProvisioner::provision`]. The floor is
+/// The Rust-side handshake deadline for every cookbook provisioning entry point (the chat and
+/// embedding paths alike), computed from the input the recipe also receives. The floor is
 /// backend-aware (vLLM's huge image needs longer than ollama/infinity). A larger
 /// `provision_timeout_s` (the distill 30B box, whose weight pull exceeds the vLLM default) EXTENDS
 /// the deadline past that floor — we add back the teardown margin the input builder subtracted, so
@@ -683,12 +683,7 @@ fn provision_and_build_cancellable(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("ephemeral remote config has no cookbook"))?;
     let input = cookbook_input_for(remote);
-    let provisioned = CookbookProvisioner::provision_cancellable(
-        cookbook,
-        &input,
-        remote.backend.provision_timeout(),
-        cancel,
-    )?;
+    let provisioned = CookbookProvisioner::provision_cancellable(cookbook, &input, cancel)?;
     // `effective_remote` PERSISTS the user's `concurrency` CAP unchanged (cap model). The live
     // embedder + reconcile window use the tuned knee, CLAMPED to that cap. The knee comes from the
     // in-Rust sweep against the box with the REAL embedder (reconcile path); the install/verify
@@ -1335,6 +1330,21 @@ mod tests {
         let tiny =
             CookbookInput { backend: RemoteBackend::Vllm, provision_timeout_s: 10, ..input() };
         assert_eq!(provision_deadline(&tiny), RemoteBackend::Vllm.provision_timeout());
+    }
+
+    #[test]
+    fn embedding_input_deadline_is_exactly_the_backend_floor() {
+        // The embedding builder subtracts the teardown margin and `provision_deadline` adds it
+        // back, so routing the embedding path through `provision_deadline` keeps its deadline at
+        // exactly the raw backend floor for every backend.
+        for backend in [RemoteBackend::Ollama, RemoteBackend::Infinity, RemoteBackend::Vllm] {
+            let remote = RemoteEmbeddingConfig { backend, ..RemoteEmbeddingConfig::default() };
+            assert_eq!(
+                provision_deadline(&cookbook_input_for(&remote)),
+                backend.provision_timeout(),
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]
