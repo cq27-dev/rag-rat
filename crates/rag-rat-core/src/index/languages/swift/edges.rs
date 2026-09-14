@@ -427,18 +427,7 @@ fn swift_precedence_group_relation_edges(
             EdgeKind::UsesPrecedenceGroup,
             Some(CalleeRange::of_node(*dependency)),
         );
-        if !out.iter().any(|existing| {
-            existing.edge_kind == edge.edge_kind
-                && existing.to_name == edge.to_name
-                && existing.callee_span.is_some_and(|span| {
-                    edge.callee_span.is_some_and(|candidate| {
-                        span.start_byte == candidate.start_byte
-                            && span.end_byte == candidate.end_byte
-                    })
-                })
-        }) {
-            out.push(edge);
-        }
+        out.push_unique_callee(edge);
     }
 }
 
@@ -594,13 +583,7 @@ fn swift_recovered_precedence_relations(
                 edge_kind: EdgeKind::UsesPrecedenceGroup,
                 confidence: EdgeConfidence::NameOnly,
             };
-            if !out.iter().any(|existing| {
-                existing.edge_kind == edge.edge_kind
-                    && existing.to_name == edge.to_name
-                    && existing.callee_span.is_some_and(|span| span.start_byte == start_byte)
-            }) {
-                out.push(edge);
-            }
+            out.push_unique_callee(edge);
         }
         cursor = relation_end.max(relation_start + label.len());
     }

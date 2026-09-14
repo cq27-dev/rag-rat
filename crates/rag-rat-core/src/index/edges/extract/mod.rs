@@ -370,8 +370,20 @@ impl EdgeEmitter<'_> {
         self.out.push(candidate);
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &EdgeCandidate> {
-        self.out.iter()
+    /// Structured and recovered paths share one dependency identity: kind, name, and full callee
+    /// range.
+    pub(crate) fn push_unique_callee(&mut self, candidate: EdgeCandidate) {
+        if !self.out.iter().any(|existing| {
+            existing.edge_kind == candidate.edge_kind
+                && existing.to_name == candidate.to_name
+                && existing.callee_span.is_some_and(|span| {
+                    candidate.callee_span.is_some_and(|other| {
+                        span.start_byte == other.start_byte && span.end_byte == other.end_byte
+                    })
+                })
+        }) {
+            self.push(candidate);
+        }
     }
 }
 
