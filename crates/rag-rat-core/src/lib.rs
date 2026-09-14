@@ -15,8 +15,6 @@ pub mod watch;
 pub use index::{IndexDatabase, IndexStatus};
 pub use output::{OutputFormat, render};
 
-/// Settle and materialize accepted `/3` memory content before dependent `/5` anchor rows are
-/// reconciled.
 /// What a drain actually did. A net `repo_memories` row count cannot express this: an UPDATE leaves
 /// the count unchanged and a retro-condemn REMOVAL lowers it, so a caller measuring table size
 /// reports "nothing materialized" for a real update and a negative delta for a real removal.
@@ -43,6 +41,8 @@ pub fn writer_invite_stream_target(conn: &rusqlite::Connection) -> anyhow::Resul
     Ok(stream.to_bytes())
 }
 
+/// Settle and materialize accepted `/3` memory content before dependent `/5` anchor rows are
+/// reconciled.
 pub fn drain_synced_memory(conn: &rusqlite::Connection) -> anyhow::Result<MemoryDrainEffects> {
     let now = rag_rat_base::time::now_ms();
     rag_rat_oplog::settle_pending_content_refolds(
