@@ -53,7 +53,14 @@ const STREAM_V2_DOMAIN: &str = "rag-rat/stream/2";
 pub struct StreamId([u8; 32]);
 
 impl StreamId {
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+    /// The placeholder a table-sync re-adoption obligation is parked under while no stream of its
+    /// account has a directory row: the account fold writes it, and the first recorded stream
+    /// context drains it. Reserved for this purpose; derived SHA-256 stream identities are
+    /// assumed not to collide with it. The stored bytes are all-zero, and writer and reader must
+    /// both name this const.
+    pub(crate) const PRECONTEXT: Self = Self([0; 32]);
+
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
@@ -532,6 +539,12 @@ mod tests {
         )]))
         .unwrap_err();
         assert_eq!(err.to_string(), "unknown stream override action `unknown`");
+    }
+
+    #[test]
+    fn the_precontext_placeholder_stays_all_zero() {
+        // Persisted in `table_sync_readoption_work.stream_id` and read back by a later binary.
+        assert_eq!(StreamId::PRECONTEXT.to_bytes(), [0; 32]);
     }
 
     #[test]

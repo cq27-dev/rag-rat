@@ -17,12 +17,13 @@
 //!
 //! Two properties keep the replay boring, and both are deliberate:
 //!
-//! - **It goes through the unmodified [`super::apply::apply_row_op`] gates**, with each entry's
-//!   ORIGINAL `OpMeta`. No clock bypass, no reordering. That is what makes every interaction
-//!   correct for free: a parked entry superseded by a later winner loses the LWW comparison; one
-//!   superseded by a delete loses to the tombstone and cannot resurrect the row; a parked `Remove`
-//!   needs no winner lookup. A bypass would have to re-derive all of that, and a bypass that skips
-//!   the clock comparison is one refactor away from skipping the tombstone comparison too.
+//! - **It goes through the unmodified [`super::apply::apply_row_op_on_stream`] gates**, with each
+//!   entry's ORIGINAL `OpMeta`. No clock bypass, no reordering. That is what makes every
+//!   interaction correct for free: a parked entry superseded by a later winner loses the LWW
+//!   comparison; one superseded by a delete loses to the tombstone and cannot resurrect the row; a
+//!   parked `Remove` needs no winner lookup. A bypass would have to re-derive all of that, and a
+//!   bypass that skips the clock comparison is one refactor away from skipping the tombstone
+//!   comparison too.
 //! - **It is bounded by the pending set**, not the log: the steady state (nothing pending) costs
 //!   one indexed probe, so the cost is proportional to what is actually outstanding. A pass owed
 //!   ONLY by a deferral narrows further, to the deferral family alone — that trigger fires at every

@@ -69,8 +69,13 @@ pub(crate) enum ApplyOutcome {
     Unprojectable(PendingReason),
 }
 
-/// Fold `op` into `spec`'s table for `repo_id`, ordered by `meta`. See the module doc for the merge
-/// rules. Every write goes through the caller's transaction, so a partially-applied op cannot leak.
+/// "No particular stream", for tests that exercise the merge rules without one. Unrelated to
+/// [`StreamId::PRECONTEXT`], the persisted re-adoption placeholder that shares its bytes.
+#[cfg(test)]
+const NO_STREAM: StreamId = StreamId::from_bytes([0; 32]);
+
+/// [`apply_row_op_on_stream`] on [`NO_STREAM`] — the arity the merge-rule tests use.
+#[cfg(test)]
 pub(crate) fn apply_row_op(
     tx: &Transaction<'_>,
     spec: &TableSpec,
@@ -78,9 +83,12 @@ pub(crate) fn apply_row_op(
     op: &RowOp,
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
-    apply_row_op_on_stream(tx, spec, repo_id, StreamId::from_bytes([0; 32]), op, meta)
+    apply_row_op_on_stream(tx, spec, repo_id, NO_STREAM, op, meta)
 }
 
+/// Fold `op` into `spec`'s table for `repo_id` on `stream`, ordered by `meta`. See the module doc
+/// for the merge rules. Every write goes through the caller's transaction, so a partially-applied
+/// op cannot leak.
 pub(crate) fn apply_row_op_on_stream(
     tx: &Transaction<'_>,
     spec: &TableSpec,
@@ -125,7 +133,7 @@ pub(crate) fn apply_row_op_on_stream(
     }
 }
 
-/// What [`apply_row_op`] decides on the PAYLOAD ALONE, before any row state is read.
+/// What [`apply_row_op_on_stream`] decides on the PAYLOAD ALONE, before any row state is read.
 #[derive(Debug, PartialEq)]
 pub(crate) enum PayloadVerdict {
     /// Nothing in the payload stands in the way; the ROW STATE decides what happens next. Carries
@@ -138,8 +146,8 @@ pub(crate) enum PayloadVerdict {
     Rejected(String),
 }
 
-/// Everything [`apply_row_op`] can settle without touching the database, in the order it settles
-/// it.
+/// Everything [`apply_row_op_on_stream`] can settle without touching the database, in the order it
+/// settles it.
 ///
 /// Factored out because it has a SECOND caller with a different question. The refold has to know,
 /// before it consults [`unsent_work_blocking_replay`], whether an entry's fate depends on the row
@@ -636,12 +644,7 @@ fn current_row_clock(
     table: &str,
     row_pk: &str,
 ) -> anyhow::Result<Option<(u64, String)>> {
-    current_row_clock_on_stream(tx, &RowKey {
-        stream: StreamId::from_bytes([0; 32]),
-        repo_id,
-        table,
-        row_pk,
-    })
+    current_row_clock_on_stream(tx, &RowKey { stream: NO_STREAM, repo_id, table, row_pk })
 }
 
 /// The row's live whole-row-LWW winner on `stream` as `(lamport, device hex)` — the merge-table
@@ -1003,7 +1006,7 @@ pub(crate) fn published_hash(
     table: &str,
     row_pk: &str,
 ) -> anyhow::Result<Option<(String, u32)>> {
-    published_hash_on_stream(tx, StreamId::from_bytes([0; 32]), repo_id, table, row_pk)
+    published_hash_on_stream(tx, NO_STREAM, repo_id, table, row_pk)
 }
 
 /// How a row whose published record predates the current spec version compares against the op that
@@ -1217,11 +1220,11 @@ fn unsent_work_on_row(
     pk_vals: &[TypedValue],
     removing: bool,
 ) -> anyhow::Result<Option<PendingReason>> {
-    // A malformed key never reached `apply_row_op`'s arity check (an entry parked as out-of-scope
-    // or unknown-kind was never validated), and binding it against `spec.pk`'s placeholders
-    // would be a parameter-count ERROR — which, propagating out of the refold, would roll back
-    // the transaction and fail every subsequent store open on the same entry. Defer to the
-    // normal path, which quarantines it.
+    // A malformed key never reached `apply_row_op_on_stream`'s arity check (an entry parked as
+    // out-of-scope or unknown-kind was never validated), and binding it against `spec.pk`'s
+    // placeholders would be a parameter-count ERROR — which, propagating out of the refold,
+    // would roll back the transaction and fail every subsequent store open on the same entry.
+    // Defer to the normal path, which quarantines it.
     if pk_vals.len() != spec.pk.len() {
         return Ok(None);
     }
@@ -1286,8 +1289,8 @@ pub(crate) enum RowDoubt {
     ///
     /// The live ingest path takes this, and the exemption is deliberately that narrow. Holding a
     /// deletion back on a verdict that may never resolve is the convergence wedge
-    /// [`apply_row_op`] keeps `Remove` clear of — a row deleted after a column change would become
-    /// undeletable across the skew.
+    /// [`apply_row_op_on_stream`] keeps `Remove` clear of — a row deleted after a column change
+    /// would become undeletable across the skew.
     ///
     /// An `Upsert` gets NO exemption. It is already version-gated, so deferring one costs nothing a
     /// skew was not costing anyway, and applying it on an unprovable verdict destroys exactly the
@@ -1375,8 +1378,8 @@ impl LocalWriterMemo {
     }
 }
 
-/// Everything that must be settled BEFORE `op` is handed to [`apply_row_op`], in the order it has
-/// to be settled in.
+/// Everything that must be settled BEFORE `op` is handed to [`apply_row_op_on_stream`], in the
+/// order it has to be settled in.
 ///
 /// Both the live ingest path and the refold need this exact sequence, and the ordering is easy to
 /// get right in one and wrong in the other — so it lives here once. The payload goes first:
@@ -1395,9 +1398,9 @@ pub(crate) fn pre_apply(
 ) -> anyhow::Result<PreApply> {
     match payload_verdict(spec, repo_id, op) {
         PayloadVerdict::Gap(reason) => return Ok(PreApply::Park(reason)),
-        // Terminal on its own merits. Hand it to `apply_row_op`, which quarantines it without
-        // writing — one writer of that verdict rather than two, and a terminal payload must not
-        // enter a retry family it can never leave.
+        // Terminal on its own merits. Hand it to `apply_row_op_on_stream`, which quarantines it
+        // without writing — one writer of that verdict rather than two, and a terminal
+        // payload must not enter a retry family it can never leave.
         PayloadVerdict::Rejected(_) => return Ok(PreApply::Apply),
         PayloadVerdict::RowDecides(_) => {},
     }
@@ -1433,7 +1436,7 @@ pub(crate) fn pre_apply(
 pub(crate) enum PreApply {
     /// Do not apply: record this reason and leave the entry outstanding.
     Park(PendingReason),
-    /// Nothing stands in the way — hand it to [`apply_row_op`].
+    /// Nothing stands in the way — hand it to [`apply_row_op_on_stream`].
     Apply,
 }
 

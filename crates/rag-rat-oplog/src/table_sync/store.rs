@@ -1234,9 +1234,9 @@ pub(crate) fn enqueue_readoption_work(
     Ok(())
 }
 
-/// Attach removals this account folded while `stream` had no directory row. Stored under a zero
-/// stream id until first contact; the current processor rejects that placeholder because it is
-/// neither current nor registered.
+/// Attach removals this account folded while `stream` had no directory row. Stored under
+/// [`StreamId::PRECONTEXT`] until first contact; the current processor rejects that placeholder
+/// because it is neither current nor registered.
 ///
 /// Known limitation: the copy lands only in the FIRST stream to record a context — a stream
 /// created later for a different scope never learns of the removal. Unreachable today: a removal
@@ -1248,7 +1248,7 @@ fn enqueue_precontext_readoption_work(
     stream: StreamId,
     account_id: AccountId,
 ) -> anyhow::Result<()> {
-    let precontext = StreamId::from_bytes([0; 32]).to_bytes();
+    let precontext = StreamId::PRECONTEXT.to_bytes();
     let mut stmt = tx.prepare(
         "SELECT device_fingerprint, roster_ref, removed_at_epoch, enqueued_at_ms
          FROM table_sync_readoption_work
