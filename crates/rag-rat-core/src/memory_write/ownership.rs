@@ -24,12 +24,14 @@ pub(crate) fn owner_stream_access_mode(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<rag_rat_oplog::AccessMode> {
-    match rag_rat_db::meta::repo_meta(conn, repo_id, STREAM_ACCESS_MODE_META_KEY)?.as_deref() {
-        Some("public") => return Ok(rag_rat_oplog::AccessMode::PublicRead),
-        Some(other) => anyhow::bail!(
-            "repo `{repo_id}` has unknown memory stream access mode `{other}`; refusing to author"
-        ),
-        None => {},
+    if let Some(token) = rag_rat_db::meta::repo_meta(conn, repo_id, STREAM_ACCESS_MODE_META_KEY)? {
+        match access_mode_from_db_str(&token) {
+            Some(mode) => return Ok(mode),
+            None => anyhow::bail!(
+                "repo `{repo_id}` has unknown memory stream access mode `{token}`; refusing to \
+                 author"
+            ),
+        }
     }
     // Derived one-way ratchet (mirrors the seal policy's `content_stream_has_sealed_ratchet`): if
     // the account ALREADY owns this repo's `PublicRead` `/2` stream, stay public even when the
@@ -49,6 +51,23 @@ pub(crate) fn owner_stream_access_mode(
     Ok(rag_rat_oplog::AccessMode::Private)
 }
 
+/// The persisted access-mode token: `public` for `PublicRead`. `Private` is the default and is
+/// encoded by ABSENCE — there is deliberately no private token.
+pub(super) fn access_mode_db_str(mode: rag_rat_oplog::AccessMode) -> Option<&'static str> {
+    match mode {
+        rag_rat_oplog::AccessMode::PublicRead => Some("public"),
+        rag_rat_oplog::AccessMode::Private => None,
+    }
+}
+
+/// Parse a PRESENT access-mode token; only `public` is one.
+pub(super) fn access_mode_from_db_str(value: &str) -> Option<rag_rat_oplog::AccessMode> {
+    match value {
+        "public" => Some(rag_rat_oplog::AccessMode::PublicRead),
+        _ => None,
+    }
+}
+
 pub(super) const STREAM_SEAL_POLICY_META_KEY: &str = "memory_stream_seal_policy";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +81,23 @@ impl StreamSealPolicy {
         match self {
             Self::Plaintext => SealPolicy::Plaintext,
             Self::Sealed => SealPolicy::Sealed,
+        }
+    }
+
+    /// The persisted seal-policy token: `sealed`. `Plaintext` is the default and is encoded by
+    /// ABSENCE — there is deliberately no plaintext token, and the parser rejects one.
+    pub(super) fn as_db_str(self) -> Option<&'static str> {
+        match self {
+            Self::Sealed => Some("sealed"),
+            Self::Plaintext => None,
+        }
+    }
+
+    /// Parse a PRESENT seal-policy token; only `sealed` is one.
+    pub(super) fn from_db_str(value: &str) -> Option<Self> {
+        match value {
+            "sealed" => Some(Self::Sealed),
+            _ => None,
         }
     }
 }
@@ -739,11 +775,14 @@ pub(super) fn explicit_stream_seal_policy(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<StreamSealPolicy>> {
-    match rag_rat_db::meta::repo_meta(conn, repo_id, STREAM_SEAL_POLICY_META_KEY)?.as_deref() {
-        None => Ok(None),
-        Some("sealed") => Ok(Some(StreamSealPolicy::Sealed)),
-        Some(other) => anyhow::bail!(
-            "repo `{repo_id}` has unknown memory stream seal policy `{other}`; refusing to author"
+    let Some(token) = rag_rat_db::meta::repo_meta(conn, repo_id, STREAM_SEAL_POLICY_META_KEY)?
+    else {
+        return Ok(None);
+    };
+    match StreamSealPolicy::from_db_str(&token) {
+        Some(policy) => Ok(Some(policy)),
+        None => anyhow::bail!(
+            "repo `{repo_id}` has unknown memory stream seal policy `{token}`; refusing to author"
         ),
     }
 }
