@@ -19,6 +19,7 @@ mod authoring;
 mod bootstrap;
 mod branch;
 mod candidate;
+mod checkpoint;
 mod content;
 mod cut;
 pub mod discovery;
@@ -63,6 +64,11 @@ pub use bootstrap::{
     upsert_account_candidate_reservation_in_tx,
 };
 pub use branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
+pub use checkpoint::{
+    CHECKPOINT_EVIDENCE_MAX_BYTES, CHECKPOINT_EVIDENCE_MAX_ENTRIES, CheckpointBundle,
+    CheckpointError, TrustedCheckpointPin, VerifiedCheckpoint, prepare_checkpoint_in_tx,
+    verify_checkpoint,
+};
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
     ContentCapacityScope, ContentEntryHeader, ContentIngestOutcome, ContentRefoldBudget,

@@ -42,10 +42,10 @@ const CANDIDATES_GLOBAL_MAX: usize = 16_384;
 const CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize = 16 * 1024 * 1024;
 const CANDIDATE_BYTES_GLOBAL_MAX: usize = 64 * 1024 * 1024;
 
-struct AccountProjection {
-    history: fold::AccountAuthHistory,
-    accepted: HashSet<AccountEntryHash>,
-    forked: HashSet<AccountEntryHash>,
+pub(super) struct AccountProjection {
+    pub(super) history: fold::AccountAuthHistory,
+    pub(super) accepted: HashSet<AccountEntryHash>,
+    pub(super) forked: HashSet<AccountEntryHash>,
 }
 
 struct AccountStateFold {
@@ -311,7 +311,7 @@ fn account_ingest_decoded_in_tx(
     })
 }
 
-fn authenticate_entry(
+pub(super) fn authenticate_entry(
     signed_bytes: &[u8],
     pubkey_bytes: &[u8; 32],
 ) -> Result<VerifiedAccountEntry, String> {
@@ -1894,6 +1894,23 @@ fn enqueue_readoption_for_closed_fact(
 }
 
 /// Derive an author-chain-coherent, authority-closed projection without touching storage.
+pub(super) fn project_verified_checkpoint_evidence(
+    entries: &[VerifiedAccountEntry],
+) -> AccountProjection {
+    let rows = entries
+        .iter()
+        .map(|entry| CandidateRow {
+            entry_hash: entry.entry_hash,
+            log_id: entry.header.log_id,
+            device_fingerprint: entry.header.device_fingerprint,
+            seq: entry.header.seq,
+            verified: entry.clone(),
+        })
+        .collect::<Vec<_>>();
+    derive_account_projection(&rows)
+}
+
+/// Derive an author-chain-coherent, authority-closed projection without touching storage.
 fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
     let mut forked = HashSet::new();
     loop {
@@ -3137,7 +3154,7 @@ fn is_sealed_snapshot(header: &AccountEntryHeader) -> bool {
         && header.crypto_suite != 0
 }
 
-fn validate_storable_header_payload(
+pub(super) fn validate_storable_header_payload(
     header: &AccountEntryHeader,
     payload: &[u8],
 ) -> Result<(), String> {
