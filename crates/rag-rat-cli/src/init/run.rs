@@ -236,9 +236,9 @@ fn apply_git_hooks(
     fs::create_dir_all(&git.hooks_dir)?;
     let mut installed = Vec::new();
     for &hook in crate::MANAGED_HOOKS {
-        let path = git.hooks_dir.join(hook);
+        let path = git.hooks_dir.join(hook.as_trigger());
         let foreign = path.exists() && !is_rag_rat_hook(&path)?;
-        match conflicts.get(hook).copied() {
+        match conflicts.get(hook.as_trigger()).copied() {
             // A foreign file with an explicit resolution.
             Some(HookConflict::Skip) | Some(HookConflict::UninstallRagRatOnly) => {
                 // Leave the foreign hook in place; install nothing for this slot.
@@ -246,13 +246,13 @@ fn apply_git_hooks(
             Some(HookConflict::Overwrite) => {
                 write_atomic(&path, hook_script(hook).as_bytes())?;
                 make_executable(&path)?;
-                installed.push(hook);
+                installed.push(hook.as_trigger());
             },
             Some(HookConflict::Chain) => {
                 let original = fs::read_to_string(&path).unwrap_or_default();
-                write_atomic(&path, render_chained_hook(&original, hook).as_bytes())?;
+                write_atomic(&path, render_chained_hook(&original, hook.as_trigger()).as_bytes())?;
                 make_executable(&path)?;
-                installed.push(hook);
+                installed.push(hook.as_trigger());
             },
             Some(HookConflict::Abort) => unreachable!("handled above"),
             // No conflict recorded: a clean slot, or one already managed by rag-rat.
@@ -267,7 +267,7 @@ fn apply_git_hooks(
                 } else {
                     // `install_hook` is safe here: the slot is empty or already a rag-rat hook.
                     install_hook(&git.hooks_dir, hook)?;
-                    installed.push(hook);
+                    installed.push(hook.as_trigger());
                 }
             },
         }
@@ -467,7 +467,7 @@ pub(crate) fn offer_hooks_install(config: &Config, assume_yes: bool) -> anyhow::
     }
     let git = git_paths(&config.root)?;
     fs::create_dir_all(&git.hooks_dir)?;
-    for hook in crate::MANAGED_HOOKS {
+    for &hook in crate::MANAGED_HOOKS {
         crate::install_hook(&git.hooks_dir, hook)?;
     }
     eprintln!("init: installed hooks in {}", git.hooks_dir.display());

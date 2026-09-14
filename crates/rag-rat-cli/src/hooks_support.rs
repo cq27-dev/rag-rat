@@ -1,5 +1,33 @@
 use super::*;
 
+// Variant names mirror Git’s installed trigger tokens, including their shared `post-` prefix.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "kebab-case")]
+pub(crate) enum ManagedHook {
+    PostCheckout,
+    PostMerge,
+    PostRewrite,
+    PostCommit,
+}
+
+impl ManagedHook {
+    pub(crate) const ALL: &[Self] =
+        &[Self::PostCheckout, Self::PostMerge, Self::PostRewrite, Self::PostCommit];
+
+    pub(crate) fn as_trigger(self) -> &'static str {
+        self.into()
+    }
+
+    pub(crate) fn from_trigger(trigger: &str) -> Option<Self> {
+        trigger.parse().ok()
+    }
+
+    pub(crate) fn changes_files(self) -> bool {
+        matches!(self, Self::PostCheckout | Self::PostMerge)
+    }
+}
+
 pub(crate) fn git_paths(root: &Path) -> anyhow::Result<GitPaths> {
     // Env-aware discovery (honors GIT_DIR / GIT_WORK_TREE) so `hooks install/status/uninstall`
     // works in a bare-dir + external-worktree checkout, matching the old `git -C root
@@ -28,8 +56,8 @@ pub(crate) fn git_paths(root: &Path) -> anyhow::Result<GitPaths> {
         .unwrap_or_else(|| git_common_dir.join("hooks"));
     Ok(GitPaths { worktree_root, git_dir, git_common_dir, hooks_dir })
 }
-pub(crate) fn install_hook(hooks_dir: &Path, hook: &str) -> anyhow::Result<()> {
-    let path = hooks_dir.join(hook);
+pub(crate) fn install_hook(hooks_dir: &Path, hook: ManagedHook) -> anyhow::Result<()> {
+    let path = hooks_dir.join(hook.as_trigger());
     if path.exists() && !is_rag_rat_hook(&path)? {
         anyhow::bail!(
             "{} already exists and is not managed by rag-rat; move it aside or merge manually",
@@ -46,35 +74,26 @@ pub(crate) fn is_rag_rat_hook(path: &Path) -> anyhow::Result<bool> {
     }
     Ok(fs::read_to_string(path)?.contains(HOOK_MARKER))
 }
-pub(crate) fn hook_script(hook: &str) -> String {
+pub(crate) fn hook_script(hook: ManagedHook) -> String {
+    let trigger = hook.as_trigger();
     let command = match hook {
-        "post-checkout" =>
+        ManagedHook::PostCheckout => format!(
             r#"rag-rat maintenance \
-    --trigger post-checkout \
+    --trigger {trigger} \
     --old-head "$1" \
     --new-head "$2" \
     --branch-checkout "$3" \
-    --max-seconds 30"#,
+    --max-seconds {DEFAULT_MAINTENANCE_SECONDS}"#
+        ),
         // No positional args: git passes post-merge a squash flag (0/1) and post-rewrite the
-        // command (amend/rebase); `rag-rat maintenance` takes no positionals, so forwarding
-        // them ("$@") made the hook abort with `unexpected argument`. The trigger flag is
-        // all maintenance needs — it re-discovers either way.
-        "post-merge" =>
+        // command (amend/rebase); maintenance needs only the trigger. post-commit passes none.
+        ManagedHook::PostMerge | ManagedHook::PostRewrite | ManagedHook::PostCommit => format!(
             r#"rag-rat maintenance \
-    --trigger post-merge \
-    --max-seconds 30"#,
-        "post-rewrite" =>
-            r#"rag-rat maintenance \
-    --trigger post-rewrite \
-    --max-seconds 30"#,
-        // git passes no positional args to post-commit; HEAD has already advanced, so the
-        // maintenance discover-index re-keys the just-committed files under the new commit.
-        "post-commit" =>
-            r#"rag-rat maintenance \
-    --trigger post-commit \
-    --max-seconds 30"#,
-        _ => unreachable!("unknown managed hook"),
+    --trigger {trigger} \
+    --max-seconds {DEFAULT_MAINTENANCE_SECONDS}"#
+        ),
     };
+    let hook = trigger;
     format!(
         r#"#!/bin/sh
 {HOOK_MARKER} Edit rag-rat config, not this hook.
@@ -122,8 +141,9 @@ mod tests {
 
     #[test]
     fn generated_hooks_clear_git_env_and_forward_no_positionals() {
-        for hook in ["post-checkout", "post-commit", "post-merge", "post-rewrite"] {
-            let script = hook_script(hook);
+        for &managed in ManagedHook::ALL {
+            let hook = managed.as_trigger();
+            let script = hook_script(managed);
             assert!(script.contains(HOOK_MARKER), "{hook}: missing marker");
             // git passes post-merge a squash flag (0/1) and post-rewrite a command (amend/rebase);
             // `rag-rat maintenance` takes no positionals, so forwarding "$@" aborted the hook.
@@ -138,5 +158,28 @@ mod tests {
             let invoke = script.find("rag-rat maintenance").expect("hook invokes maintenance");
             assert!(unset < invoke, "{hook}: clears git env AFTER invoking rag-rat");
         }
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn hook_tokens_and_scripts_are_stable() {
+        let fixtures = [
+            ("post-checkout", include_str!("hook_fixtures/post-checkout.sh")),
+            ("post-merge", include_str!("hook_fixtures/post-merge.sh")),
+            ("post-rewrite", include_str!("hook_fixtures/post-rewrite.sh")),
+            ("post-commit", include_str!("hook_fixtures/post-commit.sh")),
+        ];
+        for (&hook, (token, script)) in ManagedHook::ALL.iter().zip(fixtures) {
+            assert_eq!(hook.as_trigger(), token);
+            assert_eq!(ManagedHook::from_trigger(token), Some(hook));
+            assert_eq!(hook_script(hook), script);
+            assert_eq!(hook.changes_files(), token == "post-checkout" || token == "post-merge");
+        }
+        assert_eq!(ManagedHook::from_trigger("manual"), None);
+        assert_eq!(ManagedHook::from_trigger("POST-COMMIT"), None);
     }
 }

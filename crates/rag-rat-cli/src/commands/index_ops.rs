@@ -389,9 +389,12 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // run must stay bounded by its index budget — a mirror flight can start a full backfill or
     // wait on provider rate limits, far past `--max-seconds`. Explicit mirroring is
     // `rag-rat papertrail sync`.
-    let hook_trigger = crate::MANAGED_HOOKS.contains(&trigger.as_str());
+    let hook_trigger = crate::hooks_support::ManagedHook::from_trigger(&trigger).is_some();
 
-    if trigger == "post-checkout" && branch_checkout.as_deref() == Some("0") {
+    if crate::hooks_support::ManagedHook::from_trigger(&trigger)
+        == Some(crate::hooks_support::ManagedHook::PostCheckout)
+        && branch_checkout.as_deref() == Some("0")
+    {
         print_output(&serde_json::json!({
             "trigger": trigger,
             "status": HookStatus::Skipped,
@@ -409,7 +412,8 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // doubles the work + memory pressure. Defer to the watcher; the query-path heal covers the
     // brief staleness gap. post-commit / post-rewrite touch only git metadata, which the
     // file-watcher can't see, so those still run (and are cheap — no file content changed).
-    if matches!(trigger.as_str(), "post-checkout" | "post-merge")
+    if crate::hooks_support::ManagedHook::from_trigger(&trigger)
+        .is_some_and(crate::hooks_support::ManagedHook::changes_files)
         && crate::agent_hook::watcher_state(config).0
     {
         // The git action is still a tracker-change signal even when the index pass is the

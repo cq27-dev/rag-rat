@@ -36,9 +36,9 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
         HookAction::Install => {
             fs::create_dir_all(&git.hooks_dir)?;
             let mut installed = Vec::new();
-            for hook in MANAGED_HOOKS {
+            for &hook in MANAGED_HOOKS {
                 install_hook(&git.hooks_dir, hook)?;
-                installed.push(*hook);
+                installed.push(hook.as_trigger());
             }
             print_output(&serde_json::json!({
                 "status": "installed",
@@ -52,16 +52,16 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
         HookAction::Uninstall => {
             let mut removed = Vec::new();
             let mut kept = Vec::new();
-            for hook in MANAGED_HOOKS {
-                let path = git.hooks_dir.join(hook);
+            for &hook in MANAGED_HOOKS {
+                let path = git.hooks_dir.join(hook.as_trigger());
                 if !path.exists() {
                     continue;
                 }
                 if is_rag_rat_hook(&path)? {
                     fs::remove_file(&path)?;
-                    removed.push(*hook);
+                    removed.push(hook.as_trigger());
                 } else {
-                    kept.push(*hook);
+                    kept.push(hook.as_trigger());
                 }
             }
             print_output(&serde_json::json!({
@@ -75,10 +75,10 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
             let hooks = MANAGED_HOOKS
                 .iter()
                 .map(|hook| {
-                    let path = git.hooks_dir.join(hook);
+                    let path = git.hooks_dir.join(hook.as_trigger());
                     let managed = is_rag_rat_hook(&path).unwrap_or(false);
                     serde_json::json!({
-                        "name": hook,
+                        "name": hook.as_trigger(),
                         "path": path,
                         "exists": path.exists(),
                         "managed": managed,
