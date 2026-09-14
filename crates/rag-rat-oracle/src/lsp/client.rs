@@ -107,10 +107,7 @@ impl LspClient {
     }
 
     /// Build a client over an injected transport (no child process). The fake-server test seam.
-    fn from_transport(reader: Box<dyn BufRead + Send>, writer: Box<dyn Write + Send>) -> Self {
-        Self::from_transport_with_timeout(reader, writer, REQUEST_TIMEOUT)
-    }
-
+    #[cfg(test)]
     fn from_transport_with_timeout(
         reader: Box<dyn BufRead + Send>,
         writer: Box<dyn Write + Send>,
@@ -119,6 +116,7 @@ impl LspClient {
         Self::from_transport_with(reader, writer, request_timeout, ReadinessPolicy::ServerStatus)
     }
 
+    #[cfg(test)]
     fn from_transport_with(
         reader: Box<dyn BufRead + Send>,
         writer: Box<dyn Write + Send>,

@@ -26,6 +26,7 @@ pub(crate) struct LspRange {
 /// definition range (LSP positions), and the moniker the server minted for the callee, if any.
 /// Byte-span conversion + symbol mapping happen in slice 2 (they need the target file + the index).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code, reason = "the moniker fan-out has no production consumer yet")]
 pub(crate) struct LiveDefinition {
     pub(crate) target_uri: String,
     pub(crate) target_range: LspRange,
@@ -67,6 +68,7 @@ impl LspClient {
 
     /// Ask for the moniker at a position (`textDocument/moniker`, LSP 3.16+); `None` when the
     /// server has no moniker or does not support the request.
+    #[allow(dead_code, reason = "the moniker fan-out has no production consumer yet")]
     pub(crate) fn moniker_at(
         &mut self,
         uri: &str,
@@ -103,6 +105,7 @@ impl LspClient {
     /// computed in the session's negotiated encoding) and — only when the definition resolved — a
     /// `textDocument/moniker`. The result is aligned index-for-index with `callee_starts`; an
     /// unresolved callee is `None`.
+    #[allow(dead_code, reason = "the moniker fan-out has no production consumer yet")]
     pub(crate) fn resolve_callees(
         &mut self,
         uri: &str,
@@ -116,8 +119,8 @@ impl LspClient {
         resolved
     }
 
-    /// [`resolve_callees`] without the per-callee `textDocument/moniker` fan-out — the slice-2
-    /// write path's shape (#534). Live verdicts NEVER persist an LSP moniker (it is not
+    /// [`Self::resolve_callees`] without the per-callee `textDocument/moniker` fan-out — the
+    /// slice-2 write path's shape (#534). Live verdicts NEVER persist an LSP moniker (it is not
     /// interchangeable with the batch SCIP moniker string, so persisting one would trip the
     /// cross-tool conflict-drop), so the request would be pure waste against the pass's request
     /// budget. Returns `(target_uri, target_range)` per callee, aligned with `callee_starts`.
@@ -129,38 +132,46 @@ impl LspClient {
         callee_starts: &[usize],
     ) -> io::Result<Vec<Option<(String, LspRange)>>> {
         self.did_open(uri, language_id, text)?;
-        let resolved = (|| {
-            let index = LineIndex::new(text.as_bytes(), self.encoding());
-            let mut out = Vec::with_capacity(callee_starts.len());
-            for &start in callee_starts {
-                let position = index.position_at_byte(start);
-                out.push(self.definition_at(uri, position)?);
-            }
-            Ok(out)
-        })();
+        let resolved = self.resolve_open_definitions(uri, text, callee_starts);
         let _ = self.did_close(uri);
         resolved
     }
 
-    /// The resolution loop over an ALREADY-OPEN document (the interior of [`resolve_callees`],
-    /// split out so the enclosing `didOpen`/`didClose` always pair even when a request errors).
+    /// The definition loop over an ALREADY-OPEN document — the interior of
+    /// [`Self::resolve_definitions`] and [`Self::resolve_callees`], split out so the enclosing
+    /// `didOpen`/`didClose` always pair even when a request errors.
+    fn resolve_open_definitions(
+        &mut self,
+        uri: &str,
+        text: &str,
+        callee_starts: &[usize],
+    ) -> io::Result<Vec<Option<(String, LspRange)>>> {
+        let index = LineIndex::new(text.as_bytes(), self.encoding());
+        let mut out = Vec::with_capacity(callee_starts.len());
+        for &start in callee_starts {
+            out.push(self.definition_at(uri, index.position_at_byte(start))?);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::resolve_open_definitions`] plus the moniker fan-out: a `textDocument/moniker`
+    /// request for each callee whose definition resolved, and none for an unresolved one.
+    #[allow(dead_code, reason = "the moniker fan-out has no production consumer yet")]
     fn resolve_open_callees(
         &mut self,
         uri: &str,
         text: &str,
         callee_starts: &[usize],
     ) -> io::Result<Vec<Option<LiveDefinition>>> {
+        let definitions = self.resolve_open_definitions(uri, text, callee_starts)?;
         let index = LineIndex::new(text.as_bytes(), self.encoding());
         let mut out = Vec::with_capacity(callee_starts.len());
-        for &start in callee_starts {
-            let position = index.position_at_byte(start);
-            let Some((target_uri, target_range)) = self.definition_at(uri, position)? else {
+        for (&start, definition) in callee_starts.iter().zip(definitions) {
+            let Some((target_uri, target_range)) = definition else {
                 out.push(None);
                 continue;
             };
-            // Only spend a moniker request on a resolved callee (the per-request fan-out the plan
-            // caps in slice 2's budget).
-            let moniker = self.moniker_at(uri, position)?;
+            let moniker = self.moniker_at(uri, index.position_at_byte(start))?;
             out.push(Some(LiveDefinition { target_uri, target_range, moniker }));
         }
         Ok(out)
