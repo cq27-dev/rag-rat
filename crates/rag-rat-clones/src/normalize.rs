@@ -40,8 +40,7 @@ fn is_literal_kind(kind: &str, lang: Language) -> bool {
         || is_string_body_leaf_kind(kind)
         || matches!(
             kind,
-            "str_escaped_char"
-                | "interpreted_string_literal_content"
+            "interpreted_string_literal_content"
                 | "raw_string_literal_content"
                 | "integer"
                 | "float"
@@ -53,14 +52,19 @@ fn is_literal_kind(kind: &str, lang: Language) -> bool {
 
 /// The string-BODY leaf kinds whose value the baseline normalizer erases: Rust/Python
 /// `string_content` and TS/JS `string_fragment` (#232 #2a), plus Swift's `line_str_text` /
-/// `multi_line_str_text` (the `"…"` and `"""…"""` bodies) and `raw_str_part` / `raw_str_end_part`
+/// `multi_line_str_text` (the `"…"` and `"""…"""` bodies), `raw_str_part` / `raw_str_end_part`
 /// (the `#"…"#` body — an UNINTERPOLATED raw string arrives as a single `raw_str_end_part` leaf
-/// carrying its own delimiters).
+/// carrying its own delimiters), and `str_escaped_char` (an escape inside a Swift string body).
 ///
 /// SINGLE source of truth for [`is_literal_kind`], which buckets them, and the anti-unify string
 /// widening, which widens a hole over one of them to its enclosing quote-bearing node so the hole
 /// covers the WHOLE `"hello"`: a hole over the bare text leaf, with the quotes left as fixed
 /// template text, does not describe the `&str` value that actually varies.
+///
+/// Go's `interpreted_string_literal_content` / `raw_string_literal_content` bucket in
+/// [`is_literal_kind`] but stay OUT of this list: Go's `raw_string_literal` wrapper is already a
+/// widenable string-node kind, so listing them here would start widening Go string holes — a
+/// template change, not a refactor of this list.
 pub(crate) fn is_string_body_leaf_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -70,6 +74,7 @@ pub(crate) fn is_string_body_leaf_kind(kind: &str) -> bool {
             | "multi_line_str_text"
             | "raw_str_part"
             | "raw_str_end_part"
+            | "str_escaped_char"
     )
 }
 
