@@ -20,9 +20,14 @@ pub(crate) fn install_fastembed_model(conn: &Connection, model_id: &str) -> anyh
         conn.execute(
             "UPDATE ai_models
              SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
-                 embedding_dim = ?3, runtime = 'fastembed', last_error = NULL
+                 embedding_dim = ?3, runtime = ?4, last_error = NULL
              WHERE model_id = ?1",
-            params![model_id, now_ms(), i64::try_from(embedder.dim()).unwrap_or(i64::MAX)],
+            params![
+                model_id,
+                now_ms(),
+                i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
+                Backend::FastEmbed.as_db_str()
+            ],
         )?;
         Ok(())
     }
@@ -166,7 +171,7 @@ pub(crate) fn fastembed_operational_status(
     // FastEmbed; everything non-fastembed falls back to the MiniLM report identity.
     let active_is_fastembed = spec(active_model_id).map(|s| s.backend) == Some(Backend::FastEmbed);
     let report_model_id = if active_is_fastembed { active_model_id } else { FASTEMBED_MODEL_ID };
-    let report_display = spec(report_model_id).map_or(FASTEMBED_DISPLAY_MODEL, |s| s.display);
+    let report_display = spec(report_model_id).map_or(FASTEMBED_DISPLAY_MODEL, |s| s.display());
     let model = model(conn, report_model_id)?;
     // PERF: report coverage from CHEAP persisted counts (the `embedding_artifacts` rows + the chunk
     // total) rather than `embedding_reconcile_plan` — which loads EVERY chunk and rebuilds +

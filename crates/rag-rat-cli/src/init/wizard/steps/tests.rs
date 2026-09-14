@@ -1167,7 +1167,8 @@ fn embedding_focus_navigation_covers_selectors_and_numeric_fields() {
 fn embedding_model_help_covers_heavier_model_copy() {
     let mut state = empty_state();
     for needle in ["bge", "jina"] {
-        let model = EMBEDDING_MODELS.iter().find(|s| s.display.contains(needle)).unwrap().model_id;
+        let model =
+            EMBEDDING_MODELS.iter().find(|s| s.display().contains(needle)).unwrap().model_id;
         state.draft.model = model.to_string();
         state.step = Some(init_step(StepId::Embedding, &state));
 

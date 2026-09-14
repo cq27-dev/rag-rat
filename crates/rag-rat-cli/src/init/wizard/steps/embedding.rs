@@ -42,7 +42,10 @@ pub(super) fn model_rows() -> Vec<(String, String)> {
     EMBEDDING_MODELS
         .iter()
         .map(|s| {
-            (s.model_id.to_string(), format!("{} ({}, {}d)", s.display, s.backend.runtime(), s.dim))
+            (
+                s.model_id.to_string(),
+                format!("{} ({}, {}d)", s.display(), s.backend.as_db_str(), s.dim),
+            )
         })
         .chain(std::iter::once((
             NONE_MODEL.to_string(),
@@ -574,14 +577,14 @@ fn model_help_lines(model_id: Option<&str>) -> Vec<Line<'static>> {
         Backend::Hash =>
             "Dependency-free fallback; very fast, but weak semantic recall. Not recommended for \
              big codebases.",
-        Backend::FastEmbed if s.display.contains("MiniLM") =>
+        Backend::FastEmbed if s.display().contains("MiniLM") =>
             "Good default for general text, but its 256-token window TRUNCATES long functions — \
              their tail is not embedded, so it loses precision/recall on large code chunks. For \
              code-heavy repos prefer jina (8192 tokens), which embeds whole chunks.",
-        Backend::FastEmbed if s.display.contains("bge") =>
+        Backend::FastEmbed if s.display().contains("bge") =>
             "General-purpose 384d model with a 512-token window — a bit more context than MiniLM, \
              but still truncates long code. Useful for comparison.",
-        Backend::FastEmbed if s.display.contains("jina") =>
+        Backend::FastEmbed if s.display().contains("jina") =>
             "Code-focused 768d model with an 8192-token window: embeds WHOLE functions with no \
              truncation (unlike MiniLM's 256), so it keeps precision/recall on long chunks. \
              Heavier storage + reconcile — the best fit for code.",
@@ -597,9 +600,9 @@ fn model_help_lines(model_id: Option<&str>) -> Vec<Line<'static>> {
     vec![
         Line::from(format!(
             "{}: {weight}, {}d, {}{window}.",
-            s.display,
+            s.display(),
             s.dim,
-            s.backend.runtime()
+            s.backend.as_db_str()
         )),
         Line::from(guidance),
     ]

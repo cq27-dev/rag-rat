@@ -52,12 +52,13 @@ pub(crate) fn recover_cached_fastembed_model_at(
         conn.execute(
             "UPDATE ai_models
              SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
-                 embedding_dim = ?3, runtime = 'fastembed', last_error = NULL
+                 embedding_dim = ?3, runtime = ?4, last_error = NULL
              WHERE model_id = ?1",
             params![
                 FASTEMBED_MODEL_ID,
                 now_ms(),
-                i64::try_from(FASTEMBED_EMBEDDING_DIM).unwrap_or(i64::MAX)
+                i64::try_from(FASTEMBED_EMBEDDING_DIM).unwrap_or(i64::MAX),
+                Backend::FastEmbed.as_db_str()
             ],
         )?;
     }
@@ -311,7 +312,7 @@ pub(crate) fn install_model(
                 "remote embedding requires a transformer model, but `{model_id}` is a {} model — \
                  remove the [llm.embedding.remote] block to install it locally, or select a \
                  transformer model to serve over the remote backend",
-                spec.backend.runtime()
+                spec.backend.as_db_str()
             );
         }
         install_remote_model(conn, model_id, spec, remote)?;
@@ -321,9 +322,14 @@ pub(crate) fn install_model(
                 conn.execute(
                     "UPDATE ai_models
                      SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
-                         embedding_dim = ?3, runtime = 'hash', last_error = NULL
+                         embedding_dim = ?3, runtime = ?4, last_error = NULL
                      WHERE model_id = ?1",
-                    params![model_id, now_ms(), i64::try_from(spec.dim).unwrap_or(i64::MAX)],
+                    params![
+                        model_id,
+                        now_ms(),
+                        i64::try_from(spec.dim).unwrap_or(i64::MAX),
+                        Backend::Hash.as_db_str()
+                    ],
                 )?;
             },
             Backend::FastEmbed => install_fastembed_model(conn, model_id)?,
@@ -375,9 +381,14 @@ pub(crate) fn install_model2vec_model(conn: &Connection, model_id: &str) -> anyh
         conn.execute(
             "UPDATE ai_models
              SET installed = 1, disabled = 0, status = 'Ready', installed_at_ms = ?2,
-                 embedding_dim = ?3, runtime = 'model2vec', last_error = NULL
+                 embedding_dim = ?3, runtime = ?4, last_error = NULL
              WHERE model_id = ?1",
-            params![model_id, now_ms(), i64::try_from(embedder.dim()).unwrap_or(i64::MAX)],
+            params![
+                model_id,
+                now_ms(),
+                i64::try_from(embedder.dim()).unwrap_or(i64::MAX),
+                Backend::Model2Vec.as_db_str()
+            ],
         )?;
         Ok(())
     }
