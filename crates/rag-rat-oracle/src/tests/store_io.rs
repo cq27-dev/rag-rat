@@ -177,8 +177,12 @@ fn record_oracle_run_at_persists_the_passed_start_time() {
     let h = Harness::new();
     // Deliberately far in the past: if the impl stamped `now_ms()` instead, this would not match.
     let started_at_ms = 1_000_000_i64;
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, started_at_ms, "Completed", "{}")
-        .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, &store::OracleRunRecord {
+        started_at_ms,
+        status: "Completed",
+        stats_json: "{}",
+    })
+    .unwrap();
     assert_eq!(
         store::latest_run_started_at(&h.conn, TOOL, CHECKOUT).unwrap(),
         Some(started_at_ms),
@@ -259,15 +263,18 @@ fn current_callee_monikers_filters_sha_locals_and_conflicts() {
     // The currency gate only trusts rows the LATEST run of their tool stands behind — record a
     // completed run for BOTH tools so every row below is in play (the conflict drop must fire
     // on trusted rows, not on rows the run gate already filtered).
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 0, "Completed", "{}").unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, &store::OracleRunRecord {
+        started_at_ms: 0,
+        status: "Completed",
+        stats_json: "{}",
+    })
+    .unwrap();
     store::record_oracle_run_at(
         &h.conn,
         OracleTool::ScipClang,
         VERSION,
         CHECKOUT,
-        0,
-        "Completed",
-        "{}",
+        &store::OracleRunRecord { started_at_ms: 0, status: "Completed", stats_json: "{}" },
     )
     .unwrap();
 
@@ -339,9 +346,18 @@ fn current_callee_monikers_drops_superseded_runs_and_dead_defs() {
     };
     // The latest completed run for TOOL carries VERSION — rows under any other version of TOOL,
     // or under a tool with NO run in this checkout, are not backed by it.
-    store::record_oracle_run_at(&h.conn, TOOL, "superseded", CHECKOUT, 0, "Completed", "{}")
-        .unwrap();
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 1, "Completed", "{}").unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, "superseded", CHECKOUT, &store::OracleRunRecord {
+        started_at_ms: 0,
+        status: "Completed",
+        stats_json: "{}",
+    })
+    .unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, &store::OracleRunRecord {
+        started_at_ms: 1,
+        status: "Completed",
+        stats_json: "{}",
+    })
+    .unwrap();
 
     // (a) A row written under TOOL's SUPERSEDED version: the latest run no longer stands behind
     // it, even though its file_sha is current.
@@ -429,7 +445,12 @@ fn current_callee_monikers_includes_macro_heads_and_excludes_non_call_kinds() {
         let start = src.find(name).unwrap();
         (start, start + name.len())
     };
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 0, "Completed", "{}").unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, &store::OracleRunRecord {
+        started_at_ms: 0,
+        status: "Completed",
+        stats_json: "{}",
+    })
+    .unwrap();
 
     let (mac_lo, mac_hi) = span("emit");
     let mac_edge =
@@ -464,7 +485,12 @@ fn current_callee_monikers_drops_verdicts_without_a_live_edge() {
         let start = src.find(name).unwrap();
         (start, start + name.len())
     };
-    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, 0, "Completed", "{}").unwrap();
+    store::record_oracle_run_at(&h.conn, TOOL, VERSION, CHECKOUT, &store::OracleRunRecord {
+        started_at_ms: 0,
+        status: "Completed",
+        stats_json: "{}",
+    })
+    .unwrap();
 
     // A live edge + its verdict, keyed off the real edge — returned.
     let (live_lo, live_hi) = span("live");
