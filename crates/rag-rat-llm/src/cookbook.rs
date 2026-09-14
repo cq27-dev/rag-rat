@@ -651,7 +651,7 @@ fn cookbook_input_for(remote: &RemoteEmbeddingConfig) -> CookbookInput {
     }
 }
 
-/// Context for the in-Rust throughput sweep (see [`crate::index::ai::throughput_tune`]). Present
+/// Context for the in-Rust throughput sweep (see [`crate::throughput_tune`]). Present
 /// only on the reconcile path (which has the DB `conn` for the tune cache and the configured chunk
 /// size); the install probe / wizard verify pass `None` (they just ping — no sweep).
 pub struct TuneRequest<'a> {
@@ -697,12 +697,12 @@ pub struct ProvisionedEmbedding {
 /// EVAL-ONLY (#346): provision an ephemeral cookbook box for `remote` + `spec` and hand the caller
 /// the live [`ProvisionedBox`] — the `pub` seam the `benchmark-embedding` subcommand uses. It calls
 /// [`provision_and_build`] with `tune = None` (the benchmark runs its OWN measured concurrency
-/// sweep via [`crate::index::ai::benchmark_remote_concurrency`]; it must NOT warm the reconcile
-/// tune cache), discards the built embedder (the benchmark builds its own per-candidate embedders
-/// against the box's `endpoint`/`auth_token`), and returns ONLY the box. The caller MUST keep the
-/// returned box bound for the whole sweep — its `Drop` is the teardown, so an early drop kills the
-/// server mid-benchmark. `TuneRequest` stays crate-private: this seam never names it (always
-/// `None`).
+/// sweep via [`crate::throughput_tune::benchmark_remote_concurrency`]; it must NOT warm the
+/// reconcile tune cache), discards the built embedder (the benchmark builds its own per-candidate
+/// embedders against the box's `endpoint`/`auth_token`), and returns ONLY the box. The caller MUST
+/// keep the returned box bound for the whole sweep — its `Drop` is the teardown, so an early drop
+/// kills the server mid-benchmark. `TuneRequest` stays crate-private: this seam never names it
+/// (always `None`).
 #[cfg(feature = "eval")]
 pub fn provision_box_for_benchmark(
     remote: &RemoteEmbeddingConfig,
@@ -771,8 +771,9 @@ fn provision_and_build_cancellable(
 /// (`RemoteBackend::provision_timeout` — 300s ollama/infinity, longer for vLLM) that gates
 /// `provision`.
 ///
-/// This is the `pub` seam the CLI's Remote step probes against: `provision_and_build` is
-/// `pub(crate)`, so a connection-less verify that the CLI can call lives HERE, not in the wizard.
+/// This is the `pub` seam the CLI's Remote step probes against: the whole connection-less
+/// round-trip (provision, ping, guaranteed teardown) lives HERE, so the wizard never holds a
+/// [`ProvisionedBox`] or an embedder itself.
 /// The box is ALWAYS torn down before this returns (Drop is the teardown), so a passing test leaks
 /// no billing instance. The caller still confirms intent via the type-`provision` gate; this fn
 /// trusts that gate and just runs the round-trip.

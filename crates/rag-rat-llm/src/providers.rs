@@ -11,8 +11,8 @@
 // under `eval` so it reaches the CLI through `index::ai`.
 #[cfg(feature = "eval")]
 pub use crate::cookbook::provision_box_for_benchmark;
-// `verify_ephemeral_remote` is the `pub` init-wizard seam (the CLI's Remote step calls it);
-// the underlying `provision_and_build` stays `pub(crate)`.
+// `verify_ephemeral_remote` is the init-wizard seam (the CLI's Remote step calls it); the
+// engine's selection glue reaches `provision_and_build` through `cookbook_internals` instead.
 pub use crate::cookbook::{
     CookbookCapability, CookbookInput, CookbookProvisioner, ProvisionedBox,
     abort_active_provisioning, install_provision_log_sink, verify_ephemeral_remote,
@@ -25,7 +25,7 @@ pub use crate::model2vec::MODEL2VEC_HF_REPO;
 #[cfg(feature = "model2vec")]
 pub use crate::model2vec::Model2VecEmbedder;
 pub use crate::openai::OpenAiEmbedder;
-// The tuning sweep (index::ai::throughput_tune) builds embedders at varied concurrencies.
+// The tuning sweep (`crate::throughput_tune`) builds embedders at varied concurrencies.
 pub(crate) use crate::openai::ProvisionedEmbedderParams;
 
 pub const MODEL2VEC_MISSING_FEATURE_MESSAGE: &str =
