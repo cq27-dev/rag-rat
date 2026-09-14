@@ -35,6 +35,7 @@ pub use compact::CompactPass;
 // `repo_id`.
 pub use findings::{FindingKind, FindingStatus, ReviewVerdict, ReviewedFinding};
 pub use findings::{rederive_finding_ids, review_dream_finding};
+pub(crate) use rag_rat_query::memory::evidence as verify;
 // The single-turn chat client the verdict/compact passes consume lives in `rag-rat-llm`
 // (`rag_rat_llm::chat`): the CLI builds one from `[llm.dream.remote]` and hands the borrowed
 // `&dyn ChatModel` to `VerdictPass` / `CompactPass`.
@@ -57,7 +58,6 @@ pub use verify::{
 pub fn render_evidence_pack(conn: &Connection, memory_id: &str) -> anyhow::Result<String> {
     Ok(verdict::render_pack(&verify::evidence_pack(conn, memory_id)?))
 }
-pub(crate) use rag_rat_query::memory::evidence as verify;
 
 /// A finding as PRODUCED by a finding kind (`coverage_gap` / `stale_reference` /
 /// `memory_unverifiable` / `memory_divergence`) — the INPUT to [`findings::sync`], which derives

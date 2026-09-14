@@ -397,6 +397,64 @@ pub(super) fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFi
     Ok(out)
 }
 
+/// `memory_unverifiable`: an active memory with no live binding none of whose identifiers resolve
+/// anywhere in the index — decided deterministically here, never by a model. Two exemptions: an
+/// intentionally unanchored `Task`/`Concept` memory with zero bindings is not unverifiable, and a
+/// memory with any live binding is skipped before its identifiers are resolved.
+pub(super) fn unverifiable_findings(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
+    use rag_rat_db::schema;
+    use rag_rat_query::memory::evidence::{
+        any_identifier_resolves, extract_identifiers, indexed_file_paths, memory_has_any_binding,
+        memory_has_live_binding,
+    };
+
+    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
+    let mem_clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
+    let file_paths = indexed_file_paths(conn)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, kind, title, body FROM repo_memories WHERE status = 'active'{mem_clause} \
+         ORDER BY id"
+    ))?;
+    let mems: Vec<(String, String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut out = Vec::new();
+    for (memory_id, kind, title, body) in mems {
+        // Intentional UNANCHORED node (#463/#465): a `Task`/`Concept` legitimately has no code
+        // anchor, so a zero-binding one is NOT "unverifiable". A zero-binding memory of any OTHER
+        // kind is an orphan (all should-be-anchored) and is still flagged below, as is any memory
+        // whose bindings all went `gone` (≥1 row, none live).
+        if rag_rat_query::memory::is_polymorphic_node_kind(&kind)
+            && !memory_has_any_binding(conn, &memory_id, &scope)?
+        {
+            continue;
+        }
+        if memory_has_live_binding(conn, &memory_id, &scope)? {
+            continue;
+        }
+        let identifiers = extract_identifiers(&title, &body);
+        if any_identifier_resolves(conn, &identifiers, &file_paths)? {
+            continue;
+        }
+        let named = if identifiers.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", identifiers.join(", "))
+        };
+        out.push(DreamFinding {
+            kind: FindingKind::MemoryUnverifiable,
+            subject: memory_id,
+            evidence: format!(
+                "no live binding and none of {} identifier(s) resolve in the index{named} [E0]",
+                identifiers.len(),
+            ),
+            rank: FindingKind::MemoryUnverifiable.base_rank(),
+        });
+    }
+    Ok(out)
+}
+
 /// The active `repo_id` to scope the `dream_findings` lifecycle by (V042), or `None` on the pre-A5
 /// schema (the column is absent, so the reads/writes run unscoped — the original repo-global SQL).
 /// Probes `dream_findings` — see `schema::periphery_repo_scope`.
@@ -1281,60 +1339,6 @@ mod tests {
              IMMEDIATE, not DEFERRED (which would do no writes and silently succeed)"
         );
     }
-}
-
-pub(super) fn unverifiable_findings(conn: &Connection) -> rusqlite::Result<Vec<DreamFinding>> {
-    use rag_rat_db::schema;
-    use rag_rat_query::memory::evidence::{
-        any_identifier_resolves, extract_identifiers, indexed_file_paths, memory_has_any_binding,
-        memory_has_live_binding,
-    };
-
-    let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let mem_clause = schema::periphery_repo_scope_clause(&scope, "repo_memories");
-    let file_paths = indexed_file_paths(conn)?;
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, kind, title, body FROM repo_memories WHERE status = 'active'{mem_clause} \
-         ORDER BY id"
-    ))?;
-    let mems: Vec<(String, String, String, String)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-
-    let mut out = Vec::new();
-    for (memory_id, kind, title, body) in mems {
-        // Intentional UNANCHORED node (#463/#465): a `Task`/`Concept` legitimately has no code
-        // anchor, so a zero-binding one is NOT "unverifiable". A zero-binding memory of any OTHER
-        // kind is an orphan (all should-be-anchored) and is still flagged below, as is any memory
-        // whose bindings all went `gone` (≥1 row, none live).
-        if rag_rat_query::memory::is_polymorphic_node_kind(&kind)
-            && !memory_has_any_binding(conn, &memory_id, &scope)?
-        {
-            continue;
-        }
-        if memory_has_live_binding(conn, &memory_id, &scope)? {
-            continue;
-        }
-        let identifiers = extract_identifiers(&title, &body);
-        if any_identifier_resolves(conn, &identifiers, &file_paths)? {
-            continue;
-        }
-        let named = if identifiers.is_empty() {
-            String::new()
-        } else {
-            format!(": {}", identifiers.join(", "))
-        };
-        out.push(DreamFinding {
-            kind: FindingKind::MemoryUnverifiable,
-            subject: memory_id,
-            evidence: format!(
-                "no live binding and none of {} identifier(s) resolve in the index{named} [E0]",
-                identifiers.len(),
-            ),
-            rank: FindingKind::MemoryUnverifiable.base_rank(),
-        });
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
