@@ -38,11 +38,10 @@ pub(crate) fn reconcile_with_options_progress(
     options: ReconcileOptions,
     mut progress: impl FnMut(ReconcileProgress),
 ) -> anyhow::Result<ReconcileReport> {
-    ensure_model_manifest(conn)?;
-    let active_model_id = active_embedding_model_id(conn)?;
-    let model = model(conn, &active_model_id)?;
-    let model_version = active_embedding_model_version(conn, &active_model_id)?;
-    let embedding_dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+    let active = super::status::ActiveEmbeddingModel::resolve(conn)?;
+    let active_model_id = active.model.model_id.clone();
+    let model_version = active.model_version.clone();
+    let embedding_dim = active.dim;
     let batch_size = options
         .batch_size
         .map(usize::try_from)
@@ -55,13 +54,7 @@ pub(crate) fn reconcile_with_options_progress(
     // the embed loop below (which reuses this same `scan`).
     // `stamped_policy` is re-derived AFTER the self-heal below (a stale/absent stamp is repaired +
     // re-certified there); this initial value only governs the pre-heal preflight estimate.
-    let mut scan = EmbeddingScan {
-        model_id: &active_model_id,
-        model_version: &model_version,
-        dim: embedding_dim,
-        max_embedding_chars,
-        stamped_policy: policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
-    };
+    let mut scan = active.scan(conn, max_embedding_chars)?;
     let preflight_estimated_jobs = if batch_write::automatic_reconcile_can_skip_noop(conn, &options)
     {
         match estimated_reconcile_jobs(conn, &scan, &options) {

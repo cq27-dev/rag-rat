@@ -47,18 +47,10 @@ pub(crate) fn pending_embedding_jobs_with_options(
     conn: &Connection,
     options: &ReconcileOptions,
 ) -> anyhow::Result<u64> {
-    let Some((model_id, model_version, dim, max_embedding_chars)) =
-        ready_embedding_scan_parts(conn, options)?
-    else {
+    let Some(model) = ActiveEmbeddingModel::ready(conn)? else {
         return Ok(0);
     };
-    let scan = EmbeddingScan {
-        model_id: &model_id,
-        model_version: &model_version,
-        dim,
-        max_embedding_chars,
-        stamped_policy: super::policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
-    };
+    let scan = model.scan(conn, options.max_embedding_chars.max(MIN_EMBEDDING_CHARS))?;
     estimated_reconcile_jobs(conn, &scan, options)
 }
 
@@ -75,18 +67,10 @@ pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
     if !remote.is_ephemeral() {
         return pending_embedding_jobs_with_options(conn, options);
     }
-    let Some((model_id, model_version, dim, max_embedding_chars)) =
-        ready_embedding_scan_parts(conn, options)?
-    else {
+    let Some(model) = ActiveEmbeddingModel::ready(conn)? else {
         return Ok(0);
     };
-    let scan = EmbeddingScan {
-        model_id: &model_id,
-        model_version: &model_version,
-        dim,
-        max_embedding_chars,
-        stamped_policy: super::policy_scan::stamped_policy_certified(conn, max_embedding_chars)?,
-    };
+    let scan = model.scan(conn, options.max_embedding_chars.max(MIN_EMBEDDING_CHARS))?;
     let mut light_options = options.clone();
     light_options.provision_remote = false;
     match acquire_chunk_embedder(conn, light_options.intra_threads, &scan, &light_options) {
@@ -97,31 +81,61 @@ pub(crate) fn pending_embedding_jobs_with_available_incremental_embedder(
     }
 }
 
-fn ready_embedding_scan_parts(
-    conn: &Connection,
-    options: &ReconcileOptions,
-) -> anyhow::Result<Option<(String, String, usize, usize)>> {
-    ensure_model_manifest(conn)?;
-    let model_id = active_embedding_model_id(conn)?;
-    let model = model(conn, &model_id)?;
-    if validate_ready_model(&model).is_err() {
-        return Ok(None);
+pub(super) struct ActiveEmbeddingModel {
+    pub model: ModelInfo,
+    pub model_version: String,
+    pub dim: usize,
+}
+
+impl ActiveEmbeddingModel {
+    fn load_model(conn: &Connection) -> anyhow::Result<ModelInfo> {
+        ensure_model_manifest(conn)?;
+        let model_id = active_embedding_model_id(conn)?;
+        model(conn, &model_id)
     }
-    let model_version = active_embedding_model_version(conn, &model_id)?;
-    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
-    let max_embedding_chars = options.max_embedding_chars.max(MIN_EMBEDDING_CHARS);
-    Ok(Some((model_id, model_version, dim, max_embedding_chars)))
+
+    fn with_version(conn: &Connection, model: ModelInfo) -> anyhow::Result<Self> {
+        let model_version = active_embedding_model_version(conn, &model.model_id)?;
+        let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+        Ok(Self { model, model_version, dim })
+    }
+
+    pub(super) fn resolve(conn: &Connection) -> anyhow::Result<Self> {
+        Self::with_version(conn, Self::load_model(conn)?)
+    }
+
+    fn ready(conn: &Connection) -> anyhow::Result<Option<Self>> {
+        let model = Self::load_model(conn)?;
+        // Preserve the readiness gate before reading version metadata for unavailable models.
+        if validate_ready_model(&model).is_err() {
+            return Ok(None);
+        }
+        Self::with_version(conn, model).map(Some)
+    }
+
+    pub(super) fn scan(
+        &self,
+        conn: &Connection,
+        max_embedding_chars: usize,
+    ) -> anyhow::Result<EmbeddingScan<'_>> {
+        Ok(EmbeddingScan {
+            model_id: &self.model.model_id,
+            model_version: &self.model_version,
+            dim: self.dim,
+            max_embedding_chars,
+            stamped_policy: super::policy_scan::stamped_policy_certified(
+                conn,
+                max_embedding_chars,
+            )?,
+        })
+    }
 }
 
 pub(crate) fn reconcile_plan(
     conn: &Connection,
     max_embedding_chars: usize,
 ) -> anyhow::Result<ReconcilePlan> {
-    ensure_model_manifest(conn)?;
-    let model_id = active_embedding_model_id(conn)?;
-    let model = model(conn, &model_id)?;
-    let model_version = active_embedding_model_version(conn, &model_id)?;
-    let dim = usize::try_from(model.embedding_dim.unwrap_or_default()).unwrap_or(0);
+    let ActiveEmbeddingModel { model, model_version, dim } = ActiveEmbeddingModel::resolve(conn)?;
     let available = validate_ready_model(&model).is_ok();
     let message = (!available).then(|| model_not_ready_reason(&model));
     // The plan must classify against the SAME cap the reconcile it previews will use
