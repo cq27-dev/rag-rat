@@ -542,14 +542,14 @@ fn row_repair_op(
     deletes_at_tail: bool,
 ) -> anyhow::Result<RowRepair> {
     let key = apply::RowKey { stream, repo_id, table: spec.name, row_pk };
-    let clock = apply::row_clock_winner_on_stream(tx, &key)?;
-    let tombstone = apply::tombstone_winner_on_stream(tx, &key)?;
+    let clock = apply::current_row_clock_on_stream(tx, &key)?;
+    let tombstone = apply::current_tombstone(tx, &key)?;
     // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
     // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a live
     // clock always owns the row, and a tombstone owns the deletion only without one.
     let (winner_lamport, identity) = match (clock, tombstone) {
-        (Some((lamport, winner)), _) if winner == winner_hex => (lamport, None),
-        (None, Some((lamport, device))) => (lamport, Some((lamport, device))),
+        (Some(clock), _) if clock.device_hex == winner_hex => (clock.lamport, None),
+        (None, Some(clock)) => (clock.lamport, Some((clock.lamport, clock.device_hex))),
         _ => return Ok(RowRepair::Skip),
     };
     // What the PHYSICAL row allows decides the repair. A live winner is carried while its row is

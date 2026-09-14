@@ -58,7 +58,7 @@ fn an_insert_writes_the_row_and_records_the_clock_and_hash() {
     assert_eq!(out, ApplyOutcome::Applied);
     let row_pk = row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]);
     assert!(published_hash(&tx, "repo", "t_demo", &row_pk).unwrap().is_some());
-    assert_eq!(current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap().0, 5);
+    assert_eq!(current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap().lamport, 5);
     tx.commit().unwrap();
     assert_eq!(title(&c).as_deref(), Some("hi"));
 }
@@ -610,7 +610,7 @@ fn an_unknown_column_parks_without_disturbing_the_row_it_would_have_replaced() {
     .unwrap();
     assert_eq!(out, ApplyOutcome::Unprojectable(PendingReason::UnknownColumn));
     assert_eq!(
-        current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap().0,
+        current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().unwrap().lamport,
         5,
         "a parked op does not advance the row clock"
     );
@@ -1290,7 +1290,7 @@ fn tombstone(tx: &Transaction<'_>) -> Option<(u64, String)> {
         table: "t_demo",
         row_pk: &row_pk,
     };
-    current_tombstone(tx, &key).unwrap()
+    current_tombstone(tx, &key).unwrap().map(|clock| (clock.lamport, clock.device_hex))
 }
 
 /// A stated delete settles at ITS identity exactly as the `Remove` that first stated it would:
@@ -1433,7 +1433,13 @@ fn a_proven_unsent_edit_on_one_stated_row_outranks_an_unprovable_verdict_on_anot
     // guard cannot prove anything about it.
     tx.execute("INSERT INTO t_demo(id, title) VALUES ('a1', 'old')", []).unwrap();
     let a1 = row_op::row_pk_string(&[TypedValue::Text("a1".to_string())]);
-    record_published(&tx, stream, "repo", "t_demo", &a1, "stale-hash", 0).unwrap();
+    record_published(
+        &tx,
+        &RowKey { stream, repo_id: "repo", table: "t_demo", row_pk: &a1 },
+        "stale-hash",
+        0,
+    )
+    .unwrap();
     tx.execute(
         "INSERT INTO sync_row_clocks(
              stream_id, repo_id, table_name, row_pk, lamport, device_fingerprint)
@@ -1458,7 +1464,13 @@ fn a_proven_unsent_edit_on_one_stated_row_outranks_an_unprovable_verdict_on_anot
     // With b1 published, only the unprovable verdict remains and the exemption applies.
     let b1 = row_op::row_pk_string(&[TypedValue::Text("b1".to_string())]);
     let hash = synced_row_hash(&tx, &SPEC, &[TypedValue::Text("b1".to_string())]).unwrap().unwrap();
-    record_published(&tx, stream, "repo", "t_demo", &b1, &hash, SPEC.spec_version).unwrap();
+    record_published(
+        &tx,
+        &RowKey { stream, repo_id: "repo", table: "t_demo", row_pk: &b1 },
+        &hash,
+        SPEC.spec_version,
+    )
+    .unwrap();
     assert_eq!(
         unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &op).unwrap(),
         Some(PendingReason::DeferredUnresolvedWinner)

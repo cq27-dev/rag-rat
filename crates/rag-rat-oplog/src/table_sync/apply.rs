@@ -294,10 +294,7 @@ fn apply_restate(
 }
 
 /// A delete's `(lamport, device)` — what it competes under, and what its statements name.
-struct DeleteIdentity {
-    lamport: u64,
-    device_hex: String,
-}
+type DeleteIdentity = RowClock;
 
 /// What one delete did to its row.
 enum RowFate {
@@ -338,8 +335,7 @@ fn settle_delete(
     let key = RowKey { stream, repo_id, table: spec.name, row_pk };
     let survives = match current_row_clock_on_stream(tx, &key)? {
         // A write strictly newer than the delete keeps the row alive.
-        Some((clock_lamport, clock_device)) =>
-            beats(clock_lamport, &clock_device, identity.lamport, &identity.device_hex),
+        Some(stored) => stored.beats(identity),
         // No recorded write — nothing can outrank the delete.
         None => false,
     };
@@ -363,8 +359,8 @@ fn settle_delete(
                 }),
             Err(err) => return Err(err),
         };
-        clear_row_clock(tx, stream, repo_id, spec.name, row_pk)?;
-        clear_published(tx, stream, repo_id, spec.name, row_pk)?;
+        clear_row_clock(tx, &key)?;
+        clear_published(tx, &key)?;
         RowFate::Won { deleted }
     };
     // Raise the tombstone only once the remove has actually applied (the row was deleted, or a
@@ -472,14 +468,15 @@ fn apply_upsert(
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
     let row_pk = &row_op::row_pk_string(pk_vals);
-    let device_hex = &meta.device.to_string();
+    let incoming = RowClock { lamport: meta.lamport, device_hex: meta.device.to_string() };
+    let device_hex = &incoming.device_hex;
     let key = RowKey { stream, repo_id, table: spec.name, row_pk };
 
     // A row deleted at a clock this op cannot beat stays deleted: the delete is newer than this
     // edit, so the edit must not resurrect the row. (Suppressed, but the entry is still stored, so
     // redelivery stays idempotent.)
-    if let Some((t_lamport, t_device)) = current_tombstone(tx, &key)?
-        && !beats(meta.lamport, device_hex, t_lamport, &t_device)
+    if let Some(stored) = current_tombstone(tx, &key)?
+        && !incoming.beats(&stored)
     {
         return Ok(ApplyOutcome::Superseded);
     }
@@ -488,7 +485,7 @@ fn apply_upsert(
     // new). A losing op is a no-op — it never partially overwrites, and it must not touch the
     // published hash (that would mark an unsent local edit as sent and make the producer drop it).
     let wins = match current_row_clock_on_stream(tx, &key)? {
-        Some((c_lamport, c_device)) => beats(meta.lamport, device_hex, c_lamport, &c_device),
+        Some(stored) => incoming.beats(&stored),
         None => true, // no prior write — this op establishes the row.
     };
     if !wins {
@@ -531,7 +528,7 @@ fn apply_upsert(
     // Anti-echo: the winning op now owns the whole current row state, so record its synced hash.
     // (A losing op returned above without touching the published hash.)
     if let Some(hash) = synced_row_hash(tx, spec, pk_vals)? {
-        record_published(tx, stream, repo_id, spec.name, row_pk, &hash, spec.spec_version)?;
+        record_published(tx, &key, &hash, spec.spec_version)?;
     }
     Ok(ApplyOutcome::Applied)
 }
@@ -540,8 +537,17 @@ fn apply_upsert(
 /// lamport is higher, or equal with a lexicographically-smaller fingerprint (fixed-width lowercase
 /// hex orders exactly as the raw fingerprint bytes). The one comparison every whole-row LWW
 /// decision uses — the row write clock, the tombstone, and remove-vs-edit.
-fn beats(lamport: u64, device_hex: &str, other_lamport: u64, other_device: &str) -> bool {
-    lamport > other_lamport || (lamport == other_lamport && device_hex < other_device)
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RowClock {
+    pub(crate) lamport: u64,
+    pub(crate) device_hex: String,
+}
+
+impl RowClock {
+    fn beats(&self, other: &Self) -> bool {
+        self.lamport > other.lamport
+            || (self.lamport == other.lamport && self.device_hex < other.device_hex)
+    }
 }
 
 /// One synced row's coordinates on a stream — the key both LWW clock tables are addressed by.
@@ -554,8 +560,8 @@ pub(crate) struct RowKey<'a> {
 }
 
 /// The two whole-row LWW clock tables. They share a shape — `(lamport, device_fingerprint)` per
-/// row key, raised only by a clock that [`beats`] the stored one — and differ only in what they
-/// record: the latest write, or the latest delete.
+/// row key, raised only by a clock that [`RowClock::beats`] the stored one — and differ only in
+/// what they record: the latest write, or the latest delete.
 #[derive(Clone, Copy)]
 enum ClockTable {
     Rows,
@@ -571,12 +577,12 @@ impl ClockTable {
     }
 }
 
-/// The stored clock for `key` in `table` as `(lamport, device hex)`, or `None` if absent.
+/// The stored clock for `key` in `table`, or `None` if absent.
 fn stored_clock(
     tx: &Transaction<'_>,
     table: ClockTable,
     key: &RowKey<'_>,
-) -> anyhow::Result<Option<(u64, String)>> {
+) -> anyhow::Result<Option<RowClock>> {
     let row = tx
         .query_row(
             &format!(
@@ -588,11 +594,14 @@ fn stored_clock(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    row.map(|(lamport, device)| Ok((u64::try_from(lamport)?, device))).transpose()
+    row.map(|(lamport, device)| {
+        Ok(RowClock { lamport: u64::try_from(lamport)?, device_hex: device })
+    })
+    .transpose()
 }
 
 /// Raise `key`'s clock in `table` to `(lamport, device_hex)` under LWW — a clock that does not
-/// [`beats`] the stored one never lowers it.
+/// [`RowClock::beats`] the stored one never lowers it.
 fn raise_clock(
     tx: &Transaction<'_>,
     table: ClockTable,
@@ -600,8 +609,9 @@ fn raise_clock(
     lamport: u64,
     device_hex: &str,
 ) -> anyhow::Result<()> {
-    if let Some((old_lamport, old_device)) = stored_clock(tx, table, key)?
-        && !beats(lamport, device_hex, old_lamport, &old_device)
+    let incoming = RowClock { lamport, device_hex: device_hex.to_owned() };
+    if let Some(stored) = stored_clock(tx, table, key)?
+        && !incoming.beats(&stored)
     {
         return Ok(());
     }
@@ -629,11 +639,11 @@ fn raise_clock(
 
 /// The row's latest-write clock, or `None` if it has never been written on this device. Recorded on
 /// every write (including an insert-only row, which has no per-column clock), it is what a delete
-/// and the anti-echo gate compare against.
-fn current_row_clock_on_stream(
+/// and the anti-echo gate compare against. Fingerprints retain their lowercase hex spelling.
+pub(crate) fn current_row_clock_on_stream(
     tx: &Transaction<'_>,
     key: &RowKey<'_>,
-) -> anyhow::Result<Option<(u64, String)>> {
+) -> anyhow::Result<Option<RowClock>> {
     stored_clock(tx, ClockTable::Rows, key)
 }
 
@@ -643,18 +653,8 @@ fn current_row_clock(
     repo_id: &str,
     table: &str,
     row_pk: &str,
-) -> anyhow::Result<Option<(u64, String)>> {
+) -> anyhow::Result<Option<RowClock>> {
     current_row_clock_on_stream(tx, &RowKey { stream: NO_STREAM, repo_id, table, row_pk })
-}
-
-/// The row's live whole-row-LWW winner on `stream` as `(lamport, device hex)` — the merge-table
-/// half of the re-adoption verdict (#997). The fingerprint is stored as the lowercase hex the
-/// applier wrote (`OpMeta::device.to_string()`); callers compare the hex strings directly.
-pub(crate) fn row_clock_winner_on_stream(
-    tx: &Transaction<'_>,
-    key: &RowKey<'_>,
-) -> anyhow::Result<Option<(u64, String)>> {
-    current_row_clock_on_stream(tx, key)
 }
 
 /// Raise the row's write clock to `(lamport, device_hex)` under LWW — a later-arriving but older
@@ -668,20 +668,11 @@ fn raise_row_clock(
     raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)
 }
 
-fn current_tombstone(
+pub(crate) fn current_tombstone(
     tx: &Transaction<'_>,
     key: &RowKey<'_>,
-) -> anyhow::Result<Option<(u64, String)>> {
+) -> anyhow::Result<Option<RowClock>> {
     stored_clock(tx, ClockTable::Tombstones, key)
-}
-
-/// The row's current tombstone winner on `stream` as `(lamport, device hex)` — the deletion half
-/// of the re-adoption verdict (#997).
-pub(crate) fn tombstone_winner_on_stream(
-    tx: &Transaction<'_>,
-    key: &RowKey<'_>,
-) -> anyhow::Result<Option<(u64, String)>> {
-    current_tombstone(tx, key)
 }
 
 /// Raise the row's tombstone to `identity` under LWW — a lower clock never lowers it — and record
@@ -696,11 +687,9 @@ fn raise_tombstone(
     signer: &DeleteIdentity,
 ) -> anyhow::Result<bool> {
     let current = current_tombstone(tx, key)?;
-    let is_current = current.as_ref().is_some_and(|(lamport, device)| {
-        *lamport == identity.lamport && *device == identity.device_hex
-    });
+    let is_current = current.as_ref().is_some_and(|stored| stored == identity);
     let wins = match &current {
-        Some((lamport, device)) => beats(identity.lamport, &identity.device_hex, *lamport, device),
+        Some(stored) => identity.beats(stored),
         None => true,
     };
     if wins {
@@ -958,17 +947,11 @@ fn delete_row(
 
 // ── row clock + published-row bookkeeping ────────────────────────────────────────────────────
 
-fn clear_row_clock(
-    tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
-) -> anyhow::Result<()> {
+fn clear_row_clock(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()> {
     tx.execute(
         "DELETE FROM sync_row_clocks
           WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
-        rusqlite::params![stream.to_bytes().as_slice(), repo_id, table, row_pk],
+        rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
     )?;
     Ok(())
 }
@@ -983,16 +966,13 @@ fn clear_row_clock(
 /// covers before trusting a mismatch as a local change.
 pub(crate) fn published_hash_on_stream(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
 ) -> anyhow::Result<Option<(String, u32)>> {
     let row = tx
         .query_row(
             "SELECT synced_hash, spec_version FROM sync_published_rows
              WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
-            rusqlite::params![stream.to_bytes().as_slice(), repo_id, table, row_pk],
+            rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()?;
@@ -1006,7 +986,7 @@ pub(crate) fn published_hash(
     table: &str,
     row_pk: &str,
 ) -> anyhow::Result<Option<(String, u32)>> {
-    published_hash_on_stream(tx, NO_STREAM, repo_id, table, row_pk)
+    published_hash_on_stream(tx, &RowKey { stream: NO_STREAM, repo_id, table, row_pk })
 }
 
 /// How a row whose published record predates the current spec version compares against the op that
@@ -1042,7 +1022,7 @@ pub(crate) fn stale_row_disposition(
     current: &[Cell],
 ) -> anyhow::Result<StaleRow> {
     let row_pk = row_op::row_pk_string(pk_vals);
-    let Some((lamport, device_hex)) = current_row_clock_on_stream(tx, &RowKey {
+    let Some(clock) = current_row_clock_on_stream(tx, &RowKey {
         stream,
         repo_id,
         table: spec.name,
@@ -1051,7 +1031,8 @@ pub(crate) fn stale_row_disposition(
     else {
         return Ok(StaleRow::Unknown);
     };
-    let Some(op) = super::store::winning_entry_op(tx, stream, &device_hex, lamport)? else {
+    let Some(op) = super::store::winning_entry_op(tx, stream, &clock.device_hex, clock.lamport)?
+    else {
         // The entry is gone. Retention never drops a live winner (the pin rule, #1277), so only a
         // store compacted before that rule reaches this arm — and re-authoring repairs it.
         return Ok(StaleRow::Unknown);
@@ -1173,8 +1154,8 @@ fn delete_would_remove_row(
     let row_pk = row_op::row_pk_string(&delete.pk);
     let key = RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk };
     Ok(match current_row_clock_on_stream(tx, &key)? {
-        Some((lamport, device)) =>
-            !beats(lamport, &device, delete.lamport, &delete.device.to_string()),
+        Some(stored) => !stored
+            .beats(&RowClock { lamport: delete.lamport, device_hex: delete.device.to_string() }),
         None => true,
     })
 }
@@ -1236,9 +1217,14 @@ fn unsent_work_on_row(
             // yet authored. That is precisely what the producer's `Remove` branch keys on, so
             // replaying an upsert here would recreate the row and discard the unsent deletion for
             // good.
-            return Ok(published_hash_on_stream(tx, stream, repo_id, spec.name, &row_pk)?
-                .is_some()
-                .then_some(PendingReason::DeferredUnsentDelete));
+            return Ok(published_hash_on_stream(tx, &RowKey {
+                stream,
+                repo_id,
+                table: spec.name,
+                row_pk: &row_pk,
+            })?
+            .is_some()
+            .then_some(PendingReason::DeferredUnsentDelete));
         },
         // The row is there but has no hash, so nothing about it can be PROVEN either way — and what
         // to do about that is NOT the same for the two op kinds.
@@ -1258,25 +1244,33 @@ fn unsent_work_on_row(
             return Ok(removing.then_some(PendingReason::DeferredUnreadableRow)),
     };
     let current = row_op::cells_hash(&current_cells);
-    Ok(match published_hash_on_stream(tx, stream, repo_id, spec.name, &row_pk)? {
-        // Comparable: a differing hash is a demonstrably unsent local change.
-        Some((published, version)) if version == spec.spec_version =>
-            (published != current).then_some(PendingReason::DeferredUnsentEdit),
-        // Published under a different column set, so the hashes cannot be compared — but the row's
-        // WINNING op can be, projected under this spec. This proof path is required, not an
-        // optimization: once an older-spec op can be filled from declared defaults (#1002) a parked
-        // entry can WIN over an unsent raw edit here, where before it could not apply at all.
-        // Unprovable stays conservative: refuse to replay rather than risk overwriting.
-        Some(_) => match stale_row_disposition(tx, spec, repo_id, stream, pk_vals, &current_cells)?
-        {
-            StaleRow::LocallyChanged => Some(PendingReason::DeferredUnsentEdit),
-            StaleRow::Unknown => Some(PendingReason::DeferredUnresolvedWinner),
-            StaleRow::Unchanged => None,
+    Ok(
+        match published_hash_on_stream(tx, &RowKey {
+            stream,
+            repo_id,
+            table: spec.name,
+            row_pk: &row_pk,
+        })? {
+            // Comparable: a differing hash is a demonstrably unsent local change.
+            Some((published, version)) if version == spec.spec_version =>
+                (published != current).then_some(PendingReason::DeferredUnsentEdit),
+            // Published under a different column set, so the hashes cannot be compared — but the
+            // row's WINNING op can be, projected under this spec. This proof path is
+            // required, not an optimization: once an older-spec op can be filled from
+            // declared defaults (#1002) a parked entry can WIN over an unsent raw edit
+            // here, where before it could not apply at all. Unprovable stays
+            // conservative: refuse to replay rather than risk overwriting.
+            Some(_) =>
+                match stale_row_disposition(tx, spec, repo_id, stream, pk_vals, &current_cells)? {
+                    StaleRow::LocallyChanged => Some(PendingReason::DeferredUnsentEdit),
+                    StaleRow::Unknown => Some(PendingReason::DeferredUnresolvedWinner),
+                    StaleRow::Unchanged => None,
+                },
+            // A live row no apply ever published is purely local: the only content there came from
+            // this device, and no peer has seen it.
+            None => Some(PendingReason::DeferredUnsentEdit),
         },
-        // A live row no apply ever published is purely local: the only content there came from this
-        // device, and no peer has seen it.
-        None => Some(PendingReason::DeferredUnsentEdit),
-    })
+    )
 }
 
 /// How much doubt a caller acts on when the row's state cannot be established either way.
@@ -1446,10 +1440,7 @@ pub(crate) enum PreApply {
 /// row incomparable.
 pub(crate) fn record_published(
     tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
+    key: &RowKey<'_>,
     hash: &str,
     spec_version: u32,
 ) -> anyhow::Result<()> {
@@ -1460,10 +1451,10 @@ pub(crate) fn record_published(
          ON CONFLICT(stream_id, table_name, row_pk) DO UPDATE
              SET synced_hash = excluded.synced_hash, spec_version = excluded.spec_version",
         rusqlite::params![
-            stream.to_bytes().as_slice(),
-            repo_id,
-            table,
-            row_pk,
+            key.stream.to_bytes().as_slice(),
+            key.repo_id,
+            key.table,
+            key.row_pk,
             hash,
             spec_version,
         ],
@@ -1471,17 +1462,11 @@ pub(crate) fn record_published(
     Ok(())
 }
 
-fn clear_published(
-    tx: &Transaction<'_>,
-    stream: StreamId,
-    repo_id: &str,
-    table: &str,
-    row_pk: &str,
-) -> anyhow::Result<()> {
+fn clear_published(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()> {
     tx.execute(
         "DELETE FROM sync_published_rows
           WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
-        rusqlite::params![stream.to_bytes().as_slice(), repo_id, table, row_pk],
+        rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
     )?;
     Ok(())
 }
