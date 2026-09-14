@@ -15,7 +15,7 @@ use rag_rat_sync::{
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
-use crate::cli::{SyncArgs, SyncCommand};
+use crate::cli::{self, KeepUntil, SyncArgs, SyncCommand};
 use crate::{open_index, print_output};
 
 /// How long `serve` waits for the database-scoped session lock before refusing to start — kept
@@ -130,7 +130,8 @@ fn whoami(db: &IndexDatabase) -> anyhow::Result<()> {
 }
 
 fn grant(db: &IndexDatabase, account: &str) -> anyhow::Result<()> {
-    let grant_id = db.sync_grant(account)?;
+    let grantee = cli::parse_account_id(account).map_err(anyhow::Error::msg)?;
+    let grant_id = db.sync_grant(grantee)?;
     print_output(&serde_json::json!({
         "status": "granted",
         "repo_id": db.active_repo_id,
@@ -147,16 +148,11 @@ fn revoke(
     reason: &str,
     keep_until: Option<&str>,
 ) -> anyhow::Result<()> {
-    let keep_until = keep_until
-        .map(|value| -> anyhow::Result<(&str, u64)> {
-            let (seq, device) = value.split_once('@').context(
-                "--keep-until takes <seq>@<device-hex> — the seq, an @, then the 64-hex device \
-                 fingerprint",
-            )?;
-            Ok((device, seq.trim().parse::<u64>().context("--keep-until's seq is a number")?))
-        })
-        .transpose()?;
-    let (report, nodes_removed) = db.sync_revoke(account, reason, keep_until)?;
+    let keep_until = keep_until.map(KeepUntil::parse_parts).transpose()?;
+    let reason = cli::parse_revoke_reason(reason).map_err(anyhow::Error::msg)?;
+    let keep_until = keep_until.map(KeepUntil::from_parts).transpose()?;
+    let (report, nodes_removed) =
+        db.sync_revoke(account, reason, keep_until.map(|cut| (cut.device, cut.seq)))?;
     print_output(&serde_json::json!({
         "status": "revoked",
         "repo_id": db.active_repo_id,
@@ -1030,7 +1026,7 @@ fn contribute_with_ticket(config: &Config, ticket: &str) -> anyhow::Result<()> {
 }
 
 fn pull(config: &Config, account_hex: &str, peer_override: Option<&str>) -> anyhow::Result<()> {
-    let target = rag_rat_oplog::AccountId::from_hex(account_hex)?;
+    let target = cli::parse_account_id(account_hex).map_err(anyhow::Error::msg)?;
     let relay = effective_relay_url(config);
 
     // The per-database SESSION lock, held for the whole pull. Any process that opens an iroh

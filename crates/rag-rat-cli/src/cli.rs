@@ -908,6 +908,50 @@ fn parse_remote_backend(s: &str) -> Result<rag_rat_base::config::RemoteBackend, 
         .ok_or_else(|| format!("unknown backend `{s}` (expected ollama, infinity, or vllm)"))
 }
 
+pub(crate) fn parse_revoke_reason(value: &str) -> Result<rag_rat_oplog::RevokeReason, String> {
+    rag_rat_oplog::RevokeReason::from_db_str(value).map_err(|err| err.to_string())
+}
+
+pub(crate) fn parse_account_id(value: &str) -> Result<rag_rat_oplog::AccountId, String> {
+    rag_rat_oplog::AccountId::from_hex(value).map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeepUntil {
+    pub seq: u64,
+    pub device: rag_rat_oplog::DeviceFingerprint,
+}
+
+impl KeepUntil {
+    pub(crate) fn parse_parts(value: &str) -> anyhow::Result<(&str, u64)> {
+        use anyhow::Context as _;
+        let (seq, device) = value.split_once('@').context(
+            "--keep-until takes <seq>@<device-hex> — the seq, an @, then the 64-hex device \
+             fingerprint",
+        )?;
+        Ok((device, seq.trim().parse::<u64>().context("--keep-until's seq is a number")?))
+    }
+
+    pub(crate) fn from_parts((device, seq): (&str, u64)) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        Ok(Self {
+            seq,
+            device: device
+                .trim()
+                .parse()
+                .context("--keep-until takes <seq>@<64-hex device fingerprint>")?,
+        })
+    }
+}
+
+impl std::str::FromStr for KeepUntil {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::from_parts(Self::parse_parts(value)?)
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct OracleArgs {
     #[command(subcommand)]

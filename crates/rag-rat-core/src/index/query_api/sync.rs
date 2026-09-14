@@ -86,11 +86,10 @@ impl IndexDatabase {
         Ok(rag_rat_base::hash::hex_lower(&account.to_bytes()))
     }
 
-    /// Grant `grantee_account_hex` (a 64-hex account id from its `sync whoami`) Writer authority on
+    /// Grant `grantee` (the account id from its `sync whoami`) Writer authority on
     /// the active repo's owner stream (#1164), so that identity can author memories into this
     /// repo's shared set. Owner-only; requires a published repo. Returns the grant id as hex.
-    pub fn sync_grant(&self, grantee_account_hex: &str) -> anyhow::Result<String> {
-        let grantee = rag_rat_oplog::AccountId::from_hex(grantee_account_hex)?;
+    pub fn sync_grant(&self, grantee: rag_rat_oplog::AccountId) -> anyhow::Result<String> {
         let grant_id = crate::memory_write::grant_repo_writer(
             self.storage.connection(),
             grantee,
@@ -113,19 +112,9 @@ impl IndexDatabase {
     pub fn sync_revoke(
         &self,
         grantee_ref: &str,
-        reason: &str,
-        keep_until: Option<(&str, u64)>,
+        reason: rag_rat_oplog::RevokeReason,
+        keep_until: Option<(rag_rat_oplog::DeviceFingerprint, u64)>,
     ) -> anyhow::Result<(crate::memory_write::RepoRevokeReport, u32)> {
-        let reason = rag_rat_oplog::RevokeReason::from_db_str(reason)?;
-        let keep_until = keep_until
-            .map(|(device_hex, seq)| {
-                let fingerprint = device_hex
-                    .trim()
-                    .parse::<rag_rat_oplog::DeviceFingerprint>()
-                    .context("--keep-until takes <seq>@<64-hex device fingerprint>")?;
-                anyhow::Ok((fingerprint, seq))
-            })
-            .transpose()?;
         let report = crate::memory_write::revoke_repo_writer(
             self.storage.connection(),
             grantee_ref,
