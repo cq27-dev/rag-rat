@@ -663,25 +663,14 @@ impl IndexDatabase {
     pub fn index_targets(&self, config: &Config) -> anyhow::Result<()> {
         let (_, graph) = self.index_targets_with_progress(config, &mut |_| {})?;
         // The standalone twin of the rebuild's Phase-2 + terminal tail, in ONE short transaction
-        // (batch 6 moved base edges + package roots out of the wave loop; batch 7 completed the
-        // twin), mirroring the rebuild's order. Step by step against `rebuild_with_progress`:
-        // - build_chunk_text_store: first-index dict training — `insert_chunks` staged the text
-        //   into `temp.rebuild_chunk_text` when no dict existed; a no-op once a dict exists.
-        // - finalize_base_edges: base package roots + accumulated-edge resolution (batch 6).
-        // - rebuild_logical_symbols: the open-time graph heal re-derives EDGES only, so without
-        //   this fold the standalone pass's symbols stay invisible to symbol_lookup/graph nav (the
-        //   `finalize_overlay_refresh` precedent — every finalize that writes symbols folds).
-        // - apply_staged_parser_failures: THE batch-7 finding — the wave loop stages failures
-        //   (`graph.is_some()` routing), so the finalize must publish them; at this connection's
-        //   own (live) generation, atomic with its edges (no flip exists to defer to).
-        // - refresh_clone_token_df: recompute the LIVE df exactly (the wave ran with
-        //   `BumpDf(false)` — this pass, like the full rebuild, recomputes at finalize instead of
-        //   paying per-token upserts). Restored to the pre-#473 unconditional refresh by #479: the
-        //   persisted clone-graph postings are ordered by their own generation's `clone_df_epoch`,
-        //   so a live refresh no longer desyncs (or invalidates) anything.
-        // - sync_fts + the graph/flags marks: chunk_fts was written inline and the edges/flags were
-        //   just derived in full, so record freshness like the rebuild does — otherwise the very
-        //   next open pays a full (safe but wasted) edge re-derive heal and an FTS rebuild.
+        // and in the rebuild's order: first-index dict training (`build_chunk_text_store`, a no-op
+        // once a dict exists), base package roots + accumulated-edge resolution, then the finalize
+        // steps the rebuild's flip shares — `publish_staged_derivations` (without its symbol fold
+        // the open-time heal re-derives EDGES only, leaving this pass's symbols invisible) and
+        // `mark_derived_freshness_current` — around `sync_fts` (chunk_fts was written inline, so
+        // only freshness is recorded; otherwise the next open pays a wasted edge heal and FTS
+        // rebuild). The staged parser failures publish at this connection's own (live)
+        // generation, atomic with its edges.
         // NOT here, deliberately: the generation carry-forwards, overlay re-resolution, git
         // history/meta/cursors, source_root, the live-generation pointer, and the model seed are
         // PUBLISH authority — a standalone pass writes the live generation in place and owns no
@@ -693,12 +682,12 @@ impl IndexDatabase {
             // FullRederive: the standalone pass indexed the whole corpus (a fresh index — no
             // pre-existing rows, so the drift heal is empty), so it may stamp the logical-key
             // version (#493).
-            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::FullRederive)?;
-            self.apply_staged_parser_failures(self.active_generation)?;
-            self.refresh_clone_token_df()?;
+            self.publish_staged_derivations(
+                graph_index::KeyVersionStamp::FullRederive,
+                self.active_generation,
+            )?;
             self.sync_fts()?;
-            self.mark_graph_index_current()?;
-            self.mark_generated_flags_current()
+            self.mark_derived_freshness_current()
         })();
         if result.is_err() {
             let _ = self.storage.execute_batch("ROLLBACK");
