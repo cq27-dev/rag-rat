@@ -3,6 +3,8 @@ mod commands;
 mod fs_atomic;
 mod hooks_support;
 mod render;
+#[cfg(test)]
+mod test_support;
 // The version-string formatter is shared with `build.rs` via `include!`; the crate only needs it
 // under test (the runtime reads the baked `RAG_RAT_VERSION`), so compiling it here is test-only.
 #[cfg(test)]

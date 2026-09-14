@@ -500,37 +500,19 @@ mod tests {
     use crate::cli::{OracleArgs, OracleCommand, OracleRunArgs, OracleToolArg};
 
     fn temp_config() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
-        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-oracle-lock");
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
-            .unwrap();
-        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
-        let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
-            database_key_pinned: true,
-            database: config_root.join(".rag-rat/index.sqlite"),
-            root: config_root,
-            targets: vec![ResolvedTarget {
+        let (root, config) =
+            crate::test_support::scratch_config("cli-oracle-lock", ResolvedTarget {
                 name: "rust".to_string(),
                 language: Language::Rust,
                 directories: vec![PathBuf::from("src")],
                 include: vec!["src/".to_string()],
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
-            }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
-        };
+            });
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn caller() { target(); } fn target() {}\n")
+            .unwrap();
+
         (root, config)
     }
 
@@ -560,10 +542,6 @@ mod tests {
         // A target carrying the SAME default filters the simple `[target_bindings]` form renders
         // (`include = ["**/*.rs"]`, no exclude), so the bindings-match check accepts it.
         let config_with = |include: Vec<String>, exclude: Vec<String>| Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             root: PathBuf::from("/x"),
             database: PathBuf::from("/x/db"),
@@ -575,15 +553,8 @@ mod tests {
                 exclude,
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         let config = config_with(vec!["**/*.rs".to_string()], Vec::new());
         let profile = |dirs: &[&str]| {

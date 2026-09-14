@@ -210,7 +210,7 @@ pub(crate) fn clones_for(config: &Config, args: &ClonesForArgs) -> anyhow::Resul
 mod tests {
     use std::path::PathBuf;
 
-    use rag_rat_base::config::{Config, ResolvedTarget, TargetKind};
+    use rag_rat_base::config::{ResolvedTarget, TargetKind};
     use rag_rat_base::language::Language;
     use rag_rat_core::IndexDatabase;
 
@@ -256,7 +256,14 @@ mod tests {
         // Plant two identical functions in separate files → struct_hash fast path produces a clone
         // class. Validates that the `clones` command handler wires find_clones and prints output
         // without panicking.
-        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-clones");
+        let (root, config) = crate::test_support::scratch_config("cli-clones", ResolvedTarget {
+            name: "rust".to_string(),
+            language: Language::Rust,
+            directories: vec![PathBuf::from("src")],
+            include: vec!["src/".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Source,
+        });
         std::fs::create_dir_all(root.join("src")).unwrap();
         let clone_body =
             "pub fn cloned_helper(x: i32, y: i32) -> i32 {\n    x + y + 42\n}\n".to_string();
@@ -265,33 +272,6 @@ mod tests {
         std::fs::write(root.join("src/a.rs"), &clone_body).unwrap();
         std::fs::write(root.join("src/b.rs"), &clone_body).unwrap();
 
-        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
-        let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
-            database_key_pinned: true,
-            database: config_root.join(".rag-rat/index.sqlite"),
-            root: config_root,
-            targets: vec![ResolvedTarget {
-                name: "rust".to_string(),
-                language: Language::Rust,
-                directories: vec![PathBuf::from("src")],
-                include: vec!["src/".to_string()],
-                exclude: Vec::new(),
-                kind: TargetKind::Source,
-            }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
-        };
         IndexDatabase::rebuild(&config).unwrap();
 
         let args = ClonesArgs {

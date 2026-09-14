@@ -979,36 +979,17 @@ mod tests {
     /// `db_file_health`; this pins the CLI wiring — dispatch → open_config → VACUUM → report.)
     #[test]
     fn doctor_vacuum_runs_and_leaves_no_freelist() {
-        let root = rag_rat_base::test_scratch::ScratchDir::new("cli-vacuum");
+        let (root, config) = crate::test_support::scratch_config("cli-vacuum", ResolvedTarget {
+            name: "markdown".to_string(),
+            language: Language::Markdown,
+            directories: vec![PathBuf::from("docs")],
+            include: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            kind: TargetKind::Docs,
+        });
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::fs::write(root.join("docs/a.md"), "# Title\nalpha token\n").unwrap();
-        let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
-        let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
-            database_key_pinned: true,
-            database: config_root.join(".rag-rat/index.sqlite"),
-            root: config_root,
-            targets: vec![ResolvedTarget {
-                name: "markdown".to_string(),
-                language: Language::Markdown,
-                directories: vec![PathBuf::from("docs")],
-                include: vec!["**/*.md".to_string()],
-                exclude: Vec::new(),
-                kind: TargetKind::Docs,
-            }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
-        };
+
         IndexDatabase::rebuild(&config).unwrap();
 
         super::doctor(&config, &crate::cli::DoctorArgs { vacuum: true }).unwrap();
@@ -1041,10 +1022,6 @@ mod tests {
         git(&main, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(main.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1056,15 +1033,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1146,10 +1116,6 @@ mod tests {
         git(&main, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(main.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1161,15 +1127,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1222,10 +1181,6 @@ mod tests {
         git(&root, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1237,15 +1192,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1291,10 +1239,6 @@ mod tests {
         git(&root, &["commit", "-qm", "base"]);
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1306,15 +1250,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1361,10 +1298,6 @@ mod tests {
         std::fs::write(root.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1376,15 +1309,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1434,10 +1360,6 @@ mod tests {
         .unwrap();
         let config_root = rag_rat_base::test_scratch::canonical_config_root(root.to_path_buf());
         let config = Config {
-            trackers: Vec::new(),
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1449,15 +1371,8 @@ mod tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         };
         IndexDatabase::rebuild(&config).unwrap();
 
@@ -1523,9 +1438,7 @@ mod papertrail_hook_tests {
                 auth: None,
                 tags: Vec::new(),
             }],
-            papertrail: Default::default(),
-            sync: Default::default(),
-            repo_id_override: None,
+
             database_key_pinned: true,
             database: config_root.join(".rag-rat/index.sqlite"),
             root: config_root,
@@ -1537,15 +1450,8 @@ mod papertrail_hook_tests {
                 exclude: Vec::new(),
                 kind: TargetKind::Source,
             }],
-            llm: Default::default(),
-            watch: Default::default(),
-            version_check: Default::default(),
-            oracle: Default::default(),
-            search: Default::default(),
-            memory: Default::default(),
-            log: Default::default(),
-            source_root_reanchored_from: None,
-            allow_empty: false,
+
+            ..Default::default()
         }
     }
 

@@ -2,22 +2,22 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use path_slash::{PathBufExt, PathExt};
-use tempfile::TempDir;
+mod common;
 
 /// #427: `index` with no `[target_bindings]` must FAIL (non-zero exit) and name the section,
 /// rather than silently registering an empty repo.
 #[test]
 fn index_refuses_zero_discovered_files() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.as_path();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
     // Config with a root + database but NO [target_bindings].
     let db = root.join("index.sqlite");
     let toml = format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \"none\"\n",
-        db.to_slash_lossy()
+        common::toml_path(&db)
     );
     let config_path = root.join("rag-rat.toml");
     std::fs::write(&config_path, toml).unwrap();
@@ -36,12 +36,13 @@ fn index_refuses_zero_discovered_files() {
 /// With `--allow-empty`, the same config succeeds (empty index).
 #[test]
 fn index_allow_empty_permits_zero_discovered_files() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.as_path();
     let db = root.join("index.sqlite");
     let toml = format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \"none\"\n",
-        db.to_slash_lossy()
+        common::toml_path(&db)
     );
     let config_path = root.join("rag-rat.toml");
     std::fs::write(&config_path, toml).unwrap();
@@ -66,14 +67,15 @@ fn index_warns_when_a_clone_joins_an_indexed_repo() {
     if !rag_rat_base::test_git::available() {
         return; // identity resolution needs git; skip rather than fail.
     }
-    let dir = TempDir::new().unwrap();
-    let tmp = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.as_path();
     let shared = tmp.join("shared.sqlite");
 
     // Repo A: a committed git repo, indexed into the shared database.
     let a = tmp.join("A");
     std::fs::create_dir_all(a.join("src")).unwrap();
-    git_init_commit(&a);
+    seed_git_repo(&a);
     std::fs::write(a.join("rag-rat.toml"), shared_config(&shared)).unwrap();
     let out = run_index(&a.join("rag-rat.toml"), &a);
     assert!(out.status.success(), "indexing A should succeed: {}", stderr(&out));
@@ -100,14 +102,15 @@ fn index_warns_when_root_names_a_linked_worktree() {
     if !rag_rat_base::test_git::available() {
         return;
     }
-    let dir = TempDir::new().unwrap();
-    let tmp = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.as_path();
     let shared = tmp.join("shared.sqlite");
 
     // Main checkout with its own config (so the governing seam anchors root to main).
     let main = tmp.join("main");
     std::fs::create_dir_all(main.join("src")).unwrap();
-    git_init_commit(&main);
+    seed_git_repo(&main);
     std::fs::write(main.join("rag-rat.toml"), shared_config(&shared)).unwrap();
 
     // A linked worktree with a local config whose root="." resolves to the worktree.
@@ -143,12 +146,13 @@ fn index_allows_an_already_indexed_repo_to_go_empty() {
     if !rag_rat_base::test_git::available() {
         return;
     }
-    let dir = TempDir::new().unwrap();
-    let tmp = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.as_path();
     let db = tmp.join("index.sqlite");
     let repo = tmp.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
-    git_init_commit(&repo);
+    seed_git_repo(&repo);
     std::fs::write(repo.join("rag-rat.toml"), shared_config(&db)).unwrap();
 
     // First index registers the repo with one file.
@@ -181,8 +185,9 @@ fn full_rebuild_prunes_an_existing_placeholder_index_instead_of_refusing() {
     if !rag_rat_base::test_git::available() {
         return;
     }
-    let dir = TempDir::new().unwrap();
-    let repo = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo = dir.as_path();
     let db = repo.join("index.sqlite");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(repo.join("src/a.rs"), "fn a() {}\n").unwrap();
@@ -201,7 +206,7 @@ fn full_rebuild_prunes_an_existing_placeholder_index_instead_of_refusing() {
     git(&["config", "user.email", "t@example.com"]);
     git(&["config", "user.name", "t"]);
     git(&["add", "-A"]);
-    git(&["commit", "-qm", "init"]);
+    common::git_commit(repo, &["-qm", "init"]);
     std::fs::remove_file(repo.join("src/a.rs")).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_rag-rat"))
@@ -229,15 +234,16 @@ fn index_discover_refuses_a_first_time_empty_repo_against_an_existing_db() {
     if !rag_rat_base::test_git::available() {
         return;
     }
-    let dir = TempDir::new().unwrap();
-    let tmp = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.as_path();
     let db = tmp.join("shared.sqlite");
 
     // Repo A: real content, indexed into the shared DB — so the DB EXISTS and is non-empty, which
     // is what routes B below through the incremental path instead of the fresh-DB rebuild.
     let a = tmp.join("A");
     std::fs::create_dir_all(a.join("src")).unwrap();
-    git_init_commit(&a);
+    seed_git_repo(&a);
     std::fs::write(a.join("rag-rat.toml"), shared_config(&db)).unwrap();
     let out = run_index(&a.join("rag-rat.toml"), &a);
     assert!(out.status.success(), "indexing A should succeed: {}", stderr(&out));
@@ -255,10 +261,10 @@ fn index_discover_refuses_a_first_time_empty_repo_against_an_existing_db() {
     git_b(&["config", "user.email", "t@example.com"]);
     git_b(&["config", "user.name", "t"]);
     git_b(&["add", "-A"]);
-    git_b(&["commit", "-qm", "b"]);
+    common::git_commit(&b, &["-qm", "b"]);
     let no_targets = format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \"none\"\n",
-        db.to_slash_lossy()
+        common::toml_path(&db)
     );
     std::fs::write(b.join("rag-rat.toml"), &no_targets).unwrap();
 
@@ -281,13 +287,14 @@ fn index_discover_refuses_a_first_time_empty_repo_against_an_existing_db() {
 /// `index_watch_with_configured_targets_but_no_files_defers`.
 #[test]
 fn index_watch_on_a_no_target_config_errors() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.as_path();
     let db = root.join("index.sqlite");
     // No [target_bindings], fresh database.
     let toml = format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \"none\"\n",
-        db.to_slash_lossy()
+        common::toml_path(&db)
     );
     let config_path = root.join("rag-rat.toml");
     std::fs::write(&config_path, toml).unwrap();
@@ -311,15 +318,16 @@ fn index_watch_on_a_no_target_config_errors() {
 /// is still watching and registered nothing, then kill it.
 #[test]
 fn index_watch_with_configured_targets_but_no_files_defers() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.as_path();
     let db = root.join("index.sqlite");
     // [target_bindings] present, but the target dir currently holds no matching files.
     std::fs::create_dir_all(root.join("src")).unwrap();
     let toml = format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \
          \"none\"\n[target_bindings]\nrust = [\"src\"]\n",
-        db.to_slash_lossy()
+        common::toml_path(&db)
     );
     let config_path = root.join("rag-rat.toml");
     std::fs::write(&config_path, toml).unwrap();
@@ -352,13 +360,14 @@ fn index_watch_with_configured_targets_but_no_files_defers() {
 /// an empty scope.
 #[test]
 fn maintenance_defers_a_first_time_empty_config() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.as_path();
     let db = root.join("index.sqlite");
     // No [target_bindings] → no discoverable files.
     let toml = format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \"none\"\n",
-        db.to_slash_lossy()
+        common::toml_path(&db)
     );
     let config_path = root.join("rag-rat.toml");
     std::fs::write(&config_path, toml).unwrap();
@@ -381,14 +390,15 @@ fn maintenance_defers_a_first_time_empty_config() {
 /// watches and sit stuck. `index --watch` must refuse it at startup, same as a no-target config.
 #[test]
 fn index_watch_on_empty_target_dirs_errors() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
+    let dir = common::unique_dir("index-guards");
+    std::fs::create_dir_all(&dir).unwrap();
+    let root = dir.as_path();
     let db = root.join("index.sqlite");
     // A binding present but with no directories → non-empty targets, zero watchable dirs.
     let toml = format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \
          \"none\"\n[target_bindings]\nrust = []\n",
-        db.to_slash_lossy()
+        common::toml_path(&db)
     );
     let config_path = root.join("rag-rat.toml");
     std::fs::write(&config_path, toml).unwrap();
@@ -405,7 +415,7 @@ fn index_watch_on_empty_target_dirs_errors() {
     assert!(!db.exists() || is_empty_db_absent(&db), "must not register an empty index");
 }
 
-fn git_init_commit(dir: &Path) {
+fn seed_git_repo(dir: &Path) {
     let git = |args: &[&str]| {
         rag_rat_base::test_git::run(dir, args);
     };
@@ -414,14 +424,14 @@ fn git_init_commit(dir: &Path) {
     git(&["config", "user.name", "t"]);
     std::fs::write(dir.join("src/a.rs"), "fn a() {}\n").unwrap();
     git(&["add", "-A"]);
-    git(&["commit", "-qm", "init"]);
+    common::git_commit(dir, &["-qm", "init"]);
 }
 
 fn shared_config(db: &Path) -> String {
     format!(
         "[index]\nroot = \".\"\ndatabase = \"{}\"\n[llm.embedding]\nmodel = \
          \"none\"\n[target_bindings]\nrust = [\"src\"]\n",
-        db.to_slash_lossy()
+        common::toml_path(db)
     )
 }
 
