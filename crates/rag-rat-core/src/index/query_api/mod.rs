@@ -22,6 +22,7 @@ mod lens;
 mod memory;
 mod oracle_runs;
 mod search;
+mod sync;
 
 // Crate-internal: member-cap constants, re-exported so the schema-bootstrap tests can assert
 // the capped-class semantics by name (instead of hardcoding 50). Keeps the `clones` module
@@ -58,8 +59,8 @@ pub use lens::{
     LensGraphCallerCounts, LensHopResolvedBy, LensHopSelector, LensLaneVersions, LensPapertrailRef,
     LensStatus, LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion,
 };
-pub use memory::SyncCatchUpReport;
 pub use search::SearchRequest;
+pub use sync::{PublishSeedReport, SyncCatchUpReport};
 
 /// Volume cap on the memories `read_chunk` attaches as drive-by context. The binding is
 /// structural, so every hit is relevant; the cap is purely about how much of a reader's attention
