@@ -24,8 +24,11 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 /// How long a surfaced signal (a memory id, a static caveat) stays "recently seen" for this agent
-/// before it may ride a drive-by result in full again.
-const SEEN_TTL: Duration = Duration::from_secs(30 * 60);
+/// before it may ride a drive-by result in full again. Non-sliding: measured from the last FULL
+/// surface, so a suppressed repeat never extends it. The agent-hook listener's per-session dedup
+/// (#759) uses this same window, so the tool-result lane and the hook lane agree on when an item
+/// may resurface.
+pub(crate) const RESURFACE_WINDOW: Duration = Duration::from_secs(30 * 60);
 /// Bound on the tracked set so a long session can't grow it without limit.
 const SEEN_CAP: usize = 4096;
 
@@ -54,13 +57,13 @@ impl AgentSeen {
         // Recover from a poisoned lock rather than panic — trimming is best-effort meta, never a
         // reason to fail a tool call.
         let mut map = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
-        if map.get(key).is_some_and(|surfaced| now.duration_since(*surfaced) < SEEN_TTL) {
+        if map.get(key).is_some_and(|surfaced| now.duration_since(*surfaced) < RESURFACE_WINDOW) {
             return true;
         }
         // We're about to SHOW it → stamp this surface (and only here, so repeats don't slide it).
         map.insert(key.to_string(), now);
         if map.len() > SEEN_CAP {
-            map.retain(|_, surfaced| now.duration_since(*surfaced) < SEEN_TTL);
+            map.retain(|_, surfaced| now.duration_since(*surfaced) < RESURFACE_WINDOW);
             // Still over cap after dropping expired (a burst of fresh keys): shed arbitrary entries
             // to hold the bound. A shed key just re-surfaces once more later — harmless.
             while map.len() > SEEN_CAP {
@@ -249,21 +252,24 @@ mod tests {
         // First surface shows and stamps t0.
         assert!(!seen.should_suppress_at("k", t0), "first surface shows");
         // Repeated encounters inside the window are suppressed — and must NOT slide the window.
-        assert!(seen.should_suppress_at("k", t0 + SEEN_TTL / 2), "within window → suppressed");
         assert!(
-            seen.should_suppress_at("k", t0 + SEEN_TTL - Duration::from_secs(1)),
+            seen.should_suppress_at("k", t0 + RESURFACE_WINDOW / 2),
+            "within window → suppressed"
+        );
+        assert!(
+            seen.should_suppress_at("k", t0 + RESURFACE_WINDOW - Duration::from_secs(1)),
             "still within the original window → suppressed",
         );
         // Just past the window measured from the FIRST surface (the encounters above did not reset
         // it) → shows again, contrary to a sliding window that would suppress forever (#753
         // review).
         assert!(
-            !seen.should_suppress_at("k", t0 + SEEN_TTL + Duration::from_secs(1)),
+            !seen.should_suppress_at("k", t0 + RESURFACE_WINDOW + Duration::from_secs(1)),
             "window elapsed since the last full surface → shows again",
         );
         // That fresh surface re-stamps, so the next encounter is suppressed once more.
         assert!(
-            seen.should_suppress_at("k", t0 + SEEN_TTL + Duration::from_secs(2)),
+            seen.should_suppress_at("k", t0 + RESURFACE_WINDOW + Duration::from_secs(2)),
             "the fresh surface starts a new window",
         );
     }
