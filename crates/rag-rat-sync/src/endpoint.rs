@@ -471,8 +471,8 @@ pub async fn connect_and_sync<S: SyncStore + NodeAuth>(
     now_ms: i64,
 ) -> Result<SessionReport, SyncFailure> {
     // The `alpn` selects the STREAM the dialer wants — [`SYNC_ALPN`] for the account log,
-    // [`CONTENT_SYNC_ALPN`] for `/3` content — and must match `store`'s type. The acceptor routes
-    // to the matching store by the negotiated ALPN.
+    // [`CONTENT_SYNC_ALPN`] for the content lane — and must match `store`'s type. The acceptor
+    // routes to the matching store by the negotiated ALPN.
     let account_id = store.account_id();
     let AuthedDial { conn, send, recv, capabilities } =
         dial_authed(endpoint, peer, alpn, &*store, account_id, policy, now_ms).await?;
@@ -698,7 +698,8 @@ pub async fn connect_and_table_reconcile<S: TableSyncStore + NodeAuth>(
             tally.record(report.entries_newly_stored, report.entries_sent, report.entries_received)
                 || report.continuation_pending;
         if let ReconcileStep::Stop { converged } = reconcile_step(moved, tally.rounds, max_rounds) {
-            // `/5` is pinned `Closed`, so a session that ran at all was roster-authorized.
+            // The table lane is pinned `Closed`, so a session that ran at all was
+            // roster-authorized.
             return Ok(tally.report(converged, crate::auth::PeerCapability::ReadWrite));
         }
     }
@@ -770,8 +771,8 @@ pub async fn accept_and_sync<S: SyncStore + NodeAuth>(
 }
 
 /// Accept ONE inbound connection and run the session for the STREAM the peer negotiated: the
-/// account log ([`SYNC_ALPN`] → `account_store`), `/3` content ([`CONTENT_SYNC_ALPN`] →
-/// `content_store`), repo-scoped `/5` tables ([`TABLE_SYNC_ALPN`]), or owner-side enrollment
+/// account log ([`SYNC_ALPN`] → `account_store`), the content lane ([`CONTENT_SYNC_ALPN`] →
+/// `content_store`), the repo-scoped table lane ([`TABLE_SYNC_ALPN`]), or owner-side enrollment
 /// ([`ENROLL_ALPN`] → the account store's database).
 /// The auth phase is account-level for normal sync; enrollment instead authenticates the requested
 /// node by the QUIC transport identity and atomically adds it to the roster before normal auth can
@@ -1019,9 +1020,9 @@ async fn run_dispatched<C: SyncStore>(
     let scope = serve_scope_for(policy, admission);
     account_store.set_serve_scope(scope);
     content_store.set_serve_scope(scope);
-    // The account log and `/3` content are the anonymous-servable paths, so their egress is metered
-    // against the shared budget. Table sync is pinned `Closed` (unreachable by an anonymous peer),
-    // so it carries no anonymous egress and is left unmetered here.
+    // The account-log and content lanes are the anonymous-servable paths, so their egress is
+    // metered against the shared budget. Table sync is pinned `Closed` (unreachable by an
+    // anonymous peer), so it carries no anonymous egress and is left unmetered here.
     let limits = SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms };
     let report = match stream {
         SyncAlpn::Account =>
@@ -1280,7 +1281,7 @@ pub async fn dispatch_connection_multi(
 }
 
 /// Whether `enrollment_database`'s local account is exactly `account_id` — see the ENROLL_ALPN
-/// branch of [`accept_and_dispatch`]. A database with no minted account cannot redeem anything,
+/// branch of [`dispatch_connection`]. A database with no minted account cannot redeem anything,
 /// so it does not match either.
 fn enrollment_database_matches(
     enrollment_database: &Connection,

@@ -1,4 +1,4 @@
-//! Frozen wire shapes for the repo-scoped `/5` table-sync transport.
+//! Frozen wire shapes for the repo-scoped table lane.
 
 use std::collections::BTreeMap;
 

@@ -217,7 +217,7 @@ impl SyncStore for OplogSyncStore<'_> {
     }
 }
 
-/// A [`SyncStore`] over one account's OWN `/3` content on a live connection (phase D, #406) — the
+/// A [`SyncStore`] over one account's OWN content on a live connection (phase D, #406) — the
 /// memories themselves, where [`OplogSyncStore`] moves the account log that authorizes them.
 ///
 /// Scoped to a single account, like the account-log store: a session restores the account's own
@@ -382,7 +382,7 @@ impl NodeAuth for OplogContentSyncStore<'_> {
     }
 }
 
-/// Production adapter for current repo-scoped `/5` table streams.
+/// Production adapter for the table lane's current repo-scoped streams.
 pub struct OplogTableSyncStore<'a, F = fn() -> i64> {
     conn: &'a Connection,
     account_id: AccountId,

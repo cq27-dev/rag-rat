@@ -22,7 +22,7 @@ use minicbor::{Decoder, Encoder};
 /// against a relaying sender it would never reach a quiet round.
 pub const SYNC_ALPN: &[u8] = b"rag-rat/sync/5";
 
-/// The ALPN for the `/3` CONTENT stream — the memories themselves (#907). Same frame protocol and
+/// The ALPN for the CONTENT stream — the memories themselves (#907). Same frame protocol and
 /// same account-level auth phase as [`SYNC_ALPN`]; only the STORE differs (`OplogContentSyncStore`
 /// vs `OplogSyncStore`). The stream is discriminated by the ALPN, not a frame field, so the
 /// acceptor picks the store from `conn.alpn()` and the account-log wire stays byte-identical. A
