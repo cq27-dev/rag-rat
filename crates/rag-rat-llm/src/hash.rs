@@ -1,3 +1,6 @@
+//! The model-free hash embedder: a deterministic fallback [`Embedder`] over
+//! [`crate::serving::hash_embed_text`].
+
 use rag_rat_base::embedding_models::{HASH_EMBEDDING_DIM, HASH_MODEL_ID};
 
 use crate::providers::Embedder;
