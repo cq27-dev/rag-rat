@@ -227,10 +227,7 @@ fn a_writer_whose_identity_upgrades_mid_run_extends_its_lock_to_the_resolved_id(
         rag_rat_base::locks::WriteLock::acquire_blocking(&config.database, local_id).unwrap();
     let db = IndexDatabase::open_config(&config).unwrap();
     let resolved = db.active_repo_id.clone();
-    assert!(
-        !resolved.starts_with("local:"),
-        "the open resolved + upgraded to the portable id, got {resolved}"
-    );
+    assert!(!resolved.starts_with("local:"), "the open resolved + upgraded to the portable id");
 
     // A concurrent portable-lock writer (another thread — same-thread probes would re-enter)
     // must BLOCK while the gap writer's connection lives...
@@ -790,10 +787,7 @@ fn unshallow_upgrades_a_shallow_clone_index_from_local_to_portable_in_place() {
     let config = source_config(clone_root.clone(), Language::Rust);
     let db = IndexDatabase::rebuild(&config).expect("index the shallow clone under a LocalOnly id");
     let local_id = db.active_repo_id.clone();
-    assert!(
-        local_id.starts_with("local:"),
-        "shallow clone indexes under a local: id, got {local_id}"
-    );
+    assert!(local_id.starts_with("local:"), "shallow clone indexes under a local: id");
 
     // Bind a memory to an indexed logical symbol so we can prove it survives the id realign.
     let symbol_id: i64 = db

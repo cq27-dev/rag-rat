@@ -192,7 +192,7 @@ fn flight_runs_the_scheduled_mirror_and_persists_binding_health_end_to_end() {
     let AutosyncOutcome::Ran(report) = outcome else {
         panic!("expected a completed flight, got {outcome:?}");
     };
-    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.errors.is_empty());
     assert_eq!(report.bindings.len(), 1);
     assert!(report.bindings[0].completed_full_walk);
 
@@ -368,7 +368,7 @@ fn manual_sync_runs_under_the_flight_lock_and_drains_queued_followups() {
     flight(&config, &lock_repo).queue(AutosyncRequest::Incremental).unwrap();
 
     let report = run_manual(&config, false, || panic!("the lock is free; no wait")).unwrap();
-    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.errors.is_empty());
     assert_eq!(report.bindings.len(), 1);
     assert!(report.bindings[0].completed_full_walk);
 

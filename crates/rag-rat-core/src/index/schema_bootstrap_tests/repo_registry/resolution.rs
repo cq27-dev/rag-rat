@@ -253,8 +253,7 @@ fn open_config_adopts_a_shallow_clone_under_a_local_only_id() {
         .expect("a cut shallow clone adopts under a LocalOnly id, it does not fail");
     assert!(
         db.active_repo_id.starts_with("local:"),
-        "a cut shallow clone adopts under a LocalOnly id, got {}",
-        db.active_repo_id
+        "a cut shallow clone adopts under a LocalOnly id"
     );
     // Adopted as a real repo: the placeholder is gone and the LocalOnly id owns the registry.
     assert_eq!(repo_row_count(db.storage.connection(), LEGACY_REPO_ID), 0, "placeholder adopted");
