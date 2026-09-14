@@ -253,46 +253,20 @@ pub fn redeem_writer_invite(
     authenticated_remote_node: [u8; 32],
     now_ms: &dyn Fn() -> i64,
 ) -> Result<WriterGrantReceipt, InviteError> {
-    // Reject random unauthenticated nonces without the database-wide writer reservation; a valid
-    // candidate is re-screened after BEGIN IMMEDIATE below (mirrors [`redeem_invite`]).
-    let invite = load_invite(conn, request.nonce)?;
-    let arrival_ms = now_ms();
-    match screen_writer_invite(conn, request, invite, arrival_ms)? {
-        Screened::Replay(receipt) => return Ok(receipt),
-        Screened::ReplayExpired => {
-            prune_expired_invites(conn, arrival_ms)?;
-            return Err(InviteError::Used);
-        },
-        Screened::Proceed(_) => {},
-    }
-    let _durability = AuthoredDurability::begin(conn)?;
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .map_err(|error| InviteError::Storage(error.into()))?;
-    let commit_ms = now_ms();
-    let invite = load_invite(&tx, request.nonce)?;
-    let invite = match screen_writer_invite(&tx, request, invite, commit_ms)? {
-        Screened::Replay(receipt) => return Ok(receipt),
-        Screened::ReplayExpired => {
-            prune_expired_invites_in_tx(&tx, commit_ms)?;
-            tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
-            return Err(InviteError::Used);
-        },
-        Screened::Proceed(invite) => *invite,
+    let locked = match screen_under_writer_lock(
+        conn,
+        request.nonce,
+        now_ms,
+        |_| Ok(()),
+        |conn, invite, at_ms| screen_writer_invite(conn, request, invite, at_ms),
+    )? {
+        LockedRedemption::Replay(receipt) => return Ok(receipt),
+        LockedRedemption::Proceed(locked) => *locked,
     };
-    prune_expired_invites_in_tx(&tx, commit_ms)?;
-    let account_id = stored_invite_account(&invite)?;
-    if read_local_account(&tx)
-        .map_err(InviteError::from)?
-        .filter(|local| *local == account_id)
-        .is_none()
-    {
-        return Err(InviteError::Storage(anyhow::anyhow!(
-            "invite account is not the local account"
-        )));
-    }
-    let stream_id = writer_invite_stream(&invite)?;
+    let LockedInvite { ref tx, commit_ms, .. } = locked;
+    let stream_id = writer_invite_stream(&locked.invite)?;
     let grant_id = rag_rat_oplog::author_stream_grant_in_tx(
-        &tx,
+        tx,
         rag_rat_oplog::StreamId::from_bytes(stream_id),
         request.contributor_account,
         rag_rat_oplog::GrantRole::Writer,
@@ -310,7 +284,7 @@ pub fn redeem_writer_invite(
         ],
     )
     .map_err(|error| InviteError::Storage(error.into()))?;
-    tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+    locked.tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     Ok(WriterGrantReceipt { grant_id, stream_id })
 }
 
@@ -392,52 +366,18 @@ pub fn redeem_invite(
     if request.transport_node_id != authenticated_remote_node {
         return Err(InviteError::WrongNode);
     }
-    // Reject random unauthenticated nonces without taking SQLite's database-wide writer
-    // reservation. A valid candidate is re-screened after BEGIN IMMEDIATE below. The arrival clock
-    // is read AFTER the row lookup and the account check, so a lookup that crosses the replay
-    // deadline is judged at its end (a stale earlier sample could replay a receipt the deadline
-    // has already retired), and a wrong-account request never reads the clock.
-    let invite = load_invite(conn, request.nonce)?;
-    ensure_expected_account(&request, &invite)?;
-    let arrival_ms = now_ms();
-    match screen_invite(conn, &request, invite, arrival_ms)? {
-        Screened::Replay(receipt) => return Ok((receipt, empty_catch_up(&request))),
-        Screened::ReplayExpired => {
-            prune_expired_invites(conn, arrival_ms)?;
-            return Err(InviteError::Used);
-        },
-        Screened::Proceed(_) => {},
-    }
-    let _durability = AuthoredDurability::begin(conn)?;
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
-        .map_err(|error| InviteError::Storage(error.into()))?;
-    // BEGIN IMMEDIATE can wait out the busy timeout behind another writer: re-read the clock
-    // NOW that the writer lock is held, or an invite that expired during the wait would be
-    // consumed against the stale pre-wait timestamp.
-    let commit_ms = now_ms();
-    let invite = load_invite(&tx, request.nonce)?;
-    ensure_expected_account(&request, &invite)?;
-    let invite = match screen_invite(&tx, &request, invite, commit_ms)? {
-        Screened::Replay(receipt) => return Ok((receipt, empty_catch_up(&request))),
-        Screened::ReplayExpired => {
-            prune_expired_invites_in_tx(&tx, commit_ms)?;
-            tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
-            return Err(InviteError::Used);
-        },
-        Screened::Proceed(invite) => *invite,
+    let locked = match screen_under_writer_lock(
+        conn,
+        request.nonce,
+        now_ms,
+        |invite| ensure_expected_account(&request, invite),
+        |conn, invite, at_ms| screen_invite(conn, &request, invite, at_ms),
+    )? {
+        LockedRedemption::Replay(receipt) => return Ok((receipt, empty_catch_up(&request))),
+        LockedRedemption::Proceed(locked) => *locked,
     };
-    let account_id = stored_invite_account(&invite)?;
-    prune_expired_invites_in_tx(&tx, commit_ms)?;
-    if read_local_account(&tx)
-        .map_err(InviteError::from)?
-        .filter(|local| *local == account_id)
-        .is_none()
-    {
-        return Err(InviteError::Storage(anyhow::anyhow!(
-            "invite account is not the local account"
-        )));
-    }
-    let role = DeviceRole::from_db_str(&invite.role).map_err(InviteError::from)?;
+    let LockedInvite { ref tx, account_id, commit_ms, .. } = locked;
+    let role = DeviceRole::from_db_str(&locked.invite.role).map_err(InviteError::from)?;
     let fingerprint = DeviceFingerprint::from_bytes(Sha256::digest(request.ed25519_pubkey).into());
     // Release THIS invite's reservation under the writer lock, then RE-MEASURE the mandatory
     // requirement against current state: key targets may have grown since minting, and the
@@ -445,18 +385,25 @@ pub fn redeem_invite(
     // released (other outstanding invites' reservations still count), so it passes only if the
     // DeviceAdd plus the CURRENT wraps genuinely fit — a shortfall rolls back, preserving the
     // nonce and restoring the reservation instead of stranding the ticket mid-redemption.
-    rag_rat_oplog::release_account_candidate_reservation_in_tx(&tx, request.nonce)?;
+    rag_rat_oplog::release_account_candidate_reservation_in_tx(tx, request.nonce)?;
     // Resolve ownership in this same redemption snapshot. A long-running server can ingest
     // StreamOwn/StreamRevoke entries after startup; caching this set would either omit a newly
     // owned stream's key wrap or make a stale, no-longer-owned stream abort the whole enrollment.
-    let streams = owned_streams_for_account(&tx, account_id)?;
-    enrollment_authoring_fits(&tx, account_id, &streams, role, invite.label.as_deref(), commit_ms)?;
+    let streams = owned_streams_for_account(tx, account_id)?;
+    enrollment_authoring_fits(
+        tx,
+        account_id,
+        &streams,
+        role,
+        locked.invite.label.as_deref(),
+        commit_ms,
+    )?;
     let device_add = author_enrollment_device_add_in_tx(
-        &tx,
+        tx,
         EnrollingDevice {
             ed25519_pubkey: request.ed25519_pubkey,
             x25519_pubkey: request.x25519_pubkey,
-            label: invite.label,
+            label: locked.invite.label,
         },
         role,
         commit_ms,
@@ -468,8 +415,8 @@ pub fn redeem_invite(
             |row| row.get(0),
         )
         .map_err(|error| InviteError::Storage(error.into()))?;
-    let catch_up = enroll_stream_keys_for_device_in_tx(&tx, fingerprint, &streams, commit_ms)?;
-    let bootstrap_entries = account_entries_for_enrollment(&tx, account_id)?;
+    let catch_up = enroll_stream_keys_for_device_in_tx(tx, fingerprint, &streams, commit_ms)?;
+    let bootstrap_entries = account_entries_for_enrollment(tx, account_id)?;
     // Every candidate the joiner claims to hold MUST be one the owner's authenticated snapshot
     // also holds. An unrepresented hash means the joiner carries history this receipt cannot
     // reconcile (a competing control branch, or a false claim); adoption would refold the union
@@ -550,7 +497,7 @@ pub fn redeem_invite(
     if changed != 1 {
         return Err(InviteError::Used);
     }
-    tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+    locked.tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     if let Err(error) = retry_enrollment_pre_verify(conn, account_id, commit_ms) {
         tracing::warn!(%error, "post-enrollment pre-verify retry failed");
     }
@@ -567,6 +514,99 @@ enum Screened<R> {
     ReplayExpired,
     /// A live invite past every deterministic refusal: redeem it.
     Proceed(Box<StoredInvite>),
+}
+
+/// Where [`screen_under_writer_lock`] left a redemption: answered by a same-redemption replay, or
+/// holding the writer lock over a live invite that only its own authoring remains for.
+enum LockedRedemption<'c, R> {
+    Replay(R),
+    Proceed(Box<LockedInvite<'c>>),
+}
+
+/// A live invite past both screens, under the writer lock, with expired rows pruned and its
+/// account confirmed as the local one.
+///
+/// Field order is drop order: `tx` rolls back (or has already committed) before `_durability`
+/// restores the connection's synchronous setting, which must never happen inside an open
+/// transaction. Callers borrow or move single fields and never destructure the whole into owned
+/// bindings, whose drop order would follow the pattern instead.
+struct LockedInvite<'c> {
+    tx: Transaction<'c>,
+    _durability: AuthoredDurability<'c>,
+    invite: StoredInvite,
+    account_id: AccountId,
+    commit_ms: i64,
+}
+
+/// The control flow both redemptions share up to their own authoring. The invite is screened once
+/// BEFORE the writer lock, so a random unauthenticated nonce is refused without SQLite's
+/// database-wide writer reservation, then re-loaded and re-screened after BEGIN IMMEDIATE against
+/// a re-read clock. A same-redemption replay answers with its receipt at either screen; a consumed
+/// nonce past its retention is pruned and refused `Used`.
+///
+/// `after_load` runs straight after each row load. Before the lock that is ahead of the arrival
+/// clock, which is read AFTER the lookup so a lookup crossing the replay deadline is judged at its
+/// end (a stale earlier sample could replay a receipt the deadline has already retired).
+/// Enrollment checks the request's account there, so a wrong-account request never reads the
+/// clock. The writer flow checks nothing there: its account check sits in its screen, behind the
+/// kind check, because a pairing nonce presented to the grant flow must be refused `Unknown`
+/// before any account comparison could reveal which flow it belongs to. Its arrival clock read
+/// ahead of that check only times the replay and expiry screens and never changes which refusal
+/// wins.
+fn screen_under_writer_lock<'c, R>(
+    conn: &'c Connection,
+    nonce: [u8; 32],
+    now_ms: &dyn Fn() -> i64,
+    after_load: impl Fn(&StoredInvite) -> Result<(), InviteError>,
+    screen: impl Fn(&Connection, StoredInvite, i64) -> Result<Screened<R>, InviteError>,
+) -> Result<LockedRedemption<'c, R>, InviteError> {
+    let invite = load_invite(conn, nonce)?;
+    after_load(&invite)?;
+    let arrival_ms = now_ms();
+    match screen(conn, invite, arrival_ms)? {
+        Screened::Replay(receipt) => return Ok(LockedRedemption::Replay(receipt)),
+        Screened::ReplayExpired => {
+            prune_expired_invites(conn, arrival_ms)?;
+            return Err(InviteError::Used);
+        },
+        Screened::Proceed(_) => {},
+    }
+    let durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| InviteError::Storage(error.into()))?;
+    // BEGIN IMMEDIATE can wait out the busy timeout behind another writer: re-read the clock
+    // NOW that the writer lock is held, or an invite that expired during the wait would be
+    // consumed against the stale pre-wait timestamp.
+    let commit_ms = now_ms();
+    let invite = load_invite(&tx, nonce)?;
+    after_load(&invite)?;
+    let invite = match screen(&tx, invite, commit_ms)? {
+        Screened::Replay(receipt) => return Ok(LockedRedemption::Replay(receipt)),
+        Screened::ReplayExpired => {
+            prune_expired_invites_in_tx(&tx, commit_ms)?;
+            tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
+            return Err(InviteError::Used);
+        },
+        Screened::Proceed(invite) => *invite,
+    };
+    let account_id = stored_invite_account(&invite)?;
+    prune_expired_invites_in_tx(&tx, commit_ms)?;
+    if read_local_account(&tx)
+        .map_err(InviteError::from)?
+        .filter(|local| *local == account_id)
+        .is_none()
+    {
+        return Err(InviteError::Storage(anyhow::anyhow!(
+            "invite account is not the local account"
+        )));
+    }
+    Ok(LockedRedemption::Proceed(Box::new(LockedInvite {
+        tx,
+        _durability: durability,
+        invite,
+        account_id,
+        commit_ms,
+    })))
 }
 
 /// A redemption's invite row, `Unknown` for a nonce this store never minted. Before the writer
