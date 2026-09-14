@@ -37,7 +37,8 @@ pub struct InviteSpec<'a> {
 
 struct StoredInvite {
     account_bytes: Vec<u8>,
-    role: String,
+    /// Parsed once at the DB boundary; an unknown token remains loadable.
+    kind: Result<StoredInviteKind, String>,
     /// The stream a WRITER invite grants on (`Some` exactly for `role = 'writer'` rows).
     stream_id: Option<Vec<u8>>,
     label: Option<String>,
@@ -52,6 +53,42 @@ struct StoredInvite {
     /// Legacy full-receipt copy (pre-V092). Never written anymore; retained so invites consumed
     /// before V092 keep replaying through their 24h window. The manifest form is preferred.
     receipt_bytes: Option<Vec<u8>>,
+}
+
+impl StoredInvite {
+    /// An unrecognized token fails only the flow that must read a device role from it;
+    /// a writer screen keeps refusing it `Unknown`.
+    fn kind(&self) -> anyhow::Result<StoredInviteKind> {
+        self.kind.as_ref().copied().map_err(|message| anyhow::anyhow!("{message}"))
+    }
+}
+
+/// What a `sync_invites` row redeems into. Its persisted `role` column holds the three
+/// [`DeviceRole`] tokens for a device pairing plus `writer` for a writer grant — a domain wider
+/// than `DeviceRole`, so a writer row must never reach `DeviceRole::from_db_str`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredInviteKind {
+    Pairing(DeviceRole),
+    Writer,
+}
+
+impl StoredInviteKind {
+    const WRITER: &str = "writer";
+
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Pairing(role) => role.as_db_str(),
+            Self::Writer => Self::WRITER,
+        }
+    }
+
+    fn from_db_str(value: &str) -> anyhow::Result<Self> {
+        if value == Self::WRITER {
+            Ok(Self::Writer)
+        } else {
+            DeviceRole::from_db_str(value).map(Self::Pairing)
+        }
+    }
 }
 
 pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTicket, InviteError> {
@@ -111,7 +148,7 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         params![
             nonce.as_slice(),
             account_id.to_bytes().as_slice(),
-            role.as_db_str(),
+            StoredInviteKind::Pairing(role).as_db_str(),
             label,
             expires_at_ms,
             now_ms,
@@ -222,10 +259,11 @@ pub fn mint_writer_invite(
     tx.execute(
         "INSERT INTO sync_invites(
              nonce, account_id, role, stream_id, expires_at_ms, created_at_ms, used_at_ms
-         ) VALUES (?1, ?2, 'writer', ?3, ?4, ?5, NULL)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
         params![
             nonce.as_slice(),
             account_id.to_bytes().as_slice(),
+            StoredInviteKind::Writer.as_db_str(),
             stream_id.as_slice(),
             expires_at_ms,
             now_ms,
@@ -298,7 +336,7 @@ fn writer_redeem_preflight(
 ) -> Result<(), InviteError> {
     // An enrollment nonce presented to the grant flow is as unknown as a random one — do not
     // leak which flow a guessed nonce belongs to.
-    if invite.role != "writer" {
+    if !matches!(invite.kind(), Ok(StoredInviteKind::Writer)) {
         return Err(InviteError::Unknown);
     }
     if request.expected_account != stored_invite_account(invite)? {
@@ -335,7 +373,7 @@ fn writer_replay_receipt(
     invite: &StoredInvite,
     request: &WriterGrantRequest,
 ) -> Result<Option<WriterGrantReceipt>, InviteError> {
-    if invite.role != "writer" || invite.used_at_ms.is_none() {
+    if !matches!(invite.kind(), Ok(StoredInviteKind::Writer)) || invite.used_at_ms.is_none() {
         return Ok(None);
     }
     let Some(grant_id) =
@@ -377,7 +415,11 @@ pub fn redeem_invite(
         LockedRedemption::Proceed(locked) => *locked,
     };
     let LockedInvite { ref tx, account_id, commit_ms, .. } = locked;
-    let role = DeviceRole::from_db_str(&locked.invite.role).map_err(InviteError::from)?;
+    let role = match locked.invite.kind()? {
+        StoredInviteKind::Pairing(role) => role,
+        // A writer token remains outside the pairing role domain.
+        StoredInviteKind::Writer => DeviceRole::from_db_str(StoredInviteKind::Writer.as_db_str())?,
+    };
     let fingerprint = DeviceFingerprint::from_bytes(Sha256::digest(request.ed25519_pubkey).into());
     // Release THIS invite's reservation under the writer lock, then RE-MEASURE the mandatory
     // requirement against current state: key targets may have grown since minting, and the
@@ -674,9 +716,11 @@ fn stored_invite(conn: &Connection, nonce: [u8; 32]) -> Result<Option<StoredInvi
            FROM sync_invites WHERE nonce = ?1",
         [nonce.as_slice()],
         |row| {
+            let role: String = row.get(1)?;
+            let kind = StoredInviteKind::from_db_str(&role).map_err(|error| error.to_string());
             Ok(StoredInvite {
                 account_bytes: row.get(0)?,
-                role: row.get(1)?,
+                kind,
                 stream_id: row.get(2)?,
                 label: row.get(3)?,
                 expires_at_ms: row.get(4)?,
@@ -830,5 +874,24 @@ fn empty_catch_up(request: &EnrollmentRequest) -> CatchUpReport {
         target: DeviceFingerprint::from_bytes(Sha256::digest(request.ed25519_pubkey).into()),
         authored: Vec::new(),
         already_covered: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_stored_invite_kind_round_trips_through_its_persisted_token() {
+        for (kind, token) in [
+            (StoredInviteKind::Pairing(DeviceRole::ReadOnly), "read_only"),
+            (StoredInviteKind::Pairing(DeviceRole::Member), "member"),
+            (StoredInviteKind::Pairing(DeviceRole::Owner), "owner"),
+            (StoredInviteKind::Writer, "writer"),
+        ] {
+            assert_eq!(kind.as_db_str(), token);
+            assert_eq!(StoredInviteKind::from_db_str(token).unwrap(), kind);
+        }
+        assert!(StoredInviteKind::from_db_str("admin").is_err());
     }
 }
