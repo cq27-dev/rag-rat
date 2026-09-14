@@ -1,6 +1,6 @@
-//! The oracle pass: consume a pre-built `.scip`, join its occurrences against edge candidates,
-//! write `edge_oracle` verdicts, and return an [`OracleReport`]. Phase 1 entry point — no indexer
-//! invocation, no CLI/MCP surface (#69).
+//! The batch oracle pass: consume a `.scip` (pre-built, or produced by the tool — see
+//! [`super::produce_scip_with_tool`]), join its occurrences against edge candidates, write
+//! `edge_oracle` verdicts, and return an [`OracleReport`].
 //!
 //! Resumable-friendly shape: candidates are loaded once and processed in document order, each
 //! verdict written independently, so a future incremental driver can scope `edge_join_candidates`
