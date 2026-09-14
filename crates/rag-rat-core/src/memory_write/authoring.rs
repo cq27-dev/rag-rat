@@ -27,7 +27,7 @@ use rag_rat_oplog::{
     StreamId,
 };
 use rag_rat_query::memory::{EdgeRelation, RepoMemory, memory_repo_scope};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use super::ownership::{StreamSealPolicy, grantee_context, stream_seal_policy};
 use super::reconcile::{
@@ -68,6 +68,49 @@ impl Drop for AuthoredDurability<'_> {
         let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL;");
     }
 }
+
+/// The preamble every AUTHORED memory / edge mutation opens with, in the one order that keeps the
+/// authored commit durable. The table writes and the op-append then run in `tx`, so they commit —
+/// or roll back — together (strict-atomic); writes through the bare `conn` participate in it.
+///
+/// 1. Backfill the pre-existing history (idempotent; a cheap no-op once the chain exists). This is
+///    what mints the local account and establishes the owner stream: without it a store whose
+///    account has never been minted prepares `None`, and `author_in_owner_stream` returns Ok having
+///    written nothing.
+/// 2. Prepare the live authoring BEFORE the transaction: minting the account self-transacts and
+///    cannot nest inside the one opened below.
+/// 3. Raise [`AuthoredDurability`] only after both (#560). Each of them may self-transact under its
+///    OWN guard, whose drop restores `synchronous = NORMAL` — a guard raised earlier would be
+///    downgraded before our commit, silently losing the durability it exists to provide.
+/// 4. `BEGIN IMMEDIATE`, not deferred: memory writes are the sanctioned flock-less writers on the
+///    shared database, racing foreign repos' rebuilds by design. A deferred txn that READS first
+///    and then upgrades to write fails with SQLITE_BUSY_SNAPSHOT the moment a concurrent writer
+///    committed in between — and that error BYPASSES the busy handler, so busy_timeout never gets a
+///    say. Taking the write lock up front waits it out instead (#818).
+///
+/// Fields drop in declaration order: an uncommitted `tx` rolls back before the guard restores
+/// NORMAL, and [`commit`](Self::commit) commits before the guard drops.
+pub(super) struct AuthoredWrite<'a> {
+    pub(super) prepared: Option<PreparedOwnerAuthoring>,
+    pub(super) tx: Transaction<'a>,
+    _durability: AuthoredDurability<'a>,
+}
+
+impl<'a> AuthoredWrite<'a> {
+    pub(super) fn begin(conn: &'a Connection, now_ms: i64) -> anyhow::Result<Self> {
+        super::reconcile::backfill_memory_oplog(conn, now_ms)?;
+        let prepared = prepare_live_content_authoring(conn, now_ms)?;
+        let durability = AuthoredDurability::begin(conn)?;
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        Ok(Self { prepared, tx, _durability: durability })
+    }
+
+    pub(super) fn commit(self) -> anyhow::Result<()> {
+        self.tx.commit()?;
+        Ok(())
+    }
+}
+
 pub(crate) struct PreparedOwnerAuthoring {
     repo_id: String,
     /// The `/2` stream to author onto — this store's own owned stream in `Owner` mode, the

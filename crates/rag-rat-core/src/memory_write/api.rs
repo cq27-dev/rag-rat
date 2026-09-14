@@ -12,9 +12,9 @@ use rag_rat_query::memory::{
     stamp_bindings_from_parent_repo, upsert_memory_fts, validate_confidence, validate_kind,
     validate_len, validate_payload, validate_source, validate_status,
 };
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, params};
 
-use super::{authoring, reconcile};
+use super::authoring;
 
 pub(crate) fn create_memory(
     conn: &Connection,
@@ -66,20 +66,9 @@ pub(crate) fn create_memory(
     // scope drives the repo stamp below.
     let scope = memory_repo_scope(conn)?;
     let id = memory_id(now, &input_hash, &scope);
-    // Backfill the pre-existing history BEFORE this live entry (idempotent; a cheap no-op once the
-    // chain exists), then do the table writes + the op-append in ONE transaction so they commit —
-    // or roll back — together (strict-atomic). Writes via `conn` participate in the open txn.
-    reconcile::backfill_memory_oplog(conn, now)?;
-    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: commit durably so a `memory_create` that returned success survives power loss
-    // (#560). FULL for this transaction only; the connection restores NORMAL on drop.
-    let _durability = authoring::AuthoredDurability::begin(conn)?;
-    // IMMEDIATE, not deferred: memory writes are the sanctioned flock-less writers on the shared
-    // database, racing foreign repos' rebuilds by design. A deferred txn that READS first (the
-    // tombstone check below) and then upgrades to write fails with SQLITE_BUSY_SNAPSHOT the moment
-    // a concurrent writer committed in between — and that error BYPASSES the busy handler, so
-    // busy_timeout never gets a say. Taking the write lock up front waits it out instead (#818).
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // (#560); the tombstone check below READS before the INSERT, hence IMMEDIATE (#818).
+    let write = authoring::AuthoredWrite::begin(conn, now)?;
     // #767: revalidate the removal tombstone INSIDE the write txn — a connection that resolved its
     // active scope before `rm` ran must fail closed here rather than stamp the removed `repo_id`
     // onto a fresh row after the purge.
@@ -130,8 +119,8 @@ pub(crate) fn create_memory(
     let memory = memory_by_id(conn, &id)?
         .ok_or_else(|| anyhow::anyhow!("created memory `{id}` could not be read back"))?;
     // Author the NodeCreate in the SAME txn; an authoring error drops `tx` → the INSERT rolls back.
-    authoring::author_create(&tx, &memory, prepared.as_ref(), now)?;
-    tx.commit()?;
+    authoring::author_create(&write.tx, &memory, write.prepared.as_ref(), now)?;
+    write.commit()?;
     Ok(RepoMemoryCreateResult { memory, duplicate: false })
 }
 
@@ -140,14 +129,10 @@ pub(crate) fn update_memory(
     update: RepoMemoryUpdate,
 ) -> anyhow::Result<RepoMemory> {
     let now = now_ms();
-    // Backfill (idempotent) before opening our txn, then open an IMMEDIATE txn so the current-row
-    // READ and the UPDATE are ONE atomic unit — a racing writer cannot flip the status between the
-    // read and the write and desync the table from the op-log projection.
-    reconcile::backfill_memory_oplog(conn, now)?;
-    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
-    // Authored write (content / status / obsolete): commit durably (#560), NORMAL restored on drop.
-    let _durability = authoring::AuthoredDurability::begin(conn)?;
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Authored write (content / status / obsolete), committed durably (#560). The IMMEDIATE txn
+    // makes the current-row READ and the UPDATE ONE atomic unit — a racing writer cannot flip the
+    // status between the read and the write and desync the table from the op-log projection.
+    let write = authoring::AuthoredWrite::begin(conn, now)?;
     let current = memory_by_id(conn, &update.memory_id)?
         .ok_or_else(|| anyhow::anyhow!("memory `{}` not found", update.memory_id))?;
     if let Some(kind) = update.kind.as_deref() {
@@ -238,14 +223,14 @@ pub(crate) fn update_memory(
     // Author NodeUpdate (+ NodeStatus on a status change) in the SAME txn; an authoring error drops
     // `tx` → the UPDATE rolls back.
     authoring::author_update(
-        &tx,
+        &write.tx,
         &memory,
         content_changed,
         status_changed,
-        prepared.as_ref(),
+        write.prepared.as_ref(),
         now,
     )?;
-    tx.commit()?;
+    write.commit()?;
     Ok(memory)
 }
 
@@ -270,25 +255,11 @@ pub(crate) fn rebind_memory(
     if memory_by_id(conn, memory_id)?.is_none() {
         anyhow::bail!("memory `{memory_id}` not found");
     }
-    // Resolve inside the transaction so the stamped source_text_hash is consistent with the
-    // bindings written in the same atomic unit.
-    // Authored write (#560): a rebind is an explicit, non-reconstructable choice of a new anchor,
-    // and now mints a signed op for it. NORMAL restored on drop.
-    let _durability = authoring::AuthoredDurability::begin(conn)?;
     let now = now_ms();
-    // Backfill BEFORE preparing, like the create and update paths. This is what mints the local
-    // account and establishes the owner stream; without it a store whose account has never been
-    // minted — a memory authored under a `local:` shallow-clone id, or by a pre-#532 binary —
-    // prepares `None` and `author_in_owner_stream` returns Ok having written nothing. That was
-    // harmless while a rebind authored no op, and silently drops the snapshot now that it does.
-    reconcile::backfill_memory_oplog(conn, now)?;
-    // Prepared BEFORE the txn, like the create path: minting the account self-transacts and cannot
-    // nest inside the one opened below.
-    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
-    // IMMEDIATE for the same reason as `create_memory`: `resolve_binding` READS before the writes
-    // below, and a deferred read→write upgrade racing a foreign repo's rebuild dies with
-    // SQLITE_BUSY_SNAPSHOT, which the busy handler never sees.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Authored write (#560): a rebind is an explicit, non-reconstructable choice of a new anchor,
+    // and mints a signed op for it. `resolve_binding` runs inside the transaction so the stamped
+    // source_text_hash is consistent with the bindings written in the same atomic unit.
+    let write = authoring::AuthoredWrite::begin(conn, now)?;
     // Rebind MUST name an anchor — moving a memory to "no binding" is meaningless (delete/recreate
     // it unanchored instead). Only `create_memory` accepts the unanchored (`None`) case (#463).
     let binding = resolve_binding(conn, &bind)?.ok_or_else(|| {
@@ -317,8 +288,8 @@ pub(crate) fn rebind_memory(
     // Author the new anchor set in the SAME txn; an authoring error drops `tx` → the rebind rolls
     // back. A rebind always leaves at least one binding (it refuses an empty target above), so this
     // always emits an op — unlike the create path, where an unanchored memory authors none.
-    authoring::author_anchors(&tx, memory_id, prepared.as_ref(), now)?;
-    tx.commit()?;
+    authoring::author_anchors(&write.tx, memory_id, write.prepared.as_ref(), now)?;
+    write.commit()?;
     memory_by_id(conn, memory_id)?
         .ok_or_else(|| anyhow::anyhow!("rebound memory `{memory_id}` could not be read back"))
 }
@@ -755,8 +726,13 @@ mod tests {
     /// `authoring::tests::scoped_conn` (each module's test scaffolding is self-contained).
     fn scoped_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        scope_to_repo(&conn);
+        conn
+    }
+
+    fn scope_to_repo(conn: &Connection) {
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        rag_rat_db::schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+        rag_rat_db::schema::apply(conn, &crate::index::migration_hooks()).unwrap();
         conn.execute(
             "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES (?1, ?1, 0)",
             [REPO],
@@ -771,7 +747,52 @@ mod tests {
             [REPO],
         )
         .unwrap();
-        conn
+    }
+
+    /// A rebind whose backfill has work of its own must still commit at `synchronous = FULL`
+    /// (#560). The backfill self-transacts under its own durability guard, whose drop restores
+    /// NORMAL, so a rebind guard raised before the backfill is downgraded before the rebind's
+    /// commit. A temp trigger on the rebind's own UPDATE reads the level from inside the authored
+    /// transaction. File-backed because an in-memory database does not report `synchronous`.
+    #[test]
+    fn a_rebind_commits_durably_after_a_backfill_that_authored() {
+        let dir = rag_rat_base::test_scratch::ScratchDir::new("rebind-durability");
+        let storage = rag_rat_db::storage::IndexConnection::open(&dir.join("index.db")).unwrap();
+        let conn = storage.connection();
+        scope_to_repo(conn);
+        // A ghost: a row no op was ever authored for, so the backfill has authorable work (and, on
+        // this fresh store, mints the local account first).
+        conn.execute(
+            "INSERT INTO repo_memories(
+                 id, kind, title, body, confidence, status, created_at_ms, updated_at_ms, source,
+                 memory_version, repo_id, origin)
+             VALUES ('mem_ghost', 'Concept', 't', 'b', 'high', 'active', 1, 1, 'agent', 'v1', ?1,
+                 'local')",
+            [REPO],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TABLE sync_probe(level INTEGER);
+             CREATE TEMP TRIGGER sync_probe_on_rebind
+             AFTER UPDATE OF source_text_hash ON main.repo_memories
+             BEGIN
+                 INSERT INTO sync_probe SELECT synchronous FROM pragma_synchronous;
+             END;",
+        )
+        .unwrap();
+
+        rebind_memory(conn, "mem_ghost", RepoMemoryBindTarget {
+            commit_hash: Some("f".repeat(40)),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let level: i64 = conn
+            .query_row("SELECT level FROM sync_probe ORDER BY rowid DESC LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(level, 2, "the rebind's authored commit must run at synchronous=FULL (=2)");
     }
 
     /// Create an unanchored `Concept` (needs no code binding) through the LIVE `create_memory`.
