@@ -175,3 +175,17 @@ plus the OS page cache over a ~10 GB index DB is borderline for a hosted runner 
 point, would give a noisy, contended wall-clock. If a run OOMs or overruns `timeout-minutes` on a
 constrained box, bound `RAG_RAT_KERNEL_SUBDIRS` to the core subsystems. Validate with a manual
 dispatch first.
+
+## Persistent runner cache retention
+
+CI, evaluation, and PR benchmark jobs finish with `runner-cache-cleanup`, after tests and artifact
+uploads. On Hetzner it caps the job's configured Cargo target at 20 GB using `cargo sweep`; it never
+sweeps a sibling runner. Coverage uses its shared cycle lock, and cleanup respects Cargo's profile
+locks. Busy locks produce an explicit warning and defer cleanup to the next job. Cleanup failures
+fail the step. Hosted runners skip this action.
+
+The six-hour `runner-maintenance` workflow remains a backstop. A busy sibling can make it skip a
+cache, so a successful maintenance run does not imply every target is below the cap. The per-job
+step keeps each busy runner bounded between completed jobs without waiting for a host-wide idle
+window. Hard termination can bypass that step; the scheduled sweep remains necessary. A single
+build can still grow beyond the target cap while it runs.

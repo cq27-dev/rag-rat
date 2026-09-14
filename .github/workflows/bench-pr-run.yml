@@ -75,3 +75,7 @@ jobs:
             benchmark_results_iai.txt
             benchmark_results_criterion.txt
             event.json
+
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup

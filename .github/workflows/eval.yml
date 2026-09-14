@@ -115,3 +115,7 @@ jobs:
       # (lexical + semantic) retrieval path the product ships — every must_include_* expectation.
       - name: eval suite (hybrid, full gate)
         run: cargo nextest run -p rag-rat-core --features eval --locked -E 'test(eval_suite)'
+
+      - name: Trim this runner's build cache
+        if: ${{ always() && startsWith(runner.name, 'hetzner-') }}
+        uses: ./.github/actions/runner-cache-cleanup
