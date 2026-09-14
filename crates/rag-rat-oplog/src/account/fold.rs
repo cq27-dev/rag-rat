@@ -1780,34 +1780,51 @@ impl<'a> DepthPass<'a> {
     /// equivocation (same device + seq, different content) sorts identically under every
     /// arrival permutation (I9).
     fn run_effect_pass(&mut self, idxs: &[usize], outcomes: &mut HashMap<[u8; 32], Outcome>) {
-        let candidates = self.candidates;
-        let mut ordered = idxs.to_vec();
-        ordered.sort_by_key(|&i| {
-            let h = candidates[i].header();
-            (h.device_fingerprint.to_bytes(), h.seq, candidates[i].hash())
-        });
-        for i in ordered {
-            let c = &candidates[i];
-            if let Some(reason) = self.verdicts.condemned.get(&c.hash()) {
-                outcomes.insert(c.hash(), Outcome::Condemned(*reason));
-                continue;
-            }
-            if let Some(reason) = self.verdicts.parked.get(&c.hash()) {
-                outcomes.insert(c.hash(), Outcome::Parked(*reason));
-                continue;
-            }
-            if let Some(verdict) = self.verdicts.cut_verdicts.get(&c.hash()) {
-                outcomes.insert(c.hash(), *verdict);
-                continue;
-            }
-            let outcome = classify_effect(c, self.incarnations, &self.state, &self.verdicts.parked);
-            if let Outcome::Effective { .. } = outcome {
-                apply_effect(c, &mut self.state);
-            }
-            outcomes.insert(c.hash(), outcome);
-        }
+        effect_pass(
+            self.candidates,
+            idxs,
+            self.incarnations,
+            &self.verdicts,
+            &mut self.state,
+            outcomes,
+        );
     }
 }
+fn effect_pass(
+    candidates: &[Candidate],
+    idxs: &[usize],
+    incarnations: &Incarnations<'_>,
+    verdicts: &FoldVerdicts,
+    state: &mut FoldState,
+    outcomes: &mut HashMap<[u8; 32], Outcome>,
+) {
+    let mut ordered = idxs.to_vec();
+    ordered.sort_by_key(|&i| {
+        let h = candidates[i].header();
+        (h.device_fingerprint.to_bytes(), h.seq, candidates[i].hash())
+    });
+    for i in ordered {
+        let c = &candidates[i];
+        if let Some(reason) = verdicts.condemned.get(&c.hash()) {
+            outcomes.insert(c.hash(), Outcome::Condemned(*reason));
+            continue;
+        }
+        if let Some(reason) = verdicts.parked.get(&c.hash()) {
+            outcomes.insert(c.hash(), Outcome::Parked(*reason));
+            continue;
+        }
+        if let Some(verdict) = verdicts.cut_verdicts.get(&c.hash()) {
+            outcomes.insert(c.hash(), *verdict);
+            continue;
+        }
+        let outcome = classify_effect(c, incarnations, state, &verdicts.parked);
+        if let Outcome::Effective { .. } = outcome {
+            apply_effect(c, state);
+        }
+        outcomes.insert(c.hash(), outcome);
+    }
+}
+
 fn replay_effect_state(
     candidates: &[Candidate],
     strata: &BTreeMap<usize, Vec<usize>>,
@@ -1821,27 +1838,7 @@ fn replay_effect_state(
         if before_depth.is_some_and(|limit| depth >= limit) {
             break;
         }
-        let mut ordered = idxs.clone();
-        ordered.sort_by_key(|&i| {
-            let header = candidates[i].header();
-            (header.device_fingerprint.to_bytes(), header.seq, candidates[i].hash())
-        });
-        for i in ordered {
-            let candidate = &candidates[i];
-            let outcome = if let Some(reason) = verdicts.condemned.get(&candidate.hash()) {
-                Outcome::Condemned(*reason)
-            } else if let Some(reason) = verdicts.parked.get(&candidate.hash()) {
-                Outcome::Parked(*reason)
-            } else if let Some(verdict) = verdicts.cut_verdicts.get(&candidate.hash()) {
-                *verdict
-            } else {
-                classify_effect(candidate, incarnations, &state, &verdicts.parked)
-            };
-            if outcome.is_effective() {
-                apply_effect(candidate, &mut state);
-            }
-            outcomes.insert(candidate.hash(), outcome);
-        }
+        effect_pass(candidates, idxs, incarnations, verdicts, &mut state, outcomes);
     }
     state
 }
