@@ -70,15 +70,8 @@ pub fn search(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    search_with_query_embedding(
-        conn,
-        query,
-        limit,
-        include_generated,
-        ai::embed_query(conn, query)?,
-        false,
-        SearchOptions::default(),
-    )
+    let request = LexicalQuery { include_generated, ..LexicalQuery::new(query, limit) };
+    search_with_query_embedding(conn, &request, ai::embed_query(conn, query)?)
 }
 
 pub fn search_hash_baseline(
@@ -88,15 +81,12 @@ pub fn search_hash_baseline(
     include_generated: bool,
     graded_history: bool,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    search_with_query_embedding(
-        conn,
-        query,
-        limit,
+    let request = LexicalQuery {
         include_generated,
-        Some(ai::hash_query_embedding(query)?),
-        false,
-        SearchOptions { graded_history, ..SearchOptions::default() },
-    )
+        options: SearchOptions { graded_history, ..SearchOptions::default() },
+        ..LexicalQuery::new(query, limit)
+    };
+    search_with_query_embedding(conn, &request, Some(ai::hash_query_embedding(query)?))
 }
 
 pub fn search_explain(
@@ -105,15 +95,9 @@ pub fn search_explain(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    search_with_query_embedding(
-        conn,
-        query,
-        limit,
-        include_generated,
-        ai::embed_query(conn, query)?,
-        true,
-        SearchOptions::default(),
-    )
+    let request =
+        LexicalQuery { include_generated, explain: true, ..LexicalQuery::new(query, limit) };
+    search_with_query_embedding(conn, &request, ai::embed_query(conn, query)?)
 }
 
 /// BM25/FTS-only search for latency-critical callers (the grep-augment hook): bypasses
@@ -125,11 +109,16 @@ pub fn search_lexical_only(
     limit: u32,
     include_generated: bool,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    search_with_query_embedding(conn, query, limit, include_generated, None, false, SearchOptions {
-        include_git: false,
-        include_papertrail: false,
-        graded_history: false,
-    })
+    let request = LexicalQuery {
+        include_generated,
+        options: SearchOptions {
+            include_git: false,
+            include_papertrail: false,
+            graded_history: false,
+        },
+        ..LexicalQuery::new(query, limit)
+    };
+    search_with_query_embedding(conn, &request, None)
 }
 
 /// A lexical+vector search request: the query plus its controls. Replaces the positional
@@ -143,30 +132,33 @@ pub struct LexicalQuery<'a> {
     pub options: SearchOptions,
 }
 
+impl<'a> LexicalQuery<'a> {
+    /// The conventional defaults, as `SearchRequest::new` has them: no generated files, no explain,
+    /// git + papertrail boosts on. Override individual fields with struct-update syntax.
+    pub fn new(query: &'a str, limit: u32) -> Self {
+        Self {
+            query,
+            limit,
+            include_generated: false,
+            explain: false,
+            options: SearchOptions::default(),
+        }
+    }
+}
+
 pub fn search_with_options(
     conn: &Connection,
     request: &LexicalQuery<'_>,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    search_with_query_embedding(
-        conn,
-        request.query,
-        request.limit,
-        request.include_generated,
-        ai::embed_query(conn, request.query)?,
-        request.explain,
-        request.options,
-    )
+    search_with_query_embedding(conn, request, ai::embed_query(conn, request.query)?)
 }
 
 fn search_with_query_embedding(
     conn: &Connection,
-    query: &str,
-    limit: u32,
-    include_generated: bool,
+    request: &LexicalQuery<'_>,
     query_embedding: Option<ai::QueryEmbedding>,
-    explain: bool,
-    options: SearchOptions,
 ) -> anyhow::Result<Vec<SearchHit>> {
+    let LexicalQuery { query, limit, include_generated, explain, options } = *request;
     let terms = query::query_terms(query);
     // REPO SCOPING (A4): every candidate row flows through the `files` scope VIEW (both the bm25
     // and the vector pass JOIN `files`), which filters `repo_id` FIRST — so in a consolidated

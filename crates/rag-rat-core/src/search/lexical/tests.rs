@@ -595,16 +595,16 @@ fn graded_history_off_is_byte_identical_to_today() {
     let off = SearchOptions { graded_history: false, ..SearchOptions::default() };
     let baseline = search_with_query_embedding(
         &conn,
-        "election retry",
-        5,
-        false,
+        &LexicalQuery { explain: true, ..LexicalQuery::new("election retry", 5) },
         None,
-        true,
-        SearchOptions::default(),
     )
     .unwrap();
-    let with_flag_off =
-        search_with_query_embedding(&conn, "election retry", 5, false, None, true, off).unwrap();
+    let with_flag_off = search_with_query_embedding(
+        &conn,
+        &LexicalQuery { explain: true, options: off, ..LexicalQuery::new("election retry", 5) },
+        None,
+    )
+    .unwrap();
 
     assert_eq!(baseline.len(), with_flag_off.len());
     for (a, b) in baseline.iter().zip(&with_flag_off) {
@@ -630,8 +630,12 @@ fn graded_history_on_changes_the_git_component() {
     seed_git_history(&conn, "src/watch.rs");
 
     let on = SearchOptions { graded_history: true, ..SearchOptions::default() };
-    let hits =
-        search_with_query_embedding(&conn, "election retry", 5, false, None, true, on).unwrap();
+    let hits = search_with_query_embedding(
+        &conn,
+        &LexicalQuery { explain: true, options: on, ..LexicalQuery::new("election retry", 5) },
+        None,
+    )
+    .unwrap();
     assert_eq!(hits.len(), 1);
     let git = hits[0].score_components.as_ref().unwrap().git;
     // One commit, recent vs the only commit → recent=1, total=1:
@@ -678,20 +682,20 @@ fn graded_history_on_applies_generated_and_test_demotion() {
     // candidate.
     let off = search_with_query_embedding(
         &conn,
-        "election retry",
-        5,
-        true,
+        &LexicalQuery { include_generated: true, ..LexicalQuery::new("election retry", 5) },
         None,
-        false,
-        SearchOptions::default(),
     )
     .unwrap();
-    let on =
-        search_with_query_embedding(&conn, "election retry", 5, true, None, false, SearchOptions {
-            graded_history: true,
-            ..SearchOptions::default()
-        })
-        .unwrap();
+    let on = search_with_query_embedding(
+        &conn,
+        &LexicalQuery {
+            include_generated: true,
+            options: SearchOptions { graded_history: true, ..SearchOptions::default() },
+            ..LexicalQuery::new("election retry", 5)
+        },
+        None,
+    )
+    .unwrap();
     assert_eq!(off.len(), 1);
     assert_eq!(on.len(), 1);
     // No git history here, so the only graded-on change to the WEIGHTED sum is the git
