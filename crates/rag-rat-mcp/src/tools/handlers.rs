@@ -75,12 +75,12 @@ pub(crate) fn call_tool_with_db(
             let args: SymbolArgs = serde_json::from_value(arguments)?;
             symbol_lookup_tool(db, args, memory_surface)?
         },
-        "find_callers" => {
+        tool if tool == graph_tool_name(Direction::Callers) => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
             graph_tool(db, args, resolution_mode, Direction::Callers, memory_surface)?
         },
-        "trace_callees" => {
+        tool if tool == graph_tool_name(Direction::Callees) => {
             let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
             let resolution_mode = resolution_mode(args.resolution);
             graph_tool(db, args, resolution_mode, Direction::Callees, memory_surface)?
@@ -365,6 +365,44 @@ pub(crate) fn symbol_lookup_tool(
     Ok(value)
 }
 
+/// The graph tool that walks `direction` — the one pairing the dispatch routes by and the report's
+/// `query.tool` echoes, so a tool can never misname itself in its own answer.
+fn graph_tool_name(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Callers => "find_callers",
+        Direction::Callees => "trace_callees",
+    }
+}
+
+/// The noise-edge toggles a traversal honors. Each graph tool fills them from its own `include`
+/// enum: the tools legitimately advertise different `include` sets.
+struct TraversalNoise {
+    references: bool,
+    unresolved: bool,
+    macros: bool,
+    common_methods: bool,
+}
+
+/// The graph tools' traversal spec, unpinned (`symbol_id: None`); a caller that resolved its
+/// symbol pins it.
+fn traversal_options(
+    noise: TraversalNoise,
+    edge_kinds: Option<&[McpGraphEdgeKind]>,
+    resolution_mode: GraphResolutionMode,
+    logical_symbol_id: Option<i64>,
+) -> GraphTraversalOptions {
+    GraphTraversalOptions {
+        include_references: noise.references,
+        include_unresolved: noise.unresolved,
+        include_macros: noise.macros,
+        include_common_methods: noise.common_methods,
+        edge_kinds: graph_edge_kinds(edge_kinds),
+        resolution_mode,
+        symbol_id: None,
+        logical_symbol_id,
+    }
+}
+
 pub(crate) fn graph_tool(
     db: &IndexDatabase,
     args: SymbolGraphArgs,
@@ -376,24 +414,22 @@ pub(crate) fn graph_tool(
     let include_coverage = included(&args.include, GraphInclude::Coverage, false);
     let include_memories = included(&args.include, GraphInclude::Memories, true);
     // One traversal spec for both answers; only the resolved branch pins it to a symbol id.
-    let mut options = GraphTraversalOptions {
-        include_references: included(&args.include, GraphInclude::References, false),
-        include_unresolved: included(&args.include, GraphInclude::Unresolved, false),
-        include_macros: included(&args.include, GraphInclude::Macros, false),
-        include_common_methods: included(&args.include, GraphInclude::CommonMethods, false),
-        edge_kinds: graph_edge_kinds(args.edge_kinds.as_deref()),
+    let mut options = traversal_options(
+        TraversalNoise {
+            references: included(&args.include, GraphInclude::References, false),
+            unresolved: included(&args.include, GraphInclude::Unresolved, false),
+            macros: included(&args.include, GraphInclude::Macros, false),
+            common_methods: included(&args.include, GraphInclude::CommonMethods, false),
+        },
+        args.edge_kinds.as_deref(),
         resolution_mode,
-        symbol_id: None,
-        logical_symbol_id: args.selector.logical_symbol_id.map(|handle| handle.0),
-    };
+        args.selector.logical_symbol_id.map(|handle| handle.0),
+    );
     let selector = args.selector.selector(None, limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) => {
             options.symbol_id = Some(symbol.symbol_id);
-            let tool = match direction {
-                Direction::Callers => "find_callers",
-                Direction::Callees => "trace_callees",
-            };
+            let tool = graph_tool_name(direction);
             let mut value =
                 json!(db.graph_traversal_report(tool, &symbol, direction, limit, &options)?);
             compact_graph_coverage(&mut value, include_coverage);
@@ -454,18 +490,22 @@ pub(crate) fn compare_graph_to_text_tool(
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) => {
             let options = GraphTraversalOptions {
-                include_references: included(&args.include, CompareInclude::References, false),
-                include_unresolved: included(&args.include, CompareInclude::Unresolved, false),
-                include_macros: included(&args.include, CompareInclude::Macros, false),
-                include_common_methods: included(
-                    &args.include,
-                    CompareInclude::CommonMethods,
-                    false,
-                ),
-                edge_kinds: graph_edge_kinds(args.edge_kinds.as_deref()),
-                resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
-                logical_symbol_id,
+                ..traversal_options(
+                    TraversalNoise {
+                        references: included(&args.include, CompareInclude::References, false),
+                        unresolved: included(&args.include, CompareInclude::Unresolved, false),
+                        macros: included(&args.include, CompareInclude::Macros, false),
+                        common_methods: included(
+                            &args.include,
+                            CompareInclude::CommonMethods,
+                            false,
+                        ),
+                    },
+                    args.edge_kinds.as_deref(),
+                    resolution_mode,
+                    logical_symbol_id,
+                )
             };
             Ok(json!(db.compare_graph_to_text(
                 &symbol,
