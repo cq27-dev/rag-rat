@@ -97,6 +97,16 @@ pub(crate) struct FailureStamp<'a> {
     pub(crate) model_id: &'a str,
 }
 
+/// A model pass's `repo_memories` periphery scope and the `repo_id` its per-entry rows are keyed
+/// by: the scope's repo, or [`rag_rat_base::repo_identity::LEGACY_REPO_ID`] on an unscoped
+/// connection.
+pub(crate) fn pass_repo_scope(conn: &Connection) -> rusqlite::Result<(Option<String>, String)> {
+    let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
+    let repo_id =
+        scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID).to_string();
+    Ok((scope, repo_id))
+}
+
 pub(crate) struct RecordFailure<'a> {
     pub(crate) stamp: FailureStamp<'a>,
     pub(crate) failure: &'a DreamModelFailure,
