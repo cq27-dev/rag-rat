@@ -35,7 +35,7 @@ pub(crate) fn exact_symbols(conn: &Connection, query: &str) -> anyhow::Result<Ve
     let mut seen = BTreeSet::new();
     let multi_candidate_query = candidates.len() > 1;
     for candidate in candidates {
-        let qualified_candidate = is_qualified_symbol(candidate);
+        let qualified_candidate = has_scope_separator(candidate);
         if multi_candidate_query && !qualified_candidate && !is_high_signal_query_token(candidate) {
             continue;
         }
@@ -81,7 +81,7 @@ pub(crate) fn target_names(query: &str, targets: &[SymbolTarget]) -> Vec<String>
     let mut names = BTreeSet::new();
     for candidate in symbol_query_candidates(query) {
         names.insert(candidate.to_string());
-        names.insert(short_symbol_name(candidate).to_string());
+        names.insert(graph::short_name(candidate).to_string());
     }
     for target in targets {
         names.insert(target.name.clone());
@@ -129,10 +129,9 @@ pub(crate) fn is_non_stopword_identifier(value: &str) -> bool {
         )
 }
 
-pub(crate) fn short_symbol_name(value: &str) -> &str {
-    value.rsplit([':', '.', '#', '/']).find(|part| !part.is_empty()).unwrap_or(value)
-}
-
-pub(crate) fn is_qualified_symbol(value: &str) -> bool {
+/// Whether an impact query token carries a scope separator (`::` or `/`). Deliberately narrower
+/// than `graph::is_qualified_symbol`, which also treats a `file.rs:name`-style token as qualified:
+/// the two gate different fallbacks, and unifying them would change which tokens each admits.
+pub(crate) fn has_scope_separator(value: &str) -> bool {
     value.contains("::") || value.contains('/')
 }

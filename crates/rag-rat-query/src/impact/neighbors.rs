@@ -149,7 +149,7 @@ pub(crate) fn graph_neighbors(
         // Without a `?2` the predicate cannot match on a name at all, so the name pass has nothing
         // to contribute (an id-only `Exact` predicate against a NULL id matches nothing).
         if !binds_name
-            || (resolution_mode != GraphResolutionMode::Fuzzy && !is_qualified_symbol(name))
+            || (resolution_mode != GraphResolutionMode::Fuzzy && !has_scope_separator(name))
         {
             continue;
         }

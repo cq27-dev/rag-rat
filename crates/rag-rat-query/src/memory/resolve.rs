@@ -1719,7 +1719,7 @@ pub(crate) fn relocate_chunk_by_hash(
 
 /// Strip the persisted `"{path}::"` prefix from a path-qualified `binding_id`.
 /// Falls back to last-`::` split only when `path` is absent or not a prefix of `binding_id`.
-pub(crate) fn short_symbol_name<'a>(binding_id: &'a str, path: Option<&str>) -> &'a str {
+pub(crate) fn binding_leaf_name<'a>(binding_id: &'a str, path: Option<&str>) -> &'a str {
     if let Some(path) = path
         && let Some(rest) = binding_id.strip_prefix(path)
         && let Some(name) = rest.strip_prefix("::")
