@@ -182,8 +182,8 @@ fn retained_committed_file_map(
     conn: &rusqlite::Connection,
 ) -> anyhow::Result<BTreeMap<String, Vec<RetainedFileRow>>> {
     let active_commit: String = conn.query_row(
-        "SELECT value FROM temp.connection_context WHERE key = 'commit_sha'",
-        [],
+        "SELECT value FROM temp.connection_context WHERE key = ?1",
+        [rag_rat_db::schema::CONNECTION_CONTEXT_COMMIT_KEY],
         |row| row.get(0),
     )?;
     let mut files: BTreeMap<String, Vec<RetainedFileRow>> = BTreeMap::new();

@@ -173,8 +173,14 @@ pub(crate) fn reverse_oracle_seeded_edge_ids(
         return Ok(Vec::new());
     }
     let (Some(commit_sha), Some(worktree_id)) = (
-        rag_rat_db::schema::connection_context_value(conn, "commit_sha"),
-        rag_rat_db::schema::connection_context_value(conn, "worktree_id"),
+        rag_rat_db::schema::connection_context_value(
+            conn,
+            rag_rat_db::schema::CONNECTION_CONTEXT_COMMIT_KEY,
+        ),
+        rag_rat_db::schema::connection_context_value(
+            conn,
+            rag_rat_db::schema::CONNECTION_CONTEXT_WORKTREE_KEY,
+        ),
     ) else {
         // No scope context at all (a raw connection) — there is no checkout to key a run on.
         return Ok(Vec::new());

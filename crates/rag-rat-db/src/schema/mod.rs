@@ -17,8 +17,9 @@ pub use purge::{RepoRowCounts, count_repo_rows, purge_repo_rows, repo_scoped_tab
 // lexicographically-first repo.
 pub use registry::multiple_real_repos;
 pub use registry::{
-    A5_PERIPHERY_DIRECT_SCOPED_TABLES, CONNECTION_CONTEXT_GENERATION_KEY,
-    CONNECTION_CONTEXT_REPO_KEY, DIRECT_SCOPED_ADOPTION_TABLES, LIVE_FILES_GENERATION_META_KEY,
+    A5_PERIPHERY_DIRECT_SCOPED_TABLES, CONNECTION_CONTEXT_COMMIT_KEY,
+    CONNECTION_CONTEXT_GENERATION_KEY, CONNECTION_CONTEXT_REPO_KEY,
+    CONNECTION_CONTEXT_WORKTREE_KEY, DIRECT_SCOPED_ADOPTION_TABLES, LIVE_FILES_GENERATION_META_KEY,
     RegisteredRepo, active_generation, active_repo_id, clear_repo_removed,
     connection_context_value, earliest_recorded_root, is_repo_removed,
     is_root_already_indexed_conn, live_files_generation, mark_repo_removed, periphery_repo_scope,
