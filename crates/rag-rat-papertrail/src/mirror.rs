@@ -1103,13 +1103,11 @@ async fn sync_attested_closers<C: PapertrailClient>(
         // that the PR's `closingIssuesReferences` never lists. The PR phase only CREATES keyword
         // edges (idempotent upserts); it never reaps.
         for issue_key in &page.replaced_issue_closers {
-            report.attested_writes += reap_provider_closers_for_issue(
-                &tx,
-                &repo_id,
-                binding.provider,
-                &binding.project,
-                issue_key,
-            )?;
+            report.attested_writes +=
+                reap_provider_closers_for_issue(&tx, &repo_id, binding.provider, IssueTarget {
+                    project: &binding.project,
+                    issue_key,
+                })?;
         }
         for edge in &page.edges {
             // Store an attested edge ONLY when its target issue is a cached item that is NOT
@@ -1120,13 +1118,10 @@ async fn sync_attested_closers<C: PapertrailClient>(
             // reopened). An un-mirrored or reopened target is skipped; a later closed+in-scope
             // walk records it. (`edge.project` is the issue's project — same-project after the
             // cross-repo skips, i.e. `binding.project`.)
-            if !cached_issue_is_closed(
-                &tx,
-                &repo_id,
-                binding.provider,
-                &edge.project,
-                &edge.issue_key,
-            )? {
+            if !cached_issue_is_closed(&tx, &repo_id, binding.provider, IssueTarget {
+                project: &edge.project,
+                issue_key: &edge.issue_key,
+            })? {
                 continue;
             }
             // Defer to the issue's ONE authoritative closer: never store an edge that CONFLICTS
