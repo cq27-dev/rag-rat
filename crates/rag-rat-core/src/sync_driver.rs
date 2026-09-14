@@ -271,14 +271,24 @@ async fn resident_loop(
     advertiser.abort();
 }
 
-/// Persisted local state for one serving endpoint's announcement. The service appends rather than
-/// replaces, so the exact sealed bytes and their possible liveness must survive a restart.
+/// Who an announcement is sealed for and where it is published: the account tag, this endpoint,
+/// the discovery service and the relay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PersistedAdvertisement {
+struct AdvertisementIdentity {
     tag: [u8; 32],
     node: [u8; 32],
     service: [u8; 32],
     relay: String,
+}
+
+/// Persisted local state for one serving endpoint's announcement. The service appends rather than
+/// replaces, so the exact sealed bytes and their possible liveness must survive a restart.
+/// `identity` is flattened: the record is stored as JSON, and nesting it would change the stored
+/// keys and strand every host's existing record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistedAdvertisement {
+    #[serde(flatten)]
+    identity: AdvertisementIdentity,
     roster_stamp: Option<[u8; 32]>,
     envelope: Option<Vec<u8>>,
     published_at_ms: Option<i64>,
@@ -286,19 +296,8 @@ struct PersistedAdvertisement {
 }
 
 impl PersistedAdvertisement {
-    fn matches(
-        &self,
-        tag: &[u8; 32],
-        node: &[u8; 32],
-        service: &[u8; 32],
-        relay: &str,
-        stamp: &Option<[u8; 32]>,
-    ) -> bool {
-        self.tag == *tag
-            && self.node == *node
-            && self.service == *service
-            && self.relay == relay
-            && self.roster_stamp == *stamp
+    fn matches(&self, identity: &AdvertisementIdentity, stamp: Option<&[u8; 32]>) -> bool {
+        self.identity == *identity && self.roster_stamp.as_ref() == stamp
     }
 
     fn live(&self, now_ms: i64) -> bool {
@@ -317,10 +316,7 @@ impl PersistedAdvertisement {
 }
 
 struct Publication {
-    tag: [u8; 32],
-    node: [u8; 32],
-    service: [u8; 32],
-    relay: String,
+    identity: AdvertisementIdentity,
     envelope: Vec<u8>,
     ttl_seconds: u32,
 }
@@ -473,9 +469,7 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
         }
         let publication = match prepare_advertisement(
             &database,
-            &node,
-            &service_node,
-            &relay,
+            AdvertisementEndpoint { node: &node, service: &service_node, relay: &relay },
             time::now_ms(),
             ttl_seconds,
         ) {
@@ -507,7 +501,7 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
             rag_rat_sync::discovery::exchange(rag_rat_sync::discovery::DiscoveryExchange {
                 endpoint: &endpoint,
                 service: service.clone(),
-                tag: publication.tag,
+                tag: publication.identity.tag,
                 fetch: false,
                 publish: Some(&publication.envelope),
                 ttl_seconds,
@@ -531,11 +525,15 @@ pub async fn advertise_host(config: Config, endpoint: iroh::Endpoint, database: 
     }
 }
 
+struct AdvertisementEndpoint<'a> {
+    node: &'a [u8; 32],
+    service: &'a [u8; 32],
+    relay: &'a str,
+}
+
 fn prepare_advertisement(
     database: &Path,
-    node: &[u8; 32],
-    service: &[u8; 32],
-    relay: &str,
+    endpoint: AdvertisementEndpoint<'_>,
     now_ms: i64,
     ttl_seconds: u32,
 ) -> anyhow::Result<Option<Publication>> {
@@ -544,19 +542,21 @@ fn prepare_advertisement(
     let Some(secret) = rag_rat_sync::discovery::discovery_secret(conn)? else {
         return Ok(None);
     };
-    let tag = rag_rat_sync::discovery::account_tag(&secret);
+    let identity = AdvertisementIdentity {
+        tag: rag_rat_sync::discovery::account_tag(&secret),
+        node: *endpoint.node,
+        service: *endpoint.service,
+        relay: endpoint.relay.to_owned(),
+    };
     let stamp = rag_rat_oplog::discovery::roster_stamp(conn)?;
     let persisted = read_advertisement(conn)?;
-    let current = persisted.filter(|record| record.matches(&tag, node, service, relay, &stamp));
+    let current = persisted.filter(|record| record.matches(&identity, stamp.as_ref()));
     let record = match current {
         Some(record) => record,
         None => {
-            let envelope = seal_advertisement(conn, &tag, node)?;
+            let envelope = seal_advertisement(conn, &identity)?;
             let record = PersistedAdvertisement {
-                tag,
-                node: *node,
-                service: *service,
-                relay: relay.to_owned(),
+                identity: identity.clone(),
                 roster_stamp: stamp,
                 envelope,
                 published_at_ms: None,
@@ -579,14 +579,7 @@ fn prepare_advertisement(
     if record.live(now_ms) {
         return Ok(None);
     }
-    Ok(record.envelope.map(|envelope| Publication {
-        tag,
-        node: *node,
-        service: *service,
-        relay: relay.to_owned(),
-        envelope,
-        ttl_seconds,
-    }))
+    Ok(record.envelope.map(|envelope| Publication { identity, envelope, ttl_seconds }))
 }
 
 /// Whether this envelope can be advertised at all, said in words an operator can act on.
@@ -622,13 +615,8 @@ fn record_advertisement_liveness(
         return Ok(());
     };
     // Never make a publish from a roster that moved during the network exchange look current.
-    if !record.matches(
-        &publication.tag,
-        &publication.node,
-        &publication.service,
-        &publication.relay,
-        &stamp,
-    ) || record.envelope.as_deref() != Some(publication.envelope.as_slice())
+    if !record.matches(&publication.identity, stamp.as_ref())
+        || record.envelope.as_deref() != Some(publication.envelope.as_slice())
     {
         return Ok(());
     }
@@ -639,10 +627,10 @@ fn record_advertisement_liveness(
 
 fn seal_advertisement(
     conn: &Connection,
-    tag: &[u8; 32],
-    node: &[u8; 32],
+    identity: &AdvertisementIdentity,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    let Some(sealed) = rag_rat_oplog::discovery::seal_discovery_announcement(conn, tag, node)?
+    let Some(sealed) =
+        rag_rat_oplog::discovery::seal_discovery_announcement(conn, &identity.tag, &identity.node)?
     else {
         return Ok(None);
     };
@@ -1516,12 +1504,12 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PULL_PEER_MEMO_PREFIX, PerPeerSessionLimiter,
-        PersistedAdvertisement, RESIDENT_NUDGE, RefusedPublication, account_is_public_kb, can_host,
-        can_sync, device_sync_run, discovery_fetch, foreign_pull_hosts, foreign_pull_targets,
-        nudge_resident_host, ordered_pull_peers, peer_identity, prepare_advertisement,
-        pull_account_via_peers, pull_foreign_accounts, read_advertisement,
-        refused_publication_is_due, retry_is_due, write_advertisement,
+        AdvertisementIdentity, DISCOVERY_ADVERTISEMENT, DeviceSyncOutcome, PULL_PEER_MEMO_PREFIX,
+        PerPeerSessionLimiter, PersistedAdvertisement, RESIDENT_NUDGE, RefusedPublication,
+        account_is_public_kb, can_host, can_sync, device_sync_run, discovery_fetch,
+        foreign_pull_hosts, foreign_pull_targets, nudge_resident_host, ordered_pull_peers,
+        peer_identity, prepare_advertisement, pull_account_via_peers, pull_foreign_accounts,
+        read_advertisement, refused_publication_is_due, retry_is_due, write_advertisement,
     };
 
     fn schema_conn() -> Connection {
@@ -1734,10 +1722,12 @@ mod tests {
         rag_rat_oplog::local_account(conn, 1_000).unwrap();
         let secret = rag_rat_sync::discovery::discovery_secret(conn).unwrap().unwrap();
         write_advertisement(conn, &PersistedAdvertisement {
-            tag: rag_rat_sync::discovery::account_tag(&secret),
-            node: ADVERTISED_NODE,
-            service: ADVERTISED_SERVICE,
-            relay: ADVERTISED_RELAY.to_owned(),
+            identity: AdvertisementIdentity {
+                tag: rag_rat_sync::discovery::account_tag(&secret),
+                node: ADVERTISED_NODE,
+                service: ADVERTISED_SERVICE,
+                relay: ADVERTISED_RELAY.to_owned(),
+            },
             roster_stamp: rag_rat_oplog::discovery::roster_stamp(conn).unwrap(),
             envelope: Some(envelope),
             published_at_ms: None,
@@ -1758,9 +1748,11 @@ mod tests {
         let logged = captured_warnings(|| {
             prepared = prepare_advertisement(
                 database,
-                &ADVERTISED_NODE,
-                &ADVERTISED_SERVICE,
-                ADVERTISED_RELAY,
+                super::AdvertisementEndpoint {
+                    node: &ADVERTISED_NODE,
+                    service: &ADVERTISED_SERVICE,
+                    relay: ADVERTISED_RELAY,
+                },
                 2_000,
                 600,
             )
@@ -1868,11 +1860,11 @@ mod tests {
     fn persisted_advertisement_matches_only_the_same_endpoint_service_relay_tag_and_roster() {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+        let identity = |tag: [u8; 32], node: [u8; 32], service: [u8; 32], relay: &str| {
+            AdvertisementIdentity { tag, node, service, relay: relay.to_owned() }
+        };
         let record = PersistedAdvertisement {
-            tag: [1; 32],
-            node: [2; 32],
-            service: [3; 32],
-            relay: "https://relay.one".to_owned(),
+            identity: identity([1; 32], [2; 32], [3; 32], "https://relay.one"),
             roster_stamp: Some([3; 32]),
             envelope: Some(vec![4, 5, 6]),
             published_at_ms: Some(7),
@@ -1882,61 +1874,53 @@ mod tests {
         write_advertisement(&conn, &record).unwrap();
         let restored = read_advertisement(&conn).unwrap().expect("the record was persisted");
         assert_eq!(restored, record, "the exact sealed envelope survives a host restart");
-        assert!(restored.matches(
-            &[1; 32],
-            &[2; 32],
-            &[3; 32],
-            "https://relay.one",
-            &Some([3; 32]),
-        ));
-        assert!(!restored.matches(
-            &[9; 32],
-            &[2; 32],
-            &[3; 32],
-            "https://relay.one",
-            &Some([3; 32]),
-        ));
-        assert!(!restored.matches(
-            &[1; 32],
-            &[9; 32],
-            &[3; 32],
-            "https://relay.one",
-            &Some([3; 32]),
-        ));
-        assert!(!restored.matches(
-            &[1; 32],
-            &[2; 32],
-            &[9; 32],
-            "https://relay.one",
-            &Some([3; 32]),
-        ));
-        assert!(!restored.matches(
-            &[1; 32],
-            &[2; 32],
-            &[3; 32],
-            "https://relay.two",
-            &Some([3; 32]),
-        ));
-        assert!(!restored.matches(
-            &[1; 32],
-            &[2; 32],
-            &[3; 32],
-            "https://relay.one",
-            &Some([9; 32]),
-        ));
+        let stamp = Some(&[3u8; 32]);
+        assert!(restored.matches(&identity([1; 32], [2; 32], [3; 32], "https://relay.one"), stamp));
         assert!(
-            rag_rat_db::meta::read_meta(&conn, DISCOVERY_ADVERTISEMENT).unwrap().is_some(),
-            "the controller stores its state in index_meta"
+            !restored.matches(&identity([9; 32], [2; 32], [3; 32], "https://relay.one"), stamp)
         );
+        assert!(
+            !restored.matches(&identity([1; 32], [9; 32], [3; 32], "https://relay.one"), stamp)
+        );
+        assert!(
+            !restored.matches(&identity([1; 32], [2; 32], [9; 32], "https://relay.one"), stamp)
+        );
+        assert!(
+            !restored.matches(&identity([1; 32], [2; 32], [3; 32], "https://relay.two"), stamp)
+        );
+        assert!(!restored.matches(
+            &identity([1; 32], [2; 32], [3; 32], "https://relay.one"),
+            Some(&[9; 32]),
+        ));
+        let stored = rag_rat_db::meta::read_meta(&conn, DISCOVERY_ADVERTISEMENT)
+            .unwrap()
+            .expect("the controller stores its state in index_meta");
+        // The identity is flattened into the stored record, so every host keeps reading the flat
+        // keys it has always written.
+        let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        let mut keys: Vec<&str> = stored.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, [
+            "envelope",
+            "node",
+            "published_at_ms",
+            "relay",
+            "roster_stamp",
+            "service",
+            "tag",
+            "ttl_seconds"
+        ]);
     }
 
     #[test]
     fn a_restart_reuses_matching_liveness_until_renewal_is_due() {
         let record = PersistedAdvertisement {
-            tag: [1; 32],
-            node: [2; 32],
-            service: [3; 32],
-            relay: "https://relay.one".to_owned(),
+            identity: AdvertisementIdentity {
+                tag: [1; 32],
+                node: [2; 32],
+                service: [3; 32],
+                relay: "https://relay.one".to_owned(),
+            },
             roster_stamp: Some([3; 32]),
             envelope: Some(vec![4, 5, 6]),
             published_at_ms: Some(1_000),
