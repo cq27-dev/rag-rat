@@ -98,7 +98,7 @@ pub(crate) use prep::{
 pub(crate) use query_api::CloneDeltaHint;
 pub use query_api::{
     CLONE_DELTA_MAX_FILES, CandidateCloneClass, CloneCheckInput, CloneCompleteness,
-    CloneDeltaReport, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
+    CloneDeltaReport, CloneDeltaStatus, CloneEdgeReport, CloneEligibility, CloneFingerprintHealth,
     CloneIneligibilityReason, CloneMember, CloneSymbolSelector, ClonesForSymbolResult,
     DatabaseFileHealth, FindClonesOptions, FindClonesResult, FreelistReclaim,
     FreelistReclaimReport, GcReport, GlobalFtsStatus, GlobalStatus, ImportantSymbolsRequest,
