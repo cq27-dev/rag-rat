@@ -20,7 +20,6 @@
 //! - `readiness.rs` — the per-backend "is it safe to ask yet?" signal. Servers disagree on how they
 //!   announce that a project has finished loading, and a warming server does not reliably answer
 //!   `null` — it can answer WRONG — so this is a correctness seam, not a latency one.
-#![allow(dead_code)] // `resolve_callees`'s moniker fan-out is unused until a consumer needs it.
 
 pub(crate) mod client;
 pub(crate) mod position;
