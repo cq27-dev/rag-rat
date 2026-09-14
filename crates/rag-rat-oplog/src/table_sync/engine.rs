@@ -89,6 +89,9 @@ pub(crate) fn produce_and_author(
     for spec in ctx.registry {
         let stream =
             scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, spec.scope_id);
+        if super::coverage::stream_pending(tx, stream)? {
+            continue;
+        }
         // Record the apply context for every stream we author on: the stream id hashes
         // (repo_id, account_id, incarnation_ref, scope_id) one-way, so without the directory a
         // retained entry could never be replayed by a later binary (see [`super::refold`]).

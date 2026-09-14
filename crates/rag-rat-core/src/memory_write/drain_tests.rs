@@ -3496,6 +3496,7 @@ fn content_then_production_anchors_surface_a_synced_memory_by_path() {
                 expected_device: head.device_fingerprint,
                 signed_bytes: &entry.signed_bytes,
                 advertised_floor: None,
+                advertised_tip: None,
             },
             3,
             &Default::default(),

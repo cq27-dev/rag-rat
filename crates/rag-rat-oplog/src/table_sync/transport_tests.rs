@@ -648,6 +648,7 @@ fn production_anchors_create_rebind_and_delete_preserve_local_resolution() {
                     expected_device: heads[0].device_fingerprint,
                     signed_bytes: &entry.signed_bytes,
                     advertised_floor: None,
+                    advertised_tip: None,
                 },
                 3,
                 &Default::default(),
@@ -1035,13 +1036,19 @@ fn sync_chains(source: &Connection, peer: &Connection, account: AccountId) {
                 .unwrap()
         {
             let floor = head.floor.filter(|floor| floor.lamport == entry.cursor.lamport);
-            ingest_against(
+            ingest_received_against(
                 peer,
                 &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
-                crate::op::DeviceFingerprint::from_bytes(head.device_fingerprint),
-                &entry.signed_bytes,
+                &TableSyncReceived {
+                    expected_device: head.device_fingerprint,
+                    signed_bytes: &entry.signed_bytes,
+                    advertised_floor: floor,
+                    advertised_tip: Some(TableSyncChainCursor {
+                        lamport: head.lamport,
+                        entry_hash: head.entry_hash,
+                    }),
+                },
                 1,
-                floor,
                 &Default::default(),
             )
             .unwrap();
@@ -1534,4 +1541,131 @@ fn restating_obeys_the_twice_the_cost_rule_per_batch() {
     let fresh = peer_of(&a, account);
     sync_chains(&a, &fresh, account);
     assert_eq!(live_rows(&fresh), vec![("live".to_string(), "live".to_string())]);
+}
+
+#[test]
+fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_peer() {
+    let (source, account) = writer_store();
+    write(&source, "deleted", "old");
+    author(&source, account);
+    let intermediary = peer_of(&source, account);
+    let fresh = peer_of(&source, account);
+    // A fresh peer can learn a stale upsert from another source before it sees the floor.
+    sync_chains(&source, &fresh, account);
+    source.execute("DELETE FROM t_transport WHERE id = 'deleted'", []).unwrap();
+    author(&source, account);
+    rewrite(&source, account, "hot", 8);
+    assert!(compact(&source, account, 2) > 0);
+    let route = supported_streams_against(&source, account, &[REPO_SPEC]).unwrap().remove(0);
+    let offered = accepted_chain_page(&source, route.stream_id, None, 16).unwrap().remove(0);
+    let floor = offered.floor.unwrap();
+    assert!(floor.lamport < offered.lamport, "the delete is carried later in the suffix");
+    let first = accepted_chain_entries(
+        &source,
+        route.stream_id,
+        offered.device_fingerprint,
+        TableSyncEntryStart::At(floor),
+        1,
+    )
+    .unwrap()
+    .remove(0);
+    ingest_received_against(
+        &intermediary,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: offered.device_fingerprint,
+            signed_bytes: &first.signed_bytes,
+            advertised_floor: Some(floor),
+            advertised_tip: Some(TableSyncChainCursor {
+                lamport: offered.lamport,
+                entry_hash: offered.entry_hash,
+            }),
+        },
+        1,
+        &Default::default(),
+    )
+    .unwrap();
+    // The connection ends here, before the restatement reaches the intermediary.
+    let relayed = accepted_chain_page(&intermediary, route.stream_id, None, 16).unwrap().remove(0);
+    assert_eq!(relayed.floor, Some(floor));
+    assert_eq!(relayed.lamport, offered.lamport);
+    assert_eq!(relayed.entry_hash, offered.entry_hash);
+    let stream_id = StreamId::from_bytes(route.stream_id);
+    assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
+    assert_eq!(compact(&intermediary, account, 1), 0);
+    write(&intermediary, "unsent", "local");
+    author(&intermediary, account);
+    assert_eq!(
+        chain_lamports(&intermediary),
+        [floor.lamport as i64],
+        "incomplete stream authors nothing"
+    );
+    intermediary.execute("DELETE FROM t_transport WHERE id = 'unsent'", []).unwrap();
+    let suffix = accepted_chain_entries(
+        &source,
+        route.stream_id,
+        offered.device_fingerprint,
+        TableSyncEntryStart::At(floor),
+        16,
+    )
+    .unwrap();
+    let middle = suffix[1].cursor;
+    for start in [TableSyncEntryStart::After(middle), TableSyncEntryStart::At(middle)] {
+        assert!(
+            accepted_chain_entries(
+                &intermediary,
+                route.stream_id,
+                offered.device_fingerprint,
+                start,
+                16
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+    let wrong = TableSyncChainCursor { lamport: floor.lamport, entry_hash: [9; 32] };
+    assert!(
+        accepted_chain_entries(
+            &intermediary,
+            route.stream_id,
+            offered.device_fingerprint,
+            TableSyncEntryStart::After(wrong),
+            16
+        )
+        .is_err()
+    );
+    let tip = suffix.last().unwrap();
+    // Another source offers the target itself as a new root. It must stay gapped: a higher
+    // floor cannot bypass the original, still-missing predecessor and erase the obligation.
+    ingest_received_against(
+        &intermediary,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: offered.device_fingerprint,
+            signed_bytes: &tip.signed_bytes,
+            advertised_floor: Some(tip.cursor),
+            advertised_tip: Some(tip.cursor),
+        },
+        2,
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
+    assert_eq!(chain_lamports(&intermediary), [floor.lamport as i64]);
+    let restart = tempfile::tempdir().unwrap();
+    let database = restart.path().join("intermediary.db");
+    intermediary.execute("VACUUM INTO ?1", [database.to_str().unwrap()]).unwrap();
+    drop(intermediary);
+    let intermediary = Connection::open(&database).unwrap();
+    assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
+    sync_chains(&intermediary, &fresh, account);
+    assert!(live_rows(&fresh).iter().any(|(id, _)| id == "deleted"));
+    assert!(coverage::stream_pending(&fresh, stream_id).unwrap());
+    assert!(!live_rows(&source).iter().any(|(id, _)| id == "deleted"));
+    // Reaching the full source is sufficient to repair the stale projection.
+    sync_chains(&source, &intermediary, account);
+    sync_chains(&intermediary, &fresh, account);
+    assert_eq!(live_rows(&fresh), live_rows(&source));
+    assert!(!coverage::stream_pending(&intermediary, stream_id).unwrap());
+    assert!(!coverage::stream_pending(&fresh, stream_id).unwrap());
 }

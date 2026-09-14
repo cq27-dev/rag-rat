@@ -299,6 +299,11 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
         id_column: "stream_id",
         parent_ids: PurgeIdSet::Streams,
     },
+    TransitiveTable {
+        table: "table_sync_suffix_coverage",
+        id_column: "stream_id",
+        parent_ids: PurgeIdSet::Streams,
+    },
     // Entries held awaiting a chain predecessor. Same reasoning as the accepted log above, and for
     // the same reason it must not be exempted: these are signed operations on a stream whose id is
     // derived, so retaining them across a re-registration of the repo would replay a removed

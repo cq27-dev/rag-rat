@@ -12,7 +12,7 @@ use super::apply::LocalWriterMemo;
 use super::engine::{self, IngestOutcome, SyncCtx};
 use super::registry::{SYNCABLE_TABLES, TableSpec, scope_lens_metas};
 use super::scope_stream::{ScopeId, scope_stream_id};
-use super::{diagnostics, retention, store};
+use super::{coverage, diagnostics, retention, store};
 use crate::account::{self, RepoIncarnationState};
 use crate::device::DevicePublic;
 use crate::stream::{EntryHash, StreamId};
@@ -59,7 +59,8 @@ impl TableSyncChainCursor {
     }
 }
 
-/// The accepted tip of one device chain in a table stream.
+/// One device chain’s offered tip: the accepted tail, or an outstanding suffix tip needed
+/// to complete a previously adopted floor. Receive frontiers always use accepted state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableSyncChainHead {
     pub device_fingerprint: [u8; 32],
@@ -229,6 +230,9 @@ fn author_repo_in_tx(tx: &Transaction<'_>, ctx: &SyncCtx<'_>) -> anyhow::Result<
     streams.sort_unstable();
     streams.dedup();
     for stream in streams {
+        if coverage::stream_pending(tx, stream)? {
+            continue;
+        }
         // Drain EVERY pending removal, not one: two devices removed on one stream must not
         // wait a whole sync session for the second repair. Each call completes one removal, so
         // `has_pending` makes progress — UNLESS the pass cannot drain: a row whose synced
@@ -322,6 +326,9 @@ fn compact_overdue_against(
         anyhow::ensure!(keep >= 1, "a retention budget of zero keeps no chain tail to build on");
         let stream_id = StreamId::from_bytes(stream.stream_id);
         let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        if coverage::stream_pending(&tx, stream_id)? {
+            continue;
+        }
         let ctx = writer.then(|| SyncCtx {
             repo_id: &stream.repo_id,
             account_id,
@@ -602,12 +609,25 @@ pub fn table_sync_chain_entries(
     accepted_chain_entries(conn, stream.stream_id, device_fingerprint, start, limit)
 }
 
+/// Whether this current stream still owes an advertised suffix. This is delivery progress,
+/// not a statement that every retained entry projects or that every peer has synchronized.
+pub fn table_sync_has_pending_coverage(
+    conn: &Connection,
+    account_id: AccountId,
+    stream: &TableSyncStream,
+) -> anyhow::Result<bool> {
+    Ok(table_sync_validate_stream(conn, account_id, stream)?
+        && coverage::stream_pending(conn, StreamId::from_bytes(stream.stream_id))?)
+}
+
 /// One received table-sync entry as the session hands it to [`table_sync_ingest`]: the chain it
 /// was paged from, its bytes, and the floor the peer advertised for that chain.
 pub struct TableSyncReceived<'a> {
     pub expected_device: [u8; 32],
     pub signed_bytes: &'a [u8],
     pub advertised_floor: Option<TableSyncChainCursor>,
+    /// The offered tip is routing advice, never an accepted chain witness.
+    pub advertised_tip: Option<TableSyncChainCursor>,
 }
 
 /// Feed one untrusted signed envelope through the existing table-sync authority, chain and payload
@@ -620,13 +640,11 @@ pub fn table_sync_ingest(
     now_ms: i64,
     local_writer: &LocalWriterMemo,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
-    ingest_against(
+    ingest_received_against(
         conn,
         &IngestRoute { account_id, stream, registry: SYNCABLE_TABLES },
-        crate::op::DeviceFingerprint::from_bytes(received.expected_device),
-        received.signed_bytes,
+        received,
         now_ms,
-        received.advertised_floor,
         local_writer,
     )
 }
@@ -717,11 +735,14 @@ fn accepted_chain_page(
     limit: usize,
 ) -> anyhow::Result<Vec<TableSyncChainHead>> {
     let mut stmt = conn.prepare(
-        "SELECT e.device_fingerprint, e.lamport, e.entry_hash, f.lamport, f.entry_hash
+        "SELECT e.device_fingerprint, COALESCE(c.tip_lamport, e.lamport),
+                COALESCE(c.tip_hash, e.entry_hash), f.lamport, f.entry_hash
            FROM table_sync_entries e
            LEFT JOIN table_sync_retained_floors f
              ON f.stream_id = e.stream_id
             AND f.device_fingerprint = e.device_fingerprint
+           LEFT JOIN table_sync_suffix_coverage c
+             ON c.stream_id = e.stream_id AND c.device_fingerprint = e.device_fingerprint
           WHERE e.stream_id = ?1
             AND (?2 IS NULL OR e.device_fingerprint > ?2)
             AND NOT EXISTS (
@@ -831,6 +852,20 @@ fn accepted_chain_entries(
 ) -> anyhow::Result<Vec<TableSyncChainEntry>> {
     let stream = StreamId::from_bytes(stream_id);
     let device = crate::op::DeviceFingerprint::from_bytes(device_fingerprint);
+    if let TableSyncEntryStart::After(cursor) | TableSyncEntryStart::At(cursor) = start
+        && let Some(pending) = coverage::pending_tip(conn, stream, device)?
+        && let Some(tail) = accepted_chain_tail(conn, stream_id, device_fingerprint)?
+        && cursor.lamport > tail.lamport
+        && cursor.lamport <= pending.lamport
+    {
+        anyhow::ensure!(
+            cursor.lamport != pending.lamport || cursor.entry_hash == pending.entry_hash.to_bytes(),
+            "table-sync requested cursor conflicts with the promised suffix tip"
+        );
+        // A peer is further through the same outstanding suffix. We cannot serve its cursor,
+        // but an empty pending direction lets it supply our missing prefix in the reverse turn.
+        return Ok(Vec::new());
+    }
     let (minimum_lamport, inclusive) = match start {
         TableSyncEntryStart::Beginning => (None, false),
         TableSyncEntryStart::After(cursor) => {
@@ -941,6 +976,7 @@ struct IngestRoute<'a> {
     registry: &'a [TableSpec],
 }
 
+#[cfg(test)]
 fn ingest_against(
     conn: &Connection,
     route: &IngestRoute<'_>,
@@ -950,6 +986,30 @@ fn ingest_against(
     advertised_floor: Option<TableSyncChainCursor>,
     local_writer: &LocalWriterMemo,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
+    ingest_received_against(
+        conn,
+        route,
+        &TableSyncReceived {
+            expected_device: expected_device.to_bytes(),
+            signed_bytes,
+            advertised_floor,
+            advertised_tip: None,
+        },
+        now_ms,
+        local_writer,
+    )
+}
+
+fn ingest_received_against(
+    conn: &Connection,
+    route: &IngestRoute<'_>,
+    received: &TableSyncReceived<'_>,
+    now_ms: i64,
+    local_writer: &LocalWriterMemo,
+) -> anyhow::Result<TableSyncIngestOutcome> {
+    let TableSyncReceived { expected_device, signed_bytes, advertised_floor, advertised_tip } =
+        *received;
+    let expected_device = crate::op::DeviceFingerprint::from_bytes(expected_device);
     let IngestRoute { account_id, stream, registry } = *route;
     let Some(scope) = validated_scope(conn, account_id, stream, registry)? else {
         return Ok(TableSyncIngestOutcome::NoChange);
@@ -988,14 +1048,37 @@ fn ingest_against(
         now_ms,
         local_writer: local_writer.clone(),
     };
+    let stream_id = StreamId::from_bytes(stream.stream_id);
+    let pending = coverage::pending_tip(&tx, stream_id, signer)?.is_some();
+    let floor_before = retention::retained_floor(&tx, stream_id, signer)?;
+    // An unresolved target cannot be replaced by an unrelated higher floor. Receive contiguous
+    // entries from any source, but retain the original obligation until its exact tip arrives.
+    let usable_floor = advertised_floor.filter(|_| !pending);
+    if let (Some(floor), Some(tip)) = (usable_floor, advertised_tip) {
+        anyhow::ensure!(
+            tip.lamport >= floor.lamport && tip.lamport < crate::entry::MAX_ENTRY_LAMPORT,
+            "invalid advertised table suffix tip"
+        );
+        anyhow::ensure!(
+            tip.lamport != floor.lamport || tip.entry_hash == floor.entry_hash,
+            "advertised floor and tip conflict at the same lamport"
+        );
+    }
     let report = engine::ingest(
         &tx,
         &ctx,
         scope,
         signed_bytes,
         &pubkey,
-        advertised_floor.map(TableSyncChainCursor::to_store),
+        usable_floor.map(TableSyncChainCursor::to_store),
     )?;
+    let floor_after = retention::retained_floor(&tx, stream_id, signer)?;
+    if floor_after != floor_before
+        && let (Some(floor), Some(tip)) = (floor_after, advertised_tip)
+    {
+        coverage::record(&tx, stream_id, signer, floor, tip.to_store())?;
+    }
+    coverage::clear_delivered(&tx, stream_id, signer)?;
     // An applied row on this stream changed derived state, so advance the Lens lanes that scope
     // feeds (the explicit replacement for the row triggers the synced scopes dropped). All entries
     // in one ingest belong to one stream, hence one scope, so `scope_lens_metas(stream.scope_id)`

@@ -406,3 +406,37 @@ async fn a_peer_that_stops_reading_cannot_block_writes_forever() {
         Err(TableSessionError::Timeout { after }) if after == Duration::from_millis(20)
     ));
 }
+
+#[tokio::test]
+async fn partial_suffix_sources_report_pending_and_recover_in_either_session_role() {
+    for reverse in [false, true] {
+        let scope = item("repo", 1);
+        let mut a = MemStore::new(vec![scope.clone()]);
+        let mut b = MemStore::new(vec![scope.clone()]);
+        a.insert_chain(scope.stream_id, 7, 120, 1);
+        b.insert_chain(scope.stream_id, 7, 120, 1);
+        b.insert_chain(scope.stream_id, 7, 150, 2);
+        for store in [&mut a, &mut b] {
+            store.owed_tips.insert((scope.stream_id, [7; 32]), (200, [3; 32]));
+        }
+        let (ar, br) =
+            if reverse { pair(&mut b, &mut a).await } else { pair(&mut a, &mut b).await };
+        assert!(ar.continuation_pending && br.continuation_pending);
+        assert_eq!(a.frontier(&scope, [7; 32]).unwrap(), FrontierState::Accepted {
+            lamport: 150,
+            entry_hash: [2; 32]
+        });
+        let mut full = MemStore::new(vec![scope.clone()]);
+        full.insert_chain(scope.stream_id, 7, 120, 1);
+        full.insert_chain(scope.stream_id, 7, 150, 2);
+        full.insert_chain(scope.stream_id, 7, 200, 3);
+        pair(&mut a, &mut full).await;
+        pair(&mut a, &mut b).await;
+        let (ar, br) = pair(&mut a, &mut b).await;
+        assert!(!ar.continuation_pending && !br.continuation_pending);
+        assert_eq!(b.frontier(&scope, [7; 32]).unwrap(), FrontierState::Accepted {
+            lamport: 200,
+            entry_hash: [3; 32]
+        });
+    }
+}

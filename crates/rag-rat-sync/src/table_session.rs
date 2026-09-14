@@ -22,6 +22,9 @@ pub trait TableSyncStore {
     fn prepare(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+    fn has_pending_coverage(&self, _item: &ManifestItem) -> anyhow::Result<bool> {
+        Ok(false)
+    }
     fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>>;
     fn validates(&self, item: &ManifestItem) -> anyhow::Result<bool>;
     fn chain_page(
@@ -41,9 +44,8 @@ pub trait TableSyncStore {
     fn ingest(
         &mut self,
         item: &ManifestItem,
-        expected_device: Hash,
+        offered: &ChainHead,
         signed_bytes: &[u8],
-        advertised_floor: Option<(u64, Hash)>,
     ) -> anyhow::Result<Ingested>;
 }
 
@@ -250,7 +252,8 @@ where
     let mut continuation_pending = false;
     for item in streams {
         let mut after_device = None;
-        let mut stream_pending = false;
+        let mut stream_pending =
+            store.has_pending_coverage(item).map_err(TableSessionError::Store)?;
         loop {
             if !local_capability.can_push() {
                 break;
@@ -330,6 +333,13 @@ where
                         .entries(item, chain.device_fingerprint, start, page_limit)
                         .map_err(TableSessionError::Store)?;
                     if entries.is_empty() {
+                        let delivered = match start {
+                            ChainStart::After { lamport, entry_hash } =>
+                                lamport > chain.lamport
+                                    || (lamport == chain.lamport && entry_hash == chain.entry_hash),
+                            _ => false,
+                        };
+                        stream_pending |= !delivered;
                         break;
                     }
                     if entries.len() > page_limit
@@ -462,13 +472,13 @@ where
                                         limits.entries_per_session
                                     )));
                                 }
-                                let floor = chains
+                                let offered = chains
                                     .iter()
                                     .find(|chain| chain.device_fingerprint == device_fingerprint)
-                                    .and_then(|chain| chain.floor);
+                                    .expect("entry chain belongs to this inventory");
                                 for bytes in entries {
                                     if store
-                                        .ingest(item, device_fingerprint, &bytes, floor)
+                                        .ingest(item, offered, &bytes)
                                         .map_err(TableSessionError::Store)?
                                         == Ingested::Stored
                                     {

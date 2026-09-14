@@ -439,6 +439,14 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         Ok(())
     }
 
+    fn has_pending_coverage(&self, item: &ManifestItem) -> anyhow::Result<bool> {
+        rag_rat_oplog::table_sync_has_pending_coverage(
+            self.conn,
+            self.account_id,
+            &to_oplog_stream(item),
+        )
+    }
+
     fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>> {
         Ok(rag_rat_oplog::table_sync_supported_streams(self.conn, self.account_id)?
             .into_iter()
@@ -536,9 +544,8 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     fn ingest(
         &mut self,
         item: &ManifestItem,
-        expected_device: [u8; 32],
+        offered: &ChainHead,
         signed_bytes: &[u8],
-        advertised_floor: Option<(u64, [u8; 32])>,
     ) -> anyhow::Result<Ingested> {
         Ok(
             match rag_rat_oplog::table_sync_ingest(
@@ -546,9 +553,13 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
                 self.account_id,
                 &to_oplog_stream(item),
                 &rag_rat_oplog::TableSyncReceived {
-                    expected_device,
+                    expected_device: offered.device_fingerprint,
                     signed_bytes,
-                    advertised_floor: advertised_floor.map(|(lamport, entry_hash)| {
+                    advertised_tip: Some(rag_rat_oplog::TableSyncChainCursor {
+                        lamport: offered.lamport,
+                        entry_hash: offered.entry_hash,
+                    }),
+                    advertised_floor: offered.floor.map(|(lamport, entry_hash)| {
                         rag_rat_oplog::TableSyncChainCursor { lamport, entry_hash }
                     }),
                 },
@@ -597,6 +608,20 @@ mod tests {
         assert!(store.chain_page(&item, None, 1).unwrap().is_empty());
         assert_eq!(store.frontier(&item, [4; 32]).unwrap(), FrontierState::Empty);
         assert!(store.entries(&item, [4; 32], ChainStart::Beginning, 1).unwrap().is_empty());
-        assert_eq!(store.ingest(&item, [4; 32], &[0], None).unwrap(), Ingested::NoChange);
+        assert_eq!(
+            store
+                .ingest(
+                    &item,
+                    &ChainHead {
+                        device_fingerprint: [4; 32],
+                        lamport: 0,
+                        entry_hash: [0; 32],
+                        floor: None
+                    },
+                    &[0]
+                )
+                .unwrap(),
+            Ingested::NoChange
+        );
     }
 }

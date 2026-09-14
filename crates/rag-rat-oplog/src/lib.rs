@@ -193,6 +193,7 @@ pub use table_sync::{
     TableSyncIngestOutcome, TableSyncReceived, TableSyncRowCause, TableSyncRowDiagnostic,
     TableSyncStream, refold_stale_table_sync_projections, scope_retention_budget,
     table_sync_author_pending, table_sync_chain_entries, table_sync_chain_frontier,
-    table_sync_chain_page_after, table_sync_compact_overdue, table_sync_ingest,
-    table_sync_row_diagnostics, table_sync_supported_streams, table_sync_validate_stream,
+    table_sync_chain_page_after, table_sync_compact_overdue, table_sync_has_pending_coverage,
+    table_sync_ingest, table_sync_row_diagnostics, table_sync_supported_streams,
+    table_sync_validate_stream,
 };
