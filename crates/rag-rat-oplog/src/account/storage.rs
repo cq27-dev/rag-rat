@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry};
-use super::fold::{self, EntryStatus};
+use super::fold::{self, AuthorityChain, EntryStatus};
 use super::id::{account_id_from_genesis_payload, fixed};
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
@@ -569,23 +569,6 @@ pub fn owner_secrets_authority_in_snapshot(
         device_fingerprint,
         AuthorityChain::Secrets,
     )
-}
-
-/// Which authority chain an owner-incarnation lookup reads — each has its own `{chain}_boundary`,
-/// `{chain}_seq`, `{chain}_hash` column triple on both the incarnation and roster tables.
-#[derive(Clone, Copy)]
-enum AuthorityChain {
-    Control,
-    Secrets,
-}
-
-impl AuthorityChain {
-    fn column_prefix(self) -> &'static str {
-        match self {
-            Self::Control => "control",
-            Self::Secrets => "secrets",
-        }
-    }
 }
 
 fn owner_chain_authority(

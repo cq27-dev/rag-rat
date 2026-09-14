@@ -485,15 +485,16 @@ impl AccountAuthHistory {
         device_fingerprint: DeviceFingerprint,
         stream_id: StreamId,
     ) -> AuthorityQuery<RosterContentAuthority> {
-        let Some(fact) = self.roster_refs.get(&roster_ref) else {
-            return if self.outcomes.contains_key(&roster_ref) {
-                AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
-            } else {
-                AuthorityQuery::Unknown
-            };
+        let fact = match resolve_fact(
+            self.roster_refs.get(&roster_ref),
+            self.outcomes.contains_key(&roster_ref),
+        ) {
+            Ok(fact) => fact,
+            Err(verdict) => return verdict,
         };
-        if fact.authority.device_fingerprint != device_fingerprint {
-            return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+        if let Err(verdict) = require_subject(fact.authority.device_fingerprint, device_fingerprint)
+        {
+            return verdict;
         }
         let boundary = fact.content_boundaries.get(&stream_id).copied().unwrap_or_else(|| {
             if fact.closed_at.is_none() {
@@ -529,12 +530,7 @@ impl AccountAuthHistory {
         owner_id: [u8; 32],
         device_fingerprint: DeviceFingerprint,
     ) -> AuthorityQuery<OwnerChainAuthority> {
-        self.owner_chain_authority(
-            owner_id,
-            device_fingerprint,
-            |fact| fact.control_boundary,
-            |fact| fact.control_boundary,
-        )
+        self.owner_chain_authority(owner_id, device_fingerprint, AuthorityChain::Control)
     }
 
     pub(super) fn owner_secrets_authority(
@@ -542,40 +538,36 @@ impl AccountAuthHistory {
         owner_id: [u8; 32],
         device_fingerprint: DeviceFingerprint,
     ) -> AuthorityQuery<OwnerChainAuthority> {
-        self.owner_chain_authority(
-            owner_id,
-            device_fingerprint,
-            |fact| fact.secrets_boundary,
-            |fact| fact.secrets_boundary,
-        )
+        self.owner_chain_authority(owner_id, device_fingerprint, AuthorityChain::Secrets)
     }
 
     fn owner_chain_authority(
         &self,
         owner_id: [u8; 32],
         device_fingerprint: DeviceFingerprint,
-        device_boundary: impl Fn(&RosterFact) -> AuthorityBoundary,
-        incarnation_boundary: impl Fn(&OwnerIncarnationFact) -> AuthorityBoundary,
+        chain: AuthorityChain,
     ) -> AuthorityQuery<OwnerChainAuthority> {
-        let Some(owner) = self.owner_incarnations.get(&owner_id) else {
-            return if self.outcomes.contains_key(&owner_id) {
-                AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
-            } else {
-                AuthorityQuery::Unknown
-            };
+        let owner = match resolve_fact(
+            self.owner_incarnations.get(&owner_id),
+            self.outcomes.contains_key(&owner_id),
+        ) {
+            Ok(fact) => fact,
+            Err(verdict) => return verdict,
         };
-        if owner.authority.device_fingerprint != device_fingerprint {
-            return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+        if let Err(verdict) =
+            require_subject(owner.authority.device_fingerprint, device_fingerprint)
+        {
+            return verdict;
         }
         let device = self
             .roster_refs
             .values()
             .find(|fact| fact.authority.device_fingerprint == device_fingerprint)
-            .map_or(AuthorityBoundary::Closed, device_boundary);
+            .map_or(AuthorityBoundary::Closed, |fact| fact.boundary(chain));
         AuthorityQuery::Effective(OwnerChainAuthority {
             owner: owner.authority,
             device_boundary: device,
-            incarnation_boundary: incarnation_boundary(owner),
+            incarnation_boundary: owner.boundary(chain),
         })
     }
 
@@ -585,17 +577,16 @@ impl AccountAuthHistory {
         stream_id: StreamId,
         grantee_account_id: AccountId,
     ) -> AuthorityQuery<GrantAuthority> {
-        let Some(fact) = self.grants.get(&grant_id) else {
-            return if self.outcomes.contains_key(&grant_id) {
-                AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
-            } else {
-                AuthorityQuery::Unknown
+        let fact =
+            match resolve_fact(self.grants.get(&grant_id), self.outcomes.contains_key(&grant_id)) {
+                Ok(fact) => fact,
+                Err(verdict) => return verdict,
             };
-        };
-        if fact.authority.stream_id != stream_id
-            || fact.authority.grantee_account_id != grantee_account_id
-        {
-            return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+        if let Err(verdict) = require_subject(
+            (fact.authority.stream_id, fact.authority.grantee_account_id),
+            (stream_id, grantee_account_id),
+        ) {
+            return verdict;
         }
         AuthorityQuery::Effective(fact.authority)
     }
@@ -617,17 +608,32 @@ fn query_fact<T: Copy, S: PartialEq>(
     expected_subject: S,
     reference_is_known: bool,
 ) -> AuthorityQuery<T> {
-    let Some((authority, subject)) = fact else {
-        return if reference_is_known {
+    let (authority, subject) = match resolve_fact(fact.as_ref(), reference_is_known) {
+        Ok(fact) => fact,
+        Err(verdict) => return verdict,
+    };
+    if let Err(verdict) = require_subject(subject, &expected_subject) {
+        return verdict;
+    }
+    AuthorityQuery::Effective(*authority)
+}
+
+fn resolve_fact<F, T>(fact: Option<&F>, reference_is_known: bool) -> Result<&F, AuthorityQuery<T>> {
+    fact.ok_or_else(|| {
+        if reference_is_known {
             AuthorityQuery::Invalid(AuthorityInvalidReason::ReferencedEntryNotEffective)
         } else {
             AuthorityQuery::Unknown
-        };
-    };
-    if subject != expected_subject {
-        return AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject);
+        }
+    })
+}
+
+fn require_subject<T, S: PartialEq>(actual: S, expected: S) -> Result<(), AuthorityQuery<T>> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(AuthorityQuery::Invalid(AuthorityInvalidReason::WrongSubject))
     }
-    AuthorityQuery::Effective(authority)
 }
 
 /// A structurally-valid, signature-valid candidate the fold considers: the verified entry + its
@@ -2689,6 +2695,41 @@ impl FoldState {
 
     fn seeded(genesis_owner_id: [u8; 32]) -> Self {
         Self { live: HashSet::from([genesis_owner_id]), ..Default::default() }
+    }
+}
+
+/// Which authority chain an owner-incarnation lookup reads — each has its own `{chain}_boundary`,
+/// `{chain}_seq`, `{chain}_hash` column triple on both the incarnation and roster tables.
+#[derive(Clone, Copy)]
+pub(super) enum AuthorityChain {
+    Control,
+    Secrets,
+}
+
+impl AuthorityChain {
+    pub(super) fn column_prefix(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Secrets => "secrets",
+        }
+    }
+}
+
+impl RosterFact {
+    fn boundary(&self, chain: AuthorityChain) -> AuthorityBoundary {
+        match chain {
+            AuthorityChain::Control => self.control_boundary,
+            AuthorityChain::Secrets => self.secrets_boundary,
+        }
+    }
+}
+
+impl OwnerIncarnationFact {
+    fn boundary(&self, chain: AuthorityChain) -> AuthorityBoundary {
+        match chain {
+            AuthorityChain::Control => self.control_boundary,
+            AuthorityChain::Secrets => self.secrets_boundary,
+        }
     }
 }
 
