@@ -35,7 +35,7 @@ use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 use rag_rat_query::memory::{self, EdgeRelation};
 
-use super::cbor::{self, INFALLIBLE, VecEncoder};
+use super::cbor::{self, VecEncoder, VecEncoderExt};
 
 /// Domain tag + version, the envelope's first element. Bump the version to evolve the wire format
 /// deliberately (an old binary then rejects the new domain rather than misreading it).
@@ -472,9 +472,9 @@ pub fn encode(op: &MemoryOp) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(3).expect(INFALLIBLE);
-        enc.str(DOMAIN).expect(INFALLIBLE);
-        enc.str(op.kind_tag()).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_str(DOMAIN);
+        enc.put_str(op.kind_tag());
         encode_payload(&mut enc, op);
     }
     buf
@@ -484,37 +484,37 @@ pub fn encode(op: &MemoryOp) -> Vec<u8> {
 fn encode_payload(enc: &mut VecEncoder<'_>, op: &MemoryOp) {
     match op {
         MemoryOp::NodeCreate { node_id, content } | MemoryOp::NodeUpdate { node_id, content } => {
-            enc.array(2).expect(INFALLIBLE);
-            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_str(node_id.as_str());
             encode_content(enc, content);
         },
         MemoryOp::NodeStatus { node_id, status } => {
-            enc.array(2).expect(INFALLIBLE);
-            enc.str(node_id.as_str()).expect(INFALLIBLE);
-            enc.str(status.as_db_str()).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_str(node_id.as_str());
+            enc.put_str(status.as_db_str());
         },
         MemoryOp::EdgeAdd { edge } => encode_edge_spec(enc, edge),
         MemoryOp::EdgeRemove { edge_key } => {
-            enc.str(edge_key.as_str()).expect(INFALLIBLE);
+            enc.put_str(edge_key.as_str());
         },
         MemoryOp::Rebind { edge_key, resolved } => {
-            enc.array(2).expect(INFALLIBLE);
-            enc.str(edge_key.as_str()).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_str(edge_key.as_str());
             encode_resolved(enc, resolved);
         },
         MemoryOp::NodeAnchors { node_id, anchors } => {
-            enc.array(2).expect(INFALLIBLE);
-            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_str(node_id.as_str());
             encode_anchors(enc, anchors);
         },
         MemoryOp::NodeSourceHash { node_id, source_text_hash } => {
-            enc.array(2).expect(INFALLIBLE);
-            enc.str(node_id.as_str()).expect(INFALLIBLE);
-            enc.str(source_text_hash).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_str(node_id.as_str());
+            enc.put_str(source_text_hash);
         },
         MemoryOp::NodeAnchorScopes { node_id, scopes } => {
-            enc.array(2).expect(INFALLIBLE);
-            enc.str(node_id.as_str()).expect(INFALLIBLE);
+            enc.put_array(2);
+            enc.put_str(node_id.as_str());
             encode_anchor_scopes(enc, scopes);
         },
         MemoryOp::Snapshot => {
@@ -522,46 +522,46 @@ fn encode_payload(enc: &mut VecEncoder<'_>, op: &MemoryOp) {
             // coverage manifest (§5.4/C4) is a NEW op kind — NOT a non-null payload under this kind
             // — so an old binary retains it through the unknown-KIND seam (uniform forward-compat),
             // while `snapshot` stays null-only and its decode rejects any non-null payload.
-            enc.null().expect(INFALLIBLE);
+            enc.put_null();
         },
     }
 }
 
 fn encode_content(enc: &mut VecEncoder<'_>, content: &NodeContent) {
-    enc.array(7).expect(INFALLIBLE);
-    enc.str(&content.kind).expect(INFALLIBLE);
-    enc.str(&content.title).expect(INFALLIBLE);
-    enc.str(&content.body).expect(INFALLIBLE);
-    enc.str(&content.confidence).expect(INFALLIBLE);
-    enc.str(&content.source).expect(INFALLIBLE);
+    enc.put_array(7);
+    enc.put_str(&content.kind);
+    enc.put_str(&content.title);
+    enc.put_str(&content.body);
+    enc.put_str(&content.confidence);
+    enc.put_str(&content.source);
     // Tags are a SET: sort AND dedup before encoding so neither order nor duplicates perturb the
     // canonical bytes. `NodeContent::canonicalize` applies the SAME rule to stored content, so the
     // wire and the projected state agree.
     let mut tags: Vec<&str> = content.tags.iter().map(String::as_str).collect();
     tags.sort_unstable();
     tags.dedup();
-    enc.array(tags.len() as u64).expect(INFALLIBLE);
+    enc.put_array(tags.len() as u64);
     for tag in tags {
-        enc.str(tag).expect(INFALLIBLE);
+        enc.put_str(tag);
     }
     encode_opt_str(enc, content.payload.as_deref());
 }
 
 fn encode_edge_spec(enc: &mut VecEncoder<'_>, edge: &EdgeSpec) {
-    enc.array(6).expect(INFALLIBLE);
-    enc.str(edge.source_node_id.as_str()).expect(INFALLIBLE);
-    enc.str(edge.relation.as_db_str()).expect(INFALLIBLE);
-    enc.str(&edge.target_repo_id).expect(INFALLIBLE);
-    enc.str(&edge.target_kind).expect(INFALLIBLE);
-    enc.str(&edge.target_anchor).expect(INFALLIBLE);
-    enc.str(&edge.owner_repo_id).expect(INFALLIBLE);
+    enc.put_array(6);
+    enc.put_str(edge.source_node_id.as_str());
+    enc.put_str(edge.relation.as_db_str());
+    enc.put_str(&edge.target_repo_id);
+    enc.put_str(&edge.target_kind);
+    enc.put_str(&edge.target_anchor);
+    enc.put_str(&edge.owner_repo_id);
 }
 
 fn encode_resolved(enc: &mut VecEncoder<'_>, resolved: &ResolvedAnchor) {
-    enc.array(3).expect(INFALLIBLE);
-    enc.str(&resolved.target_repo_id).expect(INFALLIBLE);
+    enc.put_array(3);
+    enc.put_str(&resolved.target_repo_id);
     encode_opt_str(enc, resolved.target_node_id.as_deref());
-    enc.str(&resolved.anchor_status).expect(INFALLIBLE);
+    enc.put_str(&resolved.anchor_status);
 }
 
 /// Encode the anchor SET, ordered by identity so neither the caller's insertion sequence nor the
@@ -578,7 +578,7 @@ fn encode_resolved(enc: &mut VecEncoder<'_>, resolved: &ResolvedAnchor) {
 fn encode_anchors(enc: &mut VecEncoder<'_>, anchors: &[PortableAnchor]) {
     let mut ordered: Vec<&PortableAnchor> = anchors.iter().collect();
     ordered.sort_by(|a, b| a.identity().cmp(&b.identity()));
-    enc.array(ordered.len() as u64).expect(INFALLIBLE);
+    enc.put_array(ordered.len() as u64);
     for anchor in ordered {
         encode_anchor(enc, anchor);
     }
@@ -589,19 +589,19 @@ fn encode_anchors(enc: &mut VecEncoder<'_>, anchors: &[PortableAnchor]) {
 fn encode_anchor_scopes(enc: &mut VecEncoder<'_>, scopes: &[AnchorScope]) {
     let mut ordered: Vec<&AnchorScope> = scopes.iter().collect();
     ordered.sort_by(|a, b| a.identity().cmp(&b.identity()));
-    enc.array(ordered.len() as u64).expect(INFALLIBLE);
+    enc.put_array(ordered.len() as u64);
     for scope in ordered {
-        enc.array(3).expect(INFALLIBLE);
-        enc.str(&scope.binding_kind).expect(INFALLIBLE);
-        enc.str(&scope.binding_id).expect(INFALLIBLE);
-        enc.str(&scope.scope_hash).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_str(&scope.binding_kind);
+        enc.put_str(&scope.binding_id);
+        enc.put_str(&scope.scope_hash);
     }
 }
 
 fn encode_anchor(enc: &mut VecEncoder<'_>, anchor: &PortableAnchor) {
-    enc.array(14).expect(INFALLIBLE);
-    enc.str(&anchor.binding_kind).expect(INFALLIBLE);
-    enc.str(&anchor.binding_id).expect(INFALLIBLE);
+    enc.put_array(14);
+    enc.put_str(&anchor.binding_kind);
+    enc.put_str(&anchor.binding_id);
     encode_opt_str(enc, anchor.path.as_deref());
     encode_opt_i64(enc, anchor.start_line);
     encode_opt_i64(enc, anchor.end_line);
@@ -609,7 +609,7 @@ fn encode_anchor(enc: &mut VecEncoder<'_>, anchor: &PortableAnchor) {
     encode_opt_str(enc, anchor.tracker.as_deref());
     encode_opt_str(enc, anchor.project.as_deref());
     encode_opt_str(enc, anchor.item_key.as_deref());
-    enc.i64(anchor.created_at_ms).expect(INFALLIBLE);
+    enc.put_i64(anchor.created_at_ms);
     encode_opt_str(enc, anchor.symbol_kind.as_deref());
     encode_opt_str(enc, anchor.signature_hash.as_deref());
     encode_opt_str(enc, anchor.moniker_tool.as_deref());
@@ -620,16 +620,16 @@ fn encode_anchor(enc: &mut VecEncoder<'_>, anchor: &PortableAnchor) {
 /// nullable INTEGER columns (`start_line` / `end_line`), which a tracker binding leaves unset.
 fn encode_opt_i64(enc: &mut VecEncoder<'_>, value: Option<i64>) {
     match value {
-        Some(number) => enc.i64(number).expect(INFALLIBLE),
-        None => enc.null().expect(INFALLIBLE),
+        Some(number) => enc.put_i64(number),
+        None => enc.put_null(),
     };
 }
 
 /// Encode an optional string as a text item or CBOR `null` — a distinct, unambiguous absent marker.
 fn encode_opt_str(enc: &mut VecEncoder<'_>, value: Option<&str>) {
     match value {
-        Some(text) => enc.str(text).expect(INFALLIBLE),
-        None => enc.null().expect(INFALLIBLE),
+        Some(text) => enc.put_str(text),
+        None => enc.put_null(),
     };
 }
 

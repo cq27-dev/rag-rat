@@ -42,6 +42,7 @@ pub(super) trait VecEncoderExt {
     fn put_u32(&mut self, value: u32) -> &mut Self;
     fn put_u64(&mut self, value: u64) -> &mut Self;
     fn put_i64(&mut self, value: i64) -> &mut Self;
+    fn put_bool(&mut self, value: bool) -> &mut Self;
     fn put_null(&mut self) -> &mut Self;
 }
 
@@ -72,6 +73,10 @@ impl VecEncoderExt for VecEncoder<'_> {
 
     fn put_i64(&mut self, value: i64) -> &mut Self {
         self.i64(value).expect(INFALLIBLE)
+    }
+
+    fn put_bool(&mut self, value: bool) -> &mut Self {
+        self.bool(value).expect(INFALLIBLE)
     }
 
     fn put_null(&mut self) -> &mut Self {
@@ -263,8 +268,8 @@ pub(super) fn fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[
 }
 
 /// Read a leading domain string and assert it matches `want` — a wrong/absent tag is a foreign or
-/// version-bumped object an old binary must reject, never misread. Shared by every domain-tagged
-/// decoder in `oplog`.
+/// version-bumped object an old binary must reject, never misread. Shared by the domain-tagged
+/// decoders that report a mismatch in this wording; `op` and the node binding keep their own.
 pub(super) fn expect_domain(d: &mut Decoder<'_>, want: &str) -> Result<(), CborError> {
     let got = d.str()?;
     if got == want {

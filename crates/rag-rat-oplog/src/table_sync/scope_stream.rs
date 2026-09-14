@@ -9,7 +9,7 @@
 
 use minicbor::Encoder;
 
-use crate::cbor::{self, INFALLIBLE};
+use crate::cbor::{self, VecEncoderExt};
 use crate::{AccountId, StreamId};
 
 /// Domain tag + version for the table-sync stream identity. `/5` is a sibling of the content `/2`
@@ -30,12 +30,12 @@ pub(crate) fn scope_stream_id(
     let mut buf = Vec::with_capacity(96);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(5).expect(INFALLIBLE);
-        enc.str(TABLE_STREAM_DOMAIN).expect(INFALLIBLE);
-        enc.bytes(&account_id.to_bytes()).expect(INFALLIBLE);
-        enc.str(repo_id).expect(INFALLIBLE);
-        enc.bytes(&incarnation_ref).expect(INFALLIBLE);
-        enc.str(scope_id).expect(INFALLIBLE);
+        enc.put_array(5);
+        enc.put_str(TABLE_STREAM_DOMAIN);
+        enc.put_bytes(&account_id.to_bytes());
+        enc.put_str(repo_id);
+        enc.put_bytes(&incarnation_ref);
+        enc.put_str(scope_id);
     }
     StreamId::from_bytes(cbor::sha256(&buf))
 }

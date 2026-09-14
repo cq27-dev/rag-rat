@@ -20,7 +20,7 @@ use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
-use crate::cbor::{self, INFALLIBLE, VecEncoder};
+use crate::cbor::{self, VecEncoder, VecEncoderExt};
 use crate::op::DeviceFingerprint;
 
 /// Domain tag + version, the envelope's first element. Bump the version to evolve the wire format
@@ -142,9 +142,9 @@ pub fn encode(op: &RowOp) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(3).expect(INFALLIBLE);
-        enc.str(DOMAIN).expect(INFALLIBLE);
-        enc.str(op.kind_tag()).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_str(DOMAIN);
+        enc.put_str(op.kind_tag());
         encode_payload(&mut enc, op);
     }
     buf
@@ -154,22 +154,22 @@ pub fn encode(op: &RowOp) -> Vec<u8> {
 fn encode_payload(enc: &mut VecEncoder<'_>, op: &RowOp) {
     match op {
         RowOp::Upsert { table, spec_version, pk, cells } => {
-            enc.array(4).expect(INFALLIBLE);
-            enc.str(table).expect(INFALLIBLE);
-            enc.u32(*spec_version).expect(INFALLIBLE);
+            enc.put_array(4);
+            enc.put_str(table);
+            enc.put_u32(*spec_version);
             encode_values(enc, pk);
             encode_cells(enc, cells);
         },
         RowOp::Remove { table, spec_version, pk } => {
-            enc.array(3).expect(INFALLIBLE);
-            enc.str(table).expect(INFALLIBLE);
-            enc.u32(*spec_version).expect(INFALLIBLE);
+            enc.put_array(3);
+            enc.put_str(table);
+            enc.put_u32(*spec_version);
             encode_values(enc, pk);
         },
         RowOp::Restate { table, spec_version, deletes } => {
-            enc.array(3).expect(INFALLIBLE);
-            enc.str(table).expect(INFALLIBLE);
-            enc.u32(*spec_version).expect(INFALLIBLE);
+            enc.put_array(3);
+            enc.put_str(table);
+            enc.put_u32(*spec_version);
             encode_deletes(enc, deletes);
         },
     }
@@ -181,17 +181,17 @@ fn encode_payload(enc: &mut VecEncoder<'_>, op: &RowOp) {
 fn encode_deletes(enc: &mut VecEncoder<'_>, deletes: &[StatedDelete]) {
     let mut sorted: Vec<&StatedDelete> = deletes.iter().collect();
     sorted.sort_by_cached_key(|delete| row_pk_string(&delete.pk));
-    enc.array(sorted.len() as u64).expect(INFALLIBLE);
+    enc.put_array(sorted.len() as u64);
     for delete in sorted {
-        enc.array(3).expect(INFALLIBLE);
+        enc.put_array(3);
         encode_values(enc, &delete.pk);
-        enc.bytes(&delete.device.to_bytes()).expect(INFALLIBLE);
-        enc.u64(delete.lamport).expect(INFALLIBLE);
+        enc.put_bytes(&delete.device.to_bytes());
+        enc.put_u64(delete.lamport);
     }
 }
 
 fn encode_values(enc: &mut VecEncoder<'_>, values: &[TypedValue]) {
-    enc.array(values.len() as u64).expect(INFALLIBLE);
+    enc.put_array(values.len() as u64);
     for value in values {
         encode_value(enc, value);
     }
@@ -201,10 +201,10 @@ fn encode_values(enc: &mut VecEncoder<'_>, values: &[TypedValue]) {
 fn encode_cells(enc: &mut VecEncoder<'_>, cells: &[Cell]) {
     let mut sorted: Vec<&Cell> = cells.iter().collect();
     sorted.sort_by(|a, b| a.column.cmp(&b.column));
-    enc.array(sorted.len() as u64).expect(INFALLIBLE);
+    enc.put_array(sorted.len() as u64);
     for cell in sorted {
-        enc.array(2).expect(INFALLIBLE);
-        enc.str(&cell.column).expect(INFALLIBLE);
+        enc.put_array(2);
+        enc.put_str(&cell.column);
         encode_value(enc, &cell.value);
     }
 }
@@ -214,19 +214,19 @@ fn encode_cells(enc: &mut VecEncoder<'_>, cells: &[Cell]) {
 fn encode_value(enc: &mut VecEncoder<'_>, value: &TypedValue) {
     match value {
         TypedValue::Null => {
-            enc.null().expect(INFALLIBLE);
+            enc.put_null();
         },
         TypedValue::Bool(b) => {
-            enc.bool(*b).expect(INFALLIBLE);
+            enc.put_bool(*b);
         },
         TypedValue::I64(n) => {
-            enc.i64(*n).expect(INFALLIBLE);
+            enc.put_i64(*n);
         },
         TypedValue::Text(s) => {
-            enc.str(s).expect(INFALLIBLE);
+            enc.put_str(s);
         },
         TypedValue::Blob(b) => {
-            enc.bytes(b).expect(INFALLIBLE);
+            enc.put_bytes(b);
         },
     }
 }
@@ -386,10 +386,10 @@ impl StatedDelete {
         let mut buf = Vec::with_capacity(64);
         {
             let mut enc = Encoder::new(&mut buf);
-            enc.array(3).expect(INFALLIBLE);
+            enc.put_array(3);
             encode_values(&mut enc, &self.pk);
-            enc.bytes(&self.device.to_bytes()).expect(INFALLIBLE);
-            enc.u64(self.lamport).expect(INFALLIBLE);
+            enc.put_bytes(&self.device.to_bytes());
+            enc.put_u64(self.lamport);
         }
         buf.len()
     }
@@ -882,6 +882,22 @@ mod tests {
     }
 
     const GOLDEN_RESTATE_HEX: &str = "83727261672d7261742f7461626c652d6f702f3167726573746174658366745f64656d6f038283826172075820111111111111111111111111111111111111111111111111111111111111111118288382617209582022222222222222222222222222222222222222222222222222222222222222221829";
+
+    /// The one value type the upsert sample does not carry — a byte string — plus a negative
+    /// integer, so every `encode_value` arm is pinned by some golden.
+    #[test]
+    fn blob_and_negative_values_golden_vector() {
+        let op = RowOp::Upsert {
+            spec_version: 1,
+            table: "t_demo".to_string(),
+            pk: vec![TypedValue::I64(-2)],
+            cells: vec![Cell { column: "raw".to_string(), value: TypedValue::Blob(vec![0, 0xff]) }],
+        };
+        assert_eq!(
+            rag_rat_base::hash::hex_lower(&encode(&op)),
+            "83727261672d7261742f7461626c652d6f702f31667570736572748466745f64656d6f0181218182637261774200ff"
+        );
+    }
 
     const GOLDEN_REMOVE_HEX: &str =
         "83727261672d7261742f7461626c652d6f702f316672656d6f76658366745f64656d6f0782617207";
