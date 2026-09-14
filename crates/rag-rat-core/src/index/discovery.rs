@@ -77,20 +77,19 @@ pub(crate) fn discovery_plan(
         let Some(indexed) = indexed.remove(&relative) else {
             // Absent from the ACTIVE scope, but a retained committed row (a previous HEAD's
             // scope) holds this exact content under the same target: adopt it instead of
-            // re-deriving (#502). The match mirrors the drift checks below — sha for content,
-            // (language, kind) for target drift — so a carry can never smuggle a stale parse
-            // into the new scope; among several matching retained rows the most recently
-            // derived (highest id) wins. A DIRTY or UNTRACKED path is never carried even on a
-            // sha match: its disk bytes are working-tree content, not the new HEAD's committed
-            // content (a deleted-then-recreated file, or a revert to an old commit's bytes),
-            // so it falls through to normal indexing and lands in the overlay scope.
+            // re-deriving (#502). The match is the same [`IndexedIdentity`] check as the
+            // staleness below, so a carry can never smuggle a stale parse into the new scope;
+            // among several matching retained rows the most recently derived (highest id) wins.
+            // A DIRTY or UNTRACKED path is never carried even on a sha match: its disk bytes are
+            // working-tree content, not the new HEAD's committed content (a
+            // deleted-then-recreated file, or a revert to an old commit's bytes), so it falls
+            // through to normal indexing and lands in the overlay scope.
             if !changes.changed.contains(&file.relative_path)
                 && let Some(rows) = retained.get(&relative)
-                && let Some(matching) = rows.iter().rev().find(|row| {
-                    row.sha256 == current_hash
-                        && row.language == file.language.as_db_str()
-                        && row.kind == file.kind.as_db_str()
-                })
+                && let Some(matching) = rows
+                    .iter()
+                    .rev()
+                    .find(|row| row.identity.matches(&current_hash, file.language, file.kind))
             {
                 carried.push(matching.file_id);
                 continue;
@@ -103,9 +102,7 @@ pub(crate) fn discovery_plan(
         // no content change — e.g. after an upgrade or a binding edit moves a `.h` from a `c` to a
         // `cpp` target. The stored row would otherwise keep its old parse forever (sha unchanged),
         // so the `.h`→C++ upgrade would never take effect on an existing index without `--full`.
-        let target_drift =
-            indexed.language != file.language.as_db_str() || indexed.kind != file.kind.as_db_str();
-        if current_hash != indexed.sha256 || target_drift {
+        if !indexed.matches(&current_hash, file.language, file.kind) {
             changed.push(file.relative_path.clone());
             files.push(file);
         }
@@ -133,26 +130,44 @@ pub(crate) fn discovery_plan(
     })
 }
 
-/// One indexed `files` row's identity for discovery: its content hash plus the (language, kind) it
-/// was indexed under, so discovery can detect TARGET drift (a binding/precedence change that
-/// re-languages a path) as well as content drift.
-pub(crate) struct IndexedFileRow {
-    pub(crate) sha256: String,
-    pub(crate) language: String,
-    pub(crate) kind: String,
+/// The `(sha256, language, kind)` identity an indexed `files` row was derived under: its content
+/// plus the target it was parsed as. A discovered file needs no re-derive exactly when all three
+/// match — the sha catches content drift, `(language, kind)` catches TARGET drift (a
+/// binding/precedence change that re-languages a path with unchanged bytes). Discovery's
+/// staleness, the #502 carry, the explicit-path no-op skip and the overlay unchanged-file skip all
+/// decide through [`Self::matches`].
+#[derive(Debug)]
+pub(crate) struct IndexedIdentity {
+    sha256: String,
+    language: String,
+    kind: String,
+}
+
+impl IndexedIdentity {
+    /// Read the identity from the consecutive `sha256, language, kind` columns starting at `first`.
+    pub(crate) fn from_row(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            sha256: row.get(first)?,
+            language: row.get(first + 1)?,
+            kind: row.get(first + 2)?,
+        })
+    }
+
+    /// Whether content hashing to `sha256`, discovered as `language`/`kind`, is exactly what this
+    /// row was derived from.
+    pub(crate) fn matches(&self, sha256: &str, language: Language, kind: TargetKind) -> bool {
+        self.sha256 == sha256
+            && self.language == language.as_db_str()
+            && self.kind == kind.as_db_str()
+    }
 }
 
 pub(crate) fn indexed_file_map(
     conn: &rusqlite::Connection,
-) -> anyhow::Result<BTreeMap<String, IndexedFileRow>> {
+) -> anyhow::Result<BTreeMap<String, IndexedIdentity>> {
     let mut stmt = conn.prepare("SELECT path, sha256, language, kind FROM files ORDER BY path")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, IndexedFileRow {
-            sha256: row.get(1)?,
-            language: row.get(2)?,
-            kind: row.get(3)?,
-        }))
-    })?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, IndexedIdentity::from_row(row, 1)?)))?;
     let mut files = BTreeMap::new();
     for row in rows {
         let (path, indexed) = row?;
@@ -161,13 +176,11 @@ pub(crate) fn indexed_file_map(
     Ok(files)
 }
 
-/// A retained committed row's carry identity: the row to re-stamp plus the (sha256, language,
-/// kind) triple a discovered file must match for the adoption to be sound (#502).
+/// A retained committed row's carry identity: the row to re-stamp plus the identity a discovered
+/// file must match for the adoption to be sound (#502).
 struct RetainedFileRow {
     file_id: i64,
-    sha256: String,
-    language: String,
-    kind: String,
+    identity: IndexedIdentity,
 }
 
 /// Retained committed rows — this repo + live generation, `worktree_id = ''`, any commit OTHER
@@ -203,9 +216,7 @@ fn retained_committed_file_map(
     let rows = stmt.query_map([&active_commit], |row| {
         Ok((row.get::<_, String>(0)?, RetainedFileRow {
             file_id: row.get(1)?,
-            sha256: row.get(2)?,
-            language: row.get(3)?,
-            kind: row.get(4)?,
+            identity: IndexedIdentity::from_row(row, 2)?,
         }))
     })?;
     for row in rows {

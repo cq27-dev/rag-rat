@@ -1319,8 +1319,8 @@ impl IndexDatabase {
             // prepares EVERY supplied file — including clean/reverted ones — to scope
             // them, so without this an unchanged file would be needlessly
             // removed+reinserted, churning its id and cascade-dropping its chunk
-            // embeddings. Compares the FULL `(sha256, language, kind)` identity, not sha alone: a
-            // TARGET-identity drift with unchanged bytes (an extension-precedence change
+            // embeddings. Compares the FULL identity (`IndexedIdentity::matches`), not sha alone:
+            // a TARGET-identity drift with unchanged bytes (an extension-precedence change
             // re-languages the path) must still reindex, exactly as discovery's
             // staleness does — a sha-only skip would strand the old parse. Gated to
             // `Paths`: the heal / worktree-overlay callers (`InTransaction`)
@@ -1330,9 +1330,11 @@ impl IndexDatabase {
             if explicit_paths
                 && let Ok(content) = &prepared_file.prepared
                 && let Some(row) = &scope_row
-                && row.sha256 == content.sha256
-                && row.language == prepared_file.file.language.as_db_str()
-                && row.kind == prepared_file.file.kind.as_db_str()
+                && row.identity.matches(
+                    &content.sha256,
+                    prepared_file.file.language,
+                    prepared_file.file.kind,
+                )
             {
                 continue;
             }

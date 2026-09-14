@@ -6,6 +6,7 @@ use rag_rat_base::paths::path_string;
 use rag_rat_base::time::now_ms;
 use rag_rat_db::schema::{TOMBSTONE_FILE_KIND, TOMBSTONE_FILE_LANGUAGE};
 
+use super::discovery::IndexedIdentity;
 use super::*;
 
 /// The target identity of an indexed file row — what a heal re-parses the file as.
@@ -31,15 +32,11 @@ pub(super) struct ScopeRowState {
     /// guard false-positive-free: the row's OWN prior stamp is always older-or-equal (edits only
     /// advance mtime), and a tombstone's `modified_at_ms = 0` never blocks a resurrection.
     pub(super) modified_at_ms: i64,
-    /// With `language` and `kind`, the identity the explicit-path no-op skip compares (#659
-    /// review): a CLEAN/reverted `index --paths` file matches and is not needlessly
-    /// removed+reinserted. `language`/`kind` are included so a TARGET identity change with
-    /// UNCHANGED bytes (an extension-precedence upgrade re-languages a path) is NOT skipped —
-    /// mirroring discovery's `(sha256, language, kind)` staleness
-    /// ([`super::discovery::target_for_path`] drift).
-    pub(super) sha256: String,
-    pub(super) language: String,
-    pub(super) kind: String,
+    /// The identity the explicit-path no-op skip compares (#659 review): a CLEAN/reverted
+    /// `index --paths` file matches and is not needlessly removed+reinserted, while a TARGET
+    /// identity change with UNCHANGED bytes (an extension-precedence upgrade re-languages a path)
+    /// is not skipped.
+    pub(super) identity: IndexedIdentity,
 }
 
 impl IndexDatabase {
@@ -385,9 +382,7 @@ impl IndexDatabase {
                 |row| {
                     Ok(ScopeRowState {
                         modified_at_ms: row.get(0)?,
-                        sha256: row.get(1)?,
-                        language: row.get(2)?,
-                        kind: row.get(3)?,
+                        identity: IndexedIdentity::from_row(row, 1)?,
                     })
                 },
             )
