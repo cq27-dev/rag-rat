@@ -143,9 +143,9 @@ fn compaction_queue(conn: &Connection) -> rusqlite::Result<Vec<CompactionEntry>>
     // Both statuses the memory surfaces render — a `stale`-status memory is flagged, not retired,
     // and still attaches to every drive-by surface. Compacting only the active half would leave an
     // over-envelope stale note skipped here and deferred there: a bare title forever.
+    let live = rag_rat_query::memory::live_memory_status_sql("repo_memories");
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, title, body FROM repo_memories WHERE status IN ('active', \
-         'stale'){mem_clause} ORDER BY id"
+        "SELECT id, title, body FROM repo_memories WHERE {live}{mem_clause} ORDER BY id"
     ))?;
     let mems: Vec<(String, String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?

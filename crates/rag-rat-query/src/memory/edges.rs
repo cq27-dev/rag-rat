@@ -126,15 +126,16 @@ pub fn edge_key(
 /// Remove an edge by its stable `edge_key`. A no-op (returns `false`) when the key is unknown.
 /// Every edge OUT of `source_node_id` (its outgoing graph — deps, mind-map links, tracks). Owner-
 /// scoped, filtered to a LIVE source (a `stale` node is live; only `obsolete`/`rejected` are dead,
-/// exactly as the binding reads filter — see [`LIVE_SOURCE_PREDICATE`]), and re-resolved on read.
+/// exactly as the binding reads filter — see [`live_source_predicate`]), and re-resolved on read.
 /// The complete-history read the op-log reconcile needs is [`unauthored_edges`], not this — it
 /// anti-joins the projection across EVERY source regardless of status.
 pub fn edges_from(conn: &Connection, source_node_id: &str) -> anyhow::Result<Vec<NodeEdge>> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = periphery_edge_scope_clause(&scope);
+    let live_source = live_source_predicate();
     let mut stmt = conn.prepare(&format!(
-        "{EDGE_SELECT} WHERE source_node_id = ?1{repo_clause}{LIVE_SOURCE_PREDICATE} ORDER BY \
-         relation, target_anchor"
+        "{EDGE_SELECT} WHERE source_node_id = ?1{repo_clause}{live_source} ORDER BY relation, \
+         target_anchor"
     ))?;
     let rows = stmt.query_map([source_node_id], edge_row)?.collect::<rusqlite::Result<_>>()?;
     reresolve_on_read(conn, rows)
@@ -150,9 +151,10 @@ pub fn edges_into(conn: &Connection, target: &EdgeTarget) -> anyhow::Result<Vec<
     // repo's inbound edge) is a follow-up.
     let scope = memory_repo_scope(conn)?;
     let repo_clause = periphery_edge_scope_clause(&scope);
+    let live_source = live_source_predicate();
     let mut stmt = conn.prepare(&format!(
-        "{EDGE_SELECT} WHERE target_kind = ?1 AND target_anchor = \
-         ?2{repo_clause}{LIVE_SOURCE_PREDICATE} ORDER BY source_node_id, relation"
+        "{EDGE_SELECT} WHERE target_kind = ?1 AND target_anchor = ?2{repo_clause}{live_source} \
+         ORDER BY source_node_id, relation"
     ))?;
     let rows = stmt
         .query_map(params![target.kind(), target.anchor()], edge_row)?
@@ -184,12 +186,16 @@ pub const EDGE_SELECT: &str = "
     FROM repo_node_edges";
 
 /// Edges are surfaced only for a LIVE source node — one whose memory is still surfaceable by
-/// recall. That is `status IN ('active', 'stale')`, exactly as the binding reads
-/// (`memories_for_symbol` etc.) filter: a `stale` node is live (its anchor drifted, not its
-/// memory), only `obsolete`/`rejected` are dead. A subquery, not a join, so the `EDGE_SELECT`
-/// column list / `edge_row` mapper are unchanged.
-const LIVE_SOURCE_PREDICATE: &str =
-    " AND source_node_id IN (SELECT id FROM repo_memories WHERE status IN ('active', 'stale'))";
+/// recall, filtered by [`super::live_memory_status_sql`] exactly as the binding reads
+/// (`memories_for_symbol` etc.) are: a `stale` node is live (its anchor drifted, not its memory),
+/// only `obsolete`/`rejected` are dead. A subquery, not a join, so the `EDGE_SELECT` column list /
+/// `edge_row` mapper are unchanged.
+fn live_source_predicate() -> String {
+    format!(
+        " AND source_node_id IN (SELECT id FROM repo_memories WHERE {})",
+        live_memory_status_sql("repo_memories")
+    )
+}
 
 pub fn edge_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NodeEdge> {
     Ok(NodeEdge {
@@ -222,15 +228,15 @@ pub fn repo_is_registered(conn: &Connection, repo_id: &str) -> anyhow::Result<bo
 /// The active-repo owner of `source_node_id` (its `repo_id`), or `None` when the node is not a LIVE
 /// memory in the active repo. New edges are authored on — and owned by — this repo; a dead
 /// (`obsolete`/`rejected`) node is treated as absent so you cannot author a relationship FROM it
-/// (the add-time twin of the `LIVE_SOURCE_PREDICATE` read filter — a `stale` node is still live).
+/// (the add-time twin of the `live_source_predicate` read filter — a `stale` node is still live).
 pub fn source_node_owner_repo(conn: &Connection, node_id: &str) -> anyhow::Result<Option<String>> {
     let scope = memory_repo_scope(conn)?;
     let repo_clause = memory_repo_scope_clause(&scope);
     let owner = scope.clone().unwrap_or_else(|| UNASSIGNED_REPO.to_string());
+    let live = live_memory_status_sql("repo_memories");
     let exists: bool = conn.query_row(
         &format!(
-            "SELECT EXISTS(SELECT 1 FROM repo_memories WHERE id = ?1 AND status IN ('active', \
-             'stale'){repo_clause})"
+            "SELECT EXISTS(SELECT 1 FROM repo_memories WHERE id = ?1 AND {live}{repo_clause})"
         ),
         [node_id],
         |r| r.get(0),

@@ -70,6 +70,15 @@ pub(crate) fn memory_repo_scope_clause(scope: &Option<String>) -> String {
     rag_rat_db::schema::periphery_repo_scope_clause(scope, "repo_memories")
 }
 
+/// The predicate selecting the memories recall still surfaces, on the `repo_memories` row named
+/// `alias` (the table name itself where the statement does not alias it): a `stale` memory is live
+/// (its anchor drifted, not its memory), only `obsolete`/`rejected` are dead. Every memory read
+/// that attaches, lists or searches filters through this, as do the typed-edge reads and the dream
+/// queues, so reclassifying a status is one edit here.
+pub fn live_memory_status_sql(alias: &str) -> String {
+    format!("{alias}.status IN ('active', 'stale')")
+}
+
 /// Escape a string for use as a SQLite `LIKE` pattern under `ESCAPE '\'`: the three special
 /// characters `\`, `%`, `_` are backslash-escaped so a bound path containing one matches literally.
 pub(crate) fn like_escape(s: &str) -> String {
