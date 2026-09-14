@@ -25,6 +25,28 @@ pub struct RecordKey {
     pub item_key: String,
 }
 
+impl RecordKey {
+    /// The thread a search hit belongs to.
+    pub(crate) fn for_evidence(evidence: &crate::PapertrailEvidence) -> Self {
+        Self {
+            tracker: evidence.tracker.clone(),
+            project: evidence.project.clone(),
+            item_kind: evidence.item_kind.clone(),
+            item_key: evidence.item_key.clone(),
+        }
+    }
+
+    /// The thread that owns a distilled record — for a coalesced pair, the canonical thread.
+    pub(crate) fn for_record(record: &DistilledRecord) -> Self {
+        Self {
+            tracker: record.tracker.clone(),
+            project: record.project.clone(),
+            item_kind: record.item_kind.clone(),
+            item_key: record.item_key.clone(),
+        }
+    }
+}
+
 /// A thread coalesced into a record (the paired issue or PR), for issue↔PR dedup at the call site.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct CoalescedThread {
