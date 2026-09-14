@@ -1179,6 +1179,94 @@ fn stale_production_snapshot_is_skipped_not_verdicted() {
     assert_eq!(written, 0);
 }
 
+/// A pre-built `--scip` carries neither snapshot, so the index-vs-disk leg is the only
+/// definition-side drift gate it has: a definition document whose disk bytes are no longer its
+/// indexed content maps the byte-converted def range onto stale symbol spans, and the verdict is
+/// skipped as drifted. A definition document the checkout does not index has no spans to drift
+/// from, so its verdict still resolves external.
+#[test]
+fn prebuilt_scip_skips_a_verdict_whose_definition_document_drifted() {
+    enum Defs {
+        Pristine,
+        Drifted,
+        Unindexed,
+    }
+    // (verdict row; skipped_drifted; rows_written)
+    type Probe = (Option<(String, Option<i64>, String)>, u64, u64);
+    let build = |defs: Defs| -> Probe {
+        let h = Harness::new();
+        let caller = h.add_file("caller.rs", "fn caller() { target(); }\n");
+        let edge = h.add_edge(caller, "target", 14, 20, "NameOnly", None);
+        match defs {
+            Defs::Unindexed => {
+                std::fs::write(h.root().join("defs.rs"), "fn target() {}\n").unwrap();
+            },
+            Defs::Pristine | Defs::Drifted => {
+                let file = h.add_file("defs.rs", "fn target() {}\n");
+                h.add_symbol(file, "target", 3, 9);
+                if matches!(defs, Defs::Drifted) {
+                    h.set_file_sha(
+                        file,
+                        "0000000000000000000000000000000000000000000000000000000000000000",
+                    );
+                }
+            },
+        }
+
+        let sym = "scip-rust crate v1 `target`().";
+        let mut index = Index {
+            documents: vec![Document {
+                relative_path: "caller.rs".to_string(),
+                occurrences: vec![occurrence(
+                    0,
+                    14,
+                    20,
+                    sym,
+                    SymbolRole::UnspecifiedSymbolRole as i32,
+                )],
+                position_encoding: EnumOrUnknown::new(
+                    PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+                ),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        index.documents.push(Document {
+            relative_path: "defs.rs".to_string(),
+            occurrences: vec![occurrence(0, 3, 9, sym, SymbolRole::Definition as i32)],
+            position_encoding: EnumOrUnknown::new(
+                PositionEncoding::UTF8CodeUnitOffsetFromLineStart,
+            ),
+            ..Default::default()
+        });
+        let bytes = index.write_to_bytes().unwrap();
+
+        let report =
+            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        (h.verdict(edge), report.skipped_drifted, report.rows_written)
+    };
+
+    let (verdict, skipped, written) = build(Defs::Pristine);
+    let (kind, resolved, _) = verdict.expect("an undrifted definition is verdicted");
+    assert_eq!(kind, OracleResolutionKind::Upgrade.as_db_str());
+    assert!(resolved.is_some(), "the def maps onto its indexed symbol");
+    assert_eq!((skipped, written), (0, 1));
+
+    let (verdict, skipped, written) = build(Defs::Drifted);
+    assert!(
+        verdict.is_none(),
+        "a def document whose disk bytes are not its indexed content must NOT be verdicted"
+    );
+    assert_eq!(skipped, 1, "the drifted-def candidate is tallied in skipped_drifted");
+    assert_eq!(written, 0);
+
+    let (verdict, skipped, written) = build(Defs::Unindexed);
+    let (kind, resolved, _) = verdict.expect("a def in an unindexed file is still verdicted");
+    assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
+    assert_eq!(resolved, None, "an unindexed def maps to no symbol");
+    assert_eq!((skipped, written), (0, 1));
+}
+
 /// Finding 3: a run recorded for ANOTHER worktree (same tool/version/commit) does NOT surface as
 /// this checkout's last run. `oracle_runs` now carries `worktree_id` and `last_run_meta` filters on
 /// it, so the status read describes only the active checkout — consistent with its worktree-scoped

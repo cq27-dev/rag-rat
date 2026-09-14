@@ -374,10 +374,24 @@ impl DriftGates<'_> {
         true
     }
 
-    /// Whether a verdict's DEFINITION document is pinned: the production snapshot still matches
-    /// the disk bytes the def offsets were converted against, and the pre-spawn snapshot the
-    /// indexed sha the def maps onto.
+    /// Whether a verdict's DEFINITION document is pinned: an indexed def document's disk bytes
+    /// are still its indexed content, the production snapshot still matches the disk bytes the
+    /// def offsets were converted against, and the pre-spawn snapshot the indexed sha the def
+    /// maps onto.
     fn definition_is_pinned(&self, def_path: &str) -> bool {
+        // Index-vs-disk gate, DEFINITION side: the def occurrence's offsets were converted against
+        // the def file's disk bytes and are then mapped onto its INDEXED symbol spans, so the two
+        // must describe the same content — the check the moniker pass and the live pass make on
+        // the same documents. It is the only def-side gate a pre-built `--scip` has (both
+        // snapshots are `None` there). A def document this checkout does not index maps onto no
+        // spans at all (the verdict is external), so there is no indexed coordinate space for it
+        // to drift from.
+        if let Some(indexed) = self.indexed_shas.get(def_path)
+            && self.disk(def_path) != Some(indexed.as_str())
+        {
+            return false;
+        }
+
         // scip-vs-disk gate, DEFINITION side (#82 TOCTOU, def-document variant). The call-site gate
         // above only pins the document the occurrence lives in. But an in-corpus verdict also
         // depends on the DEFINITION document: the resolved symbol comes from converting the `.scip`
