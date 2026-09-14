@@ -47,12 +47,14 @@ fn classify_chunk(
     max_embedding_chars: usize,
 ) -> EmbeddingPolicyDecision {
     embedding_policy_for_chunk(
-        std::path::Path::new(path),
-        language,
-        file_kind,
-        &chunk.chunk_kind,
-        chunk.symbol_path.as_deref(),
-        &chunk.text,
+        &ChunkPolicyInput {
+            path: std::path::Path::new(path),
+            language,
+            file_kind,
+            chunk_kind: &chunk.chunk_kind,
+            symbol_path: chunk.symbol_path.as_deref(),
+            text: &chunk.text,
+        },
         max_embedding_chars,
         low_signal,
     )
@@ -76,11 +78,14 @@ fn classify_collected_file(
     // per-chunk path which parsed lazily at the low-signal gate.
     let needs_low_signal = chunks.iter().any(|chunk| {
         cheap_skip_policy(
-            std::path::Path::new(path),
-            language,
-            file_kind,
-            &chunk.chunk_kind,
-            chunk.symbol_path.as_deref(),
+            &ChunkPolicyInput {
+                path: std::path::Path::new(path),
+                language,
+                file_kind,
+                chunk_kind: &chunk.chunk_kind,
+                symbol_path: chunk.symbol_path.as_deref(),
+                text: chunk.text.trim(),
+            },
             chunk.text.trim(),
             max_embedding_chars,
         )

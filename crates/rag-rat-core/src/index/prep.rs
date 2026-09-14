@@ -76,12 +76,14 @@ pub(crate) fn prepare_chunks(
                 None => ai::LowSignalCheck::FromText,
             };
             let embedding = ai::embedding_policy_for_chunk(
-                path,
-                language,
-                file_kind,
-                chunk.kind.as_db_str(),
-                chunk.symbol_path.as_deref(),
-                &chunk.text,
+                &ai::ChunkPolicyInput {
+                    path,
+                    language,
+                    file_kind,
+                    chunk_kind: chunk.kind.as_db_str(),
+                    symbol_path: chunk.symbol_path.as_deref(),
+                    text: &chunk.text,
+                },
                 ai::DEFAULT_MAX_EMBEDDING_CHARS,
                 low_signal,
             );

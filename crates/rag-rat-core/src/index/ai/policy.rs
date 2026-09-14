@@ -1,4 +1,7 @@
+use rag_rat_base::config::TargetKind;
+
 use super::*;
+use crate::index::chunker::ChunkKind;
 use crate::index::edges::named_children;
 
 /// Persisted policy tokens. Unknown values remain opaque and ineligible on a certified scan.
@@ -152,14 +155,11 @@ impl LowSignalCheck<'_> {
 /// that needs a tree-sitter parse. A caller that shares one parse across a file's chunks uses this
 /// to skip the parse entirely when no chunk reaches the low-signal gate.
 pub(crate) fn cheap_skip_policy(
-    path: &Path,
-    language: &str,
-    file_kind: &str,
-    chunk_kind: &str,
-    symbol_path: Option<&str>,
+    input: &ChunkPolicyInput<'_>,
     trimmed: &str,
     max_embedding_chars: usize,
 ) -> Option<EmbeddingPolicyDecision> {
+    let ChunkPolicyInput { path, language, file_kind, chunk_kind, symbol_path, .. } = *input;
     // Use the SAME normalization the stored `files.path` uses (`paths::path_string`), so this
     // index-time stamp classifies generated/fixture paths byte-identically to the reconcile
     // recompute — which reads `files.path`. The raw `relative_path` is OS-native (`\` on Windows),
@@ -167,11 +167,16 @@ pub(crate) fn cheap_skip_policy(
     // keeps it in lockstep with storage on every platform.
     let path_text = rag_rat_base::paths::path_string(path);
     if trimmed.chars().count() > max_embedding_chars.saturating_mul(4)
-        && (file_kind == "generated" || chunk_kind == "generated" || symbol_path.is_none())
+        && (file_kind == TargetKind::Generated.as_db_str()
+            || chunk_kind == ChunkKind::Generated.as_db_str()
+            || symbol_path.is_none())
     {
         return Some(policy(EmbeddingPolicy::SkipTooLarge, 9, false));
     }
-    if file_kind == "generated" || chunk_kind == "generated" || looks_generated_path(&path_text) {
+    if file_kind == TargetKind::Generated.as_db_str()
+        || chunk_kind == ChunkKind::Generated.as_db_str()
+        || looks_generated_path(&path_text)
+    {
         return Some(policy(EmbeddingPolicy::SkipGenerated, 9, false));
     }
     if is_test_fixture_path(&path_text) {
@@ -186,27 +191,24 @@ pub(crate) fn cheap_skip_policy(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Raw kind tokens preserve legacy classifier behavior, including unknown and noncanonical values.
+pub(crate) struct ChunkPolicyInput<'a> {
+    pub path: &'a Path,
+    pub language: &'a str,
+    pub file_kind: &'a str,
+    pub chunk_kind: &'a str,
+    pub symbol_path: Option<&'a str>,
+    pub text: &'a str,
+}
+
 pub(crate) fn embedding_policy_for_chunk(
-    path: &Path,
-    language: &str,
-    file_kind: &str,
-    chunk_kind: &str,
-    symbol_path: Option<&str>,
-    text: &str,
+    input: &ChunkPolicyInput<'_>,
     max_embedding_chars: usize,
     low_signal: LowSignalCheck<'_>,
 ) -> EmbeddingPolicyDecision {
+    let ChunkPolicyInput { path, language, chunk_kind, symbol_path, text, .. } = *input;
     let trimmed = text.trim();
-    if let Some(skip) = cheap_skip_policy(
-        path,
-        language,
-        file_kind,
-        chunk_kind,
-        symbol_path,
-        trimmed,
-        max_embedding_chars,
-    ) {
+    if let Some(skip) = cheap_skip_policy(input, trimmed, max_embedding_chars) {
         return skip;
     }
     if low_signal.is_low_signal(language, chunk_kind, symbol_path, trimmed) {
@@ -237,12 +239,14 @@ pub(crate) fn policy_for_job(
     #[cfg(test)]
     POLICY_FROMTEXT_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
     embedding_policy_for_chunk(
-        Path::new(&chunk.path),
-        &chunk.language,
-        &chunk.file_kind,
-        &chunk.chunk_kind,
-        chunk.symbol_path.as_deref(),
-        &chunk.text,
+        &crate::index::ai::ChunkPolicyInput {
+            path: Path::new(&chunk.path),
+            language: &chunk.language,
+            file_kind: &chunk.file_kind,
+            chunk_kind: &chunk.chunk_kind,
+            symbol_path: chunk.symbol_path.as_deref(),
+            text: &chunk.text,
+        },
         max_embedding_chars,
         LowSignalCheck::FromText,
     )
@@ -579,11 +583,14 @@ mod backslash_path_tests {
     #[test]
     fn a_literal_backslash_in_a_unix_file_name_is_not_a_generated_directory() {
         let decision = super::cheap_skip_policy(
-            Path::new("pkg/target\\a.rs"),
-            "rust",
-            "source",
-            "code",
-            Some("s"),
+            &crate::index::ai::ChunkPolicyInput {
+                path: Path::new("pkg/target\\a.rs"),
+                language: "rust",
+                file_kind: "source",
+                chunk_kind: "code",
+                symbol_path: Some("s"),
+                text: SRC,
+            },
             SRC,
             4000,
         );
@@ -594,13 +601,16 @@ mod backslash_path_tests {
         // The same segment spelled as a real directory still classifies as generated.
         assert_eq!(
             super::cheap_skip_policy(
-                Path::new("pkg/target/a.rs"),
-                "rust",
-                "source",
-                "code",
-                Some("s"),
+                &crate::index::ai::ChunkPolicyInput {
+                    path: Path::new("pkg/target/a.rs"),
+                    language: "rust",
+                    file_kind: "source",
+                    chunk_kind: "code",
+                    symbol_path: Some("s"),
+                    text: SRC
+                },
                 SRC,
-                4000,
+                4000
             )
             .map(|decision| decision.policy),
             Some(super::EmbeddingPolicy::SkipGenerated),
@@ -773,12 +783,14 @@ mod policy_version_tests {
         ];
         for (label, path, lang, fk, ck, sp, text, cap) in text_cases {
             let d = embedding_policy_for_chunk(
-                Path::new(path),
-                lang,
-                fk,
-                ck,
-                *sp,
-                text,
+                &crate::index::ai::ChunkPolicyInput {
+                    path: Path::new(path),
+                    language: lang,
+                    file_kind: fk,
+                    chunk_kind: ck,
+                    symbol_path: *sp,
+                    text,
+                },
                 *cap,
                 LowSignalCheck::FromText,
             );
@@ -834,12 +846,14 @@ mod policy_version_tests {
         for (path, lang, text) in path_cases {
             // A path gate fires before the low-signal check, so the cap is immaterial here.
             let d = embedding_policy_for_chunk(
-                Path::new(path),
-                lang,
-                "source",
-                "code",
-                Some("s"),
-                text,
+                &crate::index::ai::ChunkPolicyInput {
+                    path: Path::new(path),
+                    language: lang,
+                    file_kind: "source",
+                    chunk_kind: "code",
+                    symbol_path: Some("s"),
+                    text,
+                },
                 4000,
                 LowSignalCheck::FromText,
             );
@@ -922,12 +936,14 @@ mod policy_version_tests {
             let pf = crate::index::parser::parse_file(Path::new(path), *language, plumbing)
                 .expect("plumbing parses");
             let d = embedding_policy_for_chunk(
-                Path::new(path),
-                &language.to_string(),
-                "source",
-                "code",
-                Some("s"),
-                plumbing,
+                &crate::index::ai::ChunkPolicyInput {
+                    path: Path::new(path),
+                    language: &language.to_string(),
+                    file_kind: "source",
+                    chunk_kind: "code",
+                    symbol_path: Some("s"),
+                    text: plumbing,
+                },
                 4000,
                 LowSignalCheck::FromSpan {
                     language: *language,
@@ -941,12 +957,14 @@ mod policy_version_tests {
             let df = crate::index::parser::parse_file(Path::new(path), *language, def)
                 .expect("def parses");
             let d = embedding_policy_for_chunk(
-                Path::new(path),
-                &language.to_string(),
-                "source",
-                "code",
-                Some("s"),
-                def,
+                &crate::index::ai::ChunkPolicyInput {
+                    path: Path::new(path),
+                    language: &language.to_string(),
+                    file_kind: "source",
+                    chunk_kind: "code",
+                    symbol_path: Some("s"),
+                    text: def,
+                },
                 4000,
                 LowSignalCheck::FromSpan {
                     language: *language,
@@ -1046,5 +1064,43 @@ mod policy_token_tests {
         assert!(!policy.is_eligible());
         assert_eq!(policy.as_db_str(), "FuturePolicy");
         assert_eq!(serde_json::to_value(policy).unwrap(), "FuturePolicy");
+    }
+}
+
+#[cfg(test)]
+mod policy_input_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_and_noncanonical_kind_tokens_keep_legacy_classification() {
+        let text = "fn a() { let value = compute(input); let other = process(value); \
+                    combine(value, other) }";
+        for (file_kind, chunk_kind) in
+            [("future", "future"), ("Generated", "Code"), (" generated ", " code ")]
+        {
+            let input = ChunkPolicyInput {
+                path: Path::new("src/a.rs"),
+                language: "rust",
+                file_kind,
+                chunk_kind,
+                symbol_path: Some("a"),
+                text,
+            };
+            assert!(cheap_skip_policy(&input, text, DEFAULT_MAX_EMBEDDING_CHARS).is_none());
+        }
+        for (file_kind, chunk_kind) in [("generated", "future"), ("future", "generated")] {
+            let input = ChunkPolicyInput {
+                path: Path::new("src/a.rs"),
+                language: "rust",
+                file_kind,
+                chunk_kind,
+                symbol_path: Some("a"),
+                text,
+            };
+            assert_eq!(
+                cheap_skip_policy(&input, text, DEFAULT_MAX_EMBEDDING_CHARS).unwrap().policy,
+                EmbeddingPolicy::SkipGenerated
+            );
+        }
     }
 }
