@@ -4,7 +4,7 @@ use rag_rat_db::EdgeConfidence;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::graph::RESOLVED_OPERATOR_ONLY;
+use crate::graph::{self, RESOLVED_OPERATOR_ONLY};
 use crate::{ReadChunk, SearchHit};
 
 const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler-resolved.";
@@ -415,11 +415,12 @@ fn callers(
                 span: [source_start_line, source_end_line],
             },
             edge_kind: row.get(4)?,
-            confidence: confidence(row.get::<_, String>(5)?.as_str()).to_string(),
+            confidence: graph::normalize_confidence(row.get::<_, String>(5)?.as_str()).to_string(),
         })
     })?;
     let mut seen = BTreeSet::new();
-    let mut callers = collect_rows(rows)?
+    let mut callers = rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .filter(|caller| seen.insert((caller.symbol_path.clone(), caller.edge_kind.clone())))
         .collect::<Vec<_>>();
@@ -486,11 +487,12 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
                 span: [callsite_start_line, callsite_end_line],
             },
             edge_kind: row.get(7)?,
-            confidence: confidence(row.get::<_, String>(8)?.as_str()).to_string(),
+            confidence: graph::normalize_confidence(row.get::<_, String>(8)?.as_str()).to_string(),
         })
     })?;
     let mut seen = BTreeSet::new();
-    let mut callees = collect_rows(rows)?
+    let mut callees = rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .filter(|callee| {
             seen.insert((
@@ -520,10 +522,10 @@ fn imports(conn: &Connection, chunk_id: i64, limit: u32) -> anyhow::Result<Vec<I
     let rows = stmt.query_map(params![chunk_id, i64::from(limit)], |row| {
         Ok(ImportEvidence {
             target: row.get(0)?,
-            confidence: confidence(row.get::<_, String>(1)?.as_str()).to_string(),
+            confidence: graph::normalize_confidence(row.get::<_, String>(1)?.as_str()).to_string(),
         })
     })?;
-    collect_rows(rows)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn referenced_types(
@@ -547,10 +549,10 @@ fn referenced_types(
     let rows = stmt.query_map(params![symbol_id, i64::from(limit)], |row| {
         Ok(TypeEvidence {
             name: row.get(0)?,
-            confidence: confidence(row.get::<_, String>(1)?.as_str()).to_string(),
+            confidence: graph::normalize_confidence(row.get::<_, String>(1)?.as_str()).to_string(),
         })
     })?;
-    collect_rows(rows)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 fn symbol_path(path: &str, qualified_name: &str) -> String {
@@ -558,10 +560,6 @@ fn symbol_path(path: &str, qualified_name: &str) -> String {
         return qualified_name.to_string();
     }
     format!("{path}::{qualified_name}")
-}
-
-fn confidence(value: &str) -> &'static str {
-    crate::graph::normalize_confidence(value)
 }
 
 fn quoted(values: &[&str]) -> String {
@@ -574,16 +572,6 @@ fn expanded_limit(limit: u32) -> i64 {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-fn collect_rows<T>(
-    rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
-) -> anyhow::Result<Vec<T>> {
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

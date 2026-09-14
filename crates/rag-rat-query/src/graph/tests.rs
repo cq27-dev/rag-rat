@@ -11,6 +11,7 @@ use rag_rat_core::index::install_scope_view;
 use rag_rat_db::schema;
 use rusqlite::{Connection, params};
 
+use super::predicates::is_qualified_symbol;
 use super::*;
 
 const COMMIT: &str = "c0ffee";
