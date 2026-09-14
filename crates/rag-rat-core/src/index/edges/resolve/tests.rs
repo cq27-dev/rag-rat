@@ -215,7 +215,7 @@ fn add_symbol_kind_language(
         "INSERT INTO symbols(file_id, language, name, qualified_name_id, kind, start_byte, \
          end_byte, start_line, end_line)
          VALUES (?1, ?2, ?3, (SELECT id FROM name_strings WHERE value = ?4), ?5, 0, 10, 1, 1)",
-        params![file_id, language.as_str(), name, qualified, kind],
+        params![file_id, language.as_db_str(), name, qualified, kind],
     )
     .unwrap();
     conn.last_insert_rowid()
@@ -244,7 +244,7 @@ fn preferred_candidate(id: i64, language: Language, kind: &str) -> IndexedSymbol
     IndexedSymbol {
         id,
         file_id: id,
-        language: language.as_str().to_string(),
+        language: language.as_db_str().to_string(),
         name: "Target".to_string(),
         qualified_name: format!("target-{id}::Target"),
         scope_path: "Target".to_string(),
@@ -270,22 +270,23 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
     let foreign_function = preferred_candidate(10, Language::Rust, "function");
     let swift_constructor = preferred_candidate(11, Language::Swift, "constructor");
 
-    let implements = preferred_matches(EdgeKind::Implements, Some(Language::Swift.as_str()), &[
+    let implements = preferred_matches(EdgeKind::Implements, Some(Language::Swift.as_db_str()), &[
         &foreign_trait,
         &protocol,
     ]);
     assert_eq!(implements.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![protocol.id]);
 
-    let inheritance = preferred_matches(EdgeKind::Implements, Some(Language::Swift.as_str()), &[
-        &foreign_trait,
-        &swift_class,
-    ]);
+    let inheritance =
+        preferred_matches(EdgeKind::Implements, Some(Language::Swift.as_db_str()), &[
+            &foreign_trait,
+            &swift_class,
+        ]);
     assert_eq!(inheritance.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![
         swift_class.id
     ]);
 
     let protocol_reference =
-        preferred_matches(EdgeKind::ReferencesType, Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::ReferencesType, Some(Language::Swift.as_db_str()), &[
             &foreign_trait,
             &protocol,
         ]);
@@ -294,7 +295,7 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
     ]);
 
     for edge_kind in [EdgeKind::Constructs, EdgeKind::ReferencesType] {
-        let preferred = preferred_matches(edge_kind, Some(Language::Swift.as_str()), &[
+        let preferred = preferred_matches(edge_kind, Some(Language::Swift.as_db_str()), &[
             &foreign_struct,
             &actor,
         ]);
@@ -305,14 +306,14 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
         );
     }
 
-    let macro_use = preferred_matches(EdgeKind::UsesMacro, Some(Language::Swift.as_str()), &[
+    let macro_use = preferred_matches(EdgeKind::UsesMacro, Some(Language::Swift.as_db_str()), &[
         &foreign_macro,
         &swift_macro,
     ]);
     assert_eq!(macro_use.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![swift_macro.id]);
 
     let enum_construction =
-        preferred_matches(EdgeKind::Constructs, Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::Constructs, Some(Language::Swift.as_db_str()), &[
             &foreign_struct,
             &swift_enum,
         ]);
@@ -320,14 +321,14 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
         swift_enum.id
     ]);
 
-    let call = preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_str()), &[
+    let call = preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_db_str()), &[
         &foreign_function,
         &swift_method,
     ]);
     assert_eq!(call.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![swift_method.id]);
 
     let initializer_call =
-        preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_db_str()), &[
             &foreign_function,
             &swift_constructor,
         ]);
@@ -336,19 +337,21 @@ fn swift_type_edges_prefer_swift_protocols_and_actors_over_foreign_types() {
     ]);
 
     assert!(
-        preferred_matches(EdgeKind::ReferencesType, Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::ReferencesType, Some(Language::Swift.as_db_str()), &[
             &foreign_struct
         ],)
         .is_empty(),
         "Swift type names without a Swift target must not prefer a foreign symbol"
     );
     assert!(
-        preferred_matches(EdgeKind::UsesMacro, Some(Language::Swift.as_str()), &[&foreign_macro],)
-            .is_empty(),
+        preferred_matches(EdgeKind::UsesMacro, Some(Language::Swift.as_db_str()), &[
+            &foreign_macro
+        ],)
+        .is_empty(),
         "Swift macro names without a Swift target must not prefer a foreign macro"
     );
     assert!(
-        preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_str()), &[
+        preferred_matches(EdgeKind::CallsName, Some(Language::Swift.as_db_str()), &[
             &foreign_function
         ],)
         .is_empty(),
@@ -364,14 +367,14 @@ fn generic_resolution_does_not_prefer_swift_only_symbol_kinds() {
     let rust_struct = preferred_candidate(4, Language::Rust, "struct");
 
     let implements =
-        preferred_matches(EdgeKind::Implements, Some(Language::TypeScript.as_str()), &[
+        preferred_matches(EdgeKind::Implements, Some(Language::TypeScript.as_db_str()), &[
             &swift_protocol,
             &rust_trait,
         ]);
     assert_eq!(implements.iter().map(|symbol| symbol.id).collect::<Vec<_>>(), vec![rust_trait.id]);
 
     for edge_kind in [EdgeKind::Constructs, EdgeKind::ReferencesType] {
-        let preferred = preferred_matches(edge_kind, Some(Language::TypeScript.as_str()), &[
+        let preferred = preferred_matches(edge_kind, Some(Language::TypeScript.as_db_str()), &[
             &swift_actor,
             &rust_struct,
         ]);
@@ -720,7 +723,7 @@ fn swift_local_receivers_override_external_bare_name_suppression() {
                 receiver_hint: Some(receiver),
                 receiver_type: None,
                 source_file_id: 1,
-                source_language: Some(Language::Swift.as_str()),
+                source_language: Some(Language::Swift.as_db_str()),
                 imported_external: true,
                 receiver_package: None,
                 file_package: no_packages(),
@@ -752,7 +755,7 @@ fn external_receiver_type_hint_never_binds_locally() {
         receiver_hint: Some("w"),
         receiver_type: Some(receiver_type),
         source_file_id: 1,
-        source_language: Some(Language::Rust.as_str()),
+        source_language: Some(Language::Rust.as_db_str()),
         imported_external: false,
         receiver_package: None,
         file_package: no_packages(),
@@ -968,7 +971,7 @@ fn bare_root_receiver_does_not_suffix_match_nested_owner() {
             receiver_hint: Some("w"),
             receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
             source_file_id: 1,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1005,7 +1008,7 @@ fn a_bare_receiver_owner_does_not_cross_a_package_boundary() {
         receiver_hint: Some("w"),
         receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
         source_file_id: 1,
-        source_language: Some(Language::Rust.as_str()),
+        source_language: Some(Language::Rust.as_db_str()),
         imported_external: false,
         receiver_package,
         file_package: &packages,
@@ -1062,7 +1065,7 @@ fn a_nonlocal_receiver_identity_closes_the_bare_name_fallback() {
         receiver_hint: Some("w"),
         receiver_type,
         source_file_id: 1,
-        source_language: Some(Language::Rust.as_str()),
+        source_language: Some(Language::Rust.as_db_str()),
         imported_external: false,
         receiver_package: None,
         file_package: no_packages(),
@@ -1114,7 +1117,7 @@ fn typed_self_receiver_keeps_trait_default_qualified_resolution() {
             receiver_hint: Some("self"),
             receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
             source_file_id: 1,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1136,7 +1139,7 @@ fn typed_self_receiver_keeps_trait_default_qualified_resolution() {
                 receiver_hint: Some("self"),
                 receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
                 source_file_id: 1,
-                source_language: Some(Language::Rust.as_str()),
+                source_language: Some(Language::Rust.as_db_str()),
                 imported_external: false,
                 receiver_package: None,
                 file_package: no_packages(),
@@ -1183,7 +1186,7 @@ fn typed_local_receiver_reaches_only_compatible_trait_default() {
             receiver_hint: Some("w"),
             receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker<u8>")),
             source_file_id: 1,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1211,7 +1214,7 @@ fn normalized_receiver_fallback_rejects_different_concrete_arguments() {
         receiver_hint: Some("value"),
         receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Foo<u8>")),
         source_file_id: 9,
-        source_language: Some(Language::Rust.as_str()),
+        source_language: Some(Language::Rust.as_db_str()),
         imported_external: false,
         receiver_package: None,
         file_package: no_packages(),
@@ -1251,7 +1254,7 @@ fn nested_trait_default_accepts_an_explicit_same_package_impl_identity() {
             receiver_hint: Some("worker"),
             receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
             source_file_id: 9,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: Some(10),
             file_package: &packages,
@@ -1288,7 +1291,7 @@ fn same_named_trait_in_another_package_cannot_prove_a_default() {
                 receiver_hint: Some("worker"),
                 receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
                 source_file_id: 30,
-                source_language: Some(Language::Rust.as_str()),
+                source_language: Some(Language::Rust.as_db_str()),
                 imported_external: false,
                 receiver_package: Some(1),
                 file_package: &packages,
@@ -1318,7 +1321,7 @@ fn unproven_imported_and_blanket_trait_defaults_fail_closed() {
         receiver_hint: Some("worker"),
         receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
         source_file_id: 9,
-        source_language: Some(Language::Rust.as_str()),
+        source_language: Some(Language::Rust.as_db_str()),
         imported_external: false,
         receiver_package: Some(10),
         file_package: &packages,
@@ -1372,7 +1375,7 @@ fn rust_receiver_fallback_rejects_unjustified_owners() {
         receiver_hint: Some(receiver),
         receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
         source_file_id: 10,
-        source_language: Some(Language::Rust.as_str()),
+        source_language: Some(Language::Rust.as_db_str()),
         imported_external: false,
         receiver_package: None,
         file_package: no_packages(),
@@ -1418,7 +1421,7 @@ fn an_untyped_rust_value_receiver_never_uses_bare_name_fallback() {
         receiver_hint,
         receiver_type: None,
         source_file_id: 1,
-        source_language: Some(Language::Rust.as_str()),
+        source_language: Some(Language::Rust.as_db_str()),
         imported_external: false,
         receiver_package: None,
         file_package: no_packages(),
@@ -1449,7 +1452,7 @@ fn projected_self_path_never_falls_back_to_the_impl_owner() {
             receiver_hint: Some("Self"),
             receiver_type: None,
             source_file_id: 1,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1477,7 +1480,7 @@ fn cpp_operator_scopes_are_never_rust_degenericized() {
             receiver_hint: None,
             receiver_type: None,
             source_file_id: 1,
-            source_language: Some(Language::Cpp.as_str()),
+            source_language: Some(Language::Cpp.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1563,7 +1566,7 @@ fn two_trait_impls_on_one_type_decline_receiver_resolution() {
             receiver_hint: Some("worker"),
             receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
             source_file_id: 1,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1589,7 +1592,7 @@ fn two_trait_impls_on_one_type_decline_receiver_resolution() {
             receiver_hint: Some("worker"),
             receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("Worker")),
             source_file_id: 1,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1636,7 +1639,7 @@ fn a_written_path_binds_the_impl_whose_owner_it_spells() {
             receiver_hint: None,
             receiver_type: None,
             source_file_id: 1,
-            source_language: Some(Language::Rust.as_str()),
+            source_language: Some(Language::Rust.as_db_str()),
             imported_external: false,
             receiver_package: None,
             file_package: no_packages(),
@@ -1673,7 +1676,7 @@ fn an_autoref_receiver_hint_stays_ambiguous_across_pointer_shapes() {
                 receiver_hint: Some("w"),
                 receiver_type: Some(ReceiverTypeIdentity::LocalUnqualified("W")),
                 source_file_id: 1,
-                source_language: Some(Language::Rust.as_str()),
+                source_language: Some(Language::Rust.as_db_str()),
                 imported_external: false,
                 receiver_package: None,
                 file_package: no_packages(),
@@ -1943,7 +1946,7 @@ fn add_symbol_scope_language(
         "INSERT INTO symbols(file_id, language, name, qualified_name_id, scope_path, kind, \
          start_byte, end_byte, start_line, end_line)
          VALUES (?1, ?2, ?3, (SELECT id FROM name_strings WHERE value = ?4), ?5, ?6, 0, 10, 1, 1)",
-        params![file_id, language.as_str(), name, qualified, scope_path, kind],
+        params![file_id, language.as_db_str(), name, qualified, scope_path, kind],
     )
     .unwrap();
     conn.last_insert_rowid()

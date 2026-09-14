@@ -27,7 +27,7 @@ pub struct ToolManifest {
     ///
     /// The SAME encoding `LiveBackend::languages` and `ResolvedTarget.language` use. It was once a
     /// list of lowercase registry tokens, which meant every consumer round-tripped through
-    /// `Language::as_str()` and a test had to reconcile the two spellings.
+    /// `Language::as_db_str()` and a test had to reconcile the two spellings.
     pub languages: &'static [Language],
     /// A one-line install hint surfaced when the tool is absent (the `Blocked` UX).
     pub install_hint: &'static str,

@@ -11,7 +11,7 @@ pub(crate) fn dump_config(config: &Config) -> anyhow::Result<()> {
         .map(|target| {
             serde_json::json!({
                 "name": target.name,
-                "language": target.language.as_str(),
+                "language": target.language.as_db_str(),
                 "directories": target.directories,
                 "include": target.include,
                 "exclude": target.exclude,

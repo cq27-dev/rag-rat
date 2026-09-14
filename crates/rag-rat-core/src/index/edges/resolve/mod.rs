@@ -1304,7 +1304,7 @@ impl<'r, 'a> Resolution<'r, 'a> {
         if !matches.is_empty() {
             return ControlFlow::Break(None);
         }
-        let projected_self = request.source_language == Some(Language::Rust.as_str())
+        let projected_self = request.source_language == Some(Language::Rust.as_db_str())
             && request.receiver_hint == Some("Self")
             && {
                 let segments = scope_grammar::segments(qualified);
@@ -1346,7 +1346,7 @@ impl<'r, 'a> Resolution<'r, 'a> {
         // indexed `impl Trait for Owner`; receiver spelling alone is not evidence. In particular,
         // derives mint no impl symbol, so `self.clone()` cannot claim an unrelated workspace
         // `clone`.
-        let rust_receiver_fallback = request.source_language == Some(Language::Rust.as_str())
+        let rust_receiver_fallback = request.source_language == Some(Language::Rust.as_db_str())
             && (has_local_receiver_type || matches!(request.receiver_hint, Some("self" | "Self")));
         // ANY receiver-type identity closes this door, not only a local one. An `ExternalQualified`
         // receiver proves the owner is a dependency's, so no local symbol can be the answer — that
@@ -1518,8 +1518,8 @@ fn receiver_type_admits_owner(
 }
 
 fn receiver_owners_match(receiver_owner: &str, candidate_owner: &str) -> bool {
-    receiver_scope_path(receiver_owner.trim(), Some(Language::Rust.as_str()))
-        == receiver_scope_path(candidate_owner.trim(), Some(Language::Rust.as_str()))
+    receiver_scope_path(receiver_owner.trim(), Some(Language::Rust.as_db_str()))
+        == receiver_scope_path(candidate_owner.trim(), Some(Language::Rust.as_db_str()))
 }
 
 /// External module files do not carry their module path in `scope_path`: a method in
@@ -1552,7 +1552,7 @@ fn receiver_implements_trait(
     index: &SymbolIndex<'_>,
 ) -> bool {
     let trait_marker = scope_grammar::segments(trait_owner).join(".");
-    let receiver_key = receiver_scope_path(receiver_owner, Some(Language::Rust.as_str()));
+    let receiver_key = receiver_scope_path(receiver_owner, Some(Language::Rust.as_db_str()));
     index
         .by_receiver_scope_path
         .get(receiver_key.as_ref())
@@ -1738,7 +1738,7 @@ pub(crate) fn preferred_matches<'a>(
         let same_language = preferred
             .iter()
             .copied()
-            .filter(|symbol| symbol.language == source_language.as_str())
+            .filter(|symbol| symbol.language == source_language.as_db_str())
             .collect::<Vec<_>>();
         if !same_language.is_empty() {
             return same_language;

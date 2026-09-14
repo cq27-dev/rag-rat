@@ -222,7 +222,7 @@ impl IndexDatabase {
             .query_row(
                 params![
                     path,
-                    file.language.as_str(),
+                    file.language.as_db_str(),
                     file.kind.as_db_str(),
                     prepared.sha256,
                     prepared.modified_at_ms,
@@ -523,7 +523,7 @@ impl IndexDatabase {
             )?
             .execute(params![
                 file_id,
-                language.as_str(),
+                language.as_db_str(),
                 symbol.name,
                 qualified_name_id,
                 symbol.scope_path,

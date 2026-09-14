@@ -178,7 +178,7 @@ impl IndexDatabase {
             }
             visited.insert(rel.clone());
             let branch_identity =
-                (file.language.as_str().to_string(), file.kind.as_db_str().to_string());
+                (file.language.as_db_str().to_string(), file.kind.as_db_str().to_string());
             if base_identity.get(&rel) == Some(&branch_identity) {
                 continue; // the base row already carries the branch identity → it shows through
             }

@@ -35,7 +35,7 @@ pub(crate) fn render_config(plan: &InitPlan) -> String {
     text.push_str("[target_bindings]\n");
     for language in &plan.languages {
         let dirs = plan.bindings.get(language).cloned().unwrap_or_default();
-        text.push_str(&format!("{} = [{}]\n", language.as_str(), quoted_paths(&dirs)));
+        text.push_str(&format!("{} = [{}]\n", language.as_db_str(), quoted_paths(&dirs)));
     }
     text.push('\n');
 

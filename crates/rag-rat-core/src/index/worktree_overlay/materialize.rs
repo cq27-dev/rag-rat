@@ -426,7 +426,7 @@ impl IndexDatabase {
             if existing.get(path_string(rel).as_str())
                 == Some(&(
                     hex_sha256(&bytes),
-                    language.as_str().to_string(),
+                    language.as_db_str().to_string(),
                     kind.as_db_str().to_string(),
                 ))
             {

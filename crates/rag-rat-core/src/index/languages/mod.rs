@@ -243,7 +243,7 @@ pub(super) fn target_matches_policy(
     else {
         return true;
     };
-    (!preference.same_language_only || target_language == source_language.as_str())
+    (!preference.same_language_only || target_language == source_language.as_db_str())
         && preference.symbol_kinds.contains(&target_kind)
 }
 

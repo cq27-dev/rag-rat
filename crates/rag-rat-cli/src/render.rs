@@ -230,7 +230,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
             eprintln!(
                 "index: preparing {current}/{total} ({percent:>3}%) [{}:{}] {}",
                 kind.as_db_str(),
-                language.as_str(),
+                language.as_db_str(),
                 path.display()
             );
         },
@@ -242,7 +242,7 @@ pub(crate) fn render_index_progress(progress: IndexProgress) {
             eprintln!(
                 "index: {current}/{total} ({percent:>3}%) [{}:{}] {}",
                 kind.as_db_str(),
-                language.as_str(),
+                language.as_db_str(),
                 path.display()
             );
         },

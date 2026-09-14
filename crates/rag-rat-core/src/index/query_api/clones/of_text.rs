@@ -515,7 +515,7 @@ fn check_against(
         return Ok(Vec::new());
     }
 
-    let lang = language.as_str();
+    let lang = language.as_db_str();
     // Through the shared seam, because `self_prefix` is compared against the indexed `path::name`
     // ref form, and that half is rendered by `paths::path_string`.
     let in_file = rag_rat_base::paths::path_string(path);

@@ -1329,7 +1329,7 @@ impl IndexDatabase {
                 && let Ok(content) = &prepared_file.prepared
                 && let Some(row) = &scope_row
                 && row.sha256 == content.sha256
-                && row.language == prepared_file.file.language.as_str()
+                && row.language == prepared_file.file.language.as_db_str()
                 && row.kind == prepared_file.file.kind.as_db_str()
             {
                 continue;

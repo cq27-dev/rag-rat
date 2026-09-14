@@ -324,7 +324,7 @@ pub(crate) struct WizardDraft {
     /// does not edit through `[target_bindings]`.
     pub has_rich_targets: bool,
     /// Names from preserved rich `[[target]]` blocks. Simple target bindings generate target
-    /// names from `Language::as_str()`, so the wizard must block collisions before writing.
+    /// names from `Language::as_db_str()`, so the wizard must block collisions before writing.
     pub rich_target_names: BTreeSet<String>,
     /// The embedding model selector (`[llm.embedding] model`).
     pub model: String,
@@ -493,7 +493,7 @@ impl WizardDraft {
     pub(crate) fn conflicting_rich_target_names(&self) -> Vec<String> {
         self.bindings
             .keys()
-            .map(|lang| lang.as_str())
+            .map(|lang| lang.as_db_str())
             .filter(|name| self.rich_target_names.contains(*name))
             .map(ToOwned::to_owned)
             .collect()
@@ -501,8 +501,8 @@ impl WizardDraft {
 
     /// Build an `InitPlan` from this draft — the bridge to `render_config`.
     ///
-    /// Language order follows the `BTreeMap` key order (alphabetical by `Language::as_str`), which
-    /// is stable and matches the insertion order the wizard and `from_scan` use.
+    /// Language order follows the `BTreeMap` key order (alphabetical by `Language::as_db_str`),
+    /// which is stable and matches the insertion order the wizard and `from_scan` use.
     pub(crate) fn to_init_plan(&self) -> InitPlan {
         let languages: Vec<Language> = self.bindings.keys().copied().collect();
         let backend =
@@ -560,7 +560,7 @@ impl WizardDraft {
                     // Remove any keys corresponding to languages we now own (to avoid stale
                     // entries).
                     for lang in Language::all() {
-                        table.remove(lang.as_str());
+                        table.remove(lang.as_db_str());
                     }
                     // Insert the current bindings.
                     for (lang, paths) in &self.bindings {
@@ -568,7 +568,7 @@ impl WizardDraft {
                         for path in paths {
                             arr.push(display_rel(path));
                         }
-                        table.insert(lang.as_str(), toml_edit::value(arr));
+                        table.insert(lang.as_db_str(), toml_edit::value(arr));
                     }
                 }
             }
@@ -907,7 +907,7 @@ fn raw_target_bindings(doc: &DocumentMut) -> Option<BTreeMap<Language, Vec<PathB
     let table = doc.get("target_bindings")?.as_table_like()?;
     let mut bindings = BTreeMap::new();
     for lang in Language::all() {
-        let Some(array) = table.get(lang.as_str()).and_then(Item::as_array) else {
+        let Some(array) = table.get(lang.as_db_str()).and_then(Item::as_array) else {
             continue;
         };
         let paths =
