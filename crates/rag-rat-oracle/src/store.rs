@@ -354,11 +354,7 @@ pub(crate) fn edge_join_candidates(
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     let mut stmt = conn.prepare(&edge_join_candidates_sql(""))?;
     let rows = stmt.query_map(params![commit_sha, worktree_id], map_edge_join_candidate)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The `files.sha256` of ONE indexed path in the active checkout, or `None` when the path isn't
@@ -411,13 +407,13 @@ pub(crate) fn live_covered_edges_for_path(
     source_path: &str,
     file_sha: &str,
     checkout: CheckoutRef<'_>,
-) -> anyhow::Result<std::collections::HashSet<LiveEdgeKey>> {
+) -> anyhow::Result<HashSet<LiveEdgeKey>> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     // Shared content-key rows are NOT usable continuation coverage until this checkout has a run
     // establishing the same tool version as current. Without this gate, a sibling's rows can make
     // a fresh checkout skip every request while surfacing rejects them for missing currency.
     if latest_run_tool_version(conn, tool, checkout)?.as_deref() != Some(tool_version) {
-        return Ok(std::collections::HashSet::new());
+        return Ok(HashSet::new());
     }
     let repo_clause = oracle_repo_scope_clause(conn, "edge_oracle")?;
     let def_current = edge_oracle_def_current_predicate("?5", "?6");
@@ -439,11 +435,7 @@ pub(crate) fn live_covered_edges_for_path(
             ))
         },
     )?;
-    let mut out = std::collections::HashSet::new();
-    for row in rows {
-        out.insert(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,11 +637,7 @@ fn edge_join_candidates_in_paths(
         params.push(path);
     }
     let rows = stmt.query_map(params.as_slice(), map_edge_join_candidate)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The SELECT both edge-join-candidate loaders run, with `extra` spliced in as additional `AND`
@@ -838,11 +826,7 @@ pub(crate) fn symbol_spans_for_path(
     let rows = stmt.query_map(params![path, commit_sha, worktree_id], |row| {
         Ok(SymbolSpan { symbol_id: row.get(0)?, start_byte: row.get(1)?, end_byte: row.get(2)? })
     })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The set of file paths rag-rat indexed in the active `(commit_sha, worktree_id)` checkout. Used
@@ -860,7 +844,7 @@ pub(crate) fn symbol_spans_for_path(
 pub(crate) fn indexed_paths_in_scope(
     conn: &Connection,
     checkout: CheckoutRef<'_>,
-) -> anyhow::Result<std::collections::HashSet<String>> {
+) -> anyhow::Result<HashSet<String>> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     // EXCLUDE tombstones: `mark_file_deleted` leaves a `kind='deleted'` row in `files` for a path
     // removed from the checkout (so incremental sync can detect the deletion). Its source is no
@@ -872,11 +856,7 @@ pub(crate) fn indexed_paths_in_scope(
         scope = active_checkout_file_predicate("?1", "?2"),
     ))?;
     let rows = stmt.query_map(params![commit_sha, worktree_id], |row| row.get::<_, String>(0))?;
-    let mut out = std::collections::HashSet::new();
-    for row in rows {
-        out.insert(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The `files.sha256` of every file indexed in the active `(commit_sha, worktree_id)` checkout,
@@ -887,7 +867,7 @@ pub(crate) fn indexed_paths_in_scope(
 pub(crate) fn indexed_file_shas_in_scope(
     conn: &Connection,
     checkout: CheckoutRef<'_>,
-) -> anyhow::Result<std::collections::HashMap<String, String>> {
+) -> anyhow::Result<HashMap<String, String>> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     let mut stmt = conn.prepare(&format!(
         "SELECT path, sha256 FROM files WHERE {scope} AND kind != 'deleted'",
@@ -896,12 +876,7 @@ pub(crate) fn indexed_file_shas_in_scope(
     let rows = stmt.query_map(params![commit_sha, worktree_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    let mut out = std::collections::HashMap::new();
-    for row in rows {
-        let (path, sha) = row?;
-        out.insert(path, sha);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The logical symbol a member symbol belongs to, if grouped. Local copy of the
@@ -1625,9 +1600,9 @@ pub(crate) fn current_oracle_verdicts_for_edges(
     tool_version: &str,
     checkout: CheckoutRef<'_>,
     edge_ids: &[i64],
-) -> anyhow::Result<std::collections::HashMap<i64, EdgeOracleVerdict>> {
+) -> anyhow::Result<HashMap<i64, EdgeOracleVerdict>> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
-    let mut out = std::collections::HashMap::new();
+    let mut out = HashMap::new();
     if edge_ids.is_empty() {
         return Ok(out);
     }
@@ -1704,7 +1679,7 @@ pub(crate) fn current_oracle_verdicts_all(
     tool: OracleTool,
     tool_version: &str,
     checkout: CheckoutRef<'_>,
-) -> anyhow::Result<std::collections::HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
+) -> anyhow::Result<HashMap<i64, (OracleResolutionKind, Option<i64>)>> {
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     // Re-project the LIVE edge id (#248): keyed by `edges.id` (the reindexed rowid the content join
     // resolves to), which is the id the importance ranker's heuristic traversal carries.
@@ -1721,7 +1696,7 @@ pub(crate) fn current_oracle_verdicts_all(
             let resolved_symbol_id: Option<i64> = row.get(2)?;
             Ok((edge_id, kind, resolved_symbol_id))
         })?;
-    let mut out = std::collections::HashMap::new();
+    let mut out = HashMap::new();
     for row in rows {
         let (edge_id, kind, resolved_symbol_id) = row?;
         let Some(kind) = OracleResolutionKind::from_db_str(&kind) else {
