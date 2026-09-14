@@ -330,7 +330,7 @@ fn register_repo_inner(
     // hold DIFFERENT repo ids by construction — so this is a DB-global lock like the schema lock,
     // following the same ordering rule (per-repo entry locks → global lock; the per-repo locks the
     // UPGRADE path takes while holding this are BOUNDED, so no cross-type cycle can hang — see
-    // `locks::registry_lock_path`). Bounded and reentrant; a timeout is a retryable refusal. A
+    // `locks::GlobalLock`). Bounded and reentrant; a timeout is a retryable refusal. A
     // pathless (in-memory) connection skips it — no cross-process writer can exist for it.
     let _registry_lock = acquire_registry_lock(conn, identity)?;
     // Read the registered set INSIDE the registry lock, so the decision below cannot race a

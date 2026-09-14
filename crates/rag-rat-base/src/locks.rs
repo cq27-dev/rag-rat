@@ -196,7 +196,7 @@ pub fn write_lock_path(database: &Path, repo_id: &str) -> PathBuf {
 /// Otherwise a lock keyed off `config.database` (a CLI entry lock) and a reentrant re-acquire keyed
 /// off the connection's own `conn.path()` rendering (the identity-upgrade path) miss each other and
 /// SELF-DEADLOCK on the same underlying flock until timeout — an aliased-path hang seen only where
-/// the OS aliases the temp root (macOS). Same rationale as [`election_lock_path`].
+/// the OS aliases the temp root (macOS). Same rationale as [`ListenerLock`].
 ///
 /// Canonicalizes the nearest EXISTING ancestor and re-appends the not-yet-created tail, so the key
 /// is stable whether or not the DB dir exists yet. A plain `parent.canonicalize()` would be
@@ -231,42 +231,66 @@ fn lock_dir(database: &Path) -> PathBuf {
     }
 }
 
-/// The GLOBAL schema-migration lock path, beside the DB (A6): ONE per database file, taken only by
-/// the open-time auto-migrate (the index lifecycle). A schema migration rewrites the SHARED
-/// migration ladder — every repo's tables — so it must serialize across ALL repos, unlike the
-/// per-repo [`write_lock_path`]. Keeping it separate means a repo's ordinary write is neither
-/// blocked by nor blocks an unrelated repo except during the brief migration itself.
+/// A GLOBAL lock beside the DB: ONE file per database, `rag-rat-<stem>.lock`, independent of repo
+/// and worktree — unlike the per-repo [`write_lock_path`] and [`FlightKind`] files.
+///
+/// GLOBAL-LOCK ORDERING RULE (every variant): a global lock is acquired while per-repo entry locks
+/// may already be held (per-repo → global), and any per-repo lock taken while a global lock is held
+/// (the upgrade path) must be BOUNDED — bounded edges self-break any cross-type cycle within their
+/// timeout, exactly like the canonical-order rule's out-of-order edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlobalLock {
+    /// Schema migration (A6), taken only by the open-time auto-migrate (the index lifecycle). A
+    /// schema migration rewrites the SHARED migration ladder — every repo's tables — so it must
+    /// serialize across ALL repos. Keeping it separate from the per-repo write lock means a repo's
+    /// ordinary write is neither blocked by nor blocks an unrelated repo except during the brief
+    /// migration itself.
+    Schema,
+    /// Repo registry (A7), taken by `register_repo` for its whole read-decide-write sequence.
+    /// Registration reads the registered-repo set, DECIDES (idempotent / upgrade / refuse / fresh),
+    /// then writes `repos`/`repo_roots` — two concurrent first-registrations on the shared global
+    /// DB would otherwise interleave between the read and the write (a `SQLITE_BUSY_SNAPSHOT` on
+    /// the deferred upgrade, or a `repos`-PK constraint on the same-id race). Per-repo write locks
+    /// cannot serialize this: the writers hold DIFFERENT repo ids by construction.
+    Registry,
+    /// Device-side p2p sync session (#483, phase D #406), held around each session. The per-device
+    /// ed25519 key doubles as the iroh NODE key — a machine-level identity — so two concurrent
+    /// sessions would announce the same node id from two live endpoints; this lock is what makes
+    /// the device key never live twice. Machine scope (per data-dir), NOT per repo or per worktree:
+    /// two repos' maintenance passes both wanting to sync contend here, and the loser warn-skips
+    /// (sync defers to its next pass — the op-log fold makes late convergence harmless). The
+    /// shared/remote-review transport (#217) reuses this same seam for its endpoint.
+    SyncSession,
+}
+
+impl GlobalLock {
+    fn stem(self) -> &'static str {
+        match self {
+            Self::Schema => "schema",
+            Self::Registry => "registry",
+            Self::SyncSession => "sync",
+        }
+    }
+
+    /// The lock file beside `database`.
+    pub fn path(self, database: &Path) -> PathBuf {
+        lock_dir(database).join(format!("rag-rat-{}.lock", self.stem()))
+    }
+}
+
+/// [`GlobalLock::Schema`]'s path.
 pub fn schema_lock_path(database: &Path) -> PathBuf {
-    lock_dir(database).join("rag-rat-schema.lock")
+    GlobalLock::Schema.path(database)
 }
 
-/// The GLOBAL repo-registry lock path, beside the DB (A7): ONE per database file, taken by
-/// `register_repo` for its whole read-decide-write sequence. Registration reads the registered-repo
-/// set, DECIDES (idempotent / upgrade / refuse / fresh), then writes `repos`/`repo_roots` — two
-/// concurrent first-registrations on the shared global DB would otherwise interleave between the
-/// read and the write (a `SQLITE_BUSY_SNAPSHOT` on the deferred upgrade, or a `repos`-PK constraint
-/// on the same-id race). Per-repo write locks cannot serialize this: the writers hold DIFFERENT
-/// repo ids by construction. GLOBAL-LOCK ORDERING RULE (shared with [`schema_lock_path`]): a global
-/// lock is acquired while per-repo entry locks may already be held (per-repo → global), and any
-/// per-repo lock taken while a global lock is held (the upgrade path) must be BOUNDED — bounded
-/// edges self-break any cross-type cycle within their timeout, exactly like the canonical-order
-/// rule's out-of-order edges.
+/// [`GlobalLock::Registry`]'s path.
 pub fn registry_lock_path(database: &Path) -> PathBuf {
-    lock_dir(database).join("rag-rat-registry.lock")
+    GlobalLock::Registry.path(database)
 }
 
-/// The GLOBAL sync-session lock path, beside the DB (#483): ONE per database file, held around
-/// each device-side p2p sync session (phase D, #406). The per-device ed25519 key doubles as the
-/// iroh NODE key — a machine-level identity — so two concurrent sessions would announce the same
-/// node id from two live endpoints; this lock is what makes the device key never live twice.
-/// Machine scope (per data-dir), NOT per repo or per worktree: two repos' maintenance passes both
-/// wanting to sync contend here, and the loser warn-skips (sync defers to its next pass — the
-/// op-log fold makes late convergence harmless). GLOBAL-LOCK ORDERING RULE (shared with
-/// [`schema_lock_path`] / [`registry_lock_path`]): acquired while per-repo entry locks may already
-/// be held (per-repo → global); any per-repo lock taken while it is held must be BOUNDED. The
-/// shared/remote-review transport (#217) reuses this same seam for its endpoint.
+/// [`GlobalLock::SyncSession`]'s path.
 pub fn sync_session_lock_path(database: &Path) -> PathBuf {
-    lock_dir(database).join("rag-rat-sync.lock")
+    GlobalLock::SyncSession.path(database)
 }
 
 /// A per-DB, PER-REPO lock file beside the database, `rag-rat-<stem>-<discriminator>.<suffix>`.
@@ -542,36 +566,67 @@ impl Drop for WriteLock {
 /// `sun_path` budget for Unix domain sockets (108 bytes on Linux, 104 on macOS) with headroom.
 pub const MAX_SOCKET_PATH_LEN: usize = 100;
 
-/// Stable per-worktree key: sha256 of the canonicalized root (see `election_lock_path` doc
-/// comment for why canonicalize-but-not-case-fold).
+/// Stable per-worktree key: sha256 of the canonicalized root (see [`ListenerLock`] for why
+/// canonicalize-but-not-case-fold).
 fn worktree_hash(worktree_root: &Path) -> String {
     let canonical = crate::paths::canonicalize_or_simplified(worktree_root);
     crate::hash::hex_lower(&Sha256::digest(canonical.to_string_lossy().as_bytes())[..16])
 }
 
-/// Per-worktree election lock path, keyed by a hash of the **canonicalized** worktree root —
-/// `canonicalize` resolves symlink aliases (the common way one checkout is reached via two paths)
-/// to one key. We deliberately do **not** case-fold: folding would, on a case-sensitive volume,
-/// collapse two genuinely-distinct worktrees into one key and leave one permanently un-elected
-/// (silent staleness — the exact failure this design exists to prevent). The remaining edge — the
-/// same checkout reached via differently-cased paths on a case-insensitive FS — merely elects two
-/// watchers, which the write lock makes harmless. `base_dir` is the index DB's directory (the
-/// shared location across a repo's worktrees), so all election locks sit under `<base_dir>/locks/`.
-pub fn election_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
-    base_dir.join("locks").join(format!("{}.lock", worktree_hash(worktree_root)))
+/// A per-worktree listener election lock: one elected holder per worktree, at
+/// `<base_dir>/locks/<worktree_hash>.<suffix>`. `base_dir` is the index DB's directory (the shared
+/// location across a repo's worktrees — see [`lock_base`]), so every listener lock of a repo sits
+/// under one `locks/` dir.
+///
+/// Keyed by a hash of the **canonicalized** worktree root — `canonicalize` resolves symlink aliases
+/// (the common way one checkout is reached via two paths) to one key. We deliberately do **not**
+/// case-fold: folding would, on a case-sensitive volume, collapse two genuinely-distinct worktrees
+/// into one key and leave one permanently un-elected (silent staleness — the exact failure this
+/// design exists to prevent). The remaining edge — the same checkout reached via differently-cased
+/// paths on a case-insensitive FS — merely elects two watchers, which the write lock makes
+/// harmless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerLock {
+    /// The index file watcher (one watcher per worktree).
+    WatcherElection,
+    /// The grep-augment hook socket listener, separate from the watcher election so core never
+    /// calls back into the MCP crate and either process may win each.
+    HookSocket,
+    /// The editor lens HTTP server. It lives beside the database, not under the disposable
+    /// workspace discovery directory, so deleting `.rag-rat/` cannot unlink a held lock and elect
+    /// a second server for the same worktree.
+    LensServer,
 }
 
-/// Election lock for the grep-augment hook socket: one listener per worktree, separate from the
-/// watcher election so core never calls back into the MCP crate and either process may win each.
-pub fn socket_lock_path(base_dir: &Path, worktree_root: &Path) -> PathBuf {
-    base_dir.join("locks").join(format!("{}.socket.lock", worktree_hash(worktree_root)))
+impl ListenerLock {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::WatcherElection => "lock",
+            Self::HookSocket => "socket.lock",
+            Self::LensServer => "lens.lock",
+        }
+    }
+
+    /// The lock for `worktree_root` under `base_dir`.
+    pub fn path(self, base_dir: &Path, worktree_root: &Path) -> PathBuf {
+        base_dir.join("locks").join(format!("{}.{}", worktree_hash(worktree_root), self.suffix()))
+    }
+
+    /// The lock for `worktree_root` under a config's [`lock_base`].
+    pub fn path_for(self, config: &Config, worktree_root: &Path) -> PathBuf {
+        self.path(&lock_base(config), worktree_root)
+    }
 }
 
-/// Election lock for the editor lens HTTP server. It lives beside the database, not under the
-/// disposable workspace discovery directory, so deleting `.rag-rat/` cannot unlink a held lock
-/// and elect a second server for the same worktree.
+/// The watcher election lock for a `Config`'s own root. Shared by the watcher and the hook's
+/// liveness probe so the two cannot diverge.
+pub fn election_lock_path_for(config: &Config) -> PathBuf {
+    ListenerLock::WatcherElection.path_for(config, &config.root)
+}
+
+/// [`ListenerLock::LensServer`]'s path for `worktree_root`.
 pub fn lens_server_lock_path_for(config: &Config, worktree_root: &Path) -> PathBuf {
-    lock_base(config).join("locks").join(format!("{}.lens.lock", worktree_hash(worktree_root)))
+    ListenerLock::LensServer.path_for(config, worktree_root)
 }
 
 /// The directory the per-worktree listener locks and sockets hang off for a `Config`: the index
@@ -599,7 +654,7 @@ pub fn hook_socket_path_for(config: &Config) -> PathBuf {
 /// Single source of truth for the hook socket election-lock path given a `Config`. Shared by the
 /// MCP listener and the CLI client so the two cannot diverge.
 pub fn hook_socket_lock_path_for(config: &Config) -> PathBuf {
-    socket_lock_path(&lock_base(config), &config.root)
+    ListenerLock::HookSocket.path_for(config, &config.root)
 }
 
 /// Inner implementation: builds the candidate path cascade with an explicit `runtime_base` so the
@@ -933,12 +988,65 @@ mod tests {
         assert!(reacquired, "the lock is free after the outermost session guard drops");
     }
 
+    /// Lock files are shared with already-running processes, so a renamed file is two processes
+    /// that no longer serialize: every global lock name and every listener lock suffix is pinned
+    /// byte-for-byte here. The listener names' hash stem is pinned against a literal by
+    /// `worktree_hash_is_pinned`.
+    #[test]
+    fn global_and_listener_lock_names_are_pinned() {
+        let db = Path::new("/repo/.rag-rat/index.sqlite");
+        let name = |path: PathBuf| path.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name(schema_lock_path(db)), "rag-rat-schema.lock");
+        assert_eq!(name(registry_lock_path(db)), "rag-rat-registry.lock");
+        assert_eq!(name(sync_session_lock_path(db)), "rag-rat-sync.lock");
+
+        let base = Path::new("/repo/.rag-rat");
+        let root = Path::new("/repo");
+        let hash = worktree_hash(root);
+        assert_eq!(hash.len(), 32, "a 16-byte digest prefix");
+        for (lock, expected) in [
+            (ListenerLock::WatcherElection, format!("{hash}.lock")),
+            (ListenerLock::HookSocket, format!("{hash}.socket.lock")),
+            (ListenerLock::LensServer, format!("{hash}.lens.lock")),
+        ] {
+            assert_eq!(lock.path(base, root), base.join("locks").join(expected));
+        }
+
+        // The `Config` forms hang off the database's directory, the same base the watcher and the
+        // hook probe derive from `config.database`.
+        let config =
+            Config { root: root.to_path_buf(), database: db.to_path_buf(), ..Config::default() };
+        assert_eq!(election_lock_path_for(&config), ListenerLock::WatcherElection.path(base, root));
+        assert_eq!(hook_socket_lock_path_for(&config), ListenerLock::HookSocket.path(base, root));
+        assert_eq!(
+            lens_server_lock_path_for(&config, root),
+            ListenerLock::LensServer.path(base, root)
+        );
+    }
+
+    /// The worktree hash is the stem of every listener lock file, so it is pinned against a
+    /// LITERAL: a change to the digest, its truncation, or the rendering it hashes renames those
+    /// files, and an old and a new binary would then elect two holders for one worktree. The root
+    /// does not exist, so canonicalization falls through and the hashed bytes are exactly its
+    /// spelling (Unix only: that spelling is `/`-separated and not verbatim-prefixed).
+    #[cfg(unix)]
+    #[test]
+    fn worktree_hash_is_pinned() {
+        let root = Path::new("/rag-rat-pin/no-such-worktree");
+        assert!(!root.exists(), "the pin needs a root canonicalization cannot resolve");
+        assert_eq!(worktree_hash(root), "a78ee248723eac2ac864ac67b4a451de");
+        assert_eq!(
+            ListenerLock::LensServer.path(Path::new("/db"), root),
+            Path::new("/db/locks/a78ee248723eac2ac864ac67b4a451de.lens.lock")
+        );
+    }
+
     #[test]
     fn election_path_is_stable_per_root_and_distinct_across_roots() {
         let base = Path::new("/repo/.git/rag-rat");
-        let a1 = election_lock_path(base, Path::new("/repo"));
-        let a2 = election_lock_path(base, Path::new("/repo"));
-        let b = election_lock_path(base, Path::new("/repo-wt"));
+        let a1 = ListenerLock::WatcherElection.path(base, Path::new("/repo"));
+        let a2 = ListenerLock::WatcherElection.path(base, Path::new("/repo"));
+        let b = ListenerLock::WatcherElection.path(base, Path::new("/repo-wt"));
         assert_eq!(a1, a2, "same worktree root → same lock");
         assert_ne!(a1, b, "different worktree roots → different locks");
         assert!(a1.starts_with(base.join("locks")));
@@ -948,8 +1056,8 @@ mod tests {
     fn socket_lock_path_is_distinct_from_election_lock_path() {
         let base = temp_dir();
         let root = temp_dir();
-        let election = election_lock_path(&base, &root);
-        let socket_lock = socket_lock_path(&base, &root);
+        let election = ListenerLock::WatcherElection.path(&base, &root);
+        let socket_lock = ListenerLock::HookSocket.path(&base, &root);
         assert_ne!(election, socket_lock);
         assert!(socket_lock.to_string_lossy().ends_with(".socket.lock"));
         // Same worktree key: both live under <base>/locks/ with the same hash stem.

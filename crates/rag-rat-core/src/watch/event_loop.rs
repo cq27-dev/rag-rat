@@ -103,9 +103,7 @@ fn watcher_main(
     tx: Sender<LoopMsg>,
     rx: Receiver<LoopMsg>,
 ) {
-    let base_dir =
-        config.database.parent().map(Path::to_path_buf).unwrap_or_else(|| config.root.clone());
-    let election_path = locks::election_lock_path(&base_dir, &config.root);
+    let election_path = locks::election_lock_path_for(&config);
 
     // Win election (one watcher per worktree); retry so a new watcher takes over if a holder dies.
     let _election = loop {

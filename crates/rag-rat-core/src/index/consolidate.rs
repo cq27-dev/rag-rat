@@ -402,7 +402,7 @@ fn resolve_consolidation_source(
 /// the LEGACY-side locks exclude a watcher / MCP writer still keyed beside the legacy file, so
 /// nothing can append to it between the snapshot read and the rename. Both bounded; the global
 /// locks taken inside (schema in the migration, registry in `register_repo`) follow the
-/// per-repo → global ordering rule (see `locks::registry_lock_path`).
+/// per-repo → global ordering rule (see `locks::GlobalLock`).
 ///
 /// The LEGACY side drains EVERY id the source DB itself records, not just the CURRENT identity:
 /// the legacy file predates the identity transition, so a writer started PRE-deepen still keys
