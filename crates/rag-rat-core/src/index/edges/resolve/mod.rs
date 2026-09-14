@@ -217,6 +217,28 @@ struct ReferenceInputs<'a> {
     ref_byte: usize,
 }
 
+/// Keep unresolved confidence and visibility identical for incremental and full rebuilds.
+fn unresolved_verdict(
+    source_language: Option<&str>,
+    edge_kind: EdgeKind,
+    evidence: Option<&str>,
+    current: EdgeConfidence,
+) -> (EdgeConfidence, EdgeResolution) {
+    let suppressed = crate::index::languages::resolver_policy_for_name(source_language)
+        .is_some_and(|policy| {
+            (policy.unresolved_disposition)(edge_kind, evidence)
+                == crate::index::languages::UnresolvedDisposition::Suppress
+        });
+    let confidence = if current == EdgeConfidence::Ambiguous {
+        EdgeConfidence::Ambiguous
+    } else {
+        EdgeConfidence::NameOnly
+    };
+    let resolution =
+        if suppressed { EdgeResolution::Suppressed } else { EdgeResolution::Unresolved };
+    (confidence, resolution)
+}
+
 fn resolve_reference<'s>(
     reference: ReferenceInputs<'_>,
     import_scope: &ImportScope,
@@ -618,6 +640,9 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
     ) in rows
     {
         let edge_kind = EdgeKind::from_db_str(&edge_kind)?;
+        // Unknown stored bands historically re-resolve as name-only, not a read failure.
+        let current_confidence =
+            EdgeConfidence::from_db_str(&current_confidence).unwrap_or(EdgeConfidence::NameOnly);
         // #200: a `dispatch_construct` fact's `to_name` is a synthetic `Enum::Variant` key, NOT a
         // real call target — resolving it would bind a bogus `to_symbol_id` to any same-named
         // symbol, and synthesis reads only the fact's `from_symbol_id`. Leave it
@@ -656,21 +681,13 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             &index,
         );
         let Some((to_symbol_id, confidence, reason)) = resolution else {
-            let suppressed =
-                crate::index::languages::resolver_policy_for_name(Some(&source_language))
-                    .is_some_and(|policy| {
-                        (policy.unresolved_disposition)(edge_kind, evidence.as_deref())
-                            == crate::index::languages::UnresolvedDisposition::Suppress
-                    });
-            let confidence = if current_confidence == EdgeConfidence::Ambiguous.as_db_str() {
-                EdgeConfidence::Ambiguous
-            } else {
-                EdgeConfidence::NameOnly
-            };
-            // prepare_cached: one UPDATE per edge; cache the statement so the SQL compiles once per
-            // connection instead of on every call.
-            let resolution =
-                if suppressed { EdgeResolution::Suppressed } else { EdgeResolution::Unresolved };
+            let (confidence, resolution) = unresolved_verdict(
+                Some(&source_language),
+                edge_kind,
+                evidence.as_deref(),
+                current_confidence,
+            );
+            // Cache the per-edge UPDATE so SQL compiles once per connection.
             let confidence_id = interner.get(conn, confidence.as_db_str())?;
             let resolution_id = interner.get(conn, resolution.as_db_str())?;
             conn.prepare_cached(
@@ -692,6 +709,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             continue;
         };
         let confidence_id = interner.get(conn, confidence.as_db_str())?;
+        let reason = EdgeResolution::Reason(reason);
         let resolution_id = interner.get(conn, reason.as_db_str())?;
         conn.prepare_cached(
             "UPDATE edges_data
@@ -712,7 +730,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             resolution_id,
             // A re-resolved candidate un-hides (a previously suppressed Swift macro candidate
             // whose target appears later); a resolved dispatch_handle FACT stays hidden.
-            edge_hidden_flag(edge_kind, EdgeResolution::Reason(reason)),
+            edge_hidden_flag(edge_kind, reason),
         ])?;
     }
     // #200: now that the dispatch FACT rows are resolved (handlers bound to symbols), synthesize
@@ -877,29 +895,13 @@ pub(crate) fn resolve_and_insert_edges(
                     EdgeResolution::Reason(reason),
                 ),
                 None => {
-                    let suppressed = crate::index::languages::resolver_policy_for_name(
+                    let (confidence, reason) = unresolved_verdict(
                         file_language.get(file_id).map(String::as_str),
-                    )
-                    .is_some_and(|policy| {
-                        (policy.unresolved_disposition)(candidate.edge_kind, evidence)
-                            == crate::index::languages::UnresolvedDisposition::Suppress
-                    });
-                    let confidence = if candidate.confidence == EdgeConfidence::Ambiguous {
-                        EdgeConfidence::Ambiguous
-                    } else {
-                        EdgeConfidence::NameOnly
-                    };
-                    (
-                        None,
-                        confidence,
-                        None,
-                        None,
-                        if suppressed {
-                            EdgeResolution::Suppressed
-                        } else {
-                            EdgeResolution::Unresolved
-                        },
-                    )
+                        candidate.edge_kind,
+                        evidence,
+                        candidate.confidence,
+                    );
+                    (None, confidence, None, None, reason)
                 },
             };
         // NULL when the sentinel marks an absent callee range; see
