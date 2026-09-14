@@ -1,6 +1,5 @@
-use super::super::RefineMember;
 use super::spans;
-use super::types::ClassAlignment;
+use super::types::{ClassAlignment, ClassView};
 
 /// Yield ONLY the aligned members' values from an ordinal-aligned `per_member_values` slice — the
 /// canonical way to iterate the "meaningful" values for any all/any/distinct/type-inference logic.
@@ -72,12 +71,8 @@ pub(super) fn aligned_values_all_equal(
 ///
 /// UTF-8 guard: uses `text.get(..)` (never `&text[..]`); on a `None` slice falls back to the
 /// member's baseline token strings joined — never panics.
-pub(super) fn recover_values(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    lo: usize,
-    hi: usize,
-) -> Vec<String> {
+pub(super) fn recover_values(view: ClassView<'_>, lo: usize, hi: usize) -> Vec<String> {
+    let ClassView { members, alignment, .. } = view;
     let mut values = Vec::with_capacity(members.len());
     for (m_idx, member) in members.iter().enumerate() {
         let token_idxs = spans::member_run_tokens(alignment, m_idx, lo, hi);

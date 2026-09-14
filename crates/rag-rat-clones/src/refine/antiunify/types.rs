@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::super::RefineMember;
 use super::super::score::Confidence;
 
 /// Extraction role for a variation point — what kind of helper parameter the hole would become.
@@ -148,6 +149,22 @@ pub(crate) struct ClassAlignment {
     /// straight on.
     #[cfg(test)]
     pub(super) spent_cells: u64,
+}
+
+/// The class being anti-unified: its canonical members, their star alignment, and the anchor
+/// (`members[alignment.anchor_idx]`) whose columns the spine indexes. `Copy`, so the descent and
+/// its helpers pass it by value instead of threading the triple.
+#[derive(Clone, Copy)]
+pub(super) struct ClassView<'a> {
+    pub(super) members: &'a [RefineMember],
+    pub(super) alignment: &'a ClassAlignment,
+    pub(super) anchor: &'a RefineMember,
+}
+
+impl<'a> ClassView<'a> {
+    pub(super) fn new(members: &'a [RefineMember], alignment: &'a ClassAlignment) -> Self {
+        ClassView { members, alignment, anchor: &members[alignment.anchor_idx] }
+    }
 }
 
 /// A per-span metavar before recurrence collapse.

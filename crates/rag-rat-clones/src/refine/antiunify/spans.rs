@@ -1,5 +1,5 @@
 use super::super::RefineMember;
-use super::types::ClassAlignment;
+use super::types::{ClassAlignment, ClassView};
 
 /// Coalesce the variation columns of `[lo..=hi]` into maximal contiguous runs `(rlo, rhi)`. A
 /// column is a variation column iff it is non-fixed for some member OR any member keys an insert at
@@ -32,12 +32,8 @@ pub(super) fn variation_runs(
 /// `true` iff some member contributes zero tokens to anchor span `[lo..=hi]` while at least one
 /// other member contributes ≥1 — a Type-3 indel (the whole subtree is present in some members,
 /// absent in others).
-pub(super) fn subtree_is_indel(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    lo: usize,
-    hi: usize,
-) -> bool {
+pub(super) fn subtree_is_indel(view: ClassView<'_>, lo: usize, hi: usize) -> bool {
+    let ClassView { members, alignment, .. } = view;
     let mut saw_empty = false;
     let mut saw_filled = false;
     for m_idx in 0..members.len() {

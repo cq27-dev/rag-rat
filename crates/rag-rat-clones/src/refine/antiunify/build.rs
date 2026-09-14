@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::RangeInclusive;
 
 use super::super::RefineMember;
 use super::super::budget::{ALIGN_AGGREGATE_CELLS_BUDGET, CellBudget};
@@ -12,7 +11,8 @@ use super::spans::{
     variation_runs,
 };
 use super::types::{
-    ClassAlignment, EmittedSpan, MetavarKind, OccSpan, RunMetavar, Template, VariationPoint,
+    ClassAlignment, ClassView, EmittedSpan, MetavarKind, OccSpan, RunMetavar, Template,
+    VariationPoint,
 };
 use super::values::{aligned_values_all_equal, recover_values};
 use super::widen::{
@@ -77,7 +77,8 @@ pub(super) fn anti_unify_with_budget(
     alignment: &ClassAlignment,
     budget: &mut CellBudget,
 ) -> Template {
-    let anchor = &members[alignment.anchor_idx];
+    let view = ClassView::new(members, alignment);
+    let anchor = view.anchor;
     let spine_len = anchor.seq.len();
 
     // ── Per-spine-column fixedness (§1.3): FIXED ⟺ every ALIGNED member matched a token there
@@ -107,7 +108,7 @@ pub(super) fn anti_unify_with_budget(
     // callee position, so the reopen decision and the classification stay one source of truth.
     // See [`matched_column_reopen`] for the full position audit.
     for (i, fixed) in is_fixed.iter_mut().enumerate() {
-        if *fixed && matched_column_reopen(anchor, i, members, alignment).is_some() {
+        if *fixed && matched_column_reopen(view, i).is_some() {
             *fixed = false;
         }
     }
@@ -117,10 +118,10 @@ pub(super) fn anti_unify_with_budget(
     // more exact `lcs_align`) draws from the shared per-class budget; `redescent_sampled`
     // latches when the re-descent left a matched statement whole-fixed because the budget was
     // exhausted.
-    let mut descent = Descent::new(members, alignment, &is_fixed, budget);
+    let mut descent = Descent::new(view, &is_fixed, budget);
     if spine_len > 0 {
         let root_end = subtree_token_count(anchor, 0) - 1;
-        descent.emit_metavar_spans(0..=root_end);
+        descent.emit_metavar_spans(0, root_end);
     }
     let Descent { sampled: redescent_sampled, out: mut spans, .. } = descent;
     spans.sort_by_key(EmittedSpan::lo);
@@ -140,9 +141,7 @@ pub(super) fn anti_unify_with_budget(
     // `EmittedSpan::Statement`.
     let mut zero_width_cols: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for span in &spans {
-        let Some(SpanCandidate { metavar, hi, zero_width }) =
-            candidate_for_span(span, anchor, members, alignment)
-        else {
+        let Some(SpanCandidate { metavar, hi, zero_width }) = candidate_for_span(span, view) else {
             continue;
         };
         if zero_width {
@@ -209,12 +208,8 @@ struct SpanCandidate {
 
 /// Widen, value, and classify one emitted span into a variation-point candidate, or `None` when
 /// the C1 guard drops it as a genuinely fixed region.
-fn candidate_for_span(
-    span: &EmittedSpan,
-    anchor: &RefineMember,
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-) -> Option<SpanCandidate> {
+fn candidate_for_span(span: &EmittedSpan, view: ClassView<'_>) -> Option<SpanCandidate> {
+    let ClassView { alignment, anchor, .. } = view;
     // Two Raw-span widenings, both turning a leaf hole that would render an INVALID
     // substitution into a whole-subtree hole:
     // - Fix 3 (Codex round-5): a `string_content` LEAF covers only the text INSIDE the quotes
@@ -275,8 +270,8 @@ fn candidate_for_span(
             *zero_width,
         ),
         EmittedSpan::Raw(..) => {
-            let pmv = recover_values(members, alignment, lo, hi);
-            let rc = classify_run(members, alignment, anchor, lo, hi, &pmv);
+            let pmv = recover_values(view, lo, hi);
+            let rc = classify_run(view, lo, hi, &pmv);
             (pmv, rc, false)
         },
     };
@@ -344,10 +339,7 @@ fn coverage_and_render(
 /// per-column fixedness, the per-class [`CellBudget`] the matched-statement re-descent draws from,
 /// and the two accumulators every level writes into.
 pub(super) struct Descent<'a> {
-    pub(super) members: &'a [RefineMember],
-    pub(super) alignment: &'a ClassAlignment,
-    /// `members[alignment.anchor_idx]` — the spine the descent walks.
-    pub(super) anchor: &'a RefineMember,
+    pub(super) view: ClassView<'a>,
     pub(super) is_fixed: &'a [bool],
     pub(super) budget: &'a mut CellBudget,
     /// Latches when a matched-statement re-descent was cut short (or degraded) by the budget.
@@ -358,13 +350,11 @@ pub(super) struct Descent<'a> {
 
 impl<'a> Descent<'a> {
     pub(super) fn new(
-        members: &'a [RefineMember],
-        alignment: &'a ClassAlignment,
+        view: ClassView<'a>,
         is_fixed: &'a [bool],
         budget: &'a mut CellBudget,
     ) -> Self {
-        let anchor = &members[alignment.anchor_idx];
-        Descent { members, alignment, anchor, is_fixed, budget, sampled: false, out: Vec::new() }
+        Descent { view, is_fixed, budget, sampled: false, out: Vec::new() }
     }
 
     /// Recursive anchor-subtree descent that appends metavar spans for the subtree `[lo..=hi]` (a
@@ -392,17 +382,16 @@ impl<'a> Descent<'a> {
     ///    bottoms out at rule 3 / a differing sub-subtree at rule 4); a run that STRADDLES ≥2
     ///    children is an LCS-tangled edit — emit it as ONE raw span rather than splitting it across
     ///    the straddled siblings.
-    fn emit_metavar_spans(&mut self, span: RangeInclusive<usize>) {
-        let (lo, hi) = (*span.start(), *span.end());
-        let (members, alignment, anchor, is_fixed) =
-            (self.members, self.alignment, self.anchor, self.is_fixed);
+    fn emit_metavar_spans(&mut self, lo: usize, hi: usize) {
+        let (view, is_fixed) = (self.view, self.is_fixed);
+        let ClassView { alignment, anchor, .. } = view;
         // (1) Fixed-for-all subtree with no interior inserts → fixed text.
         if (lo..=hi).all(|c| is_fixed[c]) && !any_member_inserts_within(alignment, lo, hi) {
             return;
         }
 
         // (2) Indel: a member gaps the whole subtree while another fills it → one gapped metavar.
-        if subtree_is_indel(members, alignment, lo, hi) {
+        if subtree_is_indel(view, lo, hi) {
             self.out.push(EmittedSpan::Raw(lo, hi));
             return;
         }
@@ -428,7 +417,7 @@ impl<'a> Descent<'a> {
         // raw col_map is unusable here. Snap to statement boundaries and recover
         // whole-statement values via structural alignment instead.
         if is_statement_container(anchor.node_spans[lo].kind)
-            && self.emit_block_statement_indel(lo..=hi)
+            && self.emit_block_statement_indel(lo, hi)
         {
             return;
         }
@@ -447,7 +436,7 @@ impl<'a> Descent<'a> {
                 let child = touched[0];
                 if !recursed_children.contains(&child) {
                     recursed_children.push(child);
-                    self.emit_metavar_spans(child.0..=child.1);
+                    self.emit_metavar_spans(child.0, child.1);
                 }
             } else {
                 // Straddles ≥2 children (or no child — defensive) → emit the run as one raw span.
