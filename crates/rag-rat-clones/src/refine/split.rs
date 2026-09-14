@@ -30,7 +30,7 @@
 //! to one class. NO member is lost — every θ-edge endpoint lands in at least its own seed clique.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// Budget on the number of GROWN maximal cliques before the cover stops growing and falls back to
 /// emitting the remaining θ-edges as ungrown 2-member cliques (#256). It bounds the superlinear
@@ -103,8 +103,8 @@ const MAX_SPLIT_GROUPS: usize = 256;
 ///    coherent group from `{a, b}` by adding any remaining member (in id order) that has a θ-edge
 ///    to every current group member (an edge-adjacency check against `edges`, #258 —
 ///    output-identical to the old `≥ θ` recompute when `edges` is exactly the ≥ θ set; see the
-///    parity caveat on the `adjacency` block re: #271's hot-token cap). (The grow scans members in
-///    id order; only the SEED order is similarity-ranked.) The cover is greedy and therefore
+///    parity caveat on [`adjacency_set`] re: #271's hot-token cap). (The grow scans members in id
+///    order; only the SEED order is similarity-ranked.) The cover is greedy and therefore
 ///    seed-order-dependent, but: no member is ever dropped (the union of classes is order-invariant
 ///    — post-budget endpoints become bare pairs), and on a single connected component (the only
 ///    shape this receives — callers iterate per union-find component) descending-sim cover quality
@@ -137,85 +137,119 @@ pub fn coherence_split_cancellable(
     if cancelled() {
         return None;
     }
-    // 1. Sort ascending (determinism).
+    // Sort ascending (determinism).
     let mut members: Vec<i64> = component.to_vec();
     members.sort_unstable();
+    let coherent_edges = component_theta_edges(&members, edges, &cancelled)?;
+    let adjacency = adjacency_set(&coherent_edges, &cancelled)?;
+    let seeds = seeded_by_similarity(&coherent_edges, &similarity, &cancelled)?;
+    let cover = grow_clique_cover(&members, &seeds, &adjacency, &cancelled)?;
+    retain_maximal(cover, &cancelled)
+}
+
+/// Cancellation poll strides, by how much work one loop iteration does: an O(1) step (an edge, an
+/// adjacency lookup, a seed score) polls rarely; a step that grows a clique or scans a group polls
+/// more often; one pass of the subset check compares a group against every other and polls most.
+const POLL_CHEAP_STRIDE: usize = 1024;
+const POLL_SCAN_STRIDE: usize = 256;
+const POLL_GROUP_PASS_STRIDE: usize = 32;
+
+/// `true` when iteration `i` is a poll point for `stride` and the caller has cancelled. Iteration
+/// `0` always polls.
+fn poll(i: usize, stride: usize, cancelled: &impl Fn() -> bool) -> bool {
+    i.is_multiple_of(stride) && cancelled()
+}
+
+/// Coherent-edge seed list from the caller's θ-verified pairs (#256): canonicalize each to
+/// `a < b`, keep only edges whose BOTH endpoints are members of this component (defensive — the
+/// caller buckets per component), sort + dedup for a deterministic seed order. These ARE the ≥ θ
+/// edges (verified by `candidate_pairs_from_bags` at the call site), so there is no all-pairs
+/// similarity scan here — that scan was the reason for the removed `SPLIT_MAX` member cap.
+fn component_theta_edges(
+    members: &[i64],
+    edges: &[(i64, i64)],
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<(i64, i64)>> {
     // `HashSet` (O(1) `contains`), not `BTreeSet`: this is the defensive membership filter for the
     // edge list below, hit twice per edge — on a dense giant that is ~2·n² lookups, where O(log n)
     // per lookup (BTreeSet) is needlessly slow (#256). Membership-only, never iterated, so
     // determinism is unaffected.
-    let member_set: std::collections::HashSet<i64> = members.iter().copied().collect();
-
-    // 2. Coherent-edge seed list from the caller's θ-verified pairs (#256): canonicalize each to
-    // `a < b`, keep only edges whose BOTH endpoints are members of this component (defensive — the
-    // caller buckets per component), sort + dedup for a deterministic seed order. These ARE the
-    // ≥ θ edges (verified by `candidate_pairs_from_bags` at the call site), so there is no
-    // all-pairs similarity scan here — that scan was the reason for the removed `SPLIT_MAX`
-    // member cap.
+    let member_set: HashSet<i64> = members.iter().copied().collect();
     let mut coherent_edges = Vec::with_capacity(edges.len());
     for (index, &(a, b)) in edges.iter().enumerate() {
-        if index.is_multiple_of(1024) && cancelled() {
+        if poll(index, POLL_CHEAP_STRIDE, cancelled) {
             return None;
         }
         if a != b && member_set.contains(&a) && member_set.contains(&b) {
             coherent_edges.push((a.min(b), a.max(b)));
         }
     }
-    let coherent_edges = sort_dedup_edges_cancellable(coherent_edges, &cancelled)?;
+    sort_dedup_edges_cancellable(coherent_edges, cancelled)
+}
 
-    // 2a. Adjacency set over the canonical θ-edges, for the O(1) GROW coherence check (#258).
-    //
-    // The GROW step below adds a candidate member `m` to a group only when `m` coheres with EVERY
-    // current group member `g`. The pre-#258 check RE-CALLED `similarity(m, g) >= theta` per (m,
-    // g), recomputing `overlap`/`max_len` (an O(token_len) token-bag merge) — so on a dense
-    // (near-)clique component the grow cost was O(n² · token_len). But `coherent_edges` ALREADY
-    // IS the set of pairs with similarity ≥ θ for this component: the caller threads in
-    // `candidate_pairs_from_bags` restricted to the component, i.e. every `verified_clone(a, b,
-    // θ)` pair (`overlap ≥ ceil(θ·max_len)`) plus every struct-hash pair (identical bags ⇒
-    // similarity 1.0). So "`m` coheres with `g`" ⟺ "the canonical edge `(min, max)` is in
-    // `coherent_edges`" — an O(1) HashSet lookup with NO overlap recompute. Seeding (step 2b)
-    // still consults `similarity` once per edge (O(edges)) to rank tight cliques first; only the
-    // per-(m, g) GROW recompute is eliminated.
-    //
-    // PARITY (when this is output-identical to the old per-(m, g) `similarity >= θ` grow):
-    //   FORWARD (edge ⟹ similarity ≥ θ) is UNCONDITIONAL — `verified_clone` gates `overlap ≥
-    //   ceil(θ·max_len)`, which is bit-for-bit `overlap/max_len ≥ θ` (`overlap` is a non-negative
-    //   integer, so the smallest integer ≥ θ·max_len is `ceil(θ·max_len)`, and both sites compute
-    //   the identical f64 `(θ·max_len).ceil()`); struct-hash edges have `overlap == max_len` ⇒
-    //   similarity 1.0. So every edge in `adjacency` is genuinely a ≥ θ pair: the grow NEVER
-    //   admits a member the old code would have rejected.
-    //   REVERSE (similarity ≥ θ ⟹ edge) is SourcererCC sub-block admissibility, valid EXCEPT
-    //   where #271's `HOT_TOKEN_POSTINGS_CAP` drops a θ-pair whose only shared sub-block tokens are
-    //   all hot-capped (> cap postings): that pair is never generated as a candidate, so it is not
-    //   an edge even though similarity ≥ θ. In that (recall-unsafe) case the OLD grow would admit
-    //   the member and this edge-adjacency grow rejects it — i.e. the output diverges. But that
-    //   scenario means #271 has ALREADY altered which pairs exist, so #258 does NOT introduce a new
-    //   behavior class: it inherits exactly #271's accepted recall approximation, which is gated
-    //   separately by `clones --recall-symbols`. On a recall-safe corpus (#271 drops no θ-pair) the
-    //   two grows are byte-identical — the production invariant the issue assumed, and what the
-    //   `coherence_split_edge_adjacency_equals_similarity_recompute_when_edges_are_theta_set` test
-    //   pins on `edges == exactly the ≥ θ set`.
-    let mut adjacency = std::collections::HashSet::with_capacity(coherent_edges.len());
+/// Adjacency set over the canonical θ-edges, for the O(1) GROW coherence check (#258).
+///
+/// The GROW step adds a candidate member `m` to a group only when `m` coheres with EVERY current
+/// group member `g`. The pre-#258 check RE-CALLED `similarity(m, g) >= theta` per (m, g),
+/// recomputing `overlap`/`max_len` (an O(token_len) token-bag merge) — so on a dense (near-)clique
+/// component the grow cost was O(n² · token_len). But `coherent_edges` ALREADY IS the set of pairs
+/// with similarity ≥ θ for this component: the caller threads in `candidate_pairs_from_bags`
+/// restricted to the component, i.e. every `verified_clone(a, b, θ)` pair (`overlap ≥
+/// ceil(θ·max_len)`) plus every struct-hash pair (identical bags ⇒ similarity 1.0). So "`m` coheres
+/// with `g`" ⟺ "the canonical edge `(min, max)` is in `coherent_edges`" — an O(1) HashSet lookup
+/// with NO overlap recompute. Seeding ([`seeded_by_similarity`]) still consults `similarity` once
+/// per edge (O(edges)) to rank tight cliques first; only the per-(m, g) GROW recompute is
+/// eliminated.
+///
+/// PARITY (when this is output-identical to the old per-(m, g) `similarity >= θ` grow):
+///   FORWARD (edge ⟹ similarity ≥ θ) is UNCONDITIONAL — `verified_clone` gates `overlap ≥
+///   ceil(θ·max_len)`, which is bit-for-bit `overlap/max_len ≥ θ` (`overlap` is a non-negative
+///   integer, so the smallest integer ≥ θ·max_len is `ceil(θ·max_len)`, and both sites compute
+///   the identical f64 `(θ·max_len).ceil()`); struct-hash edges have `overlap == max_len` ⇒
+///   similarity 1.0. So every edge in `adjacency` is genuinely a ≥ θ pair: the grow NEVER
+///   admits a member the old code would have rejected.
+///   REVERSE (similarity ≥ θ ⟹ edge) is SourcererCC sub-block admissibility, valid EXCEPT
+///   where #271's `HOT_TOKEN_POSTINGS_CAP` drops a θ-pair whose only shared sub-block tokens are
+///   all hot-capped (> cap postings): that pair is never generated as a candidate, so it is not
+///   an edge even though similarity ≥ θ. In that (recall-unsafe) case the OLD grow would admit
+///   the member and this edge-adjacency grow rejects it — i.e. the output diverges. But that
+///   scenario means #271 has ALREADY altered which pairs exist, so #258 does NOT introduce a new
+///   behavior class: it inherits exactly #271's accepted recall approximation, which is gated
+///   separately by `clones --recall-symbols`. On a recall-safe corpus (#271 drops no θ-pair) the
+///   two grows are byte-identical — the production invariant the issue assumed, and what the
+///   `coherence_split_edge_adjacency_equals_similarity_recompute_when_edges_are_theta_set` test
+///   pins on `edges == exactly the ≥ θ set`.
+fn adjacency_set(
+    coherent_edges: &[(i64, i64)],
+    cancelled: &impl Fn() -> bool,
+) -> Option<HashSet<(i64, i64)>> {
+    let mut adjacency = HashSet::with_capacity(coherent_edges.len());
     for (index, &edge) in coherent_edges.iter().enumerate() {
-        if index.is_multiple_of(1024) && cancelled() {
+        if poll(index, POLL_CHEAP_STRIDE, cancelled) {
             return None;
         }
         adjacency.insert(edge);
     }
+    Some(adjacency)
+}
 
-    // 2b. Seed high-similarity edges FIRST so tight real cliques grow WITHIN the MAX_SPLIT_GROUPS
-    // budget instead of falling into the bare-pair tail (#256 R-A). On the dogfood a true 7-member
-    // `collect_rows` clique (all pairs sim ≥ 0.959) was fragmented to 2-member pairs because its
-    // edges sorted late (by id) inside a 2,599-member sparse transitive component glued by generic
-    // low-`df` tokens — the budget tripped on 256 noise cliques before collect_rows was reached.
-    // Ordering by descending similarity grows the tight cliques first; the low-similarity
-    // transitive "glue" edges sort last and become the bare pairs after the trip — correct,
-    // since they are the over-merge noise, not real clones. Similarity is computed ONCE per
-    // edge here (O(edges)), NOT in the comparator. The descending-sim + `(a, b)` tie-break
-    // keeps the seed order deterministic.
+/// Seed high-similarity edges FIRST so tight real cliques grow WITHIN the MAX_SPLIT_GROUPS budget
+/// instead of falling into the bare-pair tail (#256 R-A). On the dogfood a true 7-member
+/// `collect_rows` clique (all pairs sim ≥ 0.959) was fragmented to 2-member pairs because its edges
+/// sorted late (by id) inside a 2,599-member sparse transitive component glued by generic low-`df`
+/// tokens — the budget tripped on 256 noise cliques before collect_rows was reached. Ordering by
+/// descending similarity grows the tight cliques first; the low-similarity transitive "glue" edges
+/// sort last and become the bare pairs after the trip — correct, since they are the over-merge
+/// noise, not real clones. Similarity is computed ONCE per edge here (O(edges)), NOT in the
+/// comparator. The descending-sim + `(a, b)` tie-break keeps the seed order deterministic.
+fn seeded_by_similarity(
+    coherent_edges: &[(i64, i64)],
+    similarity: &impl Fn(i64, i64) -> f64,
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<Seed>> {
     let mut seeds = Vec::with_capacity(coherent_edges.len());
     for (index, &(a, b)) in coherent_edges.iter().enumerate() {
-        if index.is_multiple_of(1024) && cancelled() {
+        if poll(index, POLL_CHEAP_STRIDE, cancelled) {
             return None;
         }
         seeds.push((similarity(a, b), a, b));
@@ -223,45 +257,59 @@ pub fn coherence_split_cancellable(
     // `total_cmp` (not `partial_cmp(...).unwrap_or(Equal)`): a guaranteed TOTAL order so the sort
     // can never panic on a non-total comparator. similarity() cannot produce NaN today (both call
     // sites guard `max_len == 0 → 1.0`), but total_cmp removes that footgun for any future caller.
-    let seeds = sort_seeds_cancellable(seeds, &cancelled)?;
+    sort_seeds_cancellable(seeds, cancelled)
+}
 
-    // 3. Greedy maximal clique cover: for each coherent edge not already fully inside some emitted
-    // group, grow a maximal coherent group from {a, b} by adding any remaining member (in id order)
-    // that is coherent with every current group member. Emit the group.
-    //
-    // The "already inside some emitted group" test is the EXACT predicate the old per-group scan
-    // computed — `(a, b)` is covered iff some single emitted group contains BOTH endpoints — but
-    // implemented without the superlinear scan (#256). We keep a `member_groups: HashMap<i64,
-    // Vec<usize>>` mapping each member to the indices of the emitted groups it belongs to; the
-    // per-edge check is "do `a` and `b` share a group index?" — an intersection of two small lists,
-    // NOT a `Vec::contains` over a giant group. The old `for g in &groups { g.contains(&a) &&
-    // g.contains(&b) }` was O(groups × members) per edge; on a DENSE clique the first edge grows
-    // one group of all n members and each of the ~n²/2 remaining edges then re-scanned that
-    // giant group → O(n³) (a 2,575-member dense blob hung, #256). Why this is exact AND fast:
-    // clique overlap is RARE (a member lands in two groups only when it coheres with two
-    // mutually-incompatible peers — the chain case), so each member's group-index list is tiny
-    // (length 1 in the dense case), and the intersection is O(1) there. It avoids the O(n²)
-    // cost of recording every intra-group PAIR (the obvious covered-edge-set), which is ~0.5M
-    // HashSet ops at n=1000 and blows the sub-second debug budget. `member_groups` is
-    // membership bookkeeping only (never iterated for output), so determinism is unaffected —
-    // the returned class order comes solely from the canonicalized `coherent_edges` + `groups`
-    // order.
-    //
-    // Past `MAX_SPLIT_GROUPS` GROWN cliques the component is pathologically tangled; we stop
-    // growing (the grow is the remaining superlinear pass) and emit every remaining uncovered edge
-    // as a bare 2-member clique. This bounds work WITHOUT dropping any member: a long chain's tail
-    // edges become pairs rather than being lost (#256).
+/// The greedy clique cover [`grow_clique_cover`] emits, before the maximality pass.
+struct CliqueCover {
+    groups: Vec<Vec<i64>>,
+    /// More than [`MAX_SPLIT_GROUPS`] cliques grew, so the tail emitted bare covering pairs and
+    /// [`retain_maximal`] skips its subset pass.
+    budget_tripped: bool,
+}
+
+/// Greedy maximal clique cover: for each coherent edge not already fully inside some emitted group,
+/// grow a maximal coherent group from {a, b} by adding any remaining member (in id order) that is
+/// coherent with every current group member. Emit the group.
+///
+/// The "already inside some emitted group" test is the EXACT predicate the old per-group scan
+/// computed — `(a, b)` is covered iff some single emitted group contains BOTH endpoints — but
+/// implemented without the superlinear scan (#256). We keep a `member_groups: HashMap<i64,
+/// Vec<usize>>` mapping each member to the indices of the emitted groups it belongs to; the
+/// per-edge check is "do `a` and `b` share a group index?" — an intersection of two small lists,
+/// NOT a `Vec::contains` over a giant group. The old `for g in &groups { g.contains(&a) &&
+/// g.contains(&b) }` was O(groups × members) per edge; on a DENSE clique the first edge grows
+/// one group of all n members and each of the ~n²/2 remaining edges then re-scanned that
+/// giant group → O(n³) (a 2,575-member dense blob hung, #256). Why this is exact AND fast:
+/// clique overlap is RARE (a member lands in two groups only when it coheres with two
+/// mutually-incompatible peers — the chain case), so each member's group-index list is tiny
+/// (length 1 in the dense case), and the intersection is O(1) there. It avoids the O(n²)
+/// cost of recording every intra-group PAIR (the obvious covered-edge-set), which is ~0.5M
+/// HashSet ops at n=1000 and blows the sub-second debug budget. `member_groups` is
+/// membership bookkeeping only (never iterated for output), so determinism is unaffected —
+/// the returned class order comes solely from the canonicalized `coherent_edges` + `groups`
+/// order.
+///
+/// Past `MAX_SPLIT_GROUPS` GROWN cliques the component is pathologically tangled; we stop
+/// growing (the grow is the remaining superlinear pass) and emit every remaining uncovered edge
+/// as a bare 2-member clique. This bounds work WITHOUT dropping any member: a long chain's tail
+/// edges become pairs rather than being lost (#256).
+fn grow_clique_cover(
+    members: &[i64],
+    seeds: &[Seed],
+    adjacency: &HashSet<(i64, i64)>,
+    cancelled: &impl Fn() -> bool,
+) -> Option<CliqueCover> {
     let mut groups: Vec<Vec<i64>> = Vec::new();
-    let mut member_groups: std::collections::HashMap<i64, Vec<usize>> =
-        std::collections::HashMap::new();
+    let mut member_groups: HashMap<i64, Vec<usize>> = HashMap::new();
     // Members already in some emitted group (a grown clique or a bare pair). Drives the
     // covering-subset emission below (#282): the over-budget tail only needs to COVER each
     // still-uncovered member, not emit every edge.
-    let mut covered: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut covered: HashSet<i64> = HashSet::new();
     let mut budget_tripped = false;
 
     for (seed_index, &(_sim, a, b)) in seeds.iter().enumerate() {
-        if seed_index.is_multiple_of(256) && cancelled() {
+        if poll(seed_index, POLL_SCAN_STRIDE, cancelled) {
             return None;
         }
         if budget_tripped {
@@ -296,9 +344,9 @@ pub fn coherence_split_cancellable(
         // membership (the old `group.contains(&m)` was O(group) per candidate → O(n²) on a
         // dense clique, #256).
         let mut group: Vec<i64> = vec![a, b];
-        let mut group_set: std::collections::HashSet<i64> = group.iter().copied().collect();
+        let mut group_set: HashSet<i64> = group.iter().copied().collect();
         for (member_index, &m) in members.iter().enumerate() {
-            if member_index.is_multiple_of(256) && cancelled() {
+            if poll(member_index, POLL_SCAN_STRIDE, cancelled) {
                 return None;
             }
             if group_set.contains(&m) {
@@ -308,12 +356,12 @@ pub fn coherence_split_cancellable(
             // pre-verified θ-edge set (#258) — an O(1) HashSet lookup per (m, g) — instead of
             // recomputing `similarity(m, g) >= theta` (an O(token_len) overlap recompute). The two
             // are output-identical: `(min, max)` is in `adjacency` iff the pair is a θ-edge iff
-            // `similarity(m, g) >= theta` (see the `adjacency` construction above). This removes
-            // the O(token_len) factor from the grow, making a dense (near-)clique
-            // component O(n²) lookups instead of O(n² · token_len) overlap recomputes.
+            // `similarity(m, g) >= theta` (see [`adjacency_set`]). This removes the O(token_len)
+            // factor from the grow, making a dense (near-)clique component O(n²) lookups instead
+            // of O(n² · token_len) overlap recomputes.
             let mut coherent = true;
             for (group_index, &g) in group.iter().enumerate() {
-                if group_index.is_multiple_of(1024) && cancelled() {
+                if poll(group_index, POLL_CHEAP_STRIDE, cancelled) {
                     return None;
                 }
                 if !adjacency.contains(&(m.min(g), m.max(g))) {
@@ -344,17 +392,24 @@ pub fn coherence_split_cancellable(
             budget_tripped = true;
         }
     }
+    Some(CliqueCover { groups, budget_tripped })
+}
 
-    // 5. Keep only maximal groups (drop any that is a strict subset of another). SKIP this
-    // O(groups² × n) pass when the budget tripped — on a pathologically tangled component it is the
-    // expensive step, and the bare-pair tail is already minimal (2-member edges). Redundant subset
-    // groups in the over-budget output are harmless to recall (they never drop a member).
+/// Keep only maximal groups (drop any that is a strict subset of another), de-duplicate identical
+/// groups, drop singletons, and sort by lowest member id.
+///
+/// The O(groups² × n) subset pass is SKIPPED when the budget tripped — on a pathologically tangled
+/// component it is the expensive step, and the bare-pair tail is already minimal (2-member edges).
+/// Redundant subset groups in the over-budget output are harmless to recall (they never drop a
+/// member).
+fn retain_maximal(cover: CliqueCover, cancelled: &impl Fn() -> bool) -> Option<Vec<Vec<i64>>> {
+    let CliqueCover { groups, budget_tripped } = cover;
     let mut maximal: Vec<Vec<i64>> = if budget_tripped {
         groups
     } else {
         let mut kept: Vec<Vec<i64>> = Vec::new();
         for (group_index, g) in groups.iter().enumerate() {
-            if group_index.is_multiple_of(32) && cancelled() {
+            if poll(group_index, POLL_GROUP_PASS_STRIDE, cancelled) {
                 return None;
             }
             let mut is_subset = false;
@@ -367,7 +422,7 @@ pub fn coherence_split_cancellable(
                 }
                 let mut contained = true;
                 for (member_index, member) in g.iter().enumerate() {
-                    if member_index.is_multiple_of(256) && cancelled() {
+                    if poll(member_index, POLL_SCAN_STRIDE, cancelled) {
                         return None;
                     }
                     if !other.contains(member) {
@@ -387,14 +442,14 @@ pub fn coherence_split_cancellable(
         kept
     };
 
-    // 6. De-duplicate identical groups (same set).
+    // De-duplicate identical groups (same set).
     maximal.sort_unstable();
     maximal.dedup();
 
-    // 7. Drop singletons (shouldn't happen since we start from edges, but be safe).
+    // Drop singletons (shouldn't happen since we start from edges, but be safe).
     maximal.retain(|g| g.len() >= 2);
 
-    // 8. Sort by lowest member id (determinism).
+    // Sort by lowest member id (determinism).
     maximal.sort_by_key(|g| g[0]);
 
     Some(maximal)
@@ -419,7 +474,7 @@ fn sort_dedup_edges_cancellable(
     let mut sorted = Vec::with_capacity(edges.len());
     let mut visits = 0usize;
     while let Some(Reverse((edge, chunk, index))) = heap.pop() {
-        if visits.is_multiple_of(1024) && cancelled() {
+        if poll(visits, POLL_CHEAP_STRIDE, cancelled) {
             return None;
         }
         visits += 1;
@@ -493,7 +548,7 @@ fn sort_seeds_cancellable(
     }
     let mut sorted = Vec::with_capacity(seeds.len());
     while let Some(SeedHead { seed, chunk, index }) = heap.pop() {
-        if sorted.len().is_multiple_of(1024) && cancelled() {
+        if poll(sorted.len(), POLL_CHEAP_STRIDE, cancelled) {
             return None;
         }
         sorted.push(seed);
