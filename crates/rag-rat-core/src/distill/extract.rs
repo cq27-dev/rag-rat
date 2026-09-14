@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rag_rat_base::time::now_ms;
 use rag_rat_db::schema::active_repo_id;
 use rag_rat_papertrail::{CloserKind, ClosingEdgeSource, FixEdgeSource, ItemKind, OutcomeStatus};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::distill::candidates::{self, AnchorCaps};
@@ -132,7 +132,7 @@ pub(crate) fn extract(
     // reads and the reconciliation writes, planning off a stale/mixed snapshot (records/queue for
     // threads that just reopened or coalesced). BEGIN IMMEDIATE takes the write lock up front, so
     // the reads and writes see one consistent snapshot.
-    in_txn(conn, || {
+    super::in_txn(conn, TransactionBehavior::Immediate, || {
         let items = load_items(conn, &repo_id)?;
         let edges = load_closing_edges(conn, &repo_id)?;
 
@@ -1997,26 +1997,6 @@ impl From<&ItemRow> for ThreadKey {
             item_kind: item.kind.as_db_str().to_owned(),
             item_key: item.key.clone(),
         }
-    }
-}
-
-/// Run `body` inside an IMMEDIATE transaction when the connection is in autocommit; otherwise run
-/// inline (the caller owns the transaction). Mirrors the store layer's fence.
-fn in_txn<T>(conn: &Connection, body: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
-    if conn.is_autocommit() {
-        conn.execute_batch("BEGIN IMMEDIATE")?;
-        match body() {
-            Ok(value) => {
-                conn.execute_batch("COMMIT")?;
-                Ok(value)
-            },
-            Err(err) => {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(err)
-            },
-        }
-    } else {
-        body()
     }
 }
 

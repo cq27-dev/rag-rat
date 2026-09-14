@@ -27,6 +27,24 @@ pub(crate) use drain::{drain, pending_count};
 pub use extract::ExtractReport;
 pub(crate) use extract::{enqueue_eligible, extract};
 
+/// Run `body` inside a `BEGIN <behavior>` transaction when the connection is in autocommit;
+/// otherwise run it inline, because the caller already owns the open transaction. A failed body
+/// rolls back, and so does a failed `COMMIT` (the dropped [`rusqlite::Transaction`] issues it) —
+/// otherwise a commit that errors would leave the transaction open on the shared connection.
+fn in_txn<T>(
+    conn: &rusqlite::Connection,
+    behavior: rusqlite::TransactionBehavior,
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if !conn.is_autocommit() {
+        return body();
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, behavior)?;
+    let value = body()?;
+    tx.commit()?;
+    Ok(value)
+}
+
 /// Advance the per-repo papertrail Lens lanes a distill write feeds — the aggregate enrichment
 /// clock and the papertrail lane.
 ///
