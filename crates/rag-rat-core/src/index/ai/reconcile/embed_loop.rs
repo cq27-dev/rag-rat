@@ -918,7 +918,7 @@ mod freshness_version_tests {
             input_chars: input_text.chars().count(),
             input_text,
             input_truncated: false,
-            policy: "Embed".to_string(),
+            policy: EmbeddingPolicy::Embed,
             priority: 0,
             reason: ReconcileReason::Missing,
         }

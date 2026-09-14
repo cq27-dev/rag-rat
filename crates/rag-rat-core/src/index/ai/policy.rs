@@ -1,6 +1,44 @@
 use super::*;
 use crate::index::edges::named_children;
 
+/// Persisted policy tokens. Unknown values remain opaque and ineligible on a certified scan.
+#[derive(Debug, Clone, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+pub enum EmbeddingPolicy {
+    Embed,
+    SkipTooLarge,
+    SkipGenerated,
+    SkipTestFixture,
+    SkipLanguageUnsupported,
+    SkipTooSmall,
+    SkipLowSignal,
+    #[strum(disabled)]
+    Unknown(String),
+}
+
+impl EmbeddingPolicy {
+    pub fn as_db_str(&self) -> &str {
+        match self {
+            Self::Unknown(token) => token,
+            _ => self.into(),
+        }
+    }
+    pub fn from_db_str(token: &str) -> Option<Self> {
+        token.parse().ok()
+    }
+    pub(crate) fn from_stored_token(token: String) -> Self {
+        Self::from_db_str(&token).unwrap_or(Self::Unknown(token))
+    }
+    pub fn is_eligible(&self) -> bool {
+        matches!(self, Self::Embed)
+    }
+}
+
+impl Serialize for EmbeddingPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_db_str())
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// Counts embed-path FromText re-classifications ([`policy_for_job`]) since the last reset — the
@@ -131,19 +169,19 @@ pub(crate) fn cheap_skip_policy(
     if trimmed.chars().count() > max_embedding_chars.saturating_mul(4)
         && (file_kind == "generated" || chunk_kind == "generated" || symbol_path.is_none())
     {
-        return Some(policy("SkipTooLarge", 9, false));
+        return Some(policy(EmbeddingPolicy::SkipTooLarge, 9, false));
     }
     if file_kind == "generated" || chunk_kind == "generated" || looks_generated_path(&path_text) {
-        return Some(policy("SkipGenerated", 9, false));
+        return Some(policy(EmbeddingPolicy::SkipGenerated, 9, false));
     }
     if is_test_fixture_path(&path_text) {
-        return Some(policy("SkipTestFixture", 9, false));
+        return Some(policy(EmbeddingPolicy::SkipTestFixture, 9, false));
     }
     if language.parse::<Language>().is_err() {
-        return Some(policy("SkipLanguageUnsupported", 9, false));
+        return Some(policy(EmbeddingPolicy::SkipLanguageUnsupported, 9, false));
     }
     if trimmed.chars().count() < MIN_EMBEDDING_CHARS {
-        return Some(policy("SkipTooSmall", 9, false));
+        return Some(policy(EmbeddingPolicy::SkipTooSmall, 9, false));
     }
     None
 }
@@ -172,16 +210,24 @@ pub(crate) fn embedding_policy_for_chunk(
         return skip;
     }
     if low_signal.is_low_signal(language, chunk_kind, symbol_path, trimmed) {
-        return policy("SkipLowSignal", 9, false);
+        return policy(EmbeddingPolicy::SkipLowSignal, 9, false);
     }
     // Normalize via `paths::path_string` as `cheap_skip_policy` does, so `embedding_priority`'s
     // path heuristics see the same form the stored `files.path` uses on every platform.
     let path_text = rag_rat_base::paths::path_string(path);
-    policy("Embed", embedding_priority(&path_text, language, chunk_kind, symbol_path), true)
+    policy(
+        EmbeddingPolicy::Embed,
+        embedding_priority(&path_text, language, chunk_kind, symbol_path),
+        true,
+    )
 }
 
-pub(crate) fn policy(name: &str, priority: i64, eligible: bool) -> EmbeddingPolicyDecision {
-    EmbeddingPolicyDecision { policy: name.to_string(), priority, eligible }
+pub(crate) fn policy(
+    name: EmbeddingPolicy,
+    priority: i64,
+    eligible: bool,
+) -> EmbeddingPolicyDecision {
+    EmbeddingPolicyDecision { policy: name, priority, eligible }
 }
 
 pub(crate) fn policy_for_job(
@@ -214,9 +260,9 @@ pub(crate) fn job_policy(
 ) -> EmbeddingPolicyDecision {
     if stamped_policy {
         return policy(
-            &chunk.embedding_policy,
+            chunk.embedding_policy.clone(),
             chunk.embedding_priority,
-            chunk.embedding_policy == "Embed",
+            chunk.embedding_policy.is_eligible(),
         );
     }
     policy_for_job(chunk, max_embedding_chars)
@@ -557,7 +603,7 @@ mod backslash_path_tests {
                 4000,
             )
             .map(|decision| decision.policy),
-            Some("SkipGenerated".to_string()),
+            Some(super::EmbeddingPolicy::SkipGenerated),
         );
     }
 }
@@ -583,7 +629,7 @@ mod policy_version_tests {
     };
 
     fn record(sig: &mut String, label: &str, d: &super::EmbeddingPolicyDecision) {
-        let _ = writeln!(sig, "{label}|{}|{}|{}", d.policy, d.priority, d.eligible);
+        let _ = writeln!(sig, "{label}|{}|{}|{}", d.policy.as_db_str(), d.priority, d.eligible);
     }
 
     fn behavior_signature() -> String {
@@ -972,5 +1018,33 @@ mod policy_version_tests {
                 super::priority_label(expected.parse().unwrap()),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_token_tests {
+    use super::*;
+
+    #[test]
+    fn persisted_policy_tokens_keep_wire_spelling_and_unknown_values() {
+        for token in [
+            "Embed",
+            "SkipTooLarge",
+            "SkipGenerated",
+            "SkipTestFixture",
+            "SkipLanguageUnsupported",
+            "SkipTooSmall",
+            "SkipLowSignal",
+        ] {
+            let policy = EmbeddingPolicy::from_db_str(token).unwrap();
+            assert_eq!(policy.as_db_str(), token);
+            assert_eq!(serde_json::to_value(&policy).unwrap(), token);
+            assert_eq!(policy.is_eligible(), token == "Embed");
+        }
+        assert_eq!(EmbeddingPolicy::from_db_str("FuturePolicy"), None);
+        let policy = EmbeddingPolicy::from_stored_token("FuturePolicy".to_string());
+        assert!(!policy.is_eligible());
+        assert_eq!(policy.as_db_str(), "FuturePolicy");
+        assert_eq!(serde_json::to_value(policy).unwrap(), "FuturePolicy");
     }
 }

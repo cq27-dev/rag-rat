@@ -48,7 +48,7 @@ pub(crate) fn current_chunk_row(
         input_hash: row.get(11)?,
         embedding_text_version: row.get(12)?,
         next_retry_after_ms: row.get(13)?,
-        embedding_policy: row.get(17)?,
+        embedding_policy: EmbeddingPolicy::from_stored_token(row.get(17)?),
         embedding_priority: row.get(18)?,
         reason: ReconcileReason::Forced,
     };
@@ -82,7 +82,7 @@ fn candidate_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CurrentCh
         input_hash: row.get(11)?,
         embedding_text_version: row.get(12)?,
         next_retry_after_ms: row.get(13)?,
-        embedding_policy: row.get(14)?,
+        embedding_policy: EmbeddingPolicy::from_stored_token(row.get(14)?),
         embedding_priority: row.get(15)?,
         reason: ReconcileReason::Forced,
     })
@@ -601,7 +601,7 @@ pub(crate) fn store_embedding(
             chunk.text_hash,
             chunk.input_hash,
             EMBEDDING_TEXT_VERSION,
-            chunk.policy,
+            chunk.policy.as_db_str(),
             chunk.priority,
             i64::try_from(chunk.input_chars).unwrap_or(i64::MAX),
             chunk.input_truncated,
@@ -702,7 +702,7 @@ pub(crate) fn store_failed_embedding(
             chunk.text_hash,
             chunk.input_hash,
             EMBEDDING_TEXT_VERSION,
-            chunk.policy,
+            chunk.policy.as_db_str(),
             chunk.priority,
             i64::try_from(chunk.input_chars).unwrap_or(i64::MAX),
             chunk.input_truncated,
@@ -719,6 +719,23 @@ pub(crate) fn store_failed_embedding(
 #[cfg(test)]
 mod artifact_status_read_tests {
     use super::*;
+
+    #[test]
+    fn certified_unknown_policy_remains_opaque_and_ineligible() {
+        let conn = Connection::open_in_memory().unwrap();
+        let chunk = conn
+            .query_row(
+                "SELECT 1, 'a.rs', 'rust', 'source', 'code', NULL, 'new', NULL, NULL, NULL, NULL, \
+                 NULL, NULL, NULL, 'FuturePolicy', 7",
+                [],
+                candidate_metadata_row,
+            )
+            .unwrap();
+        let decision = job_policy(&chunk, DEFAULT_MAX_EMBEDDING_CHARS, true);
+        assert!(!decision.eligible);
+        assert_eq!(decision.priority, 7);
+        assert_eq!(decision.policy.as_db_str(), "FuturePolicy");
+    }
 
     #[test]
     fn unknown_artifact_status_retains_row_presence_for_reason_classification() {

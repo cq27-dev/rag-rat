@@ -16,6 +16,7 @@ use std::time::Instant;
 // selection, no tune-cache write — those stay on the reconcile path.
 pub(crate) use embedder_select::{ChunkEmbedder, acquire_chunk_embedder, active_embedder};
 pub(crate) use helpers::*;
+pub use policy::EmbeddingPolicy;
 pub(crate) use policy::*;
 use rag_rat_base::language::Language;
 use rag_rat_base::time::now_ms;
@@ -340,7 +341,7 @@ impl Default for ReconcileOptions {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbeddingPolicyDecision {
-    pub policy: String,
+    pub policy: EmbeddingPolicy,
     pub priority: i64,
     pub eligible: bool,
 }
@@ -388,7 +389,7 @@ pub(crate) struct CurrentChunk {
     /// The stamped index-time policy columns (`chunks.embedding_policy` / `embedding_priority`),
     /// trusted as the policy source only under `EmbeddingScan::stamped_policy` (#530
     /// certification).
-    embedding_policy: String,
+    embedding_policy: EmbeddingPolicy,
     embedding_priority: i64,
     reason: ReconcileReason,
 }
@@ -401,7 +402,7 @@ pub(crate) struct PreparedEmbeddingJob {
     input_hash: String,
     input_chars: usize,
     input_truncated: bool,
-    policy: String,
+    policy: EmbeddingPolicy,
     priority: i64,
     reason: ReconcileReason,
 }

@@ -453,7 +453,7 @@ impl IndexDatabase {
                 anchor.start_context_hash,
                 anchor.end_context_hash,
                 anchor.context_radius,
-                prepared.embedding.policy,
+                prepared.embedding.policy.as_db_str(),
                 prepared.embedding.priority,
             ])?;
             let chunk_id = conn.last_insert_rowid();

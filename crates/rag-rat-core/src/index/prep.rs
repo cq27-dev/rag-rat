@@ -667,12 +667,12 @@ mod low_signal_wiring_tests {
 
         assert_eq!(decisions(&with_tree), decisions(&text_only), "span vs text policy parity");
         assert!(
-            with_tree.iter().any(|pc| pc.embedding.policy == "SkipLowSignal"),
+            with_tree.iter().any(|pc| pc.embedding.policy == ai::EmbeddingPolicy::SkipLowSignal),
             "fixture must exercise the low-signal outcome: {:?}",
             decisions(&with_tree),
         );
         assert!(
-            with_tree.iter().any(|pc| pc.embedding.policy == "Embed"),
+            with_tree.iter().any(|pc| pc.embedding.policy == ai::EmbeddingPolicy::Embed),
             "fixture must exercise the embed outcome: {:?}",
             decisions(&with_tree),
         );

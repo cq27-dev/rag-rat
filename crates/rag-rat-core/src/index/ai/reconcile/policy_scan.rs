@@ -5,7 +5,7 @@ use super::super::*;
 /// chunks whose recomputed policy actually differs from what is persisted.
 pub(crate) struct ChunkForPolicy {
     id: i64,
-    current_policy: String,
+    current_policy: EmbeddingPolicy,
     current_priority: i64,
     chunk_kind: String,
     symbol_path: Option<String>,
@@ -199,7 +199,7 @@ fn recompute_policy_skip_summary(
     let mut skipped_by_policy = BTreeMap::new();
     for_each_recomputed_chunk_policy(conn, max_embedding_chars, |_chunk, decision| {
         if !decision.eligible {
-            *skipped_by_policy.entry(decision.policy).or_default() += 1;
+            *skipped_by_policy.entry(decision.policy.as_db_str().to_string()).or_default() += 1;
         }
         Ok(())
     })?;
@@ -287,7 +287,7 @@ fn for_each_recomputed_chunk_policy(
                 dict_version: row.get(12)?,
             }
             .resolve(&mut decoder)?,
-            current_policy: row.get(13)?,
+            current_policy: EmbeddingPolicy::from_stored_token(row.get(13)?),
             current_priority: row.get(14)?,
         };
         // A structural file (has a grammar, not generated) within the parse cap classifies from its
@@ -478,7 +478,7 @@ fn heal_embedding_policy_locked(conn: &Connection, repo_id: &str) -> anyhow::Res
             if decision.policy != chunk.current_policy
                 || decision.priority != chunk.current_priority
             {
-                stage.execute(params![chunk.id, decision.policy, decision.priority])?;
+                stage.execute(params![chunk.id, decision.policy.as_db_str(), decision.priority])?;
             }
             Ok(())
         })?;
@@ -509,12 +509,12 @@ fn heal_embedding_policy_locked(conn: &Connection, repo_id: &str) -> anyhow::Res
 
 #[cfg(test)]
 mod reconstruct_file_text_tests {
-    use super::{ChunkForPolicy, reconstruct_file_text};
+    use super::{ChunkForPolicy, EmbeddingPolicy, reconstruct_file_text};
 
     fn chunk(start_byte: usize, end_byte: usize, text: &str) -> ChunkForPolicy {
         ChunkForPolicy {
             id: 0,
-            current_policy: "Embed".to_string(),
+            current_policy: EmbeddingPolicy::Embed,
             current_priority: 1,
             chunk_kind: "code".to_string(),
             symbol_path: None,

@@ -1196,7 +1196,7 @@ fn skip_summary_shared_parse_matches_per_chunk_text() {
                 LowSignalCheck::FromText,
             );
             if !decision.eligible {
-                *out.entry(decision.policy).or_default() += 1;
+                *out.entry(decision.policy.as_db_str().to_string()).or_default() += 1;
             }
         }
         out
