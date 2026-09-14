@@ -1287,6 +1287,39 @@ fn deleting_a_target_file_fully_dangles_its_in_edges() {
 }
 
 #[test]
+fn file_scope_tracks_the_active_checkout_and_preserves_sibling_overlays() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let linked = unique_temp_root();
+    run_git(&root, &["worktree", "add", "-q", "-b", "scope-linked", linked.to_str().unwrap()]);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let main = super::super::resolve_git_context(&root);
+    let sibling = super::super::resolve_git_context(&linked);
+    assert_ne!(main.worktree_id, sibling.worktree_id);
+    let sentinel = insert_stale_overlay_row(&db, "src/lib.rs", &main.worktree_id);
+    for checkout in [&main, &sibling] {
+        db.set_context(checkout.borrowed()).unwrap();
+        let clean = db.scope_for(false);
+        assert_eq!(clean.commit_sha, checkout.commit_sha);
+        assert!(clean.worktree_id.is_empty());
+        let dirty = db.scope_for(true);
+        assert!(dirty.commit_sha.is_empty());
+        assert_eq!(dirty.worktree_id, checkout.worktree_id);
+    }
+    db.mark_file_deleted(Path::new("src/lib.rs")).unwrap();
+    let owner: String = db
+        .storage
+        .connection()
+        .query_row("SELECT worktree_id FROM main.files WHERE id = ?1", [sentinel], |row| row.get(0))
+        .unwrap();
+    assert_eq!(owner, main.worktree_id);
+    db.active_commit_sha.clear();
+    assert_eq!(db.scope_for(false).worktree_id, sibling.worktree_id);
+    drop(db);
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn deleting_a_linked_target_dangles_only_its_overlay_edges() {
     let (root, config) = git_fixture_for_overlay_tests();
     fs::write(root.join("src/callee.rs"), "pub fn callee() {}\n").unwrap();

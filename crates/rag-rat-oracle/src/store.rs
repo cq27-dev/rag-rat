@@ -22,8 +22,8 @@ use super::{OracleResolutionKind, OracleTool};
 /// `files`-anchored oracle query can `AND` it in.
 ///
 /// SCOPE (load-bearing, #82 P0): a production `files` row carries EITHER `(commit_sha, '')` (clean,
-/// `FileScope::commit`) OR `('', worktree_id)` (dirty overlay, `FileScope::worktree`) — NEVER both
-/// (see `index/mod.rs::FileScope`, `incremental.rs::assign_file_scopes`). The old predicate
+/// `CheckoutKey::commit`) OR `('', worktree_id)` (dirty overlay, `CheckoutKey::worktree`) — NEVER
+/// both (see `IndexDatabase::scope_for` in `index/file_rows.rs`). The old predicate
 /// `files.commit_sha = ?sha AND files.worktree_id = ?wt` with BOTH non-empty therefore matched ZERO
 /// rows on any real git checkout, silently writing 0 verdicts. A row is in the active checkout iff
 /// the dirty overlay claims it (`worktree_id = wt`, overlay wins) OR the committed row does

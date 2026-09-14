@@ -1016,17 +1016,12 @@ impl IndexDatabase {
         files: Vec<IndexFile>,
         changes: &GitChangedPaths,
     ) -> Vec<IndexFile> {
-        let has_base_commit = !self.active_commit_sha.is_empty();
         files
             .into_iter()
             .map(|mut file| {
-                if !has_base_commit || changes.changed.contains(&file.relative_path) {
-                    file.commit_sha.clear();
-                    file.worktree_id.clone_from(&self.active_worktree_id);
-                } else {
-                    file.commit_sha.clone_from(&self.active_commit_sha);
-                    file.worktree_id.clear();
-                }
+                let scope = self.scope_for(changes.changed.contains(&file.relative_path));
+                file.commit_sha = scope.commit_sha;
+                file.worktree_id = scope.worktree_id;
                 file
             })
             .collect()

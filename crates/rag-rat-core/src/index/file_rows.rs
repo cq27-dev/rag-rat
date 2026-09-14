@@ -149,6 +149,17 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// The scope a file row lands in: the worktree OVERLAY when the working tree dirtied the file
+    /// — or when there is no base commit to key a committed row by — otherwise the active commit.
+    /// The one statement of this rule for the indexing passes and the read-path heal.
+    pub(super) fn scope_for(&self, is_dirty: bool) -> CheckoutKey {
+        if is_dirty || self.active_commit_sha.is_empty() {
+            CheckoutKey::worktree(self.active_worktree_id.clone())
+        } else {
+            CheckoutKey::commit(self.active_commit_sha.clone())
+        }
+    }
+
     pub(super) fn mark_file_deleted(&self, path: &Path) -> anyhow::Result<()> {
         self.write_tombstone_in_scope(path, &self.active_worktree_id)
     }
