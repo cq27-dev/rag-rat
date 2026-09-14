@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::OracleReport;
 use super::run::OracleEvalMetrics;
+use super::{OracleReport, OracleTool};
 
 /// Schema version for [`OracleResolutionReport`]. **Bump on any change to the report's shape or to
 /// the semantics of a field** (e.g. a denominator redefinition). A Δ consumer must refuse to diff
@@ -68,14 +68,15 @@ pub struct CorpusHealth {
 pub struct CorpusProfile {
     /// Stable corpus id (e.g. `"py-requests"`).
     pub corpus_id: String,
-    /// `"small"` (per-PR gate) or `"heavy"` (release → Bencher).
-    pub tier: String,
+    /// Which matrix the corpus runs in.
+    pub tier: CorpusTier,
     /// Source repo URL.
     pub repo: String,
     /// Pinned revision (commit SHA / tag).
     pub rev: String,
-    /// SCIP tool id (matches [`OracleTool::as_db_str`]).
-    pub tool: String,
+    /// The SCIP tool, spelled in the profile file as its [`OracleTool::as_db_str`] token.
+    #[serde(with = "oracle_tool_token")]
+    pub tool: OracleTool,
     /// Per-language prerequisite commands run before indexing (e.g. `cargo fetch`, venv install).
     pub prepare: Vec<String>,
     /// Target bindings (`language -> [paths]`); a `BTreeMap` so iteration/serialization order is
@@ -95,6 +96,47 @@ impl CorpusProfile {
         let canonical = serde_json::to_vec(self).expect("CorpusProfile is always serializable");
         let digest = Sha256::digest(&canonical);
         rag_rat_base::hash::hex_lower(&digest)
+    }
+}
+
+/// The corpus matrix a profile runs in. Spelled in the profile file, the report and the profile
+/// hash as its lowercase token, so the tokens are schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::IntoStaticStr)]
+#[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
+pub enum CorpusTier {
+    /// The per-PR gate.
+    Small,
+    /// The release → Bencher run.
+    Heavy,
+}
+
+impl CorpusTier {
+    pub fn as_db_str(self) -> &'static str {
+        self.into()
+    }
+}
+
+/// [`CorpusProfile::tool`] through its persisted token rather than serde's variant name: the
+/// profile file spells a tool `rust-analyzer`, and that spelling is part of the profile hash.
+mod oracle_tool_token {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::OracleTool;
+
+    pub(super) fn serialize<S: Serializer>(
+        tool: &OracleTool,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(tool.as_db_str())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<OracleTool, D::Error> {
+        let token = String::deserialize(deserializer)?;
+        OracleTool::from_db_str(&token)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown oracle tool `{token}`")))
     }
 }
 
@@ -203,10 +245,10 @@ impl OracleResolutionReport {
             report_schema_version: REPORT_SCHEMA_VERSION,
             corpus_profile_hash: profile.hash(),
             corpus_id: profile.corpus_id.clone(),
-            tier: profile.tier.clone(),
+            tier: profile.tier.as_db_str().to_string(),
             repo: profile.repo.clone(),
             rev: profile.rev.clone(),
-            tool: profile.tool.clone(),
+            tool: profile.tool.as_db_str().to_string(),
             tool_version: provenance.tool_version.clone(),
             rag_rat_commit: provenance.rag_rat_commit.clone(),
             worktree_id: provenance.worktree_id.clone(),
@@ -260,10 +302,10 @@ mod tests {
         bindings.insert("python".to_string(), vec!["src/requests".to_string()]);
         CorpusProfile {
             corpus_id: "py-requests".to_string(),
-            tier: "small".to_string(),
+            tier: CorpusTier::Small,
             repo: "https://github.com/psf/requests".to_string(),
             rev: "abc123".to_string(),
-            tool: "scip-python".to_string(),
+            tool: OracleTool::ScipPython,
             prepare: vec![
                 "python -m venv .venv".to_string(),
                 ".venv/bin/pip install .".to_string(),

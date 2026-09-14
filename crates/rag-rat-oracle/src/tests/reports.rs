@@ -64,10 +64,10 @@ fn resolution_report_assembles_before_after_from_index() {
     bindings.insert("rust".to_string(), vec!["src".to_string()]);
     let profile = super::CorpusProfile {
         corpus_id: "rust-test".to_string(),
-        tier: "small".to_string(),
+        tier: super::CorpusTier::Small,
         repo: "r".to_string(),
         rev: "1".to_string(),
-        tool: TOOL.as_db_str().to_string(),
+        tool: TOOL,
         prepare: Vec::new(),
         bindings,
         health: super::CorpusHealth {

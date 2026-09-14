@@ -8,7 +8,7 @@
 
 use serde::Deserialize;
 
-use super::report::{CorpusProfile, OracleResolutionReport};
+use super::report::{CorpusProfile, CorpusTier, OracleResolutionReport};
 
 /// The `[[corpus]]` array shape of `oracle-corpora.toml`.
 #[derive(Debug, Clone, Deserialize)]
@@ -35,8 +35,9 @@ pub fn corpus_by_id<'a>(corpora: &'a [CorpusProfile], id: &str) -> Option<&'a Co
     corpora.iter().find(|corpus| corpus.corpus_id == id)
 }
 
-/// The corpora in a tier (`"small"` for the per-PR matrix, `"heavy"` for release/Bencher).
-pub fn corpora_for_tier<'a>(corpora: &'a [CorpusProfile], tier: &str) -> Vec<&'a CorpusProfile> {
+/// The corpora in a tier ([`CorpusTier::Small`] for the per-PR matrix, [`CorpusTier::Heavy`] for
+/// release/Bencher).
+pub fn corpora_for_tier(corpora: &[CorpusProfile], tier: CorpusTier) -> Vec<&CorpusProfile> {
     corpora.iter().filter(|corpus| corpus.tier == tier).collect()
 }
 
@@ -119,7 +120,8 @@ pub fn check_corpus_health(
 mod tests {
     use super::*;
     use crate::{
-        OracleEvalMetrics, OracleReport, ResolutionBefore, ResolutionDelta, RunProvenance,
+        OracleEvalMetrics, OracleReport, OracleTool, ResolutionBefore, ResolutionDelta,
+        RunProvenance,
     };
 
     // Inline sample for the deterministic logic/health tests — kept IN-CRATE so they're packaging-
@@ -159,6 +161,21 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
         assert!(load_corpora("").is_err());
     }
 
+    #[test]
+    fn load_rejects_an_unknown_tier_or_tool() {
+        // Both are closed sets. A typo'd tier would drop the corpus from every tier's matrix — the
+        // silent no-op this loader fails closed on — and an unknown tool would only surface when
+        // the runner dispatched that one corpus.
+        let typo_tier = SAMPLE.replacen("tier      = \"small\"", "tier      = \"smal\"", 1);
+        assert_ne!(typo_tier, SAMPLE);
+        assert!(load_corpora(&typo_tier).is_err(), "a typo'd tier fails at load");
+
+        let unknown_tool = SAMPLE.replacen("\"rust-analyzer\"", "\"rust-analyser\"", 1);
+        assert_ne!(unknown_tool, SAMPLE);
+        let err = load_corpora(&unknown_tool).unwrap_err().to_string();
+        assert!(err.contains("unknown oracle tool `rust-analyser`"), "{err}");
+    }
+
     /// `CorpusProfile::hash` is the comparability key stored with every baseline report, so a
     /// loaded profile's serialized form must not move: a changed field token would silently make
     /// every stored baseline incomparable.
@@ -176,11 +193,15 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
     #[test]
     fn sample_loads_and_selects_by_id_and_tier() {
         let corpora = load_corpora(SAMPLE).unwrap();
-        let small: Vec<&str> =
-            corpora_for_tier(&corpora, "small").iter().map(|c| c.corpus_id.as_str()).collect();
+        let small: Vec<&str> = corpora_for_tier(&corpora, CorpusTier::Small)
+            .iter()
+            .map(|c| c.corpus_id.as_str())
+            .collect();
         assert_eq!(small, ["rust-semver"]);
-        let heavy: Vec<&str> =
-            corpora_for_tier(&corpora, "heavy").iter().map(|c| c.corpus_id.as_str()).collect();
+        let heavy: Vec<&str> = corpora_for_tier(&corpora, CorpusTier::Heavy)
+            .iter()
+            .map(|c| c.corpus_id.as_str())
+            .collect();
         assert_eq!(heavy, ["linux-kernel"]);
         assert!(corpus_by_id(&corpora, "nope").is_none());
     }
@@ -206,10 +227,10 @@ health    = { expected_min_heuristic_edges = 50000, expected_min_oracle_examined
             "rust-cargo",
             "linux-kernel"
         ]);
-        assert_eq!(corpus_by_id(&corpora, "py-rich").unwrap().tool, "scip-python");
-        assert_eq!(corpus_by_id(&corpora, "ts-rxjs").unwrap().tool, "scip-typescript");
-        assert_eq!(corpus_by_id(&corpora, "cpp-yaml").unwrap().tool, "scip-clang");
-        assert_eq!(corpus_by_id(&corpora, "py-django").unwrap().tool, "scip-python");
+        assert_eq!(corpus_by_id(&corpora, "py-rich").unwrap().tool, OracleTool::ScipPython);
+        assert_eq!(corpus_by_id(&corpora, "ts-rxjs").unwrap().tool, OracleTool::ScipTypescript);
+        assert_eq!(corpus_by_id(&corpora, "cpp-yaml").unwrap().tool, OracleTool::ScipClang);
+        assert_eq!(corpus_by_id(&corpora, "py-django").unwrap().tool, OracleTool::ScipPython);
 
         // GOLDEN per-profile hashes: an edit to any corpus field changes its hash (and makes prior
         // reports incomparable) — recompute deliberately when intended.
