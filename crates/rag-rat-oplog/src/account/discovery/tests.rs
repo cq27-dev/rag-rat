@@ -290,24 +290,62 @@ fn the_wrap_context_carries_account_tag_epoch_and_recipient() {
 
 // ---------------------------------------------------------------- envelope shape
 
-/// The size law an envelope obeys — and the reason the publish side has a recipient ceiling at all.
-///
-/// `1 + WRAP_LEN·n` is what makes roster size a WIRE constraint: the discovery service caps one
-/// publish, so this growth rate decides how many devices an account can have before its host can no
-/// longer seal an announcement it is able to send. The publish side derives its recipient ceiling
-/// from `WRAP_LEN`; this pins `WRAP_LEN` against what sealing actually emits, so a wrap layout that
-/// grew would fail here rather than at the service, where the refusal is indistinguishable from a
-/// transient error.
+/// Every publishable roster has the same wire length; larger rosters remain complete.
 #[test]
-fn the_envelope_is_a_version_byte_then_one_wrap_per_recipient() {
+fn padding_hides_roster_size_without_dropping_oversize_recipients() {
     let conn = db();
     let account = bootstrap::local_account(&conn, NOW).unwrap();
-    add_member(&conn, account, &DeviceX25519Secret::from_seed(&[0x5c; 32]));
+    let mut members = Vec::new();
+    for count in 1..=26 {
+        if count > 1 {
+            let secret = DeviceX25519Secret::from_seed(&[count as u8; 32]);
+            let public = DeviceSecret::from_seed(&[count as u8; 32]).public();
+            author_control_op(&conn, account, &AccountOp::DeviceAdd {
+                device_fingerprint: public.fingerprint(),
+                ed25519_pubkey: public.to_bytes(),
+                x25519_pubkey: secret.public().to_bytes(),
+                role: DeviceRole::Member,
+                label: None,
+            });
+            members.push(secret);
+        }
+        let sealed = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
+        assert_eq!(sealed.recipients, count);
+        assert_eq!(sealed.bytes[0], 1, "preserve the v1 grammar");
+        assert_eq!(sealed.bytes.len(), 1 + count.max(25) * 80);
+        assert_eq!(open_one(&conn, &TAG, &sealed.bytes), Some(NODE_ID));
+        let wraps = wraps_of(&sealed.bytes);
+        // X25519 basepoint multiplication emits canonical encodings with the high bit clear;
+        // raw random dummy bytes would fail this check with overwhelming probability.
+        assert!(wraps.iter().all(|wrap| wrap.ephemeral_pubkey[31] & 0x80 == 0));
+        for member in &members {
+            let ctx = ctx_for(account, &TAG, member);
+            let opened: Vec<_> = wraps
+                .iter()
+                .filter_map(|wrap| unwrap_content_key(wrap, member, &ctx).ok())
+                .collect();
+            assert_eq!(opened.len(), 1, "each real recipient has exactly one wrap");
+            assert_eq!(opened[0].as_slice(), NODE_ID);
+        }
+    }
+}
 
-    let sealed = seal_discovery_announcement(&conn, &TAG, &NODE_ID).unwrap().unwrap();
-    assert_eq!(sealed.bytes[0], ANNOUNCEMENT_VERSION);
-    assert_eq!(sealed.bytes.len(), 1 + 2 * WRAP_LEN, "one version byte, one wrap per recipient");
-    assert_eq!(wraps_of(&sealed.bytes).len(), 2);
+#[test]
+fn an_unpadded_v1_announcement_still_opens() {
+    let conn = db();
+    let account = bootstrap::local_account(&conn, NOW).unwrap();
+    let device = local_device(&conn, NOW).unwrap();
+    let public = device.x25519_public();
+    let sealed = keywrap::seal_content_key(
+        &ContentKey::from_seed(&NODE_ID),
+        &wrap_context(account, &TAG, &public.to_bytes()),
+        &public,
+    )
+    .unwrap();
+    let mut envelope = vec![1];
+    push_wrap(&mut envelope, &sealed);
+    assert_eq!(envelope.len(), 81);
+    assert_eq!(open_one(&conn, &TAG, &envelope), Some(NODE_ID));
 }
 
 /// Anything that is not one of ours is refused at parse, individually and quietly.
