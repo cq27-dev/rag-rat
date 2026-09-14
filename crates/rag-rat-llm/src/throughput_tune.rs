@@ -448,6 +448,9 @@ fn measure_candidates<E: Embedder>(
         let mut embedded: u64 = 0;
         let mut requests: u64 = 0;
         let mut failures: u64 = 0;
+        // Two tolerated failures per in-flight request; past that this fan-out is unstable. The
+        // one budget both stops the loop and marks the row `aborted`, which `select_knee` drops.
+        let failure_budget = u64::from(candidate) * 2;
         while Instant::now() < candidate_deadline {
             match embedder.embed_batch(&texts) {
                 Ok(vectors) => {
@@ -456,7 +459,7 @@ fn measure_candidates<E: Embedder>(
                 },
                 Err(_) => {
                     failures += 1;
-                    if failures > u64::from(candidate) * 2 {
+                    if failures > failure_budget {
                         break;
                     }
                 },
@@ -468,7 +471,7 @@ fn measure_candidates<E: Embedder>(
             texts_per_second: embedded as f64 / elapsed,
             requests,
             failures,
-            aborted: failures > u64::from(candidate) * 2,
+            aborted: failures > failure_budget,
         });
     }
     results
