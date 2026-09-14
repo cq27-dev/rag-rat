@@ -132,16 +132,16 @@ impl IndexDatabase {
         config: &Config,
         linked_path: &Path,
     ) -> anyhow::Result<()> {
-        let Some(ResolvedOverlayScope { base_sha, worktree_id, source_root, .. }) =
+        let Some(ResolvedOverlayScope { checkout, source_root, .. }) =
             resolve_overlay_scope(config, linked_path)?
         else {
             return Ok(());
         };
-        self.set_context(CheckoutRef { commit_sha: &base_sha, worktree_id: &worktree_id })?;
+        self.set_context(checkout.borrowed())?;
         self.storage.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| -> anyhow::Result<()> {
             self.refresh_packages(&source_root)?;
-            self.resolve_overlay_edges(&worktree_id)?;
+            self.resolve_overlay_edges(&checkout.worktree_id)?;
             self.bump_lens_revisions(&[rag_rat_db::meta::LENS_SYMBOLS_REVISION_META])?;
             Ok(())
         })();
@@ -406,10 +406,7 @@ impl IndexDatabase {
         let mut pruned = Vec::new();
         for path in existing {
             if !shadowing.contains(Path::new(&path)) {
-                self.remove_file_in_scope(Path::new(&path), CheckoutRef {
-                    commit_sha: "",
-                    worktree_id,
-                })?;
+                self.remove_file_in_scope(Path::new(&path), CheckoutRef::worktree(worktree_id))?;
                 pruned.push(PathBuf::from(path));
             }
         }

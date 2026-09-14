@@ -167,7 +167,7 @@ impl IndexDatabase {
         worktree_id: &str,
     ) -> anyhow::Result<()> {
         let path = path_string(path);
-        self.remove_file_in_scope(Path::new(&path), CheckoutRef { commit_sha: "", worktree_id })?;
+        self.remove_file_in_scope(Path::new(&path), CheckoutRef::worktree(worktree_id))?;
         self.storage.connection().execute(
             "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
              indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id, generation)

@@ -170,8 +170,7 @@ pub(crate) fn linked_source_root(
 /// used to re-discover both repos after this had already opened them — four `discover_repo`
 /// walks per refresh instead of two — so the handles are threaded through instead.
 pub(crate) struct ResolvedOverlayScope {
-    pub(crate) base_sha: String,
-    pub(crate) worktree_id: String,
+    pub(crate) checkout: CheckoutKey,
     /// `config.root`'s prefix relative to the repo workdir (both checkouts share the layout).
     pub(crate) config_subdir: PathBuf,
     /// The LINKED checkout's equivalent of `config.root` — overlay bytes are read from here.
@@ -200,22 +199,14 @@ pub(super) fn resolve_overlay_scope(
             config.root.display(),
         )
     })?;
-    let CheckoutKey { commit_sha: base_sha, worktree_id } =
-        git_context::resolve_worktree_scope(&config.root, Some(linked_path));
-    if worktree_id == git_context::worktree_id_of(&config.root) {
+    let checkout = git_context::resolve_worktree_scope(&config.root, Some(linked_path));
+    if checkout.worktree_id == git_context::worktree_id_of(&config.root) {
         return Ok(None);
     }
     let linked_repo = rag_rat_base::repo_discover::discover_repo(linked_path)?;
     let (config_subdir, source_root) =
         linked_config_subdir_and_root(&config.root, &base_repo, &linked_repo, linked_path)?;
-    Ok(Some(ResolvedOverlayScope {
-        base_sha,
-        worktree_id,
-        config_subdir,
-        source_root,
-        base_repo,
-        linked_repo,
-    }))
+    Ok(Some(ResolvedOverlayScope { checkout, config_subdir, source_root, base_repo, linked_repo }))
 }
 
 /// How an overlay refresh sources the COMMITTED half of its candidate set (#825) — the base↔linked

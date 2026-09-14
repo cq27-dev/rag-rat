@@ -55,14 +55,11 @@ impl IndexDatabase {
         };
         // Scope the connection to the overlay (base commit + linked worktree id) so context-
         // dependent steps (tombstones, FTS, edge resolution) operate in the linked scope.
-        self.set_context(CheckoutRef {
-            commit_sha: &overlay.base_sha,
-            worktree_id: &overlay.worktree_id,
-        })?;
+        self.set_context(overlay.checkout.borrowed())?;
 
         let committed = self.resolve_committed_delta_source(&overlay, config)?;
         let mut delta = compute_linked_worktree_delta(config, &overlay, committed)?;
-        let ResolvedOverlayScope { base_sha, worktree_id, source_root, .. } = overlay;
+        let ResolvedOverlayScope { checkout, source_root, .. } = overlay;
         // Fold in TARGET-IDENTITY drift: a branch config change that re-languages or drops a
         // byte-identical file is invisible to the content delta, but the overlay's (language, kind)
         // must still track the branch config, like discovery's staleness (#659 review). This also
@@ -73,7 +70,7 @@ impl IndexDatabase {
         // overlay refresh (#577 event-scoping).
         if self.overlay_targets_may_drift(&config.targets)? {
             let (drift_readable, drift_tombstones) = self.overlay_target_config_reconcile(
-                &base_sha,
+                &checkout.commit_sha,
                 config,
                 &source_root,
                 &delta.shadowing_paths(),
@@ -81,7 +78,7 @@ impl IndexDatabase {
             delta.readable.extend(drift_readable);
             delta.tombstones.extend(drift_tombstones);
         }
-        let scope = FileScope::worktree(worktree_id.clone());
+        let scope = CheckoutKey::worktree(checkout.worktree_id.clone());
         let mutations = self.in_overlay_refresh_txn(tail.logical_rebuild, || {
             let applied = self.index_explicit_paths_from_root(
                 config,
@@ -97,8 +94,10 @@ impl IndexDatabase {
             // path on an earlier pass and changes nothing now.
             let mut tombstoned_paths = Vec::new();
             for path in &delta.tombstones {
-                if !self.overlay_tombstone_exists(path, &worktree_id)? {
-                    self.write_tombstone_in_scope(path, &worktree_id)?;
+                if !self
+                    .overlay_tombstone_exists(path, CheckoutRef::worktree(&checkout.worktree_id))?
+                {
+                    self.write_tombstone_in_scope(path, &checkout.worktree_id)?;
                     tombstoned_paths.push(path.clone());
                 }
             }
@@ -109,14 +108,17 @@ impl IndexDatabase {
             // `shadowing_paths` would delete valid overlay rows; skip the prune and let the
             // next complete pass reconcile (mirrors gc's empty-live-set guard) (#219 review).
             let pruned_paths = if delta.status_complete {
-                self.prune_overlay_rows_not_in_delta(&worktree_id, &delta.shadowing_paths())?
+                self.prune_overlay_rows_not_in_delta(
+                    &checkout.worktree_id,
+                    &delta.shadowing_paths(),
+                )?
             } else {
                 Vec::new()
             };
             let pruned = pruned_paths.len();
             self.finalize_overlay_refresh(OverlayFinalize {
                 source_root: &source_root,
-                worktree_id: &worktree_id,
+                worktree_id: &checkout.worktree_id,
                 counts: OverlayChangeCounts { indexed, tombstoned, pruned },
                 manifest: if delta.manifest_changed {
                     ManifestSignal::Changed
@@ -130,7 +132,11 @@ impl IndexDatabase {
             // previously a separate autocommit per worktree per pass (an extra WAL-dirtying
             // commit each). Un-gated on the counts: a COMPLETE no-change refresh must still
             // record its basis (that skip proof is the whole point of #577).
-            self.apply_overlay_basis_tail(&worktree_id, delta.status_complete, tail.basis)?;
+            self.apply_overlay_basis_tail(
+                &checkout.worktree_id,
+                delta.status_complete,
+                tail.basis,
+            )?;
             let changed_paths =
                 committed_changed_paths(applied.planned, tombstoned_paths, pruned_paths);
             Ok(OverlayMutations { indexed, tombstoned, pruned, changed_paths })
@@ -138,7 +144,7 @@ impl IndexDatabase {
 
         let OverlayMutations { indexed, tombstoned, pruned, changed_paths } = mutations;
         Ok(WorktreeOverlayReport {
-            worktree_id,
+            worktree_id: checkout.worktree_id,
             source_root,
             indexed,
             changed_paths,
@@ -189,7 +195,7 @@ impl IndexDatabase {
     where
         F: FnMut(IndexProgress),
     {
-        let Some(ResolvedOverlayScope { base_sha, worktree_id, source_root, .. }) =
+        let Some(ResolvedOverlayScope { checkout, source_root, .. }) =
             resolve_overlay_scope(config, linked_path)?
         else {
             // Not a valid linked sibling — still an entry-point exit (#819 review): settle a
@@ -197,7 +203,7 @@ impl IndexDatabase {
             self.settle_pending_logical_rebuild_inline(logical_rebuild)?;
             return Ok(WorktreeOverlayReport::default());
         };
-        self.set_context(CheckoutRef { commit_sha: &base_sha, worktree_id: &worktree_id })?;
+        self.set_context(checkout.borrowed())?;
         // Classify each supplied path with the SAME symlink-safe, ignore-aware guards the base
         // `IndexMode::Paths` walker applies (#659), since a supplied path may be arbitrary (a
         // crafted `..`-escape, a symlink-crossing spelling, or an ignored file) — reuse the
@@ -238,7 +244,10 @@ impl IndexDatabase {
             let full = source_root.join(&rel);
             if is_present_indexable(&rel, &full) {
                 readable.push(rel);
-            } else if self.base_scope_has_path(&base_sha, &rel)? {
+            } else if self.base_scope_has_path(&rel, CheckoutRef {
+                commit_sha: &checkout.commit_sha,
+                worktree_id: "",
+            })? {
                 // Non-indexable (delete / ignored-now / de-targeted / symlink-replaced) but the
                 // base still has a row → shadow it with a tombstone (mirrors the whole-delta
                 // overlay). Carry `full` so the write RE-VALIDATES under the write lock, like
@@ -252,7 +261,7 @@ impl IndexDatabase {
                 removal_candidates.push((rel, full));
             }
         }
-        let scope = FileScope::worktree(worktree_id.clone());
+        let scope = CheckoutKey::worktree(checkout.worktree_id.clone());
         // Index the readable set, write tombstones, then the gated logical-symbol/edge/FTS refresh,
         // all in the one overlay-refresh transaction.
         let mutations = self.in_overlay_refresh_txn(logical_rebuild, || {
@@ -275,9 +284,12 @@ impl IndexDatabase {
                 // the filesystem. The next full sweep reconciles the recreated file
                 // (#679 review).
                 if !is_present_indexable(rel, full)
-                    && !self.overlay_tombstone_exists(rel, &worktree_id)?
+                    && !self.overlay_tombstone_exists(
+                        rel,
+                        CheckoutRef::worktree(&checkout.worktree_id),
+                    )?
                 {
-                    self.write_tombstone_in_scope(rel, &worktree_id)?;
+                    self.write_tombstone_in_scope(rel, &checkout.worktree_id)?;
                     tombstoned_paths.push(rel.clone());
                 }
             }
@@ -291,12 +303,12 @@ impl IndexDatabase {
             let mut pruned_paths = Vec::new();
             for (rel, full) in &removal_candidates {
                 if !is_present_indexable(rel, full)
-                    && self.overlay_source_row_exists(rel, &worktree_id)?
+                    && self.overlay_source_row_exists(
+                        rel,
+                        CheckoutRef::worktree(&checkout.worktree_id),
+                    )?
                 {
-                    self.remove_file_in_scope(rel, CheckoutRef {
-                        commit_sha: "",
-                        worktree_id: &worktree_id,
-                    })?;
+                    self.remove_file_in_scope(rel, CheckoutRef::worktree(&checkout.worktree_id))?;
                     pruned_paths.push(rel.clone());
                 }
             }
@@ -305,7 +317,7 @@ impl IndexDatabase {
             // supplied-manifest package refresh is the caller's job, so the manifest is Unchanged.
             self.finalize_overlay_refresh(OverlayFinalize {
                 source_root: &source_root,
-                worktree_id: &worktree_id,
+                worktree_id: &checkout.worktree_id,
                 counts: OverlayChangeCounts { indexed, tombstoned, pruned },
                 manifest: ManifestSignal::Unchanged,
                 logical_rebuild,
@@ -317,7 +329,7 @@ impl IndexDatabase {
         })?;
         let OverlayMutations { indexed, tombstoned, pruned, changed_paths } = mutations;
         Ok(WorktreeOverlayReport {
-            worktree_id,
+            worktree_id: checkout.worktree_id,
             source_root,
             indexed,
             changed_paths,
@@ -397,7 +409,7 @@ impl IndexDatabase {
         config: &Config,
         source_root: &Path,
         paths: &[PathBuf],
-        scope: &FileScope,
+        scope: &CheckoutKey,
         progress: &mut F,
     ) -> anyhow::Result<ExplicitPathWrites>
     where
@@ -410,10 +422,7 @@ impl IndexDatabase {
         // not sha alone: a branch config change that RE-LANGUAGES a byte-identical file
         // must still rewrite the overlay row, mirroring discovery / the base `Paths` flow's
         // staleness (#659).
-        let existing = self.scope_file_identities(CheckoutRef {
-            commit_sha: &scope.commit_sha,
-            worktree_id: &scope.worktree_id,
-        })?;
+        let existing = self.scope_file_identities(scope.borrowed())?;
         let mut files = Vec::new();
         for rel in paths {
             let full_path = source_root.join(rel);
