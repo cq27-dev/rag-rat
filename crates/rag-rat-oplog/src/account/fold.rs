@@ -3605,6 +3605,112 @@ mod tests {
         assert_eq!(h.outcome(&add_member), Some(Outcome::Rejected(RejectReason::StaleAuthority)));
     }
 
+    /// V1 compatibility: a direct victim-chain head does not bound the transitive credit.
+    /// O's chain stays unchanged while a device O minted appends an entry after the cut.
+    #[test]
+    fn v1_descendant_entries_can_credit_a_cut_without_advancing_the_victim_chain() {
+        for demote in [false, true] {
+            let (founder, owner, descendant, member) =
+                (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+            let mut f = Fixture::genesis(&founder);
+            let genesis = f.genesis_hash;
+            let add_owner =
+                f.author(&founder, Some(genesis), &device_add(&owner, DeviceRole::Owner));
+            let add_descendant = f.author_at_auth_len(
+                &owner,
+                Some(add_owner),
+                &device_add(&descendant, DeviceRole::Owner),
+                2,
+            );
+            let victim_head = f.chains[&owner.fp.to_bytes()];
+            let revocation = if demote {
+                owner_demote(&owner, add_owner, Cut::Empty)
+            } else {
+                device_remove(&owner, Cut::Empty)
+            };
+            let cut = f.author_at_auth_len(&founder, Some(genesis), &revocation, 4);
+            assert_eq!(f.fold().outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+
+            let later = f.author_at_auth_len(
+                &descendant,
+                Some(add_descendant),
+                &device_add(&member, DeviceRole::Member),
+                3,
+            );
+            assert_eq!(f.chains[&owner.fp.to_bytes()], victim_head);
+            for rotation in 0..f.entries.len() {
+                let history = f.fold_rotated(rotation);
+                assert!(history.is_effective(&cut));
+                assert_eq!(
+                    history.outcome(&later),
+                    Some(Outcome::Rejected(RejectReason::StaleAuthority))
+                );
+            }
+        }
+    }
+
+    /// The observable consequence of the v1 gap: descendant traffic supplies enough credit to
+    /// activate an ahead cut and its concurrent-op vouch, without moving the direct victim head.
+    #[test]
+    fn v1_descendant_credit_can_activate_an_ahead_cuts_concurrent_vouch() {
+        for demote in [false, true] {
+            let (founder, owner, descendant, concurrent_owner) =
+                (Dev::new(1), Dev::new(2), Dev::new(3), Dev::new(4));
+            let mut f = Fixture::genesis(&founder);
+            let g = f.genesis_hash;
+            let add_owner = f.author(&founder, Some(g), &device_add(&owner, DeviceRole::Owner));
+            let add_concurrent_owner = f.author_at_auth_len(
+                &founder,
+                Some(g),
+                &device_add(&concurrent_owner, DeviceRole::Owner),
+                2,
+            );
+            let add_descendant = f.author_at_auth_len(
+                &owner,
+                Some(add_owner),
+                &device_add(&descendant, DeviceRole::Owner),
+                3,
+            );
+            assert_eq!(f.fold().effective_count(), 4);
+            let victim_head = f.chains[&owner.fp.to_bytes()];
+            let revocation = if demote {
+                owner_demote(&owner, add_owner, Cut::Empty)
+            } else {
+                device_remove(&owner, Cut::Empty)
+            };
+            let cut = f.author_at_auth_len(&founder, Some(g), &revocation, 5);
+            assert_eq!(f.fold().outcome(&cut), Some(Outcome::Parked(ParkReason::AuthLenAhead)));
+            let later = f.author_at_auth_len(
+                &descendant,
+                Some(add_descendant),
+                &device_add(&Dev::new(6), DeviceRole::Member),
+                4,
+            );
+            assert_eq!(f.chains[&owner.fp.to_bytes()], victim_head);
+            let after = f.fold();
+            assert!(after.is_effective(&cut));
+            assert_eq!(
+                after.outcome(&later),
+                Some(Outcome::Rejected(RejectReason::StaleAuthority))
+            );
+            let concurrent = f.author_at_auth_len(
+                &concurrent_owner,
+                Some(add_concurrent_owner),
+                &device_add(&Dev::new(5), DeviceRole::Member),
+                5,
+            );
+            for rotation in 0..f.entries.len() {
+                let history = f.fold_rotated(rotation);
+                assert!(history.is_effective(&cut), "demote={demote}, rotation={rotation}");
+                assert!(history.is_effective(&concurrent), "demote={demote}, rotation={rotation}");
+                assert_eq!(
+                    history.outcome(&later),
+                    Some(Outcome::Rejected(RejectReason::StaleAuthority))
+                );
+            }
+        }
+    }
+
     /// A revoked device can pile up entries past the cut, all condemned, but they carry no other
     /// op past the largest citation an effective cut made. Here the pre-cut view is 5 (genesis, the
     /// adds of O and Q, O's two adds): an op cited at 5 is concurrent with the cut and takes
