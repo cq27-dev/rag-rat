@@ -155,11 +155,6 @@ pub(crate) fn tune_remote_concurrency(params: TuneRequestParams<'_>) -> u32 {
         return cap;
     }
 
-    // Build an ollama embedder for a probe — identical to the reconcile embedder in every respect
-    // (same `batch_size`, so the measured per-request cost matches the live requests and the knee
-    // is cacheable) except: `concurrency` is the fan-out being measured, and
-    // `request_timeout_s` is bounded by the tune budget so one blocking probe can't hold the
-    // box for the full HTTP timeout.
     let live = ProvisionedEmbedderParams::for_remote(
         endpoint,
         auth_token,
@@ -167,23 +162,8 @@ pub(crate) fn tune_remote_concurrency(params: TuneRequestParams<'_>) -> u32 {
         spec.model_id,
         spec.dim,
     );
-    let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
-        OpenAiEmbedder::from_provisioned(live.probe_variant(concurrency, request_timeout_s))
-    };
-
-    let per_text_chars = probe_text_chars(max_embedding_chars);
-    // Texts per probe request = how the live embedder splits (count cap AND char budget), so each
-    // probe request matches a real `/api/embed` request's weight.
-    let request_texts =
-        effective_request_texts(batch_size, remote.max_batch_chars, max_embedding_chars);
-    let sweep = MeasureParams {
-        candidates: sweep_candidates(cap),
-        per_text_chars,
-        request_texts,
-        request_timeout_s: remote.request_timeout_s,
-        budget_ms: tune_budget_ms(),
-        build,
-    };
+    let sweep =
+        probe_measure_params(live, max_embedding_chars, sweep_candidates(cap), tune_budget_ms());
     match run_sweep(sweep, cap) {
         SweepOutcome::Knee { knee, texts_per_second, complete } => {
             // Only cache a COMPLETE sweep — one where every candidate was measured. If the budget
@@ -267,27 +247,14 @@ pub fn benchmark_remote_concurrency(params: BenchmarkParams<'_>) -> Vec<Measured
         candidates,
         budget_ms,
     } = params;
-    // Mirror `tune_remote_concurrency`'s probe construction so a benchmarked candidate embeds the
-    // SAME per-request weight the live reconcile would: `batch_size` normalized to >=1 like the
-    // embedder, probe texts sized to the live chunk cap, request texts split by BOTH the count and
-    // char budgets.
-    let batch_size = remote.batch_size.max(1);
-    let per_text_chars = probe_text_chars(max_embedding_chars);
-    let request_texts =
-        effective_request_texts(batch_size, remote.max_batch_chars, max_embedding_chars);
     let live =
         ProvisionedEmbedderParams::for_remote(endpoint, auth_token, remote, selected_model_id, dim);
-    let build = |concurrency: u32, request_timeout_s: u64| -> OpenAiEmbedder {
-        OpenAiEmbedder::from_provisioned(live.probe_variant(concurrency, request_timeout_s))
-    };
-    measure_candidates(MeasureParams {
-        candidates: candidates.to_vec(),
-        per_text_chars,
-        request_texts,
-        request_timeout_s: remote.request_timeout_s,
+    measure_candidates(probe_measure_params(
+        live,
+        max_embedding_chars,
+        candidates.to_vec(),
         budget_ms,
-        build,
-    })
+    ))
     .into_iter()
     .map(|r| MeasuredCandidate {
         concurrency: r.candidate,
@@ -402,6 +369,35 @@ struct MeasureParams<E: Embedder, F: Fn(u32, u64) -> E> {
     request_timeout_s: u64,
     budget_ms: u64,
     build: F,
+}
+
+/// The probe workload against the box `live` describes — the reconcile embedder's own params — so
+/// the tuner and the benchmark measure the SAME per-request weight the live reconcile sends: probe
+/// texts sized to the live chunk cap, texts per request split by BOTH the count cap and the char
+/// budget (`effective_request_texts` normalizes `batch_size` to >=1 like the embedder), and each
+/// candidate's embedder identical to `live` except for its fan-out and a per-request timeout
+/// bounded by the budget slice. Probing a lighter request than production would cache a knee the
+/// live reconcile can't sustain.
+fn probe_measure_params<'a>(
+    live: ProvisionedEmbedderParams<'a>,
+    max_embedding_chars: usize,
+    candidates: Vec<u32>,
+    budget_ms: u64,
+) -> MeasureParams<OpenAiEmbedder, impl Fn(u32, u64) -> OpenAiEmbedder + 'a> {
+    MeasureParams {
+        candidates,
+        per_text_chars: probe_text_chars(max_embedding_chars),
+        request_texts: effective_request_texts(
+            live.batch_size,
+            live.max_batch_chars,
+            max_embedding_chars,
+        ),
+        request_timeout_s: live.request_timeout_s,
+        budget_ms,
+        build: move |concurrency: u32, request_timeout_s: u64| {
+            OpenAiEmbedder::from_provisioned(live.probe_variant(concurrency, request_timeout_s))
+        },
+    }
 }
 
 /// The per-candidate MEASUREMENT loop, extracted from [`run_sweep`] so the eval-gated
