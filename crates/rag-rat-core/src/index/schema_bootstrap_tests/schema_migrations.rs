@@ -1811,7 +1811,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 127, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 129, "move this pin with the next schema migration");
 
     let conn = fresh_conn();
     conn.execute_batch(
