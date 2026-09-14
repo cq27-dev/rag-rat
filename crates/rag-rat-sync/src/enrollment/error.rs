@@ -1,7 +1,5 @@
 //! The enrollment protocol's error type.
 
-//! The enrollment protocol's error type.
-
 #[derive(Debug, thiserror::Error)]
 pub enum InviteError {
     #[error("malformed enrollment data: {0}")]

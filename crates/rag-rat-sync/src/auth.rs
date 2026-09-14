@@ -51,10 +51,10 @@ const MAX_AUTH_FRAME_BYTES: u32 = 1024;
 /// exchange on `ENROLL_ALPN`, not an admission mode of the data path.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPolicy {
-    /// Admit any dialer for reads on the account/`/3` content paths. A valid roster binding
+    /// Admit any dialer for reads on the account-log and content lanes. A valid roster binding
     /// determines its capability when available; a rejected binding remains read-only. Only a
     /// dialer whose local authority is unavailable permits its explicitly selected server to
-    /// send the snapshot needed to restore roster state. Does NOT reach `/5` tables: the
+    /// send the snapshot needed to restore roster state. Does NOT reach the table lane: the
     /// dispatchers (`dispatch_connection` and the multi-account `dispatch_connection_multi`)
     /// pin `TABLE_SYNC_ALPN` to `Closed` regardless of the configured policy, so a table
     /// manifest is never revealed to an unverified peer.
@@ -67,7 +67,7 @@ pub enum AuthPolicy {
     /// public knowledge base (#407). Admission is identical to `Open`; the difference is the
     /// serve scope the dispatcher derives from the admission outcome (a verified member still
     /// gets the full account; an anonymous reader gets
-    /// [`crate::session::ServeScope::PublicOnly`]). Like `Open`, does NOT reach `/5` tables.
+    /// [`crate::session::ServeScope::PublicOnly`]). Like `Open`, does NOT reach the table lane.
     PublicRead,
 }
 
