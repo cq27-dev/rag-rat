@@ -6,11 +6,11 @@
 //! crate extracts.
 
 mod api;
-#[cfg(test)]
-mod contributor_authoring_tests;
 // The live op-log authoring seam: the `author_*` helpers the memory mutations call
 // in-transaction, their preparation, and the whole-op authorability guard (#532).
 mod authoring;
+#[cfg(test)]
+mod contributor_authoring_tests;
 // The REVERSE of the authoring reconcile (#691 A1): mirror a stream's accepted synced `/3` content
 // back into `repo_memories` / `repo_node_edges` as `origin='synced'` rows.
 mod drain;
