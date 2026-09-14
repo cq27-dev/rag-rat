@@ -9,9 +9,9 @@ use rag_rat_query::memory::{
     memory_repo_scope, periphery_edge_scope_clause, repo_is_registered, reresolve_on_read,
     resolve_node_target, source_node_owner_repo, validate_edge_len,
 };
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, params};
 
-use super::{authoring, reconcile};
+use super::authoring;
 
 pub(crate) fn add_edge(
     conn: &Connection,
@@ -86,16 +86,9 @@ pub(crate) fn add_edge(
     // signed (#680).
     validate_edge_len("target_repo_id", &target_repo_id)?;
     let now = now_ms();
-    // Backfill the pre-existing history (idempotent) + the edge INSERT + the EdgeAdd op in ONE
-    // transaction (strict-atomic); the write via `conn` participates in the open txn.
-    reconcile::backfill_memory_oplog(conn, now)?;
-    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
-    // Authored write: the EdgeAdd op is signed op-log content, so commit durably (#560).
-    let _durability = authoring::AuthoredDurability::begin(conn)?;
-    // IMMEDIATE, not deferred (same as `create_memory`): the tombstone check and `edge_by_key`
-    // READ before the INSERT, and a deferred read→write upgrade racing a concurrent writer fails
-    // with SQLITE_BUSY_SNAPSHOT, which bypasses the busy handler.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    // Authored write: the EdgeAdd op is signed op-log content, so commit durably (#560); the
+    // tombstone check and `edge_by_key` READ before the INSERT, hence IMMEDIATE (#818).
+    let write = authoring::AuthoredWrite::begin(conn, now)?;
     // #767: revalidate the removal tombstone INSIDE the write txn — a connection that resolved the
     // source node's owner before `rm` ran must fail closed here rather than INSERT an edge row
     // stamped with the removed `repo_id` after the purge.
@@ -134,18 +127,18 @@ pub(crate) fn add_edge(
     )?;
     if edge_is_new {
         authoring::author_edge_add(
-            &tx,
+            &write.tx,
             source_node_id,
             relation,
             &target_repo_id,
             target_kind,
             &target_anchor,
             &owner_repo_id,
-            prepared.as_ref(),
+            write.prepared.as_ref(),
             now,
         )?;
     }
-    tx.commit()?;
+    write.commit()?;
     edge_by_key(conn, &key)?.ok_or_else(|| anyhow::anyhow!("edge `{key}` disappeared after insert"))
 }
 
@@ -153,21 +146,17 @@ pub(crate) fn remove_edge(conn: &Connection, edge_key: &str) -> anyhow::Result<b
     let scope = memory_repo_scope(conn)?;
     let repo_clause = periphery_edge_scope_clause(&scope);
     let now = now_ms();
-    reconcile::backfill_memory_oplog(conn, now)?;
-    let prepared = authoring::prepare_live_content_authoring(conn, now)?;
     // Authored write: the EdgeRemove tombstone is signed op-log content, so commit durably (#560).
-    let _durability = authoring::AuthoredDurability::begin(conn)?;
-    // IMMEDIATE for the same busy-handler reason as `add_edge`.
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let write = authoring::AuthoredWrite::begin(conn, now)?;
     let n = conn
         .execute(&format!("DELETE FROM repo_node_edges WHERE edge_key = ?1{repo_clause}"), [
             edge_key,
         ])?;
     if n > 0 {
         // Author an EdgeRemove tombstone ONLY when a row was actually removed, in the same txn.
-        authoring::author_edge_remove(&tx, edge_key, prepared.as_ref(), now)?;
+        authoring::author_edge_remove(&write.tx, edge_key, write.prepared.as_ref(), now)?;
     }
-    tx.commit()?;
+    write.commit()?;
     Ok(n > 0)
 }
 
