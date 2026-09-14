@@ -208,8 +208,11 @@ impl IndexDatabase {
         self.stage_logical_rederive_path(&path)?;
         // Direct edges_data writes (#79): these statements touch up to every in-edge of a file's
         // symbols, so they must not pay the view triggers' per-row dictionary probes.
-        // 'NameOnly' is the EdgeConfidence demotion the resolver applies to a target-less edge.
-        let name_only_id = edges::intern_edge_string(self.storage.connection(), "NameOnly")?;
+        // NameOnly is the EdgeConfidence demotion the resolver applies to a target-less edge.
+        let name_only_id = edges::intern_edge_string(
+            self.storage.connection(),
+            edges::EdgeConfidence::NameOnly.as_db_str(),
+        )?;
         let repo_id = self.active_repo_id.as_str();
         // Every delete below carries the WRITER'S generation (A6, P2 review): the V043 UNIQUE
         // admits one row per (repo, path, commit, worktree) PER GENERATION, so a scope key alone
