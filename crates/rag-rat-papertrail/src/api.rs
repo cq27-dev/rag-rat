@@ -687,7 +687,7 @@ pub fn papertrail_for_commit(
 pub(crate) fn mark_fallback_evidence(evidence: &mut [PapertrailEvidence]) {
     for item in evidence {
         item.evidence_kind = match item.evidence_kind {
-            "literal_tracker_ref" => "fallback_literal_tracker_ref",
+            crate::LITERAL_TRACKER_REF => "fallback_literal_tracker_ref",
             "historical_tracker" => "fallback_historical_tracker",
             _ => "fallback_tracker_evidence",
         };

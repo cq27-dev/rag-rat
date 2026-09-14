@@ -92,11 +92,14 @@ pub(crate) fn evidence_for_item(
     )?;
     let mut evidence = collect_rows(rows)?;
     for item in &mut evidence {
-        item.evidence_kind = "literal_tracker_ref";
+        item.evidence_kind = LITERAL_TRACKER_REF;
         item.score = 1.0;
     }
     Ok(evidence)
 }
+/// The `evidence_kind` of a hit reached through an explicit tracker reference (the query or source
+/// named the item), as opposed to a keyword match. A wire token: consumers filter on it.
+pub const LITERAL_TRACKER_REF: &str = "literal_tracker_ref";
 pub(crate) fn evidence_for_commit_refs(
     conn: &Connection,
     commit_hash: &str,

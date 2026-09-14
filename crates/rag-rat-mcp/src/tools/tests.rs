@@ -8,32 +8,145 @@ use serde_json::json;
 
 use super::*;
 
+fn graph_report(completeness_risk: &str, coverage: GraphCoverage) -> GraphTraversalReport {
+    use rag_rat_query::graph::{GraphTraversalQuery, GraphTraversalSummary};
+    GraphTraversalReport {
+        query: GraphTraversalQuery {
+            tool: "find_callers".to_string(),
+            symbol_id: None,
+            logical_symbol_id: None,
+            symbol_path: "src/lib.rs::target".to_string(),
+            resolution: "syntactic".to_string(),
+        },
+        logical_symbol: None,
+        variants: Vec::new(),
+        summary: GraphTraversalSummary {
+            completeness_risk: completeness_risk.to_string(),
+            ..GraphTraversalSummary::default()
+        },
+        coverage,
+        results: Vec::new(),
+    }
+}
+
 #[test]
 fn degraded_coverage_escalates_low_completeness_risk() {
     // issue #47: a stale/partial index can hide caller edges, so a 0-result must not read
     // as confident. `low` is escalated to `medium` when coverage is degraded.
-    let mut stale = json!({
-        "summary": { "completeness_risk": "low", "returned_count": 0 },
-        "coverage": { "stale_files": 1, "parser_failures": 0, "known_index_gaps": [] },
-    });
-    compact_graph_coverage(&mut stale, true);
-    assert_eq!(stale["summary"]["completeness_risk"], "medium");
+    let stale = || GraphCoverage { stale_files: 1, ..GraphCoverage::default() };
+    let mut report = graph_report("low", stale());
+    escalate_risk_when_coverage_degraded(&mut report);
+    assert_eq!(report.summary.completeness_risk, "medium");
+    for degraded in
+        [GraphCoverage { parser_failures: 1, ..GraphCoverage::default() }, GraphCoverage {
+            known_index_gaps: vec!["gap".to_string()],
+            ..GraphCoverage::default()
+        }]
+    {
+        let mut report = graph_report("low", degraded);
+        escalate_risk_when_coverage_degraded(&mut report);
+        assert_eq!(report.summary.completeness_risk, "medium");
+    }
 
     // Clean coverage leaves an honest `low` untouched.
-    let mut clean = json!({
-        "summary": { "completeness_risk": "low" },
-        "coverage": { "stale_files": 0, "parser_failures": 0, "known_index_gaps": [] },
-    });
-    compact_graph_coverage(&mut clean, true);
-    assert_eq!(clean["summary"]["completeness_risk"], "low");
+    let mut clean = graph_report("low", GraphCoverage::default());
+    escalate_risk_when_coverage_degraded(&mut clean);
+    assert_eq!(clean.summary.completeness_risk, "low");
 
     // A medium/high risk is never downgraded by this path.
-    let mut high = json!({
-        "summary": { "completeness_risk": "high" },
-        "coverage": { "stale_files": 3, "parser_failures": 0, "known_index_gaps": [] },
+    let mut high = graph_report("high", GraphCoverage { stale_files: 3, ..stale() });
+    escalate_risk_when_coverage_degraded(&mut high);
+    assert_eq!(high.summary.completeness_risk, "high");
+}
+
+#[test]
+fn compact_coverage_swaps_the_block_for_one_line_warnings() {
+    let report = graph_report("medium", GraphCoverage {
+        parser_failures: 2,
+        stale_files: 1,
+        known_index_gaps: vec!["gap".to_string()],
+        ..GraphCoverage::default()
     });
-    compact_graph_coverage(&mut high, true);
-    assert_eq!(high["summary"]["completeness_risk"], "high");
+    let mut value = json!(report);
+    compact_graph_coverage(&mut value, &report.coverage);
+    assert!(value.get("coverage").is_none(), "the full block is dropped: {value}");
+    assert_eq!(
+        value["coverage_warnings"],
+        json!([
+            "2 parser failures may affect graph coverage",
+            "1 stale files may affect graph coverage",
+            "1 known graph index gaps",
+        ])
+    );
+
+    // Clean coverage drops the block and adds no warnings key at all.
+    let clean = graph_report("low", GraphCoverage::default());
+    let mut value = json!(clean);
+    compact_graph_coverage(&mut value, &clean.coverage);
+    assert!(value.get("coverage").is_none() && value.get("coverage_warnings").is_none());
+}
+
+#[test]
+fn rationale_search_narrows_to_literal_tracker_refs_unless_fallback_is_included() {
+    let root = unique_temp_root();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn anchor() {}\n").unwrap();
+    let config = rust_config(root.to_path_buf());
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    // Two cached issues whose text both match the query's words; only #42 is NAMED by it.
+    for (key, title) in [("42", "The referenced issue"), ("7", "A thread that only mentions it")] {
+        let item = rag_rat_papertrail::PapertrailItem {
+            project: "octo/repo".to_string(),
+            item_kind: rag_rat_papertrail::ItemKind::Issue,
+            item_key: key.to_string(),
+            url: format!("https://github.com/octo/repo/issues/{key}"),
+            state: "open".to_string(),
+            title: title.to_string(),
+            body: "octo repo rationale".to_string(),
+            author: None,
+            created_at: None,
+            updated_at: None,
+            merged_at: None,
+            closed_at: None,
+            resolution: None,
+            merge_commit_sha: None,
+            author_kind: None,
+            author_association: None,
+            tags: Vec::new(),
+        };
+        rag_rat_papertrail::store_item(db.connection(), rag_rat_papertrail::Tracker::Github, &item)
+            .unwrap();
+    }
+    drop(db);
+
+    let hits = |arguments: Value| -> Vec<(String, String)> {
+        let value = call_tool_for_config(&config, "rationale_search", arguments).unwrap();
+        value
+            .as_array()
+            .expect("rationale_search answers a list")
+            .iter()
+            .map(|hit| {
+                let field = |name: &str| hit[name].as_str().unwrap_or_default().to_string();
+                (field("item_key"), field("evidence_kind"))
+            })
+            .collect()
+    };
+
+    // Default: the literal reference wins and the keyword-only thread is dropped.
+    let narrowed = hits(json!({"query": "octo/repo#42"}));
+    assert!(!narrowed.is_empty(), "the named issue is found");
+    assert!(
+        narrowed.iter().all(|(key, kind)| key == "42" && kind == "literal_tracker_ref"),
+        "only literal tracker refs survive the default filter: {narrowed:?}"
+    );
+
+    // `fallback` keeps the keyword matches alongside it.
+    let with_fallback = hits(json!({"query": "octo/repo#42", "include": ["fallback"]}));
+    assert!(with_fallback.iter().any(|(key, kind)| key == "42" && kind == "literal_tracker_ref"));
+    assert!(
+        with_fallback.iter().any(|(key, kind)| key == "7" && kind != "literal_tracker_ref"),
+        "fallback keeps the keyword-only thread: {with_fallback:?}"
+    );
 }
 
 #[test]
