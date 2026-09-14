@@ -125,9 +125,9 @@ fn kotlin_identifier_token(leaf: &str) -> Option<&'static str> {
 ///
 /// SINGLE source of truth for the Rust type-node set, shared by
 /// [`super::refine::antiunify`]'s `is_type_position` (classifying a variation that snaps to a type
-/// node as a `type_param`) AND [`super::refine::signature`]'s `is_type_kind` (recovering the type
-/// slice for a `: T` / `-> T` annotation). Keeping ONE predicate is what stops the two from
-/// diverging — an outer composite type (`&Foo`, `[T; N]`, `(A, B)`) used to be a type to the
+/// node as a `type_param`), [`annotation_type_span`] (the `: T` annotation window) AND
+/// `signature::recover_return_type` (the `-> T` type). Keeping ONE predicate is what stops them
+/// from diverging — an outer composite type (`&Foo`, `[T; N]`, `(A, B)`) used to be a type to the
 /// signature recoverer but NOT to the anti-unify classifier, which then mis-routed it to
 /// `closure_param` (Fix 4, #215 Plan 4b Codex round-5). Any new Rust type kind goes here once.
 pub(crate) fn is_rust_type_kind(kind: &str) -> bool {
@@ -148,6 +148,29 @@ pub(crate) fn is_rust_type_kind(kind: &str) -> bool {
             | "pointer_type"
             | "function_type"
     )
+}
+
+/// How many columns before a variation column [`annotation_type_span`] looks for the `:` of a
+/// `name: T` annotation.
+const ANNOTATION_COLON_LOOKBACK: usize = 6;
+/// How many columns from that `:` [`annotation_type_span`] looks for the type node.
+const ANNOTATION_TYPE_LOOKAHEAD: usize = 8;
+
+/// The type NODE of the `: T` annotation just before column `lo`, or `None`: the nearest `:` leaf
+/// within [`ANNOTATION_COLON_LOOKBACK`] columns back, then the first [`is_rust_type_kind`] node in
+/// the [`ANNOTATION_TYPE_LOOKAHEAD`] window from it. Only the nearest colon is tried.
+///
+/// The ONE scan behind both signature type recovery and the anti-unify recurrence-collapse key, so
+/// the two always agree on which annotation a hole has.
+pub(crate) fn annotation_type_span(spans: &[NodeSpan], lo: usize) -> Option<&NodeSpan> {
+    if spans.is_empty() {
+        return None;
+    }
+    let lo = lo.min(spans.len() - 1);
+    let window_start = lo.saturating_sub(ANNOTATION_COLON_LOOKBACK);
+    let colon_idx = (window_start..lo).rev().find(|&i| spans[i].is_leaf && spans[i].kind == ":")?;
+    let search_end = (colon_idx + ANNOTATION_TYPE_LOOKAHEAD).min(spans.len());
+    spans[colon_idx + 1..search_end].iter().find(|sp| is_rust_type_kind(sp.kind))
 }
 
 /// One AST node, parallel to the token at the same index in the normalized sequence
