@@ -238,208 +238,379 @@ fn include_accepts_a_json_string_encoded_array_from_buggy_clients() {
     );
 }
 
+/// One advertised tool's schema contract. `properties` is the exact argument set, sorted (the
+/// catalog's `worktree` scoping parameter aside — its own test pins it); `include` is the exact
+/// `include` vocabulary (`None` = the tool takes no `include`); `enums` pins every other
+/// enum-valued argument. Keyed by tool so a tool added to `TOOL_NAMES` without a row fails.
+struct SchemaRow {
+    tool: &'static str,
+    required: &'static [&'static str],
+    properties: &'static [&'static str],
+    include: Option<&'static [&'static str]>,
+    enums: &'static [(&'static str, &'static [&'static str])],
+}
+
+const fn row(
+    tool: &'static str,
+    required: &'static [&'static str],
+    properties: &'static [&'static str],
+) -> SchemaRow {
+    SchemaRow { tool, required, properties, include: None, enums: &[] }
+}
+
+const GRAPH_MODE: &[&str] = &["none", "compact", "full"];
+const RESOLUTION: &[&str] = &["exact", "syntactic", "fuzzy"];
+const EDGE_KINDS: &[&str] = &[
+    "calls_name",
+    "constructs",
+    "uses_operator",
+    "uses_precedence_group",
+    "dispatches",
+    "uses_macro",
+    "references_type",
+    "imports",
+    "exports",
+    "contains",
+    "implements",
+];
+const GRAPH_INCLUDE: &[&str] =
+    &["references", "unresolved", "macros", "common_methods", "coverage", "memories"];
+const GRAPH_ENUMS: &[(&str, &[&str])] = &[("resolution", RESOLUTION), ("edge_kinds", EDGE_KINDS)];
+const MEMORY_KIND: &[&str] = &[
+    "Invariant",
+    "Decision",
+    "RejectedAlternative",
+    "Risk",
+    "BugPattern",
+    "TestExpectation",
+    "PerformanceNote",
+    "SecurityNote",
+    "FFIBoundary",
+    "PlatformQuirk",
+    "FollowUp",
+    "OpenQuestion",
+    "Obsolete",
+    "Task",
+    "Concept",
+];
+const CONFIDENCE: &[&str] = &["high", "medium", "low"];
+// #149: the wire selector is symbol/ref/id (the opaque handle); the ephemeral numeric symbol_id is
+// not an accepted input, which the exact property sets below pin.
+const GRAPH_ARGS: &[&str] =
+    &["allow_ambiguous", "edge_kinds", "id", "include", "limit", "ref", "resolution", "symbol"];
+// #202 review: tools that resolve via select_symbol (always source-only) carry no `include` —
+// advertising a `generated` opt-in they would silently ignore would be a lie.
+const SYMBOL_REF_ARGS: &[&str] = &["allow_ambiguous", "id", "lang", "limit", "ref", "symbol"];
+// The plain full-text tools honor only `query` + `limit`, never the semantic_search knobs.
+const QUERY_ARGS: &[&str] = &["limit", "query"];
+const PATH_ARGS: &[&str] = &["limit", "path"];
+
+const SCHEMA_ROWS: &[SchemaRow] = &[
+    SchemaRow {
+        include: Some(&["generated", "git", "papertrail", "fallback"]),
+        enums: &[("include_graph", GRAPH_MODE)],
+        ..row("semantic_search", &["query"], &[
+            "explain",
+            "graph_limit",
+            "include",
+            "include_graph",
+            "limit",
+            "query",
+        ])
+    },
+    SchemaRow {
+        include: Some(&["memories", "generated"]),
+        ..row("symbol_lookup", &[], &[
+            "allow_ambiguous",
+            "id",
+            "include",
+            "lang",
+            "limit",
+            "ref",
+            "symbol",
+        ])
+    },
+    SchemaRow {
+        include: Some(GRAPH_INCLUDE),
+        enums: GRAPH_ENUMS,
+        ..row("find_callers", &[], GRAPH_ARGS)
+    },
+    SchemaRow {
+        include: Some(GRAPH_INCLUDE),
+        enums: GRAPH_ENUMS,
+        ..row("trace_callees", &[], GRAPH_ARGS)
+    },
+    SchemaRow {
+        include: Some(&["tests", "references", "unresolved", "macros", "common_methods"]),
+        enums: GRAPH_ENUMS,
+        ..row("compare_graph_to_text", &["pattern"], &[
+            "allow_ambiguous",
+            "edge_kinds",
+            "id",
+            "include",
+            "limit",
+            "pattern",
+            "ref",
+            "resolution",
+            "symbol",
+        ])
+    },
+    row("compare_graph_to_scip", &[], &[]),
+    SchemaRow {
+        include: Some(&["tests", "docs", "git", "papertrail", "text_fallback", "memories"]),
+        enums: &[("resolution", RESOLUTION)],
+        ..row("impact_surface", &[], &[
+            "allow_ambiguous",
+            "full_memories",
+            "id",
+            "include",
+            "limit",
+            "query",
+            "ref",
+            "resolution",
+            "symbol",
+        ])
+    },
+    row("check_library_usage", &[], &["deprecated_only", "limit", "package", "path"]),
+    SchemaRow {
+        include: Some(&["generated", "memories"]),
+        enums: &[("mode", &["spine", "churn", "god_modules", "refactor_candidates"])],
+        ..row("repo_brief", &[], &["include", "limit", "mode"])
+    },
+    SchemaRow {
+        include: Some(&["generated", "memories"]),
+        ..row("repo_clusters", &[], &["include", "limit", "min_cluster_size"])
+    },
+    row("important_symbols", &[], &["limit", "personalize"]),
+    row("find_clones", &[], &["limit", "min_copies", "min_similarity"]),
+    row("clones_for_symbol", &[], &["id", "line", "path", "ref"]),
+    row("ffi_surface", &[], &["limit"]),
+    SchemaRow {
+        include: Some(GRAPH_INCLUDE),
+        enums: GRAPH_ENUMS,
+        ..row("docs_for_symbol", &[], GRAPH_ARGS)
+    },
+    SchemaRow {
+        include: Some(&["memories"]),
+        enums: &[("include_graph", GRAPH_MODE)],
+        ..row("read_chunk", &["chunk_id"], &["chunk_id", "graph_limit", "include", "include_graph"])
+    },
+    row("commit_search", &["query"], QUERY_ARGS),
+    row("git_history_for_path", &["path"], PATH_ARGS),
+    row("git_history_for_symbol", &[], SYMBOL_REF_ARGS),
+    row("commits_touching_query", &["query"], QUERY_ARGS),
+    row("git_blame_chunk", &["chunk_id"], &["chunk_id"]),
+    row("papertrail_for_chunk", &["chunk_id"], &["chunk_id", "limit"]),
+    row("papertrail_for_symbol", &[], SYMBOL_REF_ARGS),
+    SchemaRow {
+        include: Some(&["fallback"]),
+        ..row("papertrail_for_commit", &["commit_hash"], &["commit_hash", "include", "limit"])
+    },
+    row("papertrail_issue_search", &["query"], QUERY_ARGS),
+    row("papertrail_refs_for_path", &["path"], PATH_ARGS),
+    SchemaRow {
+        include: Some(&["fallback"]),
+        ..row("rationale_search", &["query"], &["include", "limit", "query"])
+    },
+    row("llm_status", &[], &[]),
+    row("heal_index", &[], &["limit"]),
+    row("papertrail_sync_status", &[], &[]),
+    row("index_status", &[], &[]),
+    // `bind` is OPTIONAL (#463): omitting it creates an unanchored Concept/Task node.
+    SchemaRow {
+        enums: &[
+            ("kind", MEMORY_KIND),
+            ("confidence", CONFIDENCE),
+            ("source", &["agent", "human", "imported", "generated"]),
+        ],
+        ..row("memory_create", &["kind", "title", "body", "confidence"], &[
+            "bind",
+            "body",
+            "confidence",
+            "created_by",
+            "kind",
+            "payload",
+            "source",
+            "tags",
+            "title",
+        ])
+    },
+    row("memory_rebind", &["memory_id", "bind"], &["bind", "memory_id"]),
+    SchemaRow {
+        enums: &[
+            ("kind", MEMORY_KIND),
+            ("confidence", CONFIDENCE),
+            ("status", &["active", "stale", "obsolete", "rejected"]),
+        ],
+        ..row("memory_update", &["memory_id"], &[
+            "body",
+            "confidence",
+            "kind",
+            "memory_id",
+            "payload",
+            "status",
+            "tags",
+            "title",
+        ])
+    },
+    row("memory_search", &["query"], QUERY_ARGS),
+    row("memory_for_symbol", &[], &["allow_ambiguous", "id", "limit", "ref", "symbol"]),
+    row("memory_for_path", &["path"], PATH_ARGS),
+    row("memory_for_call_path", &["edge_sequence_hash"], &["edge_sequence_hash", "limit"]),
+    row("memory_show", &["memory_id"], &["memory_id"]),
+    row("memory_validate", &[], &[]),
+    row("memory_doctor", &[], &[]),
+    row("memory_mark_obsolete", &["memory_id"], &["memory_id"]),
+    SchemaRow {
+        enums: &[("relation", &[
+            "depends_on",
+            "relates_to",
+            "supersedes",
+            "derived_from",
+            "tracks",
+        ])],
+        ..row("memory_edge_add", &["source_node_id", "relation"], &[
+            "github_number",
+            "github_owner",
+            "github_repo",
+            "relation",
+            "source_node_id",
+            "target_node_id",
+            "target_repo_id",
+        ])
+    },
+    row("memory_edge_remove", &["edge_key"], &["edge_key"]),
+    SchemaRow {
+        enums: &[("direction", &["from", "into"])],
+        ..row("memory_edges", &["direction"], &[
+            "direction",
+            "github_number",
+            "github_owner",
+            "github_repo",
+            "node_id",
+        ])
+    },
+    row("dream", &[], &["all", "limit"]),
+    SchemaRow {
+        enums: &[("verdict", &["accept", "dismiss", "reset"])],
+        ..row("dream_review", &["finding", "verdict"], &["finding", "verdict"])
+    },
+];
+
 #[test]
 fn list_tools_exposes_complete_typed_schemas() {
     let tools = list_tools();
     let tools = tools.as_array().expect("tools/list shape");
-    let names =
-        tools.iter().map(|tool| tool["name"].as_str().expect("tool name")).collect::<Vec<_>>();
-
-    for expected in [
-        "semantic_search",
-        "symbol_lookup",
-        "find_callers",
-        "trace_callees",
-        "compare_graph_to_text",
-        "compare_graph_to_scip",
-        "impact_surface",
-        "repo_brief",
-        "repo_clusters",
-        "ffi_surface",
-        "docs_for_symbol",
-        "read_chunk",
-        "index_status",
-        "commit_search",
-        "git_history_for_path",
-        "git_history_for_symbol",
-        "commits_touching_query",
-        "git_blame_chunk",
-        "papertrail_for_chunk",
-        "papertrail_for_symbol",
-        "papertrail_for_commit",
-        "papertrail_issue_search",
-        "papertrail_refs_for_path",
-        "rationale_search",
-        "llm_status",
-        "heal_index",
-        "papertrail_sync_status",
-        "memory_create",
-        "memory_update",
-        "memory_search",
-        "memory_for_symbol",
-        "memory_for_path",
-        "memory_for_call_path",
-        "memory_validate",
-        "memory_mark_obsolete",
-        "find_clones",
-        "clones_for_symbol",
-    ] {
-        assert!(names.contains(&expected), "missing MCP tool {expected}");
+    for row in SCHEMA_ROWS {
+        assert!(TOOL_NAMES.contains(&row.tool), "row for unlisted tool {}", row.tool);
     }
-
-    for tool in tools {
-        let name = tool["name"].as_str().expect("tool name");
+    for name in TOOL_NAMES {
+        let row = SCHEMA_ROWS
+            .iter()
+            .find(|row| row.tool == *name)
+            .unwrap_or_else(|| panic!("{name}: no schema row — add one to SCHEMA_ROWS"));
         let schema = tool_schema(tools, name);
-        let properties = schema["properties"].as_object();
-        for required in schema["required"].as_array().into_iter().flatten() {
-            let required = required.as_str().expect("required property name");
-            assert!(
-                properties.is_some_and(|properties| properties.contains_key(required)),
-                "{name} requires `{required}` but does not define it"
+        assert_eq!(schema["type"], "object", "{name}: arguments are an object");
+
+        let mut properties: Vec<&str> = schema["properties"]
+            .as_object()
+            .map(|properties| {
+                properties.keys().map(String::as_str).filter(|key| *key != "worktree").collect()
+            })
+            .unwrap_or_default();
+        properties.sort_unstable();
+        assert_eq!(properties, row.properties, "{name}: advertised arguments");
+
+        let mut required = schema["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|field| field.as_str().expect("required property name"))
+            .collect::<Vec<_>>();
+        required.sort_unstable();
+        let mut expected_required = row.required.to_vec();
+        expected_required.sort_unstable();
+        assert_eq!(required, expected_required, "{name}: required arguments");
+        for field in &required {
+            assert!(properties.contains(field), "{name} requires `{field}` but does not define it");
+        }
+
+        for field in ["include", "edge_kinds"] {
+            if schema["properties"].get(field).is_some() {
+                assert_schema_array_property(schema, field);
+            }
+        }
+
+        let owned = |values: &[&str]| values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(enum_values(schema, "include"), row.include.map(owned), "{name}.include");
+        for property in properties.iter().filter(|property| **property != "include") {
+            let pinned = row.enums.iter().find(|(pinned, _)| pinned == property);
+            assert_eq!(
+                enum_values(schema, property),
+                pinned.map(|(_, values)| owned(values)),
+                "{name}.{property}: every enum-valued argument is pinned, and only those"
             );
         }
     }
-
-    assert_schema_requires(tools, "semantic_search", "query");
-    assert_schema_has_property(tools, "semantic_search", "include_graph");
-    assert_schema_property_enum(tools, "semantic_search", "include_graph", &[
-        "none", "compact", "full",
-    ]);
-    assert_schema_has_property(tools, "semantic_search", "graph_limit");
-    assert_schema_array_item_enum(tools, "semantic_search", "include", &[
-        "generated",
-        "git",
-        "papertrail",
-        "fallback",
-    ]);
-    assert_schema_has_property(tools, "semantic_search", "explain");
-    assert_symbol_selector_schema(tools, "symbol_lookup");
-    assert_schema_array_item_enum(tools, "symbol_lookup", "include", &["memories", "generated"]);
-    // #202 review: the `generated` opt-in is advertised ONLY where it's honored (symbol_lookup).
-    // git_history_for_symbol / papertrail_for_symbol resolve via select_symbol (always source-only)
-    // and carry no `include` at all — advertising a flag they'd silently ignore would be a lie.
-    assert_schema_lacks_property(tools, "git_history_for_symbol", "include");
-    assert_schema_lacks_property(tools, "papertrail_for_symbol", "include");
-    assert_schema_array_item_enum(tools, "find_callers", "include", &[
-        "references",
-        "unresolved",
-        "macros",
-        "common_methods",
-        "coverage",
-        "memories",
-    ]);
-    assert_schema_has_property(tools, "find_callers", "edge_kinds");
-    assert_schema_has_property(tools, "find_callers", "resolution");
-    assert_schema_property_enum(tools, "find_callers", "resolution", &[
-        "exact",
-        "syntactic",
-        "fuzzy",
-    ]);
-    assert_schema_array_item_enum(tools, "find_callers", "edge_kinds", &[
-        "calls_name",
-        "constructs",
-        "uses_operator",
-        "uses_precedence_group",
-        "dispatches",
-        "uses_macro",
-        "references_type",
-        "imports",
-        "exports",
-        "contains",
-        "implements",
-    ]);
-    assert_schema_has_property(tools, "find_callers", "id");
-    assert_symbol_selector_schema(tools, "find_callers");
-    assert_schema_array_item_enum(tools, "trace_callees", "include", &[
-        "references",
-        "unresolved",
-        "macros",
-        "common_methods",
-        "coverage",
-        "memories",
-    ]);
-    assert_schema_has_property(tools, "trace_callees", "edge_kinds");
-    assert_schema_has_property(tools, "trace_callees", "resolution");
-    assert_schema_has_property(tools, "trace_callees", "id");
-    assert_symbol_selector_schema(tools, "trace_callees");
-    assert_schema_requires(tools, "compare_graph_to_text", "pattern");
-    assert_schema_array_item_enum(tools, "compare_graph_to_text", "include", &[
-        "tests",
-        "references",
-        "unresolved",
-        "macros",
-        "common_methods",
-    ]);
-    assert_schema_has_property(tools, "compare_graph_to_text", "edge_kinds");
-    assert_schema_has_property(tools, "compare_graph_to_text", "resolution");
-    assert_schema_has_property(tools, "compare_graph_to_text", "id");
-    assert_symbol_selector_schema(tools, "compare_graph_to_text");
-    assert_schema_has_property(tools, "impact_surface", "resolution");
-    assert_schema_array_item_enum(tools, "impact_surface", "include", &[
-        "tests",
-        "docs",
-        "git",
-        "papertrail",
-        "text_fallback",
-        "memories",
-    ]);
-    assert_schema_has_property(tools, "impact_surface", "id");
-    assert_symbol_selector_schema(tools, "impact_surface");
-    assert_schema_has_property(tools, "repo_brief", "mode");
-    assert_schema_property_enum(tools, "repo_brief", "mode", &[
-        "spine",
-        "churn",
-        "god_modules",
-        "refactor_candidates",
-    ]);
-    assert_schema_has_property(tools, "repo_brief", "limit");
-    assert_schema_array_item_enum(tools, "repo_brief", "include", &["generated", "memories"]);
-    assert_schema_has_property(tools, "repo_clusters", "limit");
-    assert_schema_array_item_enum(tools, "repo_clusters", "include", &["generated", "memories"]);
-    assert_schema_has_property(tools, "repo_clusters", "min_cluster_size");
-    assert_symbol_selector_schema(tools, "docs_for_symbol");
-    assert_symbol_selector_schema(tools, "git_history_for_symbol");
-    assert_symbol_selector_schema(tools, "papertrail_for_symbol");
-    assert_schema_requires(tools, "read_chunk", "chunk_id");
-    assert_schema_has_property(tools, "read_chunk", "include_graph");
-    assert_schema_property_enum(tools, "read_chunk", "include_graph", &["none", "compact", "full"]);
-    assert_schema_has_property(tools, "read_chunk", "graph_limit");
-    assert_schema_array_item_enum(tools, "read_chunk", "include", &["memories"]);
-    assert_schema_requires(tools, "papertrail_for_commit", "commit_hash");
-    assert_schema_array_item_enum(tools, "papertrail_for_commit", "include", &["fallback"]);
-    assert_schema_array_item_enum(tools, "rationale_search", "include", &["fallback"]);
-    // The plain full-text tools honor only `query` + `limit`; they must not advertise the
-    // semantic_search knobs they would silently discard.
-    for tool in ["commit_search", "commits_touching_query", "papertrail_issue_search"] {
-        for knob in ["explain", "include", "include_graph", "graph_limit"] {
-            assert_schema_lacks_property(tools, tool, knob);
-        }
+    for field in ["edge_id", "edge_sequence_hash", "path_summary"] {
+        assert_schema_nested_property(tools, "memory_create", "bind", field);
     }
-    assert_schema_lacks_property(tools, "rationale_search", "include_graph");
-    assert_schema_has_property(tools, "heal_index", "limit");
-    assert_schema_requires(tools, "memory_create", "kind");
-    assert_schema_has_property(tools, "memory_create", "title");
-    // `bind` is OPTIONAL (#463): omitting it creates an unanchored Concept/Task node.
-    assert_schema_has_property(tools, "memory_create", "bind");
-    assert_schema_has_property(tools, "memory_create", "confidence");
-    assert_schema_nested_property(tools, "memory_create", "bind", "edge_id");
-    assert_schema_nested_property(tools, "memory_create", "bind", "edge_sequence_hash");
-    assert_schema_nested_property(tools, "memory_create", "bind", "path_summary");
-    assert_schema_requires(tools, "memory_update", "memory_id");
-    assert_schema_requires(tools, "memory_search", "query");
-    assert_schema_has_property(tools, "memory_for_symbol", "id");
-    assert_schema_requires(tools, "memory_for_path", "path");
-    assert_schema_requires(tools, "memory_for_call_path", "edge_sequence_hash");
-    assert_schema_requires(tools, "memory_mark_obsolete", "memory_id");
-    assert_eq!(tool_schema(tools, "memory_validate")["type"], "object");
-    assert_eq!(tool_schema(tools, "llm_status")["type"], "object");
-    assert_schema_has_property(tools, "find_clones", "min_similarity");
-    assert_schema_has_property(tools, "find_clones", "min_copies");
-    assert_schema_has_property(tools, "find_clones", "limit");
-    assert_schema_has_property(tools, "clones_for_symbol", "id");
-    assert_schema_has_property(tools, "clones_for_symbol", "ref");
-    assert_schema_has_property(tools, "clones_for_symbol", "path");
-    assert_schema_has_property(tools, "clones_for_symbol", "line");
+}
+
+fn assert_schema_array_property(root: &Value, field: &str) {
+    let property = resolve_schema_ref(root, &root["properties"][field]);
+    property
+        .get("items")
+        .or_else(|| {
+            property
+                .get("anyOf")?
+                .as_array()?
+                .iter()
+                .map(|candidate| resolve_schema_ref(root, candidate))
+                .find(|candidate| candidate["type"] == "array")?
+                .get("items")
+        })
+        .expect("array items schema");
+}
+
+#[test]
+#[should_panic(expected = "array items schema")]
+fn schema_array_guard_rejects_a_scalar_with_the_same_vocabulary() {
+    assert_schema_array_property(
+        &json!({
+            "properties": {"include": {"type": "string", "enum": ["memories", "generated"]}}
+        }),
+        "include",
+    );
+}
+
+/// The value vocabulary `property` advertises — a string enum, directly or as an array's items,
+/// through `$ref`, a nullable `anyOf`, or a documented-variant `oneOf` — or `None` when the
+/// property is absent or not enum-valued.
+fn enum_values(root: &Value, property: &str) -> Option<Vec<String>> {
+    enum_vocabulary(root, root["properties"].get(property)?)
+}
+
+fn enum_vocabulary(root: &Value, schema: &Value) -> Option<Vec<String>> {
+    let schema = resolve_schema_ref(root, schema);
+    let schema = schema.get("items").map_or(schema, |items| resolve_schema_ref(root, items));
+    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+        return Some(
+            values.iter().map(|value| value.as_str().expect("string enum value").into()).collect(),
+        );
+    }
+    if let Some(variants) = schema.get("oneOf").and_then(Value::as_array) {
+        return variants
+            .iter()
+            .map(|variant| variant.get("const").and_then(Value::as_str).map(str::to_string))
+            .collect();
+    }
+    schema
+        .get("anyOf")?
+        .as_array()?
+        .iter()
+        .filter(|candidate| candidate.get("type").and_then(Value::as_str) != Some("null"))
+        .find_map(|candidate| enum_vocabulary(root, candidate))
 }
 
 #[test]
@@ -1015,54 +1186,11 @@ fn find_callers_zero_callers_is_not_low_completeness() {
     assert!(callee["summary"]["completeness_note"].is_null());
 }
 
-fn assert_schema_requires(tools: &[Value], name: &str, field: &str) {
-    let schema = tool_schema(tools, name);
-    let required = schema["required"].as_array().expect("required array");
-    assert!(required.iter().any(|value| value == field), "{name} should require {field}");
-}
-
-fn assert_schema_has_property(tools: &[Value], name: &str, field: &str) {
-    let schema = tool_schema(tools, name);
-    assert!(schema["properties"].get(field).is_some(), "{name} should define {field}");
-}
-
-fn assert_schema_lacks_property(tools: &[Value], name: &str, field: &str) {
-    let schema = tool_schema(tools, name);
-    assert!(schema["properties"].get(field).is_none(), "{name} must not define {field}");
-}
-
 fn assert_schema_nested_property(tools: &[Value], name: &str, parent: &str, field: &str) {
     let schema = tool_schema(tools, name);
     let property = schema["properties"].get(parent).expect("schema property");
     let resolved = resolve_schema_ref(schema, property);
     assert!(resolved["properties"].get(field).is_some(), "{name}.{parent} should define {field}");
-}
-
-fn assert_schema_property_enum(tools: &[Value], name: &str, field: &str, expected: &[&str]) {
-    let schema = tool_schema(tools, name);
-    let property = schema["properties"].get(field).expect("schema property");
-    let resolved = resolve_schema_ref(schema, property);
-    let enum_schema = enum_schema(schema, resolved);
-    assert_enum_values(enum_schema, expected, &format!("{name}.{field}"));
-}
-
-fn assert_schema_array_item_enum(tools: &[Value], name: &str, field: &str, expected: &[&str]) {
-    let schema = tool_schema(tools, name);
-    let property = schema["properties"].get(field).expect("schema property");
-    let resolved = resolve_schema_ref(schema, property);
-    let items = resolved
-        .get("items")
-        .or_else(|| {
-            resolved.get("anyOf").and_then(|any| {
-                any.as_array()?
-                    .iter()
-                    .find(|schema| schema.get("type").and_then(Value::as_str) == Some("array"))?
-                    .get("items")
-            })
-        })
-        .expect("array items schema");
-    let items = resolve_schema_ref(schema, items);
-    assert_enum_values(items, expected, &format!("{name}.{field}[]"));
 }
 
 fn resolve_schema_ref<'a>(root: &'a Value, value: &'a Value) -> &'a Value {
@@ -1073,43 +1201,6 @@ fn resolve_schema_ref<'a>(root: &'a Value, value: &'a Value) -> &'a Value {
         return value;
     };
     &root["$defs"][definition]
-}
-
-fn enum_schema<'a>(root: &'a Value, value: &'a Value) -> &'a Value {
-    if value.get("enum").is_some() {
-        return value;
-    }
-    if let Some(any_of) = value.get("anyOf").and_then(Value::as_array) {
-        for candidate in any_of {
-            if candidate.get("type").and_then(Value::as_str) == Some("null") {
-                continue;
-            }
-            let resolved = resolve_schema_ref(root, candidate);
-            if resolved.get("enum").is_some() {
-                return resolved;
-            }
-        }
-    }
-    value
-}
-
-fn assert_enum_values(schema: &Value, expected: &[&str], label: &str) {
-    let values = schema["enum"]
-        .as_array()
-        .unwrap_or_else(|| panic!("{label} should expose enum values: {schema:?}"))
-        .iter()
-        .map(|value| value.as_str().expect("string enum value"))
-        .collect::<Vec<_>>();
-    assert_eq!(values, expected, "{label} enum mismatch");
-}
-
-fn assert_symbol_selector_schema(tools: &[Value], name: &str) {
-    // #149: the wire selector is symbol/ref/id (the opaque handle); the
-    // ephemeral numeric symbol_id is no longer an accepted input.
-    for field in ["symbol", "ref", "id", "allow_ambiguous"] {
-        assert_schema_has_property(tools, name, field);
-    }
-    assert_schema_lacks_property(tools, name, "symbol_id");
 }
 
 #[test]
