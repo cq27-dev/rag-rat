@@ -854,6 +854,15 @@ pub enum OracleResolutionKind {
 }
 
 impl OracleResolutionKind {
+    /// `edge_oracle.kind = …` token of an in-corpus recovery ([`Self::Upgrade`]).
+    pub(crate) const UPGRADE_SQL: &'static str = "'upgrade'";
+    /// `edge_oracle.kind IN …` list of the verdicts that place a low-confidence edge anywhere —
+    /// in the corpus or in a dependency.
+    pub(crate) const UPGRADEABLE_SQL: &'static str = "('upgrade', 'resolved-external')";
+    /// `edge_oracle.kind IN …` list of the verdicts naming an in-corpus target the heuristic
+    /// missed or agrees with — the ones a caller traversal can seed from.
+    pub const IN_CORPUS_SQL: &'static str = "('upgrade', 'confirm')";
+
     pub fn as_db_str(self) -> &'static str {
         self.into()
     }

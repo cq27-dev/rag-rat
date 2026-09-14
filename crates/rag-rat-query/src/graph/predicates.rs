@@ -215,7 +215,7 @@ pub(crate) fn reverse_oracle_seeded_edge_ids(
     // SECOND SPELLING (invariant): the run-currency and content-key gates below say the same thing
     // as `rag_rat_oracle::store`'s `edge_oracle_scope_join` + `edge_oracle_current_predicate` +
     // `edge_oracle_def_current_predicate`, which is what the read-side enrichment applies. They are
-    // separate SQL because this crate does not depend on `rag-rat-oracle` and because the gates
+    // separate SQL because the gates
     // there are written against the RAW `files` table with explicit commit/worktree bind slots,
     // while every join here goes through the connection's scoped `files` view. Change one and the
     // other must move with it, or this query seeds callers enrichment then declines to promote.
@@ -241,7 +241,7 @@ pub(crate) fn reverse_oracle_seeded_edge_ids(
                   AND edges.callee_start_byte = edge_oracle.callee_start_byte
                   AND edges.callee_end_byte = edge_oracle.callee_end_byte
                   AND edges.edge_kind = edge_oracle.edge_kind
-        WHERE edge_oracle.kind IN ('upgrade', 'confirm')
+        WHERE edge_oracle.kind IN {in_corpus}
           AND {seed}{verdict_repo}
         ORDER BY edges.id
         LIMIT {ORACLE_SEED_EDGE_CAP}
@@ -249,6 +249,7 @@ pub(crate) fn reverse_oracle_seeded_edge_ids(
         runs_repo = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "oracle_runs"),
         latest_repo = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "latest"),
         verdict_repo = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "edge_oracle"),
+        in_corpus = rag_rat_oracle::OracleResolutionKind::IN_CORPUS_SQL,
     );
     let seed_id = options.logical_symbol_id.or(options.symbol_id).unwrap_or(-1);
     let mut stmt = conn.prepare(&sql)?;

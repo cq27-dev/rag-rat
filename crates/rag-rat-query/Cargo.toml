@@ -16,6 +16,7 @@ anyhow.workspace = true
 rag-rat-base.workspace = true
 rag-rat-papertrail.workspace = true
 rag-rat-db.workspace = true
+rag-rat-oracle.workspace = true
 minicbor.workspace = true
 regex.workspace = true
 rusqlite.workspace = true
