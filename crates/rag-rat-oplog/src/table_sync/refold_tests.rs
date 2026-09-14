@@ -223,7 +223,7 @@ fn a_parked_column_is_recovered_by_the_refold_and_then_the_producer_stays_quiet(
     // partially applied.
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ],);
     assert_eq!(b.row(), None, "nothing is written for an op we cannot fully project");
     assert_eq!(b.pending_count(), 1, "the entry is marked for replay");
@@ -351,9 +351,7 @@ fn refold_replay_of_a_memory_lane_row_bumps_the_memories_lens_lane() {
         tx.commit().unwrap();
         out
     };
-    assert_eq!(outcomes, vec![IngestOutcome::Retained(
-        PendingReason::NewerSpecVersion.as_db_str()
-    )]);
+    assert_eq!(outcomes, vec![IngestOutcome::Retained(PendingReason::NewerSpecVersion)]);
     assert_eq!(lens_memories_revision(&b.conn), 0, "a parked entry has not applied");
 
     // Refold under the new spec applies it, and the guard advances the memories lane.
@@ -389,7 +387,7 @@ fn refold_replay_of_a_non_memory_row_leaves_the_memories_lens_lane_untouched() {
     let entries = author_wide_row(&mut a);
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ]);
 
     assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
@@ -408,7 +406,7 @@ fn absent_or_contested_incarnation_authority_keeps_retryable_refold_debt() {
     let entries = author_wide_row(&mut a);
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ]);
 
     b.conn
@@ -695,8 +693,10 @@ fn ingest_defers_an_upsert_whose_row_state_cannot_be_established() {
     b.enroll(a.pubkey().fingerprint());
     let outcomes = b.ingest(NEW_REGISTRY, "repo", &entries, &a.pubkey());
     assert!(
-        outcomes.iter().all(|outcome| *outcome
-            == IngestOutcome::Retained(PendingReason::DeferredUnresolvedWinner.as_db_str())),
+        outcomes
+            .iter()
+            .all(|outcome| *outcome
+                == IngestOutcome::Retained(PendingReason::DeferredUnresolvedWinner)),
         "each upsert is deferred rather than applied: {outcomes:?}",
     );
     assert_eq!(b.row().unwrap().0, "edited", "the possibly-unsent local edit survives");
@@ -1024,7 +1024,7 @@ fn a_column_without_a_declared_default_still_parks_an_older_op() {
     let narrow = a.produce(OLD_REGISTRY, "repo");
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(&[NO_DEFAULT], "repo", &narrow, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::PartialAfterImage.as_db_str())
+        IngestOutcome::Retained(PendingReason::PartialAfterImage)
     ],);
     assert_eq!(b.row(), None, "nothing is invented for a column with no declared default");
 }
@@ -1138,7 +1138,7 @@ fn devices_at_different_spec_versions_converge_in_both_directions() {
         .unwrap();
     let from_new = new_dev.produce(NEW_REGISTRY, "repo");
     assert_eq!(old_dev.ingest(OLD_REGISTRY, "repo", &from_new, &new_dev.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ],);
 
     // OLDER then authors its own row; the newer peer APPLIES it, filling the column it
@@ -1296,7 +1296,7 @@ fn park_a_remove_over_an_unreadable_row(a: &mut Device, b: &mut Device) {
     let removes = a.produce(&[BOOL], "repo");
     assert_eq!(removes.len(), 1, "the local delete is authored as a Remove");
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &removes, &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::TableNotInScope.as_db_str())
+        IngestOutcome::Retained(PendingReason::TableNotInScope)
     ]);
     assert_eq!(b.pending_count(), 1);
 }
@@ -1472,7 +1472,7 @@ fn a_malformed_key_is_quarantined_rather_than_failing_the_whole_refold() {
     // Parked because this scope has no such table for the ingesting registry.
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(&[], "repo", &[signed], &a.pubkey()), vec![IngestOutcome::Retained(
-        PendingReason::TableNotInScope.as_db_str()
+        PendingReason::TableNotInScope
     )],);
 
     // The refold must complete — not error — and the malformed entry must be rejected durably.
@@ -1521,7 +1521,7 @@ fn a_quarantine_found_during_replay_is_recorded_rather_than_silently_cleared() {
 
     b.enroll(a.pubkey().fingerprint());
     assert_eq!(b.ingest(OLD_REGISTRY, "repo", &[signed], &a.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ],);
 
     assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
@@ -2251,7 +2251,7 @@ fn park_wide_entry(store: &SharedStore) {
     let opener = store.open();
     opener.enroll(peer.pubkey().fingerprint());
     assert_eq!(opener.ingest(OLD_REGISTRY, "repo", &entries, &peer.pubkey()), vec![
-        IngestOutcome::Retained(PendingReason::NewerSpecVersion.as_db_str())
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
     ]);
     assert_eq!(opener.pending_count(), 1, "the fixture leaves exactly one entry parked");
 }

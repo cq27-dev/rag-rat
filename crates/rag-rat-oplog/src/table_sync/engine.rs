@@ -17,7 +17,7 @@ use super::registry::TableSpec;
 use super::retention::{Pin, PinKind};
 use super::row_op::{self, RowOp, StatedDelete};
 use super::scope_stream::{ScopeId, scope_stream_id};
-use super::store::{self, AcceptOutcome};
+use super::store::{self, AcceptOutcome, PendingReason};
 use super::{produce, refold};
 use crate::device::DevicePublic;
 use crate::op::OpMeta;
@@ -43,8 +43,9 @@ pub(crate) struct SyncCtx<'a> {
 pub(crate) enum IngestOutcome {
     Applied,
     /// Stored and relayed, but not applied — an undecodable/unknown/out-of-scope payload. The
-    /// `&str` is the reason. Forward-compatible: the chain advanced, the payload is retained.
-    Retained(&'static str),
+    /// payload carries the typed reason. Forward-compatible: the chain advanced, the payload is
+    /// retained.
+    Retained(PendingReason),
     AlreadyPresent,
     /// The entry's chain predecessor has not arrived, so it is RETAINED and will be promoted when
     /// the predecessor is accepted. Not an error: out-of-order delivery is the normal condition on
@@ -765,7 +766,7 @@ fn ingest_one(
                 let Some(spec) =
                     ctx.registry.iter().find(|s| s.scope_id == scope_id && s.name == op.table())
                 else {
-                    return Ok((IngestOutcome::Retained("table not in scope"), accepted));
+                    return Ok((IngestOutcome::Retained(PendingReason::TableNotInScope), accepted));
                 };
                 // NEVER apply over unsent local work. A raw local write does not advance the row
                 // clock, so the LWW comparison below cannot see it: this op would simply win and
@@ -835,7 +836,7 @@ fn ingest_one(
                         deferral,
                         refold::TABLE_SYNC_PROJECTOR_VERSION,
                     )?;
-                    return Ok((IngestOutcome::Retained(deferral.as_db_str()), accepted));
+                    return Ok((IngestOutcome::Retained(deferral), accepted));
                 }
                 let outcome = match apply::apply_row_op_on_stream(
                     tx,
@@ -873,15 +874,13 @@ fn ingest_one(
                             reason,
                             refold::TABLE_SYNC_PROJECTOR_VERSION,
                         )?;
-                        IngestOutcome::Retained(reason.as_db_str())
+                        IngestOutcome::Retained(reason)
                     },
                 };
                 (outcome, accepted)
             },
-            AcceptOutcome::StoredInert { reason, entry_hash, prev_hash } => (
-                IngestOutcome::Retained(reason.as_db_str()),
-                Some(AcceptedEntry { entry_hash, prev_hash }),
-            ),
+            AcceptOutcome::StoredInert { reason, entry_hash, prev_hash } =>
+                (IngestOutcome::Retained(reason), Some(AcceptedEntry { entry_hash, prev_hash })),
             // Nothing was stored by these, so none of them advances a chain and none can unblock a
             // retained successor.
             AcceptOutcome::AlreadyPresent => (IngestOutcome::AlreadyPresent, None),

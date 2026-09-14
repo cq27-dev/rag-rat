@@ -1175,9 +1175,7 @@ fn a_promoted_entry_still_defers_to_unsent_local_work() {
     let report = b.ingest_reports(&filler, &a.pubkey());
     assert_eq!(
         report[0].promoted,
-        vec![IngestOutcome::Retained(
-            crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
-        )],
+        vec![IngestOutcome::Retained(crate::table_sync::store::PendingReason::DeferredUnsentEdit)],
         "the promoted entry defers rather than applying",
     );
     assert_eq!(b.title().as_deref(), Some("from-B"), "B's unsent edit survives promotion");
@@ -1595,7 +1593,7 @@ fn a_removed_writer_keeps_its_unpublished_edit_behind_the_guard() {
     remove_writer(&b.conn, AccountId::from_bytes([42; 32]), b.local.fingerprint());
     a.set_title("from-A");
     assert_eq!(b.ingest_all(&a.produce(), &a.pubkey()), vec![IngestOutcome::Retained(
-        crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
+        crate::table_sync::store::PendingReason::DeferredUnsentEdit
     )]);
     assert_eq!(b.title().as_deref(), Some("unsent-B"), "the unsent local edit survives");
 }
@@ -1666,7 +1664,7 @@ fn two_devices_with_unsent_edits_converge_through_the_deferral() {
     // A authors first. B, still holding its own unsent edit, defers rather than clobbering it.
     let from_a = a.produce();
     assert_eq!(b.ingest_all(&from_a, &a.pubkey()), vec![IngestOutcome::Retained(
-        crate::table_sync::store::PendingReason::DeferredUnsentEdit.as_db_str()
+        crate::table_sync::store::PendingReason::DeferredUnsentEdit
     )],);
     assert_eq!(b.title().as_deref(), Some("from-B"), "B's edit is intact");
 
@@ -2027,7 +2025,7 @@ fn replay_after_removal_re_arms_re_adoption() {
     let delete = produce_on(&a, BOOL);
     c.conn.execute("UPDATE t_typed SET flag = 2 WHERE id = 'r1'", []).unwrap();
     assert_eq!(ingest_on(&c, BOOL, &delete, &a.pubkey()), vec![IngestOutcome::Retained(
-        store::PendingReason::DeferredUnreadableRow.as_db_str()
+        store::PendingReason::DeferredUnreadableRow
     )]);
     // A is removed while its delete is parked: A owns nothing on C, so the drain completes.
     assert_eq!(drain_removal(&c, BOOL, a.pubkey().fingerprint(), stream), Some(0));
