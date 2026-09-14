@@ -21,6 +21,9 @@ mod branch;
 mod candidate;
 mod checkpoint;
 mod content;
+// Isolated grammar and evidence planning only; production control dispatch remains v1.
+#[allow(dead_code, reason = "control v2 execution awaits frozen legacy fold policy (#1311)")]
+mod control_v2;
 mod cut;
 pub mod discovery;
 mod envelope;
