@@ -164,10 +164,10 @@ impl IndexDatabase {
     /// or when `f` panics and the unwind drops it. IMMEDIATE takes the write lock up front, so a
     /// racing writer waits out busy_timeout instead of failing a deferred read→write upgrade with
     /// SQLITE_BUSY. Used by the heal paths, whose contract this is. Sites with a different failure
-    /// policy keep their own BEGIN/COMMIT: the standalone finalize, generated-flags heal,
-    /// overlay package refresh and pending logical rebuild leave a failed COMMIT's transaction
-    /// open, and the rebuild's wave loop and phase-2/terminal transactions leave the rollback
-    /// to the rebuild's outer handler, which joins the git-history worker first.
+    /// policy keep their own BEGIN/COMMIT: the standalone finalize and generated-flags heal
+    /// leave a failed COMMIT's transaction open, and the rebuild's wave loop and phase-2/terminal
+    /// transactions leave the rollback to the rebuild's outer handler, which joins the
+    /// git-history worker first.
     pub(super) fn in_immediate_txn<T>(
         &self,
         f: impl FnOnce() -> anyhow::Result<T>,
