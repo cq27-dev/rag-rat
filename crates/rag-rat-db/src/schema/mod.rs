@@ -1140,6 +1140,23 @@ pub struct SchemaStatus {
     pub message: String,
 }
 
+impl SchemaStatus {
+    fn new(
+        state: SchemaState,
+        current_version: u32,
+        migrations: Vec<AppliedMigration>,
+        message: String,
+    ) -> Self {
+        Self {
+            state,
+            current_version,
+            latest_version: LATEST_SCHEMA_VERSION,
+            migrations,
+            message,
+        }
+    }
+}
+
 /// Provision the baseline (001) idempotently: the schema_version ledger, then `apply_baseline`
 /// (all `CREATE … IF NOT EXISTS`), then record 001. Shared by [`apply`] (fresh DB) and
 /// [`migrate_forward`] (existing DB behind by N). LOAD-BEARING for forward-only: a pre-interning
@@ -1448,90 +1465,83 @@ pub fn status(conn: &Connection) -> anyhow::Result<SchemaStatus> {
     if !table_exists(conn, "schema_version")? {
         let has_legacy_tables = table_exists(conn, "files")? || table_exists(conn, "chunks")?;
         return Ok(if has_legacy_tables {
-            SchemaStatus {
-                state: SchemaState::Older,
-                current_version: 0,
-                latest_version: LATEST_SCHEMA_VERSION,
-                migrations: Vec::new(),
-                message: "legacy index schema has no version ledger; rebuild the derived index \
-                          with `rag-rat index --full`"
+            SchemaStatus::new(
+                SchemaState::Older,
+                0,
+                Vec::new(),
+                "legacy index schema has no version ledger; rebuild the derived index with \
+                 `rag-rat index --full`"
                     .to_string(),
-            }
+            )
         } else {
-            SchemaStatus {
-                state: SchemaState::Missing,
-                current_version: 0,
-                latest_version: LATEST_SCHEMA_VERSION,
-                migrations: Vec::new(),
-                message: "index schema is not initialized; build the derived index with `rag-rat \
-                          index` or `rag-rat index --full`"
+            SchemaStatus::new(
+                SchemaState::Missing,
+                0,
+                Vec::new(),
+                "index schema is not initialized; build the derived index with `rag-rat index` or \
+                 `rag-rat index --full`"
                     .to_string(),
-            }
+            )
         });
     }
 
     let applied = migrations::applied_migrations(conn)?;
+    let current_version = migrations::known_version(&applied);
     if applied.iter().any(|migration| migration.id == DIRTY_MIGRATION_ID) {
-        return Ok(SchemaStatus {
-            state: SchemaState::Dirty,
-            current_version: migrations::known_version(&applied),
-            latest_version: LATEST_SCHEMA_VERSION,
-            migrations: applied,
-            message: "dirty or partial schema migration detected; rebuild the derived index with \
-                      `rag-rat index --full`"
+        return Ok(SchemaStatus::new(
+            SchemaState::Dirty,
+            current_version,
+            applied,
+            "dirty or partial schema migration detected; rebuild the derived index with `rag-rat \
+             index --full`"
                 .to_string(),
-        });
+        ));
     }
     if applied.iter().any(migrations::migration_checksum_mismatch) {
-        return Ok(SchemaStatus {
-            state: SchemaState::Dirty,
-            current_version: migrations::known_version(&applied),
-            latest_version: LATEST_SCHEMA_VERSION,
-            migrations: applied,
-            message: "schema migration checksum mismatch; refusing to open, rebuild the derived \
-                      index with `rag-rat index --full`"
+        return Ok(SchemaStatus::new(
+            SchemaState::Dirty,
+            current_version,
+            applied,
+            "schema migration checksum mismatch; refusing to open, rebuild the derived index with \
+             `rag-rat index --full`"
                 .to_string(),
-        });
+        ));
     }
     if applied.iter().any(|migration| !migrations::known_migration(&migration.id)) {
-        return Ok(SchemaStatus {
-            state: SchemaState::Newer,
-            current_version: migrations::known_version(&applied),
-            latest_version: LATEST_SCHEMA_VERSION,
-            migrations: applied,
+        return Ok(SchemaStatus::new(
+            SchemaState::Newer,
+            current_version,
+            applied,
             // #484/#585: on a shared global DB one upgraded agent migrates the schema and every
             // process still on an older binary lands here — the refusal must carry the remedy AND
-            // name this binary's schema ceiling + WHO migrated the store (from provenance), because
-            // it surfaces as the error text of every CLI/MCP open and is how a fleet outage is
-            // diagnosed.
-            message: format!(
+            // name this binary's schema ceiling + WHO migrated the store (from provenance),
+            // because it surfaces as the error text of every CLI/MCP open and is how a
+            // fleet outage is diagnosed.
+            format!(
                 "index schema was created by a newer rag-rat; refusing to open — this rag-rat \
                  supports up to schema v{LATEST_SCHEMA_VERSION}, so upgrade rag-rat or restart \
                  sessions/servers still running an older binary{}{}",
                 hot_upgrade_caveat(),
                 migrations::migration_provenance_note(conn),
             ),
-        });
+        ));
     }
-    let current_version = migrations::known_version(&applied);
     if current_version < LATEST_SCHEMA_VERSION {
-        return Ok(SchemaStatus {
-            state: SchemaState::Older,
+        return Ok(SchemaStatus::new(
+            SchemaState::Older,
             current_version,
-            latest_version: LATEST_SCHEMA_VERSION,
-            migrations: applied,
-            message: "index schema is older than this rag-rat; it migrates forward automatically \
-                      on open (or rebuild with `rag-rat index --full`)"
+            applied,
+            "index schema is older than this rag-rat; it migrates forward automatically on open \
+             (or rebuild with `rag-rat index --full`)"
                 .to_string(),
-        });
+        ));
     }
-    Ok(SchemaStatus {
-        state: SchemaState::Compatible,
+    Ok(SchemaStatus::new(
+        SchemaState::Compatible,
         current_version,
-        latest_version: LATEST_SCHEMA_VERSION,
-        migrations: applied,
-        message: "schema is compatible".to_string(),
-    })
+        applied,
+        "schema is compatible".to_string(),
+    ))
 }
 
 /// Make the open-able index schema current, migrating FORWARD automatically when it lags this
