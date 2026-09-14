@@ -14,6 +14,7 @@ mod gitlab;
 mod http;
 mod mirror;
 mod parse;
+pub mod ref_sync;
 mod schedule;
 mod store;
 mod sync;
@@ -23,7 +24,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::OnceLock;
 
-pub use api::{sync_from_refs, sync_from_refs_with_progress, *};
+pub use api::*;
 pub use distill::{
     AnchorKind, DistillEdgeKind, EpistemicStatus, FixEdgeSource, OutcomeStatus, ThreadShape,
 };
@@ -48,7 +49,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub use schedule::{AutosyncRequest, *};
 use serde::{Deserialize, Serialize};
 pub use store::{rebuild_fts, *};
-pub use sync::*;
+pub(crate) use sync::*;
 pub(crate) use trackers::resolve_trackers;
 pub use trackers::{
     ResolvedTracker, auto_detect_tracker, detect_tracker_for_remote,
@@ -228,24 +229,6 @@ pub enum SyncErrorStatus {
     AttestedWalkFailed,
     /// A reference-driven fetch found no such item.
     NotFound,
-}
-
-#[derive(Debug, Clone)]
-pub struct PapertrailSyncProgress {
-    pub current: usize,
-    pub total: usize,
-    pub project: String,
-    pub item_key: String,
-    pub action: PapertrailSyncAction,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PapertrailSyncAction {
-    Syncing,
-    Skipped,
-    Synced,
-    Failed,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -940,14 +923,6 @@ pub fn block_on<T>(
              sync entry points on that runtime instead"
         ),
     }
-}
-
-#[derive(Default)]
-pub struct SyncRefsReport {
-    synced_items: usize,
-    skipped_refs: usize,
-    failed_refs: usize,
-    errors: Vec<PapertrailSyncError>,
 }
 
 pub(crate) struct FtsRow<'a> {

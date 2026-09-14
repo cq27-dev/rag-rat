@@ -273,7 +273,7 @@ fn sync_from_refs_blocking<C: papertrail::PapertrailClient>(
     offline: bool,
     ctx: &papertrail::PapertrailContext,
 ) -> anyhow::Result<papertrail::PapertrailSyncReport> {
-    papertrail::block_on(papertrail::sync_from_refs(conn, root, client, offline, ctx))
+    papertrail::block_on(papertrail::ref_sync::sync_from_refs(conn, root, client, offline, ctx))
 }
 // ---- #219 stage 2: linked-worktree overlay indexing ----
 
