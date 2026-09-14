@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-use crate::auth::{AuthRole, SessionCapabilities};
+use crate::auth::{AuthRole, PeerCapability, SessionCapabilities};
 use crate::session::{DEFAULT_IDLE_TIMEOUT, Ingested, MAX_SESSION_ENTRIES};
 use crate::table_codec::{self, TableCodecError};
 use crate::table_wire::{
@@ -94,37 +94,23 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    run_table_session_with_idle_timeout(store, send, recv, role, capabilities, DEFAULT_IDLE_TIMEOUT)
-        .await
-}
-
-async fn run_table_session_with_idle_timeout<S, R, W>(
-    store: &mut S,
-    send: W,
-    recv: R,
-    role: AuthRole,
-    capabilities: SessionCapabilities,
-    idle_timeout: Duration,
-) -> Result<TableSessionReport, TableSessionError>
-where
-    S: TableSyncStore,
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
     run_table_session_with_limits(
         store,
         send,
         recv,
         role,
         capabilities,
-        idle_timeout,
         TableSessionLimits::default(),
     )
     .await
 }
 
+/// The per-session bounds of [`run_table_session_with_limits`]. The default is the session
+/// [`run_table_session`] runs: the default idle timeout and the protocol's page and session caps.
 #[derive(Clone, Copy)]
 struct TableSessionLimits {
+    /// Every frame read or write fails if the peer makes no progress within this window.
+    idle_timeout: Duration,
     chains_per_page: usize,
     chains_per_session: usize,
     entries_per_page: usize,
@@ -134,6 +120,7 @@ struct TableSessionLimits {
 impl Default for TableSessionLimits {
     fn default() -> Self {
         Self {
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
             chains_per_page: MAX_TABLE_CHAINS_PER_PAGE,
             chains_per_session: MAX_TABLE_CHAINS_PER_SESSION,
             entries_per_page: MAX_TABLE_ENTRIES_PER_PAGE,
@@ -148,7 +135,6 @@ async fn run_table_session_with_limits<S, R, W>(
     mut recv: R,
     role: AuthRole,
     capabilities: SessionCapabilities,
-    idle_timeout: Duration,
     limits: TableSessionLimits,
 ) -> Result<TableSessionReport, TableSessionError>
 where
@@ -156,6 +142,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let idle_timeout = limits.idle_timeout;
     debug_assert!(limits.chains_per_page > 0);
     debug_assert!(limits.chains_per_page <= limits.chains_per_session);
     debug_assert!(limits.entries_per_page > 0);
@@ -191,8 +178,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.local.can_push(),
-                idle_timeout,
+                capabilities.local,
                 limits,
             )
             .await?;
@@ -201,8 +187,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.peer.can_push(),
-                idle_timeout,
+                capabilities.peer,
                 limits,
             )
             .await?;
@@ -214,8 +199,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.peer.can_push(),
-                idle_timeout,
+                capabilities.peer,
                 limits,
             )
             .await?;
@@ -224,8 +208,7 @@ where
                 &intersection,
                 &mut send,
                 &mut recv,
-                capabilities.local.can_push(),
-                idle_timeout,
+                capabilities.local,
                 limits,
             )
             .await?;
@@ -248,8 +231,7 @@ async fn send_direction<S, R, W>(
     streams: &[ManifestItem],
     send: &mut W,
     recv: &mut R,
-    can_push: bool,
-    idle_timeout: Duration,
+    local_capability: PeerCapability,
     limits: TableSessionLimits,
 ) -> Result<(usize, bool), TableSessionError>
 where
@@ -257,6 +239,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let TableSessionLimits { idle_timeout, .. } = limits;
     let mut sent = 0;
     let mut offered_chains: usize = 0;
     let mut continuation_pending = false;
@@ -264,7 +247,7 @@ where
         let mut after_device = None;
         let mut stream_pending = false;
         loop {
-            if !can_push {
+            if !local_capability.can_push() {
                 break;
             }
             if sent >= limits.entries_per_session {
@@ -404,8 +387,7 @@ async fn receive_direction<S, R, W>(
     streams: &[ManifestItem],
     send: &mut W,
     recv: &mut R,
-    peer_can_push: bool,
-    idle_timeout: Duration,
+    peer_capability: PeerCapability,
     limits: TableSessionLimits,
 ) -> Result<(usize, usize, bool), TableSessionError>
 where
@@ -413,6 +395,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let TableSessionLimits { idle_timeout, .. } = limits;
     let mut received = 0;
     let mut newly_stored = 0;
     let mut offered_chains: usize = 0;
@@ -422,7 +405,7 @@ where
         loop {
             match read_before(recv, idle_timeout).await? {
                 TableFrame::ChainInventory { stream_id, chains } => {
-                    if !peer_can_push {
+                    if !peer_capability.can_push() {
                         return Err(TableSessionError::UnauthorizedPush);
                     }
                     let ordered_after_previous = chains.first().is_some_and(|first| {
@@ -851,7 +834,6 @@ mod tests {
                 a_recv,
                 AuthRole::Dialer,
                 SessionCapabilities::bidirectional(),
-                DEFAULT_IDLE_TIMEOUT,
                 limits,
             ),
             run_table_session_with_limits(
@@ -860,7 +842,6 @@ mod tests {
                 b_recv,
                 AuthRole::Acceptor,
                 SessionCapabilities::bidirectional(),
-                DEFAULT_IDLE_TIMEOUT,
                 limits,
             ),
         )
@@ -915,7 +896,6 @@ mod tests {
                 a_recv,
                 AuthRole::Dialer,
                 capabilities,
-                DEFAULT_IDLE_TIMEOUT,
                 TableSessionLimits::default(),
             ),
             run_table_session_with_limits(
@@ -924,7 +904,6 @@ mod tests {
                 b_recv,
                 AuthRole::Acceptor,
                 capabilities,
-                DEFAULT_IDLE_TIMEOUT,
                 TableSessionLimits::default(),
             ),
         );
@@ -947,6 +926,7 @@ mod tests {
             chains_per_session: 8,
             entries_per_page: 1,
             entries_per_session: 2,
+            ..Default::default()
         };
 
         let mut moved = Vec::new();
@@ -979,8 +959,7 @@ mod tests {
                 &streams,
                 &mut source_send,
                 &mut source_recv,
-                true,
-                DEFAULT_IDLE_TIMEOUT,
+                PeerCapability::ReadWrite,
                 limits,
             ),
             receive_direction(
@@ -988,8 +967,7 @@ mod tests {
                 &streams,
                 &mut destination_send,
                 &mut destination_recv,
-                true,
-                DEFAULT_IDLE_TIMEOUT,
+                PeerCapability::ReadWrite,
                 limits,
             ),
         );
@@ -1059,6 +1037,7 @@ mod tests {
             chains_per_session: 2,
             entries_per_page: 1,
             entries_per_session: 3,
+            ..Default::default()
         };
 
         let (source_report, destination_report) =
@@ -1087,6 +1066,7 @@ mod tests {
                 chains_per_session: 2,
                 entries_per_page: 1,
                 entries_per_session: 2,
+                ..Default::default()
             };
             let (mut receiver_send, mut peer_recv) = tokio::io::duplex(4096);
             let (mut peer_send, mut receiver_recv) = tokio::io::duplex(4096);
@@ -1131,8 +1111,7 @@ mod tests {
                 &streams,
                 &mut receiver_send,
                 &mut receiver_recv,
-                true,
-                DEFAULT_IDLE_TIMEOUT,
+                PeerCapability::ReadWrite,
                 limits,
             );
             let (result, ()) = tokio::join!(receiver, peer);
@@ -1178,8 +1157,7 @@ mod tests {
             &streams,
             &mut receiver_send,
             &mut receiver_recv,
-            true,
-            DEFAULT_IDLE_TIMEOUT,
+            PeerCapability::ReadWrite,
             TableSessionLimits::default(),
         );
         let (result, ()) = tokio::join!(receiver, peer);
@@ -1214,13 +1192,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
         let (result, ()) = tokio::join!(
-            run_table_session_with_idle_timeout(
+            run_table_session_with_limits(
                 &mut store,
                 send,
                 recv,
                 AuthRole::Dialer,
                 SessionCapabilities::bidirectional(),
-                Duration::from_millis(20),
+                TableSessionLimits {
+                    idle_timeout: Duration::from_millis(20),
+                    ..Default::default()
+                },
             ),
             peer,
         );
