@@ -55,3 +55,33 @@ pub(crate) fn version_check(config: &Config) -> anyhow::Result<()> {
         .or_else(|| version_check::read_cache(&config.database));
     print_output(&version_check::build_status(version_check::current_version(), cached.as_ref()))
 }
+
+/// Background thread that keeps the crates.io version cache fresh for the long-lived MCP server:
+/// refresh-if-stale now, then poll on a sub-TTL cadence so a release that lands while the server
+/// stays up is picked up within `DEFAULT_TTL_MS` (not only at restart) — `index_status` and the
+/// SessionStart digest read that cache. Best-effort + non-blocking: the actual crates.io call runs
+/// at most once per TTL (gated by `needs_refresh`), fail-open; the thread dies with the process (a
+/// hot-upgrade re-exec re-spawns it). No-op when version checking is disabled.
+pub(crate) fn spawn_detached_version_refresh(config: &rag_rat_base::config::Config) {
+    use rag_rat_core::version_check;
+    /// Poll cadence — well under the TTL so the once-per-day network refresh actually fires on a
+    /// server that outlives the TTL, while the cache read in between is trivially cheap.
+    const POLL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+    if !config.version_check.enabled {
+        return;
+    }
+    let database = config.database.clone();
+    std::thread::spawn(move || {
+        loop {
+            let now = rag_rat_base::time::now_ms();
+            if version_check::needs_refresh(
+                version_check::read_cache(&database).as_ref(),
+                now,
+                version_check::DEFAULT_TTL_MS,
+            ) {
+                let _ = version_check::refresh(&database);
+            }
+            std::thread::sleep(POLL);
+        }
+    });
+}
