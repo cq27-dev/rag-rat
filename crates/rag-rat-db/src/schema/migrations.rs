@@ -7469,7 +7469,7 @@ pub fn apply_reindex_after_unix_backslash_rendering(conn: &Connection) -> rusqli
 /// that for itself rather than inherit this conclusion.
 ///
 /// That fence only holds if the conversion and the stamp are never separately visible, so this
-/// migration is in `LEDGER_ATOMIC_MIGRATIONS`: the ladder runs the sweep inside the same IMMEDIATE
+/// migration is flagged `ledger_atomic`: the ladder runs the sweep inside the same IMMEDIATE
 /// transaction that writes the `schema_version` row. Committed separately, the rekeyed store would
 /// answer `Compatible` to a pre-V097 binary until the stamp landed — for a moment on a healthy
 /// upgrade, indefinitely after a crash between the two commits — and every refusal above would wave
@@ -8520,7 +8520,7 @@ pub fn apply_syncable_distill_anchors(conn: &Connection) -> rusqlite::Result<()>
 /// replay is idempotent by the same shape (the hook is idempotent too — a purged store has
 /// nothing left to purge).
 ///
-/// Listed in `LEDGER_ATOMIC_MIGRATIONS`: the queue rows, the deletions, and the ledger stamp
+/// Flagged `ledger_atomic`: the queue rows, the deletions, and the ledger stamp
 /// commit together, so an old writer racing the upgrade cannot slip poison into a half-purged
 /// store that still answers V112-compatible, and a crash cannot leave a partial purge behind an
 /// unstamped ledger. Neither statement below opens a transaction of its own — the ladder owns it.
