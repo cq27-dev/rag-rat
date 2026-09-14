@@ -1136,19 +1136,19 @@ impl IndexDatabase {
             // file's committed row.
             if kind == "deleted" {
                 if self.committed_row_exists(&path)? {
-                    self.remove_file_in_scope(Path::new(&path), CheckoutRef {
-                        commit_sha: "",
-                        worktree_id: &self.active_worktree_id,
-                    })?;
+                    self.remove_file_in_scope(
+                        Path::new(&path),
+                        CheckoutRef::worktree(&self.active_worktree_id),
+                    )?;
                     healed += 1;
                 }
                 continue;
             }
             if self.committed_row_exists(&path)? {
-                self.remove_file_in_scope(Path::new(&path), CheckoutRef {
-                    commit_sha: "",
-                    worktree_id: &self.active_worktree_id,
-                })?;
+                self.remove_file_in_scope(
+                    Path::new(&path),
+                    CheckoutRef::worktree(&self.active_worktree_id),
+                )?;
                 healed += 1;
                 continue;
             }
