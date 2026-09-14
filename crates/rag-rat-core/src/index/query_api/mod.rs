@@ -101,9 +101,10 @@ impl IndexDatabase {
                 .repo_meta("indexed_at_ms")?
                 .and_then(|value| value.parse::<i64>().ok()),
             content_revision: content_revision.clone(),
-            fts_synced_at_ms: self
-                .meta("fts_synced_at_ms")?
-                .and_then(|value| value.parse::<i64>().ok()),
+            fts_synced_at_ms: rag_rat_db::meta::read_meta_i64(
+                self.storage.connection(),
+                "fts_synced_at_ms",
+            )?,
             fts_dirty,
             fts_fresh: !fts_dirty
                 && fts_source_revision.as_deref() == Some(content_revision.as_str()),

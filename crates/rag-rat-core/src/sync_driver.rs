@@ -172,9 +172,10 @@ fn resident_worker(
 /// Record a durable hook request and report whether a resident host has recently heartbeated.
 pub fn nudge_resident_host(conn: &Connection) -> anyhow::Result<bool> {
     let now = time::now_ms();
-    rag_rat_db::meta::set_meta(conn, RESIDENT_NUDGE, &now.to_string())?;
-    let heartbeat = rag_rat_db::meta::read_meta(conn, RESIDENT_HEARTBEAT)?
-        .and_then(|value| value.parse::<i64>().ok());
+    rag_rat_db::meta::set_meta_i64(conn, RESIDENT_NUDGE, now)?;
+    let heartbeat = rag_rat_db::meta::read_meta_i64(conn, RESIDENT_HEARTBEAT)?;
+    // Unlike `within_window`, a heartbeat stamped ahead of `now` counts as recent here, and an age
+    // of exactly `HEARTBEAT_MAX_AGE_MS` still does.
     Ok(heartbeat.is_some_and(|at| now.saturating_sub(at) <= HEARTBEAT_MAX_AGE_MS))
 }
 
@@ -243,14 +244,11 @@ async fn resident_loop(
         let result = async {
             let storage = IndexConnection::open(&database)?;
             let conn = storage.connection();
-            let nudge = rag_rat_db::meta::read_meta(conn, RESIDENT_NUDGE)?
-                .and_then(|value| value.parse::<i64>().ok())
-                .unwrap_or_default();
+            let nudge = rag_rat_db::meta::read_meta_i64(conn, RESIDENT_NUDGE)?.unwrap_or_default();
             let now = time::now_ms();
-            if last_heartbeat == 0
-                || now < last_heartbeat
-                || now - last_heartbeat >= HEARTBEAT_INTERVAL_MS
-            {
+            // `last_heartbeat == 0` means this process has not heartbeated yet; it is a flag, not a
+            // timestamp to compare.
+            if last_heartbeat == 0 || !within_window(last_heartbeat, now, HEARTBEAT_INTERVAL_MS) {
                 heartbeat(conn)?;
                 last_heartbeat = now;
             }
@@ -1413,22 +1411,27 @@ fn sync_due(conn: &Connection, interval_secs: u64) -> anyhow::Result<bool> {
     if interval_secs == 0 {
         return Ok(true);
     }
-    let Some(last) =
-        rag_rat_db::meta::read_meta(conn, LAST_SYNC)?.and_then(|value| value.parse::<i64>().ok())
-    else {
+    let Some(last) = rag_rat_db::meta::read_meta_i64(conn, LAST_SYNC)? else {
         return Ok(true);
     };
     let now = time::now_ms();
-    Ok(last > now
-        || now - last >= i64::try_from(interval_secs).unwrap_or(i64::MAX).saturating_mul(1000))
+    let interval_ms = i64::try_from(interval_secs).unwrap_or(i64::MAX).saturating_mul(1000);
+    Ok(!within_window(last, now, interval_ms))
+}
+
+/// Whether a stamp taken at `stamp_ms` is still inside a `window_ms` window at `now_ms`. A stamp
+/// AHEAD of `now_ms` (a backwards wall-clock step) is outside it, so a clock that moved backwards
+/// makes the periodic work due instead of suppressing it until the clock catches up.
+fn within_window(stamp_ms: i64, now_ms: i64, window_ms: i64) -> bool {
+    stamp_ms <= now_ms && now_ms - stamp_ms < window_ms
 }
 
 fn record_sync(conn: &Connection) -> anyhow::Result<()> {
-    Ok(rag_rat_db::meta::set_meta(conn, LAST_SYNC, &time::now_ms().to_string())?)
+    Ok(rag_rat_db::meta::set_meta_i64(conn, LAST_SYNC, time::now_ms())?)
 }
 
 fn heartbeat(conn: &Connection) -> anyhow::Result<()> {
-    Ok(rag_rat_db::meta::set_meta(conn, RESIDENT_HEARTBEAT, &time::now_ms().to_string())?)
+    Ok(rag_rat_db::meta::set_meta_i64(conn, RESIDENT_HEARTBEAT, time::now_ms())?)
 }
 
 fn roster_capability(
@@ -1910,6 +1913,16 @@ mod tests {
             "tag",
             "ttl_seconds"
         ]);
+    }
+
+    /// The cadence window is half-open and a stamp from the future is outside it, so the sync and
+    /// heartbeat cadences both come due at the interval boundary and after a backwards clock step.
+    #[test]
+    fn within_window_is_half_open_and_rejects_a_future_stamp() {
+        assert!(super::within_window(1_000, 1_000, 10));
+        assert!(super::within_window(1_000, 1_009, 10));
+        assert!(!super::within_window(1_000, 1_010, 10), "the boundary itself is due");
+        assert!(!super::within_window(1_001, 1_000, 10), "a stamp ahead of now is due");
     }
 
     #[test]
