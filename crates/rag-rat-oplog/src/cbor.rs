@@ -143,9 +143,8 @@ fn check_canonical_item(bytes: &[u8], pos: &mut usize, depth: usize) -> Result<(
             Ok(())
         },
         6 => check_canonical_item(bytes, pos, depth + 1), // tag: one following item
-        7 => Ok(()),                                      /* simple value (null/bool/…); floats */
-        // already rejected by the header
-        // reader
+        // Simple value (null/bool/…); floats were already rejected by the header reader.
+        7 => Ok(()),
         _ => Err(CborError::message("invalid CBOR major type")),
     }
 }

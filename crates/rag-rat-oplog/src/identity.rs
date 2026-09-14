@@ -27,13 +27,10 @@ pub struct LocalDevice {
     secret: DeviceSecret,
     public: DevicePublic,
     fingerprint: DeviceFingerprint,
-    // The X25519 encryption keypair. C1 mints/persists/validates it; the first CONSUMER is C4
-    // (account.secrets sealed-box wrap / unwrap, #607), so the accessors are unused this slice —
-    // carried now so the identity owns both keys per §5, mirroring how mod.rs pre-exports
-    // not-yet-wired seams.
-    #[allow(dead_code)]
+    // The X25519 encryption keypair: account bootstrap publishes the public half, content-key
+    // sealing wraps to it and unwraps with the secret (`account::secrets`), and discovery
+    // decrypts with the secret alone.
     x25519_secret: DeviceX25519Secret,
-    #[allow(dead_code)]
     x25519_public: DeviceX25519Public,
 }
 
@@ -71,15 +68,13 @@ impl LocalDevice {
         self.fingerprint
     }
 
-    /// The device's X25519 public encryption key. `pub(super)`; C4 (sealed-box wrap) is the first
-    /// caller.
-    #[allow(dead_code)]
+    /// The device's X25519 public encryption key — what account bootstrap publishes and content-key
+    /// wraps are sealed to.
     pub(super) fn x25519_public(&self) -> DeviceX25519Public {
         self.x25519_public
     }
 
-    /// The device's X25519 secret. `pub(super)`; C4 (sealed-box unwrap / ECDH) is the first caller.
-    #[allow(dead_code)]
+    /// The device's X25519 secret — the sealed-box unwrap / ECDH side of content-key sealing.
     pub(super) fn x25519_secret(&self) -> &DeviceX25519Secret {
         &self.x25519_secret
     }
