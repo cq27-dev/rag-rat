@@ -2340,7 +2340,7 @@ fn align_to_anchor_aggregate_budget_caps_template_lane() {
 /// The parent star-align ALIGNS the member (so the indel snap engages and the re-descent path
 /// is reached), but the SHARED budget is already exhausted by the time the re-descent runs
 /// — exactly the production state when the parent star-align of a huge class spends the
-/// whole budget before `anti_unify` re-seeds it (`budget.spent = alignment.spent_cells`).
+/// whole budget before `anti_unify` resumes it from `alignment.spent_cells`.
 /// We reproduce that precise precondition (member aligned, budget exhausted) by running the
 /// parent align under a generous budget, then driving `anti_unify_with_budget` with a
 /// budget marked exhausted. Verified against the SAME fixture under a generous budget
@@ -2395,9 +2395,10 @@ fn redescent_shares_parent_align_budget() {
         "the parent star-align under a generous budget must align the member (not sampled)"
     );
     assert!(starved_align.aligned.iter().all(|&a| a), "every member must be aligned");
-    // The parent has now spent the budget down to `shared.spent`; force the exhausted state the
-    // re-descent would see when a huge parent star-align consumes the whole per-class budget.
-    shared.exhausted = true;
+    // Force the exhausted state the re-descent would see when a huge parent star-align consumes
+    // the whole per-class budget.
+    let mut shared =
+        CellBudget::resumed(ALIGN_AGGREGATE_CELLS_BUDGET, ALIGN_AGGREGATE_CELLS_BUDGET + 1);
     let starved_tpl = anti_unify_with_budget(&starved, &starved_align, &mut shared);
     assert!(
         !inner_value_present(&starved_tpl),

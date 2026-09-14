@@ -431,7 +431,7 @@ impl Descent<'_> {
         // instead of running another exact sub-DP. Latch `sampled` so the class is honestly
         // flagged sampled. This is what bounds the WHOLE per-class anti-unify (parent align
         // + all re-descents) by ONE budget.
-        if self.budget.exhausted {
+        if self.budget.is_exhausted() {
             self.sampled = true;
             return;
         }
