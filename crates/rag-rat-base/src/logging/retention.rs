@@ -164,7 +164,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prunes_by_age() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("log-retention");
         for i in 0..3 {
             write_log(dir.path(), &format!("mcp-{DEAD_PID}-{i}.log"), 1, 3600);
         }
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn keeps_recently_modified_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("log-retention");
         // Dead pid but touched just now → spared by the recent-mtime window (every platform).
         write_log(dir.path(), &format!("mcp-{DEAD_PID}-9.log"), 8192, 0);
         sweep_retention(&LogConfig {
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn ignores_foreign_log_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("log-retention");
         // A non-rag-rat `*.log` in a shared dir must never be a candidate.
         write_log(dir.path(), "some-other-app.log", 8192, 7 * 86_400);
         sweep_retention(&LogConfig {
@@ -220,7 +220,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn prunes_oversize_then_count() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("log-retention");
         write_log(dir.path(), &format!("mcp-{DEAD_PID}-1.log"), 4096, 3600);
         write_log(dir.path(), &format!("mcp-{DEAD_PID}-2.log"), 1, 3600);
         sweep_retention(&LogConfig {
@@ -240,7 +240,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn keeps_files_of_live_processes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("log-retention");
         // Our OWN pid is alive; an old, oversized log named with it must survive an aggressive
         // sweep.
         let live = std::process::id();
@@ -260,7 +260,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn max_files_counts_protected_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("log-retention");
         let live = std::process::id();
         // 2 live (protected) + 3 dead+idle (candidates); cap the whole dir at 2.
         for i in 0..2 {

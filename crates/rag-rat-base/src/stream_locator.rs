@@ -142,7 +142,7 @@ mod tests {
         // from it pins or refuses against the WRONG file while the operator stands in the branch.
         // `worktree_root` is the session-side root that rebases onto the active checkout.
         const OTHER: &str = "99ff249f76f43de5497761bde999a7baa902008491e4cd1a6a943bcbf1d1f7b1";
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_scratch::ScratchDir::new("stream-locator");
         let main = tmp.path().join("main");
         std::fs::create_dir_all(&main).unwrap();
         crate::test_git::run(&main, &["init", "-q", "."]);
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn an_absent_file_is_not_an_error_but_a_malformed_one_is() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("stream-locator");
         assert_eq!(load(dir.path()).unwrap(), None, "a repo may simply check none in");
 
         std::fs::write(dir.path().join(STREAM_LOCATOR_FILE), "owner = \"nope\"\n").unwrap();
