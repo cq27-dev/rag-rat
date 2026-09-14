@@ -6,7 +6,7 @@ use std::path::Path;
 use rag_rat_base::locks::WriteLock;
 use rag_rat_llm::chat::ChatModel;
 use rag_rat_papertrail::FixEdgeSource;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -115,8 +115,9 @@ pub(crate) fn drain(
     let budget = PromptBudget::default();
     // This read transaction ends before the first model call. Every job crossing that boundary is
     // fully owned, including the exact source text used to materialize evidence later.
-    let jobs =
-        in_transaction(conn, "DEFERRED", || load_prepared_jobs(conn, repo_id, limit, &budget))?;
+    let jobs = super::in_txn(conn, TransactionBehavior::Deferred, || {
+        load_prepared_jobs(conn, repo_id, limit, &budget)
+    })?;
     let mut report = DistillDrainReport { threads: jobs.len(), ..Default::default() };
     let mut aggregate_stats = LadderStats::default();
 
@@ -138,10 +139,10 @@ pub(crate) fn drain(
         // short state transition with extraction, indexing, and maintenance.
         let _write_lock = WriteLock::acquire_blocking(database_path, repo_id)?;
         let applied = match outcome {
-            Ok(result) => in_transaction(conn, "IMMEDIATE", || {
+            Ok(result) => super::in_txn(conn, TransactionBehavior::Immediate, || {
                 persist_success(conn, repo_id, &job, &result, &budget, run_at_ms)
             })?,
-            Err(failure) => in_transaction(conn, "IMMEDIATE", || {
+            Err(failure) => super::in_txn(conn, TransactionBehavior::Immediate, || {
                 persist_failure(conn, repo_id, &job, &failure, &budget)
             })?,
         };
@@ -160,7 +161,7 @@ pub(crate) fn drain(
     report.rung_tolerant = aggregate_stats.rung_tolerant;
     report.repaired_serde = aggregate_stats.repaired_serde;
     let _write_lock = WriteLock::acquire_blocking(database_path, repo_id)?;
-    in_transaction(conn, "IMMEDIATE", || {
+    super::in_txn(conn, TransactionBehavior::Immediate, || {
         run_stats::record_distill_run(
             conn,
             repo_id,
@@ -924,27 +925,6 @@ fn usize_from_sql(value: i64, column: usize) -> rusqlite::Result<usize> {
 
 fn bound_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
-}
-
-fn in_transaction<T>(
-    conn: &Connection,
-    mode: &str,
-    f: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    conn.execute_batch(&format!("BEGIN {mode}"))?;
-    match f() {
-        Ok(value) =>
-            if let Err(error) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                Err(error.into())
-            } else {
-                Ok(value)
-            },
-        Err(error) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(error)
-        },
-    }
 }
 
 #[cfg(test)]
