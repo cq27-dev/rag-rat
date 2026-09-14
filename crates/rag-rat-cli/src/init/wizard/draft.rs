@@ -396,7 +396,7 @@ impl WizardDraft {
             bindings,
             has_rich_targets: false,
             rich_target_names: BTreeSet::new(),
-            model: backend.as_str().to_string(),
+            model: backend.as_config_str().to_string(),
             remote: None,
             oracle_auto_run: false,
             oracle_quiet_secs: oracle.auto_run_quiet_period_secs,
@@ -417,7 +417,7 @@ impl WizardDraft {
     /// Field mappings:
     /// - `cfg.targets` grouped by `ResolvedTarget.language` → `bindings`; directories merged in
     ///   declaration order (stable — `Config` preserves the TOML `targets` order).
-    /// - `cfg.llm.embedding.backend.as_str()` → `model`.
+    /// - `cfg.llm.embedding.backend.as_config_str()` → `model`.
     /// - `cfg.llm.embedding.remote` → `remote` (`endpoint` → `RemoteMode::Connect`, `cookbook` →
     ///   `RemoteMode::Ephemeral`).
     /// - `cfg.oracle.*` → oracle fields.
@@ -445,7 +445,7 @@ impl WizardDraft {
             bindings,
             has_rich_targets: false,
             rich_target_names: BTreeSet::new(),
-            model: cfg.llm.embedding.backend.as_str().to_string(),
+            model: cfg.llm.embedding.backend.as_config_str().to_string(),
             remote,
             oracle_auto_run: oracle.auto_run,
             oracle_quiet_secs: oracle.auto_run_quiet_period_secs,

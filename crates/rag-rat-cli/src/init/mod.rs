@@ -461,7 +461,10 @@ mod tests {
         let config = Config::load(root.join("rag-rat.toml")).unwrap();
 
         assert_eq!(config.targets.len(), 1);
-        assert_eq!(config.llm.embedding.backend.as_str(), "sentence-transformers/all-MiniLM-L6-v2");
+        assert_eq!(
+            config.llm.embedding.backend.as_config_str(),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
     }
 
     #[test]

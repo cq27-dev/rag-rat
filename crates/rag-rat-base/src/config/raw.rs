@@ -5,10 +5,10 @@ use serde::Deserialize;
 
 use super::{
     ConfigError, DEFAULT_QUERY_ENDPOINT, DistillLlmConfig, DreamLlmConfig, EmbeddingBackend,
-    EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
+    EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig,
     MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, OracleLiveConfig,
     PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig,
-    SyncConfig, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
+    SyncConfig, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig, types,
 };
 use crate::embedding_models::Backend;
 
@@ -266,11 +266,11 @@ impl TryFrom<RawLog> for LogConfig {
     fn try_from(raw: RawLog) -> Result<Self, Self::Error> {
         let d = LogConfig::default();
         let level = match raw.level {
-            Some(s) => LogLevel::parse_config(&s).ok_or(ConfigError::UnknownLogLevel(s))?,
+            Some(s) => types::parse_config_token(&s).ok_or(ConfigError::UnknownLogLevel(s))?,
             None => d.level,
         };
         let format = match raw.format {
-            Some(s) => LogFormat::parse_config(&s).ok_or(ConfigError::UnknownLogFormat(s))?,
+            Some(s) => types::parse_config_token(&s).ok_or(ConfigError::UnknownLogFormat(s))?,
             None => d.format,
         };
         Ok(Self {
@@ -422,8 +422,7 @@ impl TryFrom<RawMemory> for MemoryConfig {
 
     fn try_from(raw: RawMemory) -> Result<Self, Self::Error> {
         let surface = match raw.surface {
-            Some(s) =>
-                MemorySurface::parse_config(&s).ok_or(ConfigError::UnknownMemorySurface(s))?,
+            Some(s) => types::parse_config_token(&s).ok_or(ConfigError::UnknownMemorySurface(s))?,
             None => MemorySurface::default(),
         };
         Ok(Self { surface })
@@ -691,7 +690,7 @@ impl TryFrom<RawEmbedding> for EmbeddingConfig {
         // a remote block that never installs or provisions anything.
         if remote.is_some() && !matches!(backend.registry_backend(), Some(Backend::FastEmbed)) {
             return Err(ConfigError::RemoteEmbeddingNonTransformerModel(
-                backend.as_str().to_string(),
+                backend.as_config_str().to_string(),
             ));
         }
         Ok(Self { backend, runtime: raw.runtime.into(), remote })

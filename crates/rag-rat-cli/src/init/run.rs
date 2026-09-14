@@ -398,7 +398,7 @@ pub(crate) fn setup_model_and_reconcile(
         || Confirm::new()
             .with_prompt(format!(
                 "Install the {} embedding model and reconcile vectors now?",
-                backend.as_str()
+                backend.as_config_str()
             ))
             .default(true)
             .interact()?;
@@ -421,7 +421,7 @@ pub(crate) fn setup_model_and_reconcile(
             if remote.is_none()
                 && (model_id == FASTEMBED_MODEL_ID || model_id == MODEL2VEC_MODEL_ID) =>
         {
-            eprintln!("init: {} install failed: {err}", backend.as_str());
+            eprintln!("init: {} install failed: {err}", backend.as_config_str());
             eprintln!("init: falling back to {HASH_MODEL_ID}");
             // Hash is a local backend — no remote config needed for the fallback.
             db.install_model(HASH_MODEL_ID, None)?;

@@ -172,9 +172,12 @@ fn memory_surface_defaults_summary_and_parses_full_and_rejects_unknown() {
     let memory: MemoryConfig = raw.memory.try_into().unwrap();
     assert_eq!(memory.surface, MemorySurface::Full, "surface = \"full\" opts back to whole bodies");
 
-    // Case-insensitive, and a round-trip through `as_str`.
-    assert_eq!(MemorySurface::parse_config("SUMMARY"), Some(MemorySurface::Summary));
-    assert_eq!(MemorySurface::parse_config("FULL"), Some(MemorySurface::Full));
+    // Trimmed and case-insensitive, and a round-trip through `as_db_str`.
+    let upper: RawConfig =
+        toml::from_str("[index]\nroot = \".\"\n\n[memory]\nsurface = \" SUMMARY \"\n").unwrap();
+    let memory: MemoryConfig = upper.memory.try_into().unwrap();
+    assert_eq!(memory.surface, MemorySurface::Summary);
+    assert_eq!("FULL".parse(), Ok(MemorySurface::Full));
     assert_eq!(MemorySurface::Summary.as_db_str(), "summary");
     assert_eq!(MemorySurface::Full.as_db_str(), "full");
 
@@ -311,4 +314,17 @@ fn log_dir_defaults_to_db_sibling_and_custom_is_config_relative() {
     std::fs::write(dir.join("rag-rat.toml"), "[log]\nenabled=true\n").unwrap();
     let cfg = Config::load(dir.join("rag-rat.toml")).unwrap();
     assert_eq!(cfg.log.dir, cfg.database.parent().unwrap().join("logs"));
+}
+
+/// The `[log]` tokens are config spellings an operator writes by hand: pinned, and accepted
+/// trimmed in any case.
+#[test]
+fn log_tokens_are_pinned_and_case_insensitive() {
+    assert_eq!(LogLevel::Warn.as_filter_str(), "warn");
+    assert_eq!(LogFormat::Text.as_db_str(), "text");
+    assert_eq!(LogFormat::Json.as_db_str(), "json");
+    let raw: RawConfig = toml::from_str("[log]\nlevel = \" TRACE \"\nformat = \"Json\"\n").unwrap();
+    let log: LogConfig = raw.log.try_into().unwrap();
+    assert_eq!(log.level, LogLevel::Trace);
+    assert_eq!(log.format, LogFormat::Json);
 }
