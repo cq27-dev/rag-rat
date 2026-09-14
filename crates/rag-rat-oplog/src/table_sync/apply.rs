@@ -530,6 +530,7 @@ fn apply_upsert(
     // (A losing op returned above without touching the published hash.)
     if let Some(hash) = synced_row_hash(tx, spec, pk_vals)? {
         record_published(tx, &key, &hash, spec.spec_version)?;
+        diagnostics::clear(tx, &key)?;
     }
     Ok(ApplyOutcome::Applied)
 }
@@ -1484,7 +1485,8 @@ pub(crate) enum PreApply {
 /// Claim `row_pk` as a COMPLETE projection: `hash` covers every synced column this binary knows,
 /// stamped with the TABLE's spec version, which is what defines that column set. Deliberately not
 /// the store-global projector version — that would make an unrelated table's registration mark this
-/// row incomparable.
+/// row incomparable. This also serves bookkeeping-only version refreshes; diagnostic settlement
+/// belongs to the winning apply path, not this hash write.
 pub(crate) fn record_published(
     tx: &Transaction<'_>,
     key: &RowKey<'_>,
@@ -1506,7 +1508,6 @@ pub(crate) fn record_published(
             spec_version,
         ],
     )?;
-    diagnostics::clear(tx, key)?;
     Ok(())
 }
 

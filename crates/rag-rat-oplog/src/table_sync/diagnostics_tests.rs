@@ -314,6 +314,16 @@ fn superseded_self_apply_is_reported_when_the_winner_itself_resolves() {
             .unwrap(),
         1
     );
+    d.conn.execute("UPDATE t_demo SET title = 'value'", []).unwrap();
+    assert!(d.produce(NEW_REGISTRY, "repo").is_empty());
+    assert_eq!(
+        causes(&d.conn),
+        ["self_apply_superseded"],
+        "an unchanged-row version refresh does not settle the blocking tombstone"
+    );
+    d.conn.execute("UPDATE t_demo SET title = 'unsent'", []).unwrap();
+    // Restore the old publication version to exercise both comparison paths below.
+    d.conn.execute("UPDATE sync_published_rows SET spec_version = 1", []).unwrap();
     let peer = Device::new();
     d.enroll(peer.local.fingerprint());
     let incoming = RowOp::Upsert {
