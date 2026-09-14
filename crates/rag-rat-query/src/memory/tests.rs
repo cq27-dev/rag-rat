@@ -1,5 +1,5 @@
-
 use super::*;
+use crate::memory::fixtures::{self, MemorySeed};
 
 fn binding(kind: &str, anchor_status: &str, path: Option<&str>) -> RepoMemoryBinding {
     RepoMemoryBinding {
@@ -189,12 +189,20 @@ fn binding_shadow_readers_and_the_carry_cover_the_same_columns() {
 
     let conn = Connection::open_in_memory().unwrap();
     rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
+    conn.execute(
+        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0)",
+        [],
+    )
+    .unwrap();
+    fixtures::seed_memory(&conn, MemorySeed {
+        id: "m",
+        created_by: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        ..MemorySeed::default()
+    });
     conn.execute_batch(
-        "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('r', 'r', 0);
-             INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,
-                     updated_at_ms, source, memory_version, repo_id)
-             VALUES ('m', 'Invariant', 't', 'b', 'high', 'active', 0, 0, 'agent', 'v1', 'r');
-             INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,
+        "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path,
                      start_line, end_line, symbol_kind, signature_hash, moniker_tool_version,
                      anchor_status, created_at_ms, repo_id, resolved, resolved_binding_id,
                      resolved_path, resolved_start_line, resolved_end_line, resolved_symbol_kind,
@@ -547,13 +555,7 @@ fn memory_get_returns_the_full_body_even_when_a_summary_exists() {
     // full body regardless of any compacted summary.
     let c = summary_conn();
     let body = "the full body that memory show must always return";
-    c.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
-         ('m1','Invariant','t',?1,'high','active','agent',1,1,'agent','v1','r')",
-        [body],
-    )
-    .unwrap();
+    fixtures::seed_memory(&c, MemorySeed { body, ..MemorySeed::default() });
     seed_summary(&c, "m1", body, "A short summary stands in for surfacing. Not for show. Ok.");
     let fetched = memory_by_id(&c, "m1").unwrap().expect("memory present");
     assert_eq!(fetched.body, body, "memory_get returns the full body regardless of the summary");

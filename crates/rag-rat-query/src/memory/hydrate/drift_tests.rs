@@ -1,6 +1,6 @@
-
 use super::*;
 use crate::memory::api::{memories_for_chunk, memories_for_path, memories_for_symbol};
+use crate::memory::fixtures::{self, MemorySeed};
 
 const REPO: &str = "r";
 
@@ -21,14 +21,7 @@ fn db() -> Connection {
 
 /// A file with one chunk whose current text hashes to `text_hash`.
 fn seed_chunk(conn: &Connection, path: &str, text_hash: &str) -> i64 {
-    conn.execute(
-        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-         commit_sha, worktree_id, repo_id, generation) VALUES \
-         (?1,'rust','source',?2,0,0,'','',?3,0)",
-        params![path, format!("sha-{path}"), REPO],
-    )
-    .unwrap();
-    let file_id = conn.last_insert_rowid();
+    let file_id = fixtures::seed_file(conn, path, REPO);
     conn.execute(
         "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
          text_hash) VALUES (?1,'code',0,10,1,5,?2)",
@@ -40,13 +33,13 @@ fn seed_chunk(conn: &Connection, path: &str, text_hash: &str) -> i64 {
 
 /// A memory carrying `stamp` as its author-stamped hash, anchored to `chunk_id`.
 fn seed_memory(conn: &Connection, id: &str, origin: &str, stamp: Option<&str>, chunk_id: i64) {
-    conn.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, source_text_hash) \
-         VALUES (?1,'Invariant','t','b','high','active','agent',1,1,'agent','v1',?2,?3,?4)",
-        params![id, REPO, origin, stamp],
-    )
-    .unwrap();
+    fixtures::seed_memory(conn, MemorySeed {
+        id,
+        repo_id: REPO,
+        origin,
+        source_text_hash: stamp,
+        ..MemorySeed::default()
+    });
     conn.execute(
         "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, chunk_id, \
          anchor_status, created_at_ms, repo_id) VALUES \
@@ -122,14 +115,12 @@ fn a_path_anchor_is_priced_by_its_files_hash() {
     // path-anchored memory presenting as current however far its file had moved on.
     seed_chunk(&conn, "src/a.rs", "irrelevant");
     install_files_view(&conn, "");
-    conn.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, source_text_hash) \
-         VALUES ('m1','Invariant','t','b','high','active','agent',1,1,'agent','v1',?1,'synced','\
-         stamped-then')",
-        params![REPO],
-    )
-    .unwrap();
+    fixtures::seed_memory(&conn, MemorySeed {
+        repo_id: REPO,
+        origin: "synced",
+        source_text_hash: Some("stamped-then"),
+        ..MemorySeed::default()
+    });
     conn.execute(
         "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, start_line, \
          end_line, anchor_status, created_at_ms, repo_id) VALUES \
@@ -176,14 +167,12 @@ fn an_overlay_shadows_the_base_row_it_overrides() {
     set_active_worktree(&conn, "wt-active");
     install_files_view(&conn, "wt-active");
 
-    conn.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, source_text_hash) \
-         VALUES ('m1','Invariant','t','b','high','active','agent',1,1,'agent','v1',?1,'synced','\
-         stamped-base')",
-        params![REPO],
-    )
-    .unwrap();
+    fixtures::seed_memory(&conn, MemorySeed {
+        repo_id: REPO,
+        origin: "synced",
+        source_text_hash: Some("stamped-base"),
+        ..MemorySeed::default()
+    });
     conn.execute(
         "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, \
          anchor_status, created_at_ms, repo_id) VALUES \
@@ -378,14 +367,12 @@ fn an_edge_anchor_is_priced_by_its_source_files_hash() {
     .unwrap();
     let edge_id = conn.last_insert_rowid();
     install_files_view(&conn, "");
-    conn.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, source_text_hash) \
-         VALUES ('m1','Invariant','t','b','high','active','agent',1,1,'agent','v1',?1,'synced','\
-         stamped-then')",
-        params![REPO],
-    )
-    .unwrap();
+    fixtures::seed_memory(&conn, MemorySeed {
+        repo_id: REPO,
+        origin: "synced",
+        source_text_hash: Some("stamped-then"),
+        ..MemorySeed::default()
+    });
     conn.execute(
         "INSERT INTO repo_memory_bindings(memory_id, binding_kind, binding_id, path, edge_id, \
          anchor_status, created_at_ms, repo_id) VALUES \
@@ -440,13 +427,12 @@ fn seed_unresolved_binding(conn: &Connection, kind: &str, path: &str, span: Opti
 }
 
 fn seed_bare_memory(conn: &Connection, stamp: &str) {
-    conn.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id, origin, source_text_hash) \
-         VALUES ('m1','Invariant','t','b','high','active','agent',1,1,'agent','v1',?1,'synced',?2)",
-        params![REPO, stamp],
-    )
-    .unwrap();
+    fixtures::seed_memory(conn, MemorySeed {
+        repo_id: REPO,
+        origin: "synced",
+        source_text_hash: Some(stamp),
+        ..MemorySeed::default()
+    });
 }
 
 #[test]

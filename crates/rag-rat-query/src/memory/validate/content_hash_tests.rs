@@ -1,4 +1,3 @@
-
 use super::content_hash;
 
 #[test]
