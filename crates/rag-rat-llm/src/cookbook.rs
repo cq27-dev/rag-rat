@@ -265,11 +265,9 @@ pub struct ProvisionedBox {
     /// The box's bearer token, or `None` for an unauthenticated box. A DIRECT token, not an env
     /// name.
     pub auth_token: Option<String>,
+    /// The cookbook process. On unix it spawned as its own group leader, so its pid is the
+    /// process-GROUP id teardown `killpg`s.
     child: Child,
-    /// The cookbook's process-GROUP id (= the immediate child's pid; it's the group leader because
-    /// it spawned in its own group). Teardown `killpg`s this whole group. Unix only.
-    #[cfg(unix)]
-    pgid: i32,
 }
 
 #[cfg(all(test, unix))]
@@ -277,7 +275,7 @@ impl ProvisionedBox {
     /// The process-GROUP id, for the leak-safety harness (#334) to probe `group_alive(pgid)` AFTER
     /// `Drop`, asserting no fault leaves a leaked group. Test-only — production teardown owns it.
     pub(crate) fn pgid(&self) -> i32 {
-        self.pgid
+        self.child.id() as i32
     }
 }
 
@@ -341,16 +339,7 @@ impl CookbookProvisioner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // Put the cookbook in its OWN process group so teardown can killpg the WHOLE tree — `npx
-        // -y` makes the recipe holding the box a grandchild, unreachable by a kill of the
-        // immediate child. The group leader's pid == the child's pid.
-        #[cfg(unix)]
-        command.process_group(0);
-
-        // Install the SIGINT/SIGTERM handler before the box exists, so a Ctrl-C during provisioning
-        // (after the child spawns) still reclaims the group via `ACTIVE_PGID`.
-        #[cfg(unix)]
-        install_signal_handler();
+        prepare_process_tree(&mut command);
 
         if cancel() {
             anyhow::bail!("cookbook `{label}` provisioning cancelled before start");
@@ -360,14 +349,7 @@ impl CookbookProvisioner {
             anyhow::anyhow!("failed to spawn cookbook `{label}`: {e} (is `node`/`npx` on PATH?)")
         })?;
 
-        // The child is its own group leader, so pgid == pid. Register it so the signal handler can
-        // reach the box even though `Drop` won't run on Ctrl-C / process exit.
-        #[cfg(unix)]
-        let pgid = child.id() as i32;
-        #[cfg(unix)]
-        ACTIVE_PGID.store(pgid, Ordering::SeqCst);
-        #[cfg(windows)]
-        ACTIVE_CHILD_PID.store(child.id(), Ordering::SeqCst);
+        register_active_child(&child);
 
         if cancel() {
             abort_cancelled_cookbook(&mut child);
@@ -384,10 +366,7 @@ impl CookbookProvisioner {
         let (endpoint, auth_token) = match await_handshake(&stdout.handshake, &mut child, timeout) {
             Handshake::Ready { endpoint, auth_token } => (endpoint, auth_token),
             Handshake::Exited => {
-                #[cfg(unix)]
-                reap_group(pgid);
-                #[cfg(windows)]
-                clear_active_child_pid(child.id());
+                reap_exited_cookbook(&child);
                 return Err(provision_failed(
                     label,
                     &mut child,
@@ -397,7 +376,7 @@ impl CookbookProvisioner {
                 ));
             },
             Handshake::TimedOut => {
-                teardown_timed_out_cookbook(&mut child);
+                teardown_cookbook(&mut child);
                 let _ = stdout.handle.join();
                 let _ = stderr_handle.join();
                 anyhow::bail!(
@@ -412,13 +391,7 @@ impl CookbookProvisioner {
         // detach it (the child closing stdout on SIGTERM ends it). The stderr thread likewise.
         drop(stdout.handle);
         drop(stderr_handle);
-        Ok(ProvisionedBox {
-            endpoint,
-            auth_token,
-            child,
-            #[cfg(unix)]
-            pgid,
-        })
+        Ok(ProvisionedBox { endpoint, auth_token, child })
     }
 }
 
@@ -529,40 +502,106 @@ fn await_handshake(
     }
 }
 
-/// Stop a cookbook cancelled after spawn but before its handshake: the full SIGTERM → grace →
-/// SIGKILL group teardown on unix (the child is its own group leader, so its pid is the pgid), a
-/// `taskkill /T` tree kill on Windows, a plain kill elsewhere.
-fn abort_cancelled_cookbook(child: &mut Child) {
-    #[cfg(unix)]
-    teardown_group(child.id() as i32, child);
-    #[cfg(windows)]
-    {
-        let pid = child.id();
-        taskkill_tree(pid);
-        clear_active_child_pid(pid);
-        let _ = child.wait();
-    }
-    #[cfg(all(not(unix), not(windows)))]
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
+// Platform process-tree shims: every step of the cookbook lifecycle that differs by OS, one
+// definition per platform, so the provisioning core above carries no `cfg`. On unix the child is
+// its own process-group leader, so its pid is the pgid every `killpg` targets.
+
+/// Configure the cookbook `command` before it spawns. Unix: its OWN process group, so teardown can
+/// killpg the WHOLE tree — `npx -y` makes the recipe holding the box a grandchild, unreachable by a
+/// kill of the immediate child — and the SIGINT/SIGTERM handler, installed before the box exists
+/// so a Ctrl-C during provisioning (after the child spawns) still reclaims the group via
+/// `ACTIVE_PGID`.
+#[cfg(unix)]
+fn prepare_process_tree(command: &mut Command) {
+    command.process_group(0);
+    install_signal_handler();
 }
 
-/// Stop a cookbook whose handshake deadline passed. The recipe may hold a LIVE box mid-pull/verify,
-/// so unix gives it its SIGTERM teardown window before SIGKILL (`teardown_group`; the child is its
-/// own group leader, so its pid is the pgid) — `reap_group`'s hard SIGKILL is only for the
-/// already-exited path. Elsewhere the child is killed directly.
-fn teardown_timed_out_cookbook(child: &mut Child) {
-    #[cfg(unix)]
-    teardown_group(child.id() as i32, child);
-    #[cfg(not(unix))]
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    #[cfg(windows)]
+/// Non-unix: no process group or signal handler to set up.
+#[cfg(not(unix))]
+fn prepare_process_tree(_command: &mut Command) {}
+
+/// Register the spawned cookbook as the active one, so the signal handler (unix) or the quit-path
+/// [`abort_active_provisioning`] can reach the box even though `Drop` won't run on Ctrl-C / exit.
+#[cfg(unix)]
+fn register_active_child(child: &Child) {
+    ACTIVE_PGID.store(child.id() as i32, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+fn register_active_child(child: &Child) {
+    ACTIVE_CHILD_PID.store(child.id(), Ordering::SeqCst);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn register_active_child(_child: &Child) {}
+
+/// The cookbook exited before its handshake. Unix SIGKILLs whatever survives of the group, then
+/// releases the registration (`reap_group`); Windows only releases the registration.
+#[cfg(unix)]
+fn reap_exited_cookbook(child: &Child) {
+    reap_group(child.id() as i32);
+}
+
+#[cfg(windows)]
+fn reap_exited_cookbook(child: &Child) {
     clear_active_child_pid(child.id());
+}
+
+#[cfg(not(any(unix, windows)))]
+fn reap_exited_cookbook(_child: &Child) {}
+
+/// Stop a cookbook cancelled after spawn but before its handshake: the full SIGTERM → grace →
+/// SIGKILL group teardown on unix, a `taskkill /T` tree kill on Windows, a plain kill elsewhere.
+#[cfg(unix)]
+fn abort_cancelled_cookbook(child: &mut Child) {
+    teardown_group(child.id() as i32, child);
+}
+
+#[cfg(windows)]
+fn abort_cancelled_cookbook(child: &mut Child) {
+    let pid = child.id();
+    taskkill_tree(pid);
+    clear_active_child_pid(pid);
+    let _ = child.wait();
+}
+
+#[cfg(not(any(unix, windows)))]
+fn abort_cancelled_cookbook(child: &mut Child) {
+    kill_child(child);
+}
+
+/// Stop a cookbook that may hold a LIVE box — its handshake deadline passed (mid-pull/verify), or
+/// its [`ProvisionedBox`] dropped. Unix gives the recipe its SIGTERM teardown window before SIGKILL
+/// (`teardown_group`); `reap_group`'s hard SIGKILL is only for the already-exited path.
+///
+/// Windows kills only the immediate child here, while the cancel path
+/// ([`abort_cancelled_cookbook`]) and the quit path ([`abort_active_provisioning`]) run a
+/// `taskkill /T` tree kill. That is a known gap, not a deliberate trade-off: an `npx`-spawned
+/// recipe grandchild can outlive this teardown (and [`reap_exited_cookbook`]) and keep its box
+/// running. Closing it means routing these arms through `taskkill_tree` too, which needs verifying
+/// on Windows — the cookbook lifecycle tests are unix-only.
+#[cfg(unix)]
+fn teardown_cookbook(child: &mut Child) {
+    teardown_group(child.id() as i32, child);
+}
+
+#[cfg(windows)]
+fn teardown_cookbook(child: &mut Child) {
+    kill_child(child);
+    clear_active_child_pid(child.id());
+}
+
+#[cfg(not(any(unix, windows)))]
+fn teardown_cookbook(child: &mut Child) {
+    kill_child(child);
+}
+
+/// Kill and reap only the immediate child — the non-unix fallback where no tree kill is used.
+#[cfg(not(unix))]
+fn kill_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The Rust-side handshake deadline for every cookbook provisioning entry point (the chat and
@@ -946,17 +985,8 @@ fn provision_failed(
 }
 
 impl Drop for ProvisionedBox {
-    #[cfg(unix)]
     fn drop(&mut self) {
-        teardown_group(self.pgid, &mut self.child);
-    }
-
-    #[cfg(not(unix))]
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        #[cfg(windows)]
-        clear_active_child_pid(self.child.id());
+        teardown_cookbook(&mut self.child);
     }
 }
 
