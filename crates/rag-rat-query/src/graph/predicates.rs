@@ -18,8 +18,8 @@ use super::*;
 /// A resolved row (`to_symbol_id IS NOT NULL`) is by definition bound to a real operator symbol, so
 /// requiring resolution is what separates the two.
 ///
-/// Valid wherever the edges table is named or aliased `edges`. `forward_visibility_filter` below
-/// encodes the same rule in positive form, inside its OR-chains; `graph_meta` and
+/// Valid wherever the edges table is named or aliased `edges`. [`RESOLVED_FORWARD_TARGET_SQL`]
+/// encodes the same rule in positive form, inside its OR-chain; `graph_meta` and
 /// `impact::neighbors` splice this guard verbatim.
 /// `search_and_read_chunk_attach_bounded_graph_evidence` poisons the index with one unresolved
 /// operator edge and asserts EVERY consumer — search graph metadata and all three `impact_surface`
@@ -486,142 +486,62 @@ pub(crate) fn forward_target_filter(
         GraphResolutionMode::Fuzzy => "1 = 1",
     }
 }
-pub(crate) fn forward_visibility_filter(options: &GraphTraversalOptions) -> &'static str {
-    match (options.include_unresolved, options.include_macros, options.include_common_methods) {
-        (true, true, true) => "1 = 1",
-        (true, true, false) =>
-            "
-            (
-                edges.edge_kind != 'calls_name'
-                OR edges.to_name NOT IN (
-                    'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
-                    'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
-                    'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
-                    'expect', 'ok', 'err'
-                )
-                OR edges.to_symbol_id IS NOT NULL
-            )
-            ",
-        (true, false, true) => "edges.edge_kind != 'uses_macro'",
-        (true, false, false) =>
-            "
-            edges.edge_kind != 'uses_macro'
-            AND (
-                edges.edge_kind != 'calls_name'
-                OR edges.to_name NOT IN (
-                    'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
-                    'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
-                    'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
-                    'expect', 'ok', 'err'
-                )
-                OR edges.to_symbol_id IS NOT NULL
-            )
-            ",
-        (false, true, true) =>
-            "
-            (
-                edges.edge_kind = 'calls_name'
-                AND (
-                    edges.to_symbol_id IS NOT NULL
-                    OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
-                )
-            )
-            OR (
-                edges.edge_kind = 'constructs'
-                AND edges.to_symbol_id IS NOT NULL
-            )
-            OR (
-                edges.edge_kind = 'uses_operator'
-                AND edges.to_symbol_id IS NOT NULL
-            )
-            OR edges.edge_kind = 'uses_macro'
-            OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
-            ",
-        (false, true, false) =>
-            "
-            (
-                edges.edge_kind = 'calls_name'
-                AND (
-                    edges.to_symbol_id IS NOT NULL
-                    OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
-                )
-                AND (
-                    edges.to_name NOT IN (
-                        'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
-                        'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
-                        'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
-                        'expect', 'ok', 'err'
-                    )
-                    OR edges.to_symbol_id IS NOT NULL
-                )
-            )
-            OR (
-                edges.edge_kind = 'constructs'
-                AND edges.to_symbol_id IS NOT NULL
-            )
-            OR (
-                edges.edge_kind = 'uses_operator'
-                AND edges.to_symbol_id IS NOT NULL
-            )
-            OR edges.edge_kind = 'uses_macro'
-            OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
-            ",
-        (false, false, true) =>
-            "
-            edges.edge_kind != 'uses_macro'
-            AND (
-                (
-                    edges.edge_kind = 'calls_name'
-                    AND (
-                        edges.to_symbol_id IS NOT NULL
-                        OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT \
-             NULL)
-                    )
-                )
-                OR (
-                    edges.edge_kind = 'constructs'
-                    AND edges.to_symbol_id IS NOT NULL
-                )
-                OR (
-                    edges.edge_kind = 'uses_operator'
-                    AND edges.to_symbol_id IS NOT NULL
-                )
-                OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
-            )
-            ",
-        (false, false, false) =>
-            "
-            edges.edge_kind != 'uses_macro'
-            AND (
-                (
-                    edges.edge_kind = 'calls_name'
-                    AND (
-                        edges.to_symbol_id IS NOT NULL
-                        OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT \
-             NULL)
-                    )
-                    AND (
-                        edges.to_name NOT IN (
-                            'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
-                            'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
-                            'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
-                            'expect', 'ok', 'err'
-                        )
-                        OR edges.to_symbol_id IS NOT NULL
-                    )
-                )
-                OR (
-                    edges.edge_kind = 'constructs'
-                    AND edges.to_symbol_id IS NOT NULL
-                )
-                OR (
-                    edges.edge_kind = 'uses_operator'
-                    AND edges.to_symbol_id IS NOT NULL
-                )
-                OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
-            )
-            ",
+/// The resolved-target chain: a call must be resolved or carry a qualified syntactic target, a
+/// construction or an operator use must resolve to an indexed symbol (the positive form of
+/// [`RESOLVED_OPERATOR_ONLY`]), and every other kind passes. In force unless the caller opts into
+/// `include_unresolved`. Valid wherever the edges table is named or aliased `edges`.
+const RESOLVED_FORWARD_TARGET_SQL: &str = "(
+    (
+        edges.edge_kind = 'calls_name'
+        AND (
+            edges.to_symbol_id IS NOT NULL
+            OR (edges.confidence = 'Syntactic' AND edges.target_qualified_name IS NOT NULL)
+        )
+    )
+    OR (
+        edges.edge_kind = 'constructs'
+        AND edges.to_symbol_id IS NOT NULL
+    )
+    OR (
+        edges.edge_kind = 'uses_operator'
+        AND edges.to_symbol_id IS NOT NULL
+    )
+    OR edges.edge_kind NOT IN ('calls_name', 'constructs', 'uses_operator')
+)";
+
+/// The common-method allowlist: an unresolved `calls_name` edge to one of these names is hidden
+/// unless the caller opts into `include_common_methods`; a resolved edge always passes. Valid
+/// wherever the edges table is named or aliased `edges`.
+const COMMON_METHOD_NAMES_SQL: &str = "(
+    edges.edge_kind != 'calls_name'
+    OR edges.to_name NOT IN (
+        'clone', 'map', 'map_err', 'and_then', 'unwrap_or', 'unwrap_or_else',
+        'to_string', 'to_owned', 'as_ref', 'as_mut', 'get', 'insert',
+        'new', 'default', 'into', 'from', 'iter', 'collect', 'unwrap',
+        'expect', 'ok', 'err'
+    )
+    OR edges.to_symbol_id IS NOT NULL
+)";
+
+pub(crate) fn forward_visibility_filter(options: &GraphTraversalOptions) -> String {
+    // Each flag withholds one population and the clauses are independent, so the filter is the AND
+    // of those in force. The common-method clause stands beside the resolved chain rather than
+    // inside its `calls_name` arm: every other arm of the chain requires `edge_kind !=
+    // 'calls_name'`, where the clause is TRUE, so the two positions admit the same rows.
+    let mut clauses = Vec::new();
+    if !options.include_macros {
+        clauses.push("edges.edge_kind != 'uses_macro'");
     }
+    if !options.include_unresolved {
+        clauses.push(RESOLVED_FORWARD_TARGET_SQL);
+    }
+    if !options.include_common_methods {
+        clauses.push(COMMON_METHOD_NAMES_SQL);
+    }
+    if clauses.is_empty() {
+        return "1 = 1".to_string();
+    }
+    clauses.join(" AND ")
 }
 pub fn unique_symbol_name(conn: &Connection, name: &str) -> anyhow::Result<bool> {
     // GENERATION-SCOPED via the `files` view (batch 6, count-scoping class): an unscoped
