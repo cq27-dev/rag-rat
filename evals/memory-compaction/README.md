@@ -45,7 +45,7 @@ does **not** gate anything. The probe suite is the metric that matches the real 
 | gate | applies when | bar |
 |---|---|---|
 | **compaction** | the compactor model or prompt changes (`dream/compact.rs`) | **zero trap-flips** across all 39 traps, and zero critical false-asserts |
-| **verification** | the verdict model or prompt changes (`dream/verdict.rs`) | **≥ 70% accuracy** on the 14-case model-verdict manifest; **0/33 false positives and ≥ 2/3 recall** on the reviewed replay |
+| **verification** | the verdict model or prompt changes (`dream/verdict/mod.rs`) | **≥ 70% accuracy** on the 14-case model-verdict manifest; **0/33 false positives and ≥ 2/3 recall** on the reviewed replay |
 
 The zero-trap-flip bar is absolute: a single inverted negation is a correctness regression, not a
 coverage trade-off. Coverage (how many `gold: true` claims survive) is a *quality* number to
@@ -331,13 +331,14 @@ identifiers. The eval is the check for the ref classes the runtime deliberately 
 
 These prompts are LIVE in rag-rat, versioned so a change is traceable:
 
-- `dream/verdict.rs` — `PROMPT_VERSION = "verify-pack-v6"` (the evidence-pack verdict prompt).
+- `dream/verdict/mod.rs` — `PROMPT_VERSION = "verify-pack-v6"` (the evidence-pack verdict prompt),
+  re-exported from `rag_rat_query::memory::evidence::VERDICT_PROMPT_VERSION`.
 - `query/memory/evidence.rs` — `COMPACT_PROMPT_VERSION = "compact-v2"` (the self-containment compact
   prompt, rendered from `dream/prompts/compact_head.md`). `export-reviewed-intent-context.py`'s
   `--compact-prompt-version` must track it: the summary join is a LEFT JOIN, so a stale value
   exports NULL summaries with no error.
 
-The harness's `VERIFY_PACK_PROMPT` mirrors the shipped verdict prompt (`dream/verdict.rs`'s
+The harness's `VERIFY_PACK_PROMPT` mirrors the shipped verdict prompt (`dream/verdict/mod.rs`'s
 `VERDICT_PROMPT_HEAD` + the NOTE/PACK tail) at `PROMPT_VERSION = "verify-pack-v6"`. **Re-sync
 `VERIFY_PACK_PROMPT` whenever `PROMPT_VERSION` bumps**, or the gate stops exercising what ships.
 
