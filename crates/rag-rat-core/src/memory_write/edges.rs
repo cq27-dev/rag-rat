@@ -3,7 +3,7 @@
 //! `rag_rat_query::memory`.
 
 use rag_rat_base::time::now_ms;
-use rag_rat_oplog::StreamId;
+use rag_rat_oplog::{EdgeSpec, NodeId, StreamId};
 use rag_rat_query::memory::{
     EDGE_SELECT, EdgeRelation, EdgeTarget, NodeEdge, edge_by_key, edge_key, edge_row,
     memory_repo_scope, periphery_edge_scope_clause, repo_is_registered, reresolve_on_read,
@@ -126,17 +126,15 @@ pub(crate) fn add_edge(
         ],
     )?;
     if edge_is_new {
-        authoring::author_edge_add(
-            &write.tx,
-            source_node_id,
+        let edge = EdgeSpec {
+            source_node_id: NodeId::from(source_node_id),
             relation,
-            &target_repo_id,
-            target_kind,
-            &target_anchor,
-            &owner_repo_id,
-            write.prepared.as_ref(),
-            now,
-        )?;
+            target_repo_id,
+            target_kind: target_kind.to_string(),
+            target_anchor,
+            owner_repo_id,
+        };
+        authoring::author_edge_add(&write.tx, edge, write.prepared.as_ref(), now)?;
     }
     write.commit()?;
     edge_by_key(conn, &key)?.ok_or_else(|| anyhow::anyhow!("edge `{key}` disappeared after insert"))

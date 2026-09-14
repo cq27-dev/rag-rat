@@ -11,7 +11,9 @@ use std::collections::HashSet;
 
 use anyhow::Context;
 use rag_rat_oplog::{EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, StreamId};
-use rag_rat_query::memory::{EdgeRelation, NodeEdge, memory_repo_scope, tags_for_memory};
+use rag_rat_query::memory::{
+    EdgeRelation, NodeEdge, RepoMemory, memory_repo_scope, tags_for_memory,
+};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use super::authoring::{
@@ -37,25 +39,31 @@ pub(super) struct MemoryRow {
     pub(super) tags: Vec<String>,
 }
 
-/// Build the op model's content register from a memory's projectable columns — shared by the
-/// reconcile ([`node_ops`]) and the live create/update authors, so all three agree byte-for-byte.
-pub(super) fn node_content(
-    kind: &str,
-    title: &str,
-    body: &str,
-    confidence: &str,
-    source: &str,
-    tags: &[String],
-    payload_json: Option<&str>,
-) -> NodeContent {
+/// The op model's content register for a reconciled row. It and [`node_content_of_memory`] are the
+/// two sources of signed `NodeContent`, so both map every column to its register by NAME: the
+/// adjacent `confidence` / `source` tokens are carried verbatim into an append-only log.
+pub(super) fn node_content_of_row(row: &MemoryRow) -> NodeContent {
     NodeContent {
-        kind: kind.to_string(),
-        title: title.to_string(),
-        body: body.to_string(),
-        confidence: confidence.to_string(),
-        source: source.to_string(),
-        tags: tags.to_vec(),
-        payload: payload_json.map(str::to_string),
+        kind: row.kind.clone(),
+        title: row.title.clone(),
+        body: row.body.clone(),
+        confidence: row.confidence.clone(),
+        source: row.source.clone(),
+        tags: row.tags.clone(),
+        payload: row.payload_json.clone(),
+    }
+}
+
+/// The op model's content register for a live-authored memory; see [`node_content_of_row`].
+pub(super) fn node_content_of_memory(memory: &RepoMemory) -> NodeContent {
+    NodeContent {
+        kind: memory.kind.clone(),
+        title: memory.title.clone(),
+        body: memory.body.clone(),
+        confidence: memory.confidence.clone(),
+        source: memory.source.clone(),
+        tags: memory.tags.clone(),
+        payload: memory.payload_json.clone(),
     }
 }
 
@@ -77,18 +85,8 @@ pub(super) fn node_ops(
     elide_active_status: bool,
 ) -> anyhow::Result<Vec<MemoryOp>> {
     let node_id = NodeId::from(row.memory_id.as_str());
-    let mut ops = vec![MemoryOp::NodeCreate {
-        node_id: node_id.clone(),
-        content: node_content(
-            &row.kind,
-            &row.title,
-            &row.body,
-            &row.confidence,
-            &row.source,
-            &row.tags,
-            row.payload_json.as_deref(),
-        ),
-    }];
+    let mut ops =
+        vec![MemoryOp::NodeCreate { node_id: node_id.clone(), content: node_content_of_row(row) }];
     let is_active = row.status == NodeStatus::default().as_db_str();
     if !(elide_active_status && is_active) {
         let status = NodeStatus::from_db_str(&row.status).ok_or_else(|| {
@@ -185,15 +183,7 @@ pub(super) fn build_reconcile_ops(
 pub(super) fn node_is_authorable(row: &MemoryRow, policy: StreamSealPolicy) -> bool {
     let op = MemoryOp::NodeCreate {
         node_id: NodeId::from(row.memory_id.as_str()),
-        content: node_content(
-            &row.kind,
-            &row.title,
-            &row.body,
-            &row.confidence,
-            &row.source,
-            &row.tags,
-            row.payload_json.as_deref(),
-        ),
+        content: node_content_of_row(row),
     };
     content_op_is_authorable(&op, policy)
 }

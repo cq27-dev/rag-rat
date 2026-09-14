@@ -23,15 +23,15 @@
 //! local account is minted, leaving scope-less callers untouched.
 
 use rag_rat_oplog::{
-    EdgeKey, EdgeSpec, MemoryOp, NodeContent, NodeId, NodeStatus, PreparedContentAuthoring,
-    StreamId,
+    EdgeKey, EdgeSpec, MemoryOp, NodeId, NodeStatus, PreparedContentAuthoring, StreamId,
 };
-use rag_rat_query::memory::{EdgeRelation, RepoMemory, memory_repo_scope};
+use rag_rat_query::memory::{RepoMemory, memory_repo_scope};
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
 use super::ownership::{StreamSealPolicy, grantee_context, stream_seal_policy};
 use super::reconcile::{
-    content_op_is_authorable, node_content, stable_owner_stream, stable_owner_stream_for_repo,
+    content_op_is_authorable, node_content_of_memory, stable_owner_stream,
+    stable_owner_stream_for_repo,
 };
 
 /// Scoped durability bump for an AUTHORED write (#560). The index connection runs
@@ -381,8 +381,10 @@ pub(crate) fn author_create(
     now_ms: i64,
 ) -> anyhow::Result<()> {
     let node_id = NodeId::from(memory.memory_id.as_str());
-    let mut ops =
-        vec![MemoryOp::NodeCreate { node_id: node_id.clone(), content: content_of(memory) }];
+    let mut ops = vec![MemoryOp::NodeCreate {
+        node_id: node_id.clone(),
+        content: node_content_of_memory(memory),
+    }];
     ops.extend(anchor_publication_ops(tx, &memory.memory_id)?);
     author_in_owner_stream(tx, &ops, prepared, now_ms)
 }
@@ -598,7 +600,10 @@ pub(crate) fn author_update(
     let node_id = NodeId::from(memory.memory_id.as_str());
     let mut ops = Vec::new();
     if content_changed {
-        ops.push(MemoryOp::NodeUpdate { node_id: node_id.clone(), content: content_of(memory) });
+        ops.push(MemoryOp::NodeUpdate {
+            node_id: node_id.clone(),
+            content: node_content_of_memory(memory),
+        });
     }
     if status_changed {
         let status = NodeStatus::from_db_str(&memory.status).ok_or_else(|| {
@@ -614,29 +619,13 @@ pub(crate) fn author_update(
 
 /// Author a live edge ADD (`EdgeAdd`) inside the caller's mutation txn — presence + the durable
 /// spec only (no `Rebind`; edge resolution is per-device, recomputed on read).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn author_edge_add(
     tx: &Transaction<'_>,
-    source_node_id: &str,
-    relation: EdgeRelation,
-    target_repo_id: &str,
-    target_kind: &str,
-    target_anchor: &str,
-    owner_repo_id: &str,
+    edge: EdgeSpec,
     prepared: Option<&PreparedOwnerAuthoring>,
     now_ms: i64,
 ) -> anyhow::Result<()> {
-    let op = MemoryOp::EdgeAdd {
-        edge: EdgeSpec {
-            source_node_id: NodeId::from(source_node_id),
-            relation,
-            target_repo_id: target_repo_id.to_string(),
-            target_kind: target_kind.to_string(),
-            target_anchor: target_anchor.to_string(),
-            owner_repo_id: owner_repo_id.to_string(),
-        },
-    };
-    author_in_owner_stream(tx, &[op], prepared, now_ms)
+    author_in_owner_stream(tx, &[MemoryOp::EdgeAdd { edge }], prepared, now_ms)
 }
 
 /// Author a live edge REMOVE (`EdgeRemove` tombstone) inside the caller's mutation txn.
@@ -651,19 +640,6 @@ pub(crate) fn author_edge_remove(
         &[MemoryOp::EdgeRemove { edge_key: EdgeKey::from(edge_key) }],
         prepared,
         now_ms,
-    )
-}
-
-/// The op-model content register for a persisted memory.
-fn content_of(memory: &RepoMemory) -> NodeContent {
-    node_content(
-        &memory.kind,
-        &memory.title,
-        &memory.body,
-        &memory.confidence,
-        &memory.source,
-        &memory.tags,
-        memory.payload_json.as_deref(),
     )
 }
 

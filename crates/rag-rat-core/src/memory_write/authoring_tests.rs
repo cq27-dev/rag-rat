@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
-use rag_rat_query::memory::NodeEdge;
+use rag_rat_oplog::NodeContent;
+use rag_rat_query::memory::{EdgeRelation, NodeEdge};
 
 use super::super::grants::{
     catch_up_enrolled_device_keys, enable_public_authoring, enable_sealed_authoring,
@@ -9,8 +10,9 @@ use super::super::ownership::{
     STREAM_ACCESS_MODE_META_KEY, STREAM_SEAL_POLICY_META_KEY, owner_stream_access_mode,
 };
 use super::super::reconcile::{
-    ANCHOR_BACKFILL_PER_PASS, MemoryRow, backfill_memory_oplog, edge_add_op, node_is_authorable,
-    node_ops, read_anchor_backfill_ids, read_reconcile_work, read_unauthored_memory_rows,
+    ANCHOR_BACKFILL_PER_PASS, MemoryRow, backfill_memory_oplog, edge_add_op,
+    node_content_of_memory, node_content_of_row, node_is_authorable, node_ops,
+    read_anchor_backfill_ids, read_reconcile_work, read_unauthored_memory_rows,
 };
 use super::*;
 
@@ -601,6 +603,46 @@ fn authored_durability_raises_full_then_restores_normal() {
         1,
         "the authored-durability guard must restore synchronous=NORMAL (=1) on drop"
     );
+}
+
+/// Both sources of signed `NodeContent` carry each column into its OWN register. `confidence` and
+/// `source` are adjacent short tokens signed verbatim into an append-only log, so the fixtures give
+/// every register a distinct value: a transposition fails here instead of signing the wrong bytes.
+#[test]
+fn node_content_maps_every_column_to_its_own_register() {
+    let row = MemoryRow {
+        memory_id: "mem_a".to_string(),
+        kind: "Decision".to_string(),
+        title: "the title".to_string(),
+        body: "the body".to_string(),
+        confidence: "low".to_string(),
+        status: "active".to_string(),
+        source: "human".to_string(),
+        payload_json: Some("{\"schema_version\":1}".to_string()),
+        tags: vec!["tag".to_string()],
+    };
+    assert_eq!(node_content_of_row(&row), NodeContent {
+        kind: "Decision".to_string(),
+        title: "the title".to_string(),
+        body: "the body".to_string(),
+        confidence: "low".to_string(),
+        source: "human".to_string(),
+        tags: vec!["tag".to_string()],
+        payload: Some("{\"schema_version\":1}".to_string()),
+    });
+
+    let conn = scoped_conn();
+    insert_memory(&conn, "mem_b", "active", 100);
+    let memory = rag_rat_query::memory::memory_by_id(&conn, "mem_b").unwrap().unwrap();
+    assert_eq!(node_content_of_memory(&memory), NodeContent {
+        kind: "Invariant".to_string(),
+        title: "mem_b".to_string(),
+        body: "body".to_string(),
+        confidence: "high".to_string(),
+        source: "agent".to_string(),
+        tags: Vec::new(),
+        payload: None,
+    });
 }
 
 /// A `MemoryRow` with the given status, no payload, one tag — the fixture the ported op-split
