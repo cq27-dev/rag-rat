@@ -108,8 +108,7 @@ fn token_fingerprint(token: Option<&str>) -> String {
     use sha2::{Digest, Sha256};
     match token.map(str::trim).filter(|t| !t.is_empty()) {
         None => "anonymous".to_string(),
-        Some(token) =>
-            Sha256::digest(token.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect(),
+        Some(token) => rag_rat_base::hash::hex_lower(&Sha256::digest(token.as_bytes())[..8]),
     }
 }
 
