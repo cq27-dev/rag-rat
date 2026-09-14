@@ -80,6 +80,32 @@ fn local_auth(
     Ok(LocalAuth { binding, capability })
 }
 
+/// Implement [`NodeAuth`] for an op-log store holding `conn` and `account_id` by delegating to
+/// [`local_auth`] and [`authorize_binding`]. Both methods take `now_ms` per HANDSHAKE (distinct
+/// from the store's `now_fn` ingest clock): binding freshness must track the live clock, or a
+/// reused store would mint stale bindings and never advance the replay window.
+///
+/// A macro, not a blanket `impl<T: ..> NodeAuth for T`: a blanket impl over a local trait would
+/// forbid every other `NodeAuth` impl in the crate, including the auth handshake's test fake.
+macro_rules! impl_account_node_auth {
+    ($(<$($generic:ident),*>)? for $store:ty) => {
+        impl$(<$($generic),*>)? NodeAuth for $store {
+            fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
+                local_auth(self.conn, self.account_id, local_node, now_ms)
+            }
+
+            fn authorize(
+                &self,
+                binding: &[u8],
+                remote_node: &[u8; 32],
+                now_ms: i64,
+            ) -> anyhow::Result<PeerAuthorization> {
+                authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
+            }
+        }
+    };
+}
+
 /// A [`SyncStore`] over one account's op log on a live connection. Scoped to a single account: a
 /// session syncs one account, and the hello handshake refuses a peer naming a different one. The
 /// only foreign logs it admits are those of accounts its owner granted a stream (#1280).
@@ -346,41 +372,11 @@ impl SyncStore for OplogContentSyncStore<'_> {
     }
 }
 
-// Both op-log stores carry the same account-level node-authorization capability (the binding is
-// about the account + transport node, independent of whether the session moves account entries or
-// content), so both delegate to the shared helpers above.
-// Both auth methods take `now_ms` per HANDSHAKE (distinct from the store's `now_fn` ingest clock):
-// binding freshness must track the live clock, or a reused store would mint stale bindings and
-// never advance the replay window.
-impl NodeAuth for OplogSyncStore<'_> {
-    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
-        local_auth(self.conn, self.account_id, local_node, now_ms)
-    }
-
-    fn authorize(
-        &self,
-        binding: &[u8],
-        remote_node: &[u8; 32],
-        now_ms: i64,
-    ) -> anyhow::Result<PeerAuthorization> {
-        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
-    }
-}
-
-impl NodeAuth for OplogContentSyncStore<'_> {
-    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
-        local_auth(self.conn, self.account_id, local_node, now_ms)
-    }
-
-    fn authorize(
-        &self,
-        binding: &[u8],
-        remote_node: &[u8; 32],
-        now_ms: i64,
-    ) -> anyhow::Result<PeerAuthorization> {
-        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
-    }
-}
+// Every op-log store carries the same account-level node-authorization capability (the binding is
+// about the account + transport node, independent of whether the session moves account entries,
+// content, or table streams), so each delegates to the shared helpers above.
+impl_account_node_auth!(for OplogSyncStore<'_>);
+impl_account_node_auth!(for OplogContentSyncStore<'_>);
 
 /// Production adapter for the table lane's current repo-scoped streams.
 pub struct OplogTableSyncStore<'a, F = fn() -> i64> {
@@ -556,20 +552,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 }
 
-impl<F> NodeAuth for OplogTableSyncStore<'_, F> {
-    fn local_auth(&self, local_node: &[u8; 32], now_ms: i64) -> anyhow::Result<LocalAuth> {
-        local_auth(self.conn, self.account_id, local_node, now_ms)
-    }
-
-    fn authorize(
-        &self,
-        binding: &[u8],
-        remote_node: &[u8; 32],
-        now_ms: i64,
-    ) -> anyhow::Result<PeerAuthorization> {
-        authorize_binding(self.conn, self.account_id, binding, remote_node, now_ms)
-    }
-}
+impl_account_node_auth!(<F> for OplogTableSyncStore<'_, F>);
 
 #[cfg(test)]
 mod tests {
