@@ -4,7 +4,7 @@
 //! trigger mechanics against the full ladder's `files` shape); the real-`IndexDatabase` tests drive
 //! the production seams (rebuild, gc) end to end.
 
-use rag_rat_db::content_digest::{content_row_hash, encode_state, fold_row};
+use rag_rat_db::content_digest::{FoldSign, content_row_hash, encode_state, fold_row};
 
 use super::*;
 
@@ -30,7 +30,7 @@ fn digest_scan(conn: &rusqlite::Connection) -> (String, i64) {
     while let Some(row) = rows.next().unwrap() {
         let path: String = row.get(0).unwrap();
         let sha256: String = row.get(1).unwrap();
-        fold_row(&mut state, &content_row_hash(&path, &sha256), true);
+        fold_row(&mut state, &content_row_hash(&path, &sha256), FoldSign::Add);
         count += 1;
     }
     (encode_state(&state), count)

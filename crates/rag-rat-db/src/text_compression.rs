@@ -137,15 +137,15 @@ impl<'a> ChunkTextDecoder<'a> {
         blob: &[u8],
         capacity: usize,
     ) -> Result<Vec<u8>> {
-        if !self.cache.contains_key(&dict_version) {
-            let dict = self.dicts.get(&dict_version).map(Vec::as_slice).unwrap_or(&[]);
-            self.cache.insert(dict_version, ChunkDecompressor::new(dict)?);
-        }
-        // Present by construction (just inserted if missing).
-        self.cache
-            .get_mut(&dict_version)
-            .expect("decompressor cached above")
-            .decompress(blob, capacity)
+        use std::collections::hash_map::Entry;
+        let decompressor = match self.cache.entry(dict_version) {
+            Entry::Occupied(cached) => cached.into_mut(),
+            Entry::Vacant(slot) => {
+                let dict = self.dicts.get(&dict_version).map(Vec::as_slice).unwrap_or(&[]);
+                slot.insert(ChunkDecompressor::new(dict)?)
+            },
+        };
+        decompressor.decompress(blob, capacity)
     }
 }
 

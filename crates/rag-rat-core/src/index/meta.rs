@@ -226,7 +226,11 @@ impl IndexDatabase {
             let path: String = row.get(0)?;
             let sha256: String = row.get(1)?;
             let hash = rag_rat_db::content_digest::content_row_hash(&path, &sha256);
-            rag_rat_db::content_digest::fold_row(&mut state, &hash, true);
+            rag_rat_db::content_digest::fold_row(
+                &mut state,
+                &hash,
+                rag_rat_db::content_digest::FoldSign::Add,
+            );
             rows_folded += 1;
         }
         Ok((state, rows_folded))
