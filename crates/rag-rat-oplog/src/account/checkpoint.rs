@@ -56,9 +56,14 @@ pub struct VerifiedCheckpoint {
     forked: HashSet<AccountEntryHash>,
     nonaccepted: HashSet<AccountEntryHash>,
     continuation_heads: Vec<DeviceCut>,
+    frozen: fold::v2::FrozenLegacy,
 }
 
 impl VerifiedCheckpoint {
+    pub(super) fn frozen_legacy(&self) -> &fold::v2::FrozenLegacy {
+        &self.frozen
+    }
+
     pub fn pin(&self) -> TrustedCheckpointPin {
         self.pin
     }
@@ -294,7 +299,7 @@ fn verify_projection(
     certificate: Certificate,
     entries: Vec<VerifiedAccountEntry>,
 ) -> anyhow::Result<VerifiedCheckpoint> {
-    let projection = storage::project_verified_checkpoint_evidence(&entries);
+    let (projection, trace) = storage::project_checkpoint_with_trace(&entries);
     anyhow::ensure!(
         projection.history.classification() == AccountClassification::Live,
         "checkpoint account is contested"
@@ -349,6 +354,12 @@ fn verify_projection(
         })
         .map(|entry| entry.entry_hash)
         .collect();
+    let frozen = fold::v2::FrozenLegacy::new(
+        entries,
+        projection.history,
+        trace.ok_or_else(|| anyhow::anyhow!("checkpoint has no final legacy trace"))?,
+        projection.accepted.clone(),
+    );
     Ok(VerifiedCheckpoint {
         pin: expected,
         bundle: bundle.clone(),
@@ -356,6 +367,7 @@ fn verify_projection(
         forked: projection.forked,
         nonaccepted,
         continuation_heads,
+        frozen,
     })
 }
 

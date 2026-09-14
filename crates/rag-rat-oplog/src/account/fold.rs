@@ -13,6 +13,10 @@
 //! is genuine owner-key compromise ⇒ the account folds `contested` and halts authority mutation
 //! (§12).
 
+// Pure v2 execution is isolated until the account activation path is integrated.
+#[allow(dead_code, reason = "control v2 execution is not enabled in production (#1311)")]
+pub(super) mod v2;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
 
@@ -199,6 +203,7 @@ pub(super) enum AccountClassification {
 
 /// The derived authority history of one account: per-entry outcomes, the account classification,
 /// and (only when `contested`) the deterministic recovery successor.
+#[derive(Clone)]
 pub(super) struct AccountAuthHistory {
     outcomes: HashMap<AccountEntryHash, Outcome>,
     classification: AccountClassification,
@@ -1057,6 +1062,20 @@ fn join_register(
 /// MUST share `account_id` (the caller groups by account). Order-independent: the result is
 /// identical under every permutation of `entries`.
 pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHistory {
+    fold_account_traced(entries, false).0
+}
+
+/// Captured only for an explicitly verified checkpoint, never allocated on ordinary v1 replay.
+pub(super) struct LegacyTrace {
+    registers: HashMap<RegisterKey, Cut>,
+    contributors: HashSet<AccountEntryHash>,
+    readiness_exclusions: HashMap<AccountEntryHash, Outcome>,
+}
+
+pub(super) fn fold_account_traced(
+    entries: &[VerifiedAccountEntry],
+    capture: bool,
+) -> (AccountAuthHistory, Option<LegacyTrace>) {
     // Readiness is monotone: once an entry proves it was authored ahead of the locally folded
     // authority history (or depends on authority that did not survive the fold), it cannot
     // contribute a register or phase-E mutation in this fold. Re-run the frozen stratified pass
@@ -1065,7 +1084,8 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     // exclusions only grow.
     let mut readiness_exclusions = HashMap::new();
     loop {
-        let (history, discovered) = fold_account_pass(entries, &readiness_exclusions);
+        let (history, discovered, mut trace) =
+            fold_account_pass(entries, &readiness_exclusions, capture);
         let mut changed = false;
         for (hash, outcome) in discovered {
             if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -1076,7 +1096,10 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             }
         }
         if !changed {
-            return history;
+            if let Some(trace) = &mut trace {
+                trace.readiness_exclusions = readiness_exclusions;
+            }
+            return (history, trace);
         }
     }
 }
@@ -1084,7 +1107,8 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
 fn fold_account_pass(
     entries: &[VerifiedAccountEntry],
     readiness_exclusions: &HashMap<AccountEntryHash, Outcome>,
-) -> (AccountAuthHistory, HashMap<AccountEntryHash, Outcome>) {
+    capture: bool,
+) -> (AccountAuthHistory, HashMap<AccountEntryHash, Outcome>, Option<LegacyTrace>) {
     let mut outcomes: HashMap<AccountEntryHash, Outcome> = HashMap::new();
 
     // Decode once, then classify. `candidates` are the ops the fold actually folds; `all_headers`
@@ -1164,6 +1188,7 @@ fn fold_account_pass(
                 genesis_hash: None,
             },
             HashMap::new(),
+            None,
         );
     };
     let genesis_owner_id = genesis.hash();
@@ -1370,6 +1395,11 @@ fn fold_account_pass(
             genesis_hash: Some(genesis_owner_id),
         },
         discovered,
+        capture.then(|| LegacyTrace {
+            registers,
+            contributors: register_contributors,
+            readiness_exclusions: HashMap::new(),
+        }),
     )
 }
 
