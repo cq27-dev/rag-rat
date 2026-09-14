@@ -811,12 +811,12 @@ mod tests {
 
     /// An `ALIGNMENT_VERSION` bump invalidates a stale-version row: a row written at
     /// `alignment_version = 1` (the 4a pin) MISSES the lookup at the current `ALIGNMENT_VERSION`
-    /// (= 3), so it is never served; recomputing writes the row at the current version with the
+    /// (= 4), so it is never served; recomputing writes the row at the current version with the
     /// REAL 4b payload. (The bump lives in the lookup WHERE + the content key — no schema
     /// migration.)
     #[test]
     fn alignment_version_bump_invalidates_and_recomputes() {
-        assert_eq!(ALIGNMENT_VERSION, 3, "this test pins the current alignment version");
+        assert_eq!(ALIGNMENT_VERSION, 4, "this test pins the current alignment version");
 
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &rag_rat_db::MigrationHooks::noop()).unwrap();
@@ -846,7 +846,7 @@ mod tests {
         )
         .unwrap();
 
-        // The lookup at the CURRENT version (2) must MISS the v1 row.
+        // The lookup at the CURRENT version must MISS the v1 row.
         assert!(
             refine_lookup(&conn, &key, RefineMode::Baseline).unwrap().is_none(),
             "an alignment_version=1 row must not serve at the current version"
