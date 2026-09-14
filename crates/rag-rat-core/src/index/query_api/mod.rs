@@ -29,6 +29,7 @@ mod sync;
 // the capped-class semantics by name (instead of hardcoding 50). Keeps the `clones` module
 // private so `build_class`'s reachability stays narrow (no `private_interfaces` widening of
 // `SymbolBag`).
+pub use chunk_read::ReadChunkRequest;
 pub(crate) use clones::delta::CloneDeltaHint;
 pub use clones::delta::{CLONE_DELTA_MAX_FILES, CloneDeltaReport, CloneDeltaStatus};
 pub use clones::of_text::{CloneCheckInput, CloneFingerprintHealth, TextCloneMatch};
@@ -415,13 +416,13 @@ mod drive_by_memory_cap_tests {
     fn read_chunk_attaches_at_most_the_drive_by_cap() {
         let (_dir, db, chunk_id) = db_with_chunk_memories(9);
         let chunk = db
-            .read_chunk_with_graph_and_memories(
+            .read_chunk_with(crate::index::ReadChunkRequest {
                 chunk_id,
-                GraphMetaMode::Full,
-                20,
-                true,
-                rag_rat_base::config::MemorySurface::Full,
-            )
+                graph_mode: GraphMetaMode::Full,
+                graph_limit: 20,
+                include_memories: true,
+                surface: rag_rat_base::config::MemorySurface::Full,
+            })
             .unwrap()
             .expect("chunk");
         assert_eq!(
@@ -459,13 +460,13 @@ mod drive_by_memory_cap_tests {
         let db = open_seeded(&dir, conn);
 
         let chunk = db
-            .read_chunk_with_graph_and_memories(
+            .read_chunk_with(crate::index::ReadChunkRequest {
                 chunk_id,
-                GraphMetaMode::Full,
-                20,
-                true,
-                rag_rat_base::config::MemorySurface::Full,
-            )
+                graph_mode: GraphMetaMode::Full,
+                graph_limit: 20,
+                include_memories: true,
+                surface: rag_rat_base::config::MemorySurface::Full,
+            })
             .unwrap()
             .expect("chunk");
 

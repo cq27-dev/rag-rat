@@ -183,20 +183,30 @@ fn surface_summary_defers_bodies_across_the_db_memory_renderers() {
 
     // read_chunk memory attachments (and the include_memories=false wrapper stays exercised).
     let chunk = db
-        .read_chunk_with_graph_and_memories(
+        .read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Summary,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Summary,
+        })
         .unwrap()
         .expect("chunk");
     let cm =
         chunk.memories.iter().find(|m| m.memory_id == sym_mem.memory_id).expect("chunk memory");
     assert!(cm.body.contains("body elided"), "{}", cm.body);
     assert_eq!(cm.summary.as_deref(), Some("Keep target's invariant."));
-    assert!(db.read_chunk_with_graph(chunk_id, GraphMetaMode::Full, 20).unwrap().is_some());
+    assert!(
+        db.read_chunk_with(crate::index::ReadChunkRequest {
+            chunk_id,
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: false,
+            ..crate::index::ReadChunkRequest::new(chunk_id)
+        })
+        .unwrap()
+        .is_some()
+    );
 
     // find_callers / trace_callees evidence.
     let evidence = db
@@ -273,13 +283,13 @@ fn read_chunk_attaches_distilled_records_for_the_chunk_symbol() {
 
     // Happy path: the record surfaces on read_chunk, labeled unreviewed.
     let chunk = db
-        .read_chunk_with_graph_and_memories(
+        .read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Full,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk");
     assert_eq!(
@@ -291,13 +301,13 @@ fn read_chunk_attaches_distilled_records_for_the_chunk_symbol() {
 
     // include_memories = false skips the whole drive-by lane, same as memories.
     let bare = db
-        .read_chunk_with_graph_and_memories(
+        .read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            false,
-            MemorySurface::Full,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: false,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk");
     assert!(bare.distilled_records.is_empty(), "the drive-by rides the memories include flag");
@@ -388,13 +398,13 @@ fn drive_by_records_disambiguate_same_name_overloads_by_symbol_id() {
     .unwrap();
 
     let read = |chunk_id: i64| {
-        db.read_chunk_with_graph_and_memories(
+        db.read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Full,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk")
         .distilled_records
@@ -485,13 +495,13 @@ fn drive_by_records_disambiguate_nested_same_name_symbols() {
     .unwrap();
 
     let read = |chunk_id: i64| {
-        db.read_chunk_with_graph_and_memories(
+        db.read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Full,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk")
         .distilled_records
@@ -585,13 +595,13 @@ fn drive_by_records_bind_a_split_continuation_to_its_outer_symbol_over_a_nested_
     .unwrap();
 
     let recs = db
-        .read_chunk_with_graph_and_memories(
-            cont_chunk,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Full,
-        )
+        .read_chunk_with(crate::index::ReadChunkRequest {
+            chunk_id: cont_chunk,
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk")
         .distilled_records
@@ -680,13 +690,13 @@ fn drive_by_records_resolve_same_line_symbols_by_symbol_id() {
     .unwrap();
 
     let read = |chunk_id: i64| {
-        db.read_chunk_with_graph_and_memories(
+        db.read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Full,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk")
         .distilled_records
@@ -761,13 +771,13 @@ fn drive_by_records_survive_a_v083_upgrade_via_the_backfill() {
     .unwrap();
 
     let read = || {
-        db.read_chunk_with_graph_and_memories(
+        db.read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Full,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk")
         .distilled_records

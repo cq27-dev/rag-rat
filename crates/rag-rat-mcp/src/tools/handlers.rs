@@ -137,13 +137,13 @@ pub(crate) fn call_tool_with_db(
         },
         "read_chunk" => {
             let args: ReadChunkArgs = serde_json::from_value(arguments)?;
-            json!(db.read_chunk_with_graph_and_memories(
-                args.chunk_id,
-                GraphMetaMode::parse(args.include_graph.as_str())?,
-                args.graph_limit,
-                included(&args.include, MemoriesInclude::Memories, true),
-                memory_surface,
-            )?)
+            json!(db.read_chunk_with(rag_rat_core::index::ReadChunkRequest {
+                chunk_id: args.chunk_id,
+                graph_mode: GraphMetaMode::parse(args.include_graph.as_str())?,
+                graph_limit: args.graph_limit,
+                include_memories: included(&args.include, MemoriesInclude::Memories, true),
+                surface: memory_surface
+            })?)
         },
         "commit_search" => {
             let args: QueryArgs = serde_json::from_value(arguments)?;

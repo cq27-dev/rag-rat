@@ -953,13 +953,13 @@ fn a_decision_record_does_not_leak_between_distinct_same_named_methods() {
     .unwrap();
 
     let records_on = |chunk_id: i64| -> Vec<String> {
-        db.read_chunk_with_graph_and_memories(
+        db.read_chunk_with(crate::index::ReadChunkRequest {
             chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            MemorySurface::Full,
-        )
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: MemorySurface::Full,
+        })
         .unwrap()
         .expect("chunk")
         .distilled_records

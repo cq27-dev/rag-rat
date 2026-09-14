@@ -108,9 +108,10 @@ pub use query_api::{
     LensFileMemories, LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
     LensGraphCallerCounts, LensHopResolvedBy, LensHopSelector, LensLaneVersions, LensPapertrailRef,
     LensStatus, LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion, MemoryCounts,
-    MemoryKindCounts, PapertrailCursor, PublishSeedReport, RepoContent, RepoFreshness,
-    RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, SyncCatchUpReport, TextCloneMatch,
-    WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
+    MemoryKindCounts, PapertrailCursor, PublishSeedReport, ReadChunkRequest, RepoContent,
+    RepoFreshness, RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, SyncCatchUpReport,
+    TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay,
+    reclaim_freelist_at,
 };
 use rag_rat_base::checkout::CheckoutKey;
 pub use schema::RegisteredRepo;

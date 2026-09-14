@@ -2,44 +2,39 @@
 
 use super::*;
 
+/// Controls graph and memory enrichment for one chunk read.
+pub struct ReadChunkRequest {
+    pub chunk_id: i64,
+    pub graph_mode: GraphMetaMode,
+    pub graph_limit: u32,
+    pub include_memories: bool,
+    pub surface: rag_rat_base::config::MemorySurface,
+}
+
+impl ReadChunkRequest {
+    /// Full graph context and memory bodies, matching the one-argument chunk read.
+    pub fn new(chunk_id: i64) -> Self {
+        Self {
+            chunk_id,
+            graph_mode: GraphMetaMode::Full,
+            graph_limit: 20,
+            include_memories: true,
+            surface: rag_rat_base::config::MemorySurface::Full,
+        }
+    }
+}
+
 impl IndexDatabase {
     pub fn read_chunk(&self, chunk_id: i64) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
-        // Internal/CLI/test entry — always the FULL memory bodies; the surface-aware path is the
-        // MCP `read_chunk` tool, which calls `read_chunk_with_graph_and_memories` with the
-        // config surface.
-        self.read_chunk_with_graph_and_memories(
-            chunk_id,
-            GraphMetaMode::Full,
-            20,
-            true,
-            rag_rat_base::config::MemorySurface::Full,
-        )
+        self.read_chunk_with(ReadChunkRequest::new(chunk_id))
     }
 
-    pub fn read_chunk_with_graph(
+    pub fn read_chunk_with(
         &self,
-        chunk_id: i64,
-        graph_mode: GraphMetaMode,
-        graph_limit: u32,
+        request: ReadChunkRequest,
     ) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
-        // `include_memories = false`, so the surface never applies — pass `Full`.
-        self.read_chunk_with_graph_and_memories(
-            chunk_id,
-            graph_mode,
-            graph_limit,
-            false,
-            rag_rat_base::config::MemorySurface::Full,
-        )
-    }
-
-    pub fn read_chunk_with_graph_and_memories(
-        &self,
-        chunk_id: i64,
-        graph_mode: GraphMetaMode,
-        graph_limit: u32,
-        include_memories: bool,
-        surface: rag_rat_base::config::MemorySurface,
-    ) -> anyhow::Result<Option<rag_rat_query::ReadChunk>> {
+        let ReadChunkRequest { chunk_id, graph_mode, graph_limit, include_memories, surface } =
+            request;
         let Some(mut chunk) = self.read_chunk_current(chunk_id)? else {
             return Ok(None);
         };
