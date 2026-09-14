@@ -500,21 +500,32 @@ const MIN_CITATION_CHARS: usize = 10;
 /// (whitespace-normalized substring) — an identifier-table entry or a bound-file excerpt line, NOT
 /// a section header or boilerplate (see [`is_pack_content_line`]) — and be at least
 /// [`MIN_CITATION_CHARS`] non-whitespace chars long. There must also be at least one line: an
-/// empty-evidence verdict is rejected too, so the model can't skip citing. `pack_text` is the exact
-/// string rendered into the prompt. Matching only content lines (not the flattened whole pack) is
-/// what stops a citation of pack boilerplate — a header the guard itself emits — from passing.
-fn verdict_is_cited(pack_text: &str, parsed: &ParsedVerdict) -> bool {
+/// empty-evidence verdict is rejected too, so the model can't skip citing. `content` is
+/// [`pack_content_lines`] of the exact string rendered into the prompt. Matching only content lines
+/// (not the flattened whole pack) is what stops a citation of pack boilerplate — a header the guard
+/// itself emits — from passing.
+fn every_citation_matches(content: &[String], parsed: &ParsedVerdict) -> bool {
     if parsed.evidence.is_empty() {
         return false;
     }
-    let content: Vec<String> =
-        pack_text.lines().filter(|line| is_pack_content_line(line)).map(normalize_ws).collect();
     parsed.evidence.iter().all(|line| {
         let cite = normalize_ws(line);
         cite.chars().filter(|c| !c.is_whitespace()).count() >= MIN_CITATION_CHARS
             && !is_bare_locator(&cite)
             && content.iter().any(|c| c.contains(&cite))
     })
+}
+
+/// [`every_citation_matches`] against a rendered pack — the citation guard on its own.
+#[cfg(test)]
+fn verdict_is_cited(pack_text: &str, parsed: &ParsedVerdict) -> bool {
+    every_citation_matches(&pack_content_lines(pack_text), parsed)
+}
+
+/// The pack's citable content lines, whitespace-normalized — the one set both the citation guard
+/// and the divergence guard match citations against.
+fn pack_content_lines(pack_text: &str) -> Vec<String> {
+    pack_text.lines().filter(|line| is_pack_content_line(line)).map(normalize_ws).collect()
 }
 
 /// Minimum normalized length of a copied note claim. This rejects vacuous fragments such as a
@@ -535,7 +546,8 @@ fn verdict_is_grounded(
     pack_text: &str,
     parsed: &ParsedVerdict,
 ) -> bool {
-    if !verdict_is_cited(pack_text, parsed) {
+    let content = pack_content_lines(pack_text);
+    if !every_citation_matches(&content, parsed) {
         return false;
     }
     if parsed.verdict == Verdict::Current {
@@ -555,8 +567,6 @@ fn verdict_is_grounded(
         return false;
     }
 
-    let content: Vec<String> =
-        pack_text.lines().filter(|line| is_pack_content_line(line)).map(normalize_ws).collect();
     // The resolver owns the resolution labels; `render_pack` joins each to its identifier with an
     // arrow (`->`).
     let absent_row = format!("-> {}", verify::NOT_FOUND);
