@@ -46,7 +46,7 @@ pub(super) fn is_string_node_kind(kind: &str) -> bool {
 /// widen like every other grammar's.
 fn is_string_delimiter_or_body_leaf_kind(kind: &str) -> bool {
     normalize::is_string_body_leaf_kind(kind)
-        || matches!(kind, "\"" | "`" | "'" | "\"\"\"" | "escape_sequence" | "str_escaped_char")
+        || matches!(kind, "\"" | "`" | "'" | "\"\"\"" | "escape_sequence")
 }
 
 /// `true` when the anchor subtree rooted at `str_col` contains an interpolation — a TS/JS
