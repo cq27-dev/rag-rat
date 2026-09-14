@@ -9,7 +9,6 @@
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -56,7 +55,7 @@ impl Role {
 }
 
 /// A per-process log file name, `<role>-<pid>-<start_ms>.log`.
-fn log_file_name(role: &Role, pid: u32, start_ms: u128) -> String {
+fn log_file_name(role: &Role, pid: u32, start_ms: i64) -> String {
     format!("{}-{pid}-{start_ms}.log", role.file_stem())
 }
 
@@ -106,7 +105,7 @@ fn try_init(config: &Config, role: &Role, env: Option<String>) -> anyhow::Result
         .unwrap_or_else(|_| EnvFilter::new(log.level.as_filter_str()));
 
     let pid = std::process::id();
-    let start_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let start_ms = crate::time::now_ms();
     let file_name = log_file_name(role, pid, start_ms);
 
     // One file per process (no date suffix). BLOCKING writes (the appender is its own `MakeWriter`,
@@ -129,7 +128,7 @@ fn try_init(config: &Config, role: &Role, env: Option<String>) -> anyhow::Result
         role = %role.as_str(),
         pid,
         root = %config.root.display(),
-        version = env!("CARGO_PKG_VERSION"),
+        version = crate::version::binary_version(),
         "rag-rat logging started"
     );
     Ok(LogHandle { _private: () })
