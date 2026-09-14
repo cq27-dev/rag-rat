@@ -850,7 +850,7 @@ fn compute_input_hash(inputs: &HashInputs<'_>) -> String {
         hash_str(&mut hasher, &xref.title);
         hash_str(&mut hasher, &xref.opening);
     }
-    let hex: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = rag_rat_base::hash::hex_lower(&hasher.finalize());
     format!("sha256:{hex}")
 }
 

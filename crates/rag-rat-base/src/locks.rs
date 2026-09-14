@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 
@@ -570,7 +569,7 @@ pub const MAX_SOCKET_PATH_LEN: usize = 100;
 /// canonicalize-but-not-case-fold).
 fn worktree_hash(worktree_root: &Path) -> String {
     let canonical = crate::paths::canonicalize_or_simplified(worktree_root);
-    crate::hash::hex_lower(&Sha256::digest(canonical.to_string_lossy().as_bytes())[..16])
+    crate::hash::hex_sha256_prefix(canonical.to_string_lossy().as_bytes(), 16)
 }
 
 /// A per-worktree listener election lock: one elected holder per worktree, at

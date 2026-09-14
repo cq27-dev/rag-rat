@@ -505,13 +505,7 @@ pub(crate) fn embedding_input_hash(model_id: &str, model_version: &str, input: &
     hasher.update(EMBEDDING_TEXT_VERSION.as_bytes());
     hasher.update(b"\0");
     hasher.update(input.as_bytes());
-    let hash = hasher.finalize();
-    let mut out = String::with_capacity(hash.len() * 2);
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    rag_rat_base::hash::hex_lower(&hasher.finalize())
 }
 
 pub(crate) fn write_current_embedding_batch(

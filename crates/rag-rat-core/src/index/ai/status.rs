@@ -151,7 +151,7 @@ pub(crate) fn remote_freshness_version(
     let digest = hasher.finalize();
     // 8 hex bytes (16 chars) is ample to separate model/runtime combinations; keep the
     // human-legible `spec.version` prefix so the persisted value still reads as this model.
-    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let short = rag_rat_base::hash::hex_lower(&digest[..8]);
     format!("{}-{short}", spec.version)
 }
 

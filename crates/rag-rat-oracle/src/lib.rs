@@ -517,14 +517,7 @@ pub fn probe_oracle_tool(tool: OracleTool) -> ToolAvailability {
 /// content-addressed `tool_version` — which would let a stale run's verdicts masquerade as the new
 /// fixture's (#82 P3). 12 hex chars (48 bits) is ample for a human-run fixture namespace.
 pub fn scip_content_fingerprint(scip_bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(scip_bytes);
-    let mut out = String::with_capacity(12);
-    for byte in digest.iter().take(6) {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    rag_rat_base::hash::hex_sha256_prefix(scip_bytes, 6)
 }
 
 /// Fetch the CURRENT, in-scope oracle verdicts for a set of edge ids — the read-side join that

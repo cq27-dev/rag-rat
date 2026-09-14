@@ -6717,7 +6717,7 @@ mod tests {
         enqueue_refold(&conn, healthy, 2);
         // Fail only the poisoned stream's queue clear: its whole per-stream txn (refold writes
         // included) rolls back, so the queue row is deleted only after a COMMIT.
-        let poison_hex: String = poisoned.iter().map(|byte| format!("{byte:02x}")).collect();
+        let poison_hex: String = rag_rat_base::hash::hex_lower(&poisoned);
         conn.execute_batch(&format!(
             "CREATE TRIGGER poison_queue_clear
              BEFORE DELETE ON content_streams_pending_refold
@@ -7140,7 +7140,7 @@ mod tests {
         seed_synthetic_candidates(&conn, oversize, 50);
         enqueue_refold(&conn, poisoned, 1);
         enqueue_refold(&conn, oversize, 2);
-        let poison_hex: String = poisoned.iter().map(|byte| format!("{byte:02x}")).collect();
+        let poison_hex: String = rag_rat_base::hash::hex_lower(&poisoned);
         conn.execute_batch(&format!(
             "CREATE TRIGGER poison_oversize_starvation
              BEFORE DELETE ON content_streams_pending_refold
@@ -7217,7 +7217,7 @@ mod tests {
         seed_synthetic_candidates(&conn, healthy, 1);
         enqueue_refold(&conn, poisoned, 1);
         enqueue_refold(&conn, healthy, 2);
-        let poison_hex: String = poisoned.iter().map(|byte| format!("{byte:02x}")).collect();
+        let poison_hex: String = rag_rat_base::hash::hex_lower(&poisoned);
         conn.execute_batch(&format!(
             "CREATE TRIGGER poison_demote_queue_clear
              BEFORE DELETE ON content_streams_pending_refold
@@ -7280,7 +7280,7 @@ mod tests {
         }
         // Fail only the poisoned stream's queue clear: its per-stream txn rolls back, the row is
         // retained, and it is collected for a single post-loop demotion.
-        let poison_hex: String = poisoned.iter().map(|byte| format!("{byte:02x}")).collect();
+        let poison_hex: String = rag_rat_base::hash::hex_lower(&poisoned);
         conn.execute_batch(&format!(
             "CREATE TRIGGER poison_paging_queue_clear
              BEFORE DELETE ON content_streams_pending_refold

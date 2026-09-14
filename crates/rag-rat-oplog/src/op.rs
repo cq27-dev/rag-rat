@@ -142,10 +142,7 @@ impl FromStr for DeviceFingerprint {
 
 impl fmt::Display for DeviceFingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        f.write_str(&rag_rat_base::hash::hex_lower(&self.0))
     }
 }
 
@@ -910,7 +907,7 @@ mod tests {
     }
 
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        rag_rat_base::hash::hex_lower(bytes)
     }
 
     /// Hand-roll a raw CBOR envelope, scoping the encoder so its borrow on the buffer ends before

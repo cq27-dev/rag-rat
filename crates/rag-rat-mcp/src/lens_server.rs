@@ -564,12 +564,7 @@ pub fn ownership_token() -> anyhow::Result<String> {
     let mut bytes = [0_u8; 16];
     getrandom::fill(&mut bytes)
         .map_err(|error| anyhow::anyhow!("generating lens ownership token: {error}"))?;
-    let mut token = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(token, "{byte:02x}");
-    }
-    Ok(token)
+    Ok(rag_rat_base::hash::hex_lower(&bytes))
 }
 
 /// The worktree where discovery, election keys, and source scoping anchor: the reanchored linked

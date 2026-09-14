@@ -249,7 +249,7 @@ fn seed_table_sync_stream(conn: &rusqlite::Connection, repo_id: &str, seed: u8) 
 /// A blob as a SQL `X'..'` literal, for the stream-keyed orphan check (the other id sets are
 /// integers or text).
 fn blob_literal(bytes: &[u8]) -> String {
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = rag_rat_base::hash::hex_lower(bytes);
     format!("X'{hex}'")
 }
 

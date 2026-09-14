@@ -624,7 +624,7 @@ fn compute_model_input_hash(
     hash_bytes(&mut hasher, b"rag-rat-distill-model-input-v1");
     hash_bytes(&mut hasher, rendered_prompt.as_bytes());
     hash_bytes(&mut hasher, &schema);
-    let hex: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    let hex: String = rag_rat_base::hash::hex_lower(&hasher.finalize());
     Ok(format!("sha256:{hex}"))
 }
 

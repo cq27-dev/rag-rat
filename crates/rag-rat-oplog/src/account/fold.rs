@@ -3122,7 +3122,7 @@ mod tests {
         // are what moved. A change to what `folded_state_hash` covers is still a
         // `SNAPSHOT_STATE_FORMAT_V1` bump.
         assert_eq!(
-            hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            rag_rat_base::hash::hex_lower(&hash),
             "5c8aee143bb180044289c4aeee5ad8279a7cb66e51091120d57614e7545604b0",
         );
     }

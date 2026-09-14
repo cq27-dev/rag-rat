@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 
 /// Lower-hex encode a byte slice (two chars per byte, `0`-padded). The one hex encoder for the
 /// workspace — there is no `hex` crate dependency, so every caller that needs raw-bytes→hex (digest
-/// rendering, a hex-encoded meta value, the table-sync golden vectors) routes through here rather
-/// than hand-rolling the loop.
+/// rendering, a hex-encoded meta value, the table-sync golden vectors) routes through here, or
+/// through [`hex_sha256`] / [`hex_sha256_prefix`], rather than hand-rolling the loop.
 pub fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -45,9 +45,16 @@ pub fn hex_sha256(bytes: &[u8]) -> String {
     hex_lower(&Sha256::digest(bytes))
 }
 
+/// Hex of the first `keep` bytes of the SHA-256 of `bytes` (all 32 when `keep` is larger) — the
+/// short, stable fingerprint shape: `2 * keep` hex chars, a prefix of [`hex_sha256`].
+pub fn hex_sha256_prefix(bytes: &[u8], keep: usize) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_lower(&digest[..keep.min(digest.len())])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hex_decode, hex_lower};
+    use super::{hex_decode, hex_lower, hex_sha256, hex_sha256_prefix};
 
     /// Both halves of the round trip, plus the rejections the doc promises. `hex_decode` consumes
     /// whole pairs and reports the leftover separately, so an odd length and a bad nibble must
@@ -64,5 +71,16 @@ mod tests {
 
         let bytes = [0x00, 0x7f, 0x80, 0xff];
         assert_eq!(hex_decode(&hex_lower(&bytes)), Some(bytes.to_vec()));
+    }
+
+    /// The truncated-digest shape is a prefix of the full digest, `2 * keep` chars long, and
+    /// saturates at the digest length.
+    #[test]
+    fn hex_sha256_prefix_is_a_prefix_of_the_full_digest() {
+        let full = hex_sha256(b"abc");
+        assert_eq!(full, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(hex_sha256_prefix(b"abc", 8), full[..16]);
+        assert_eq!(hex_sha256_prefix(b"abc", 0), "");
+        assert_eq!(hex_sha256_prefix(b"abc", 64), full);
     }
 }

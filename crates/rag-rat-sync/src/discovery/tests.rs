@@ -71,7 +71,7 @@ fn the_tag_is_keyed_by_the_secret() {
 #[test]
 fn the_tag_derivation_is_pinned() {
     let tag = account_tag(&[0xab; 32]);
-    let hex: String = tag.iter().map(|b| format!("{b:02x}")).collect();
+    let hex: String = rag_rat_base::hash::hex_lower(&tag);
     assert_eq!(hex, "27da05bee4ecf160b800de8f223835cda93e73d3d883b578966a5f82229fcaaf");
 }
 

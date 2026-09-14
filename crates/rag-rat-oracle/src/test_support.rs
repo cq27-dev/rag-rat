@@ -440,14 +440,7 @@ pub fn scip_bytes(path: &str, encoding: PositionEncoding, occurrences: Vec<Occur
 /// Hex SHA-256 of bytes — the same hash `files.sha256` carries, so a test file's recorded sha
 /// matches the disk-byte hash the oracle's content-integrity gate computes (finding 2).
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
+    rag_rat_base::hash::hex_sha256(bytes)
 }
 
 // A sibling checkout sharing the same DB: a DIFFERENT commit, clean (empty worktree). Modelling the
