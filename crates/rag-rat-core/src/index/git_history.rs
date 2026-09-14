@@ -5,8 +5,9 @@ use gix::object::tree::diff::{Action, Change};
 use gix::revision::walk::Sorting;
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_db::meta::{
-    LENS_COUPLING_REVISION_META, LENS_ENRICHMENT_REVISION_META, bump_lens_revisions,
-    delete_repo_meta, repo_meta, scoped_table_row_count, set_repo_meta,
+    BoolMetaKey, BoolSpelling, LENS_COUPLING_REVISION_META, LENS_ENRICHMENT_REVISION_META,
+    bump_lens_revisions, delete_repo_meta, repo_meta, repo_meta_bool, scoped_table_row_count,
+    set_repo_meta, set_repo_meta_bool,
 };
 use rag_rat_db::schema;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -39,8 +40,10 @@ const GIT_HISTORY_INDEXED_HEAD_META: &str = "git_history_indexed_head";
 /// than spelled twice — the migration lives below this crate and a drifted literal there is a
 /// silent miss, not a compile error.
 const GIT_HISTORY_INDEXED_ROOT_META: &str = rag_rat_db::meta::GIT_HISTORY_INDEXED_ROOT_META;
-const GIT_HISTORY_INDEXED_SHALLOW_META: &str = "git_history_indexed_shallow";
-const GIT_HISTORY_INDEXED_COMPLETE_META: &str = "git_history_indexed_complete";
+const GIT_HISTORY_INDEXED_SHALLOW_META: BoolMetaKey =
+    BoolMetaKey { key: "git_history_indexed_shallow", spelling: BoolSpelling::Digit };
+const GIT_HISTORY_INDEXED_COMPLETE_META: BoolMetaKey =
+    BoolMetaKey { key: "git_history_indexed_complete", spelling: BoolSpelling::Digit };
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GitHistoryIndexStatus {

@@ -12,7 +12,7 @@ impl IndexDatabase {
         let dirty = is_worktree_dirty(root);
         let commit_changed = self.set_repo_meta_if_changed("git_commit", &commit)?;
         let dirty_changed =
-            self.set_repo_meta_if_changed("git_dirty", if dirty { "true" } else { "false" })?;
+            self.set_repo_meta_bool_if_changed(rag_rat_db::meta::GIT_DIRTY_META, dirty)?;
         Ok(commit_changed || dirty_changed)
     }
 

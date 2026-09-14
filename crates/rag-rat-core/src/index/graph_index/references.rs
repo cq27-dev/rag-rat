@@ -1,6 +1,8 @@
 //! Durable references to logical-symbol ids: the on-open realign, the remap / vacate / null
 //! rewrites a key-drift heal applies, and synced distill-anchor re-resolution.
 
+use rag_rat_db::schema::TOMBSTONE_FILE_KIND;
+
 use super::logical_key::LogicalSymbolKey;
 use crate::index::*;
 
@@ -461,27 +463,32 @@ pub(crate) fn resolve_synced_symbol_anchors(
     // already repo-scoped but does NOT project `repo_id`/`generation`, so the explicit pin here
     // must read the base tables — the `all_symbols` #89/A3/A6 rule, and what makes this correct
     // on BOTH the view-installed (incremental/open) and view-less (bare-open) paths.
-    const DERIVED: &str = "SELECT 'sym_' || format('%x', m.logical_symbol_id)
+    let derived = format!(
+        "SELECT 'sym_' || format('%x', m.logical_symbol_id)
          FROM main.symbols s
          JOIN main.files f ON f.id = s.file_id
          JOIN main.logical_symbol_members m ON m.symbol_id = s.id
-         WHERE f.repo_id = ?1 AND f.generation = ?2 AND f.kind != 'deleted'
+         WHERE f.repo_id = ?1 AND f.generation = ?2 AND f.kind != '{TOMBSTONE_FILE_KIND}'
            AND f.path = a.file_path AND s.name = a.name
-         ORDER BY s.id LIMIT 1";
+         ORDER BY s.id LIMIT 1"
+    );
     // Name-bound validity: does the STORED handle still name a symbol called `a.name` (any file)?
-    const STORED_HANDLE_STILL_NAMES_IT: &str = "SELECT 1
+    let stored_handle_still_names_it = format!(
+        "SELECT 1
          FROM main.symbols s
          JOIN main.files f ON f.id = s.file_id
          JOIN main.logical_symbol_members m ON m.symbol_id = s.id
-         WHERE f.repo_id = ?1 AND f.generation = ?2 AND f.kind != 'deleted' AND s.name = a.name
-           AND 'sym_' || format('%x', m.logical_symbol_id) = a.logical_symbol_id";
+         WHERE f.repo_id = ?1 AND f.generation = ?2 AND f.kind != '{TOMBSTONE_FILE_KIND}' AND \
+         s.name = a.name
+           AND 'sym_' || format('%x', m.logical_symbol_id) = a.logical_symbol_id"
+    );
     let sql = format!(
         "UPDATE papertrail_distill_anchors AS a
-         SET logical_symbol_id = ({DERIVED}),
-             resolved = CASE WHEN ({DERIVED}) IS NOT NULL THEN 1 ELSE 0 END
+         SET logical_symbol_id = ({derived}),
+             resolved = CASE WHEN ({derived}) IS NOT NULL THEN 1 ELSE 0 END
          WHERE a.repo_id = ?1 AND a.anchor_kind = 'symbol' AND a.selected = 1
-           AND ({DERIVED}) IS NOT a.logical_symbol_id
-           AND (a.logical_symbol_id IS NULL OR NOT EXISTS ({STORED_HANDLE_STILL_NAMES_IT}))"
+           AND ({derived}) IS NOT a.logical_symbol_id
+           AND (a.logical_symbol_id IS NULL OR NOT EXISTS ({stored_handle_still_names_it}))"
     );
     let changed = conn.execute(&sql, params![repo_id, generation])?;
     if changed > 0 {

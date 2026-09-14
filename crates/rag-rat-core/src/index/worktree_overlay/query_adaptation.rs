@@ -1,6 +1,8 @@
 use rag_rat_base::checkout::CheckoutRef;
+use rag_rat_db::schema::TOMBSTONE_FILE_KIND;
 
 use super::*;
+use crate::index::discovery::IndexedIdentity;
 
 impl IndexDatabase {
     /// Whether a live (non-deleted) OVERLAY source row for `path` exists in `worktree_id`'s scope —
@@ -12,8 +14,11 @@ impl IndexDatabase {
         checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-             commit_sha = ?5 AND worktree_id = ?3 AND kind != 'deleted' AND generation = ?4)",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
+                 commit_sha = ?5 AND worktree_id = ?3 AND kind != '{TOMBSTONE_FILE_KIND}' AND \
+                 generation = ?4)"
+            ),
             params![
                 self.active_repo_id,
                 path_string(path),
@@ -35,8 +40,11 @@ impl IndexDatabase {
         checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-             commit_sha = ?5 AND worktree_id = ?3 AND kind = 'deleted' AND generation = ?4)",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
+                 commit_sha = ?5 AND worktree_id = ?3 AND kind = '{TOMBSTONE_FILE_KIND}' AND \
+                 generation = ?4)"
+            ),
             params![
                 self.active_repo_id,
                 path_string(path),
@@ -56,8 +64,11 @@ impl IndexDatabase {
         checkout: CheckoutRef<'_>,
     ) -> anyhow::Result<bool> {
         Ok(self.storage.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
-             commit_sha = ?3 AND worktree_id = ?5 AND kind != 'deleted' AND generation = ?4)",
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM main.files WHERE repo_id = ?1 AND path = ?2 AND \
+                 commit_sha = ?3 AND worktree_id = ?5 AND kind != '{TOMBSTONE_FILE_KIND}' AND \
+                 generation = ?4)"
+            ),
             params![
                 self.active_repo_id,
                 path_string(path),
@@ -120,8 +131,8 @@ impl IndexDatabase {
         Ok(paths)
     }
 
-    /// Existing file rows in a scope as `path → (sha256, language, kind)` — for the identity-aware
-    /// idle-safe skip above. A direct `main.files` probe (bypasses the repo-scoped view), so it
+    /// Existing file rows in a scope as `path → identity` — for the identity-aware idle-safe skip
+    /// above. A direct `main.files` probe (bypasses the repo-scoped view), so it
     /// carries the `repo_id` predicate explicitly (A3): today's sole caller passes a non-empty
     /// (path-derived, globally unique) `worktree_id`, but this is the documented reusable primitive
     /// — a base-scope caller (`commit_sha`, `''`) would otherwise skip files on the strength of a
@@ -129,19 +140,16 @@ impl IndexDatabase {
     pub(super) fn scope_file_identities(
         &self,
         checkout: CheckoutRef<'_>,
-    ) -> anyhow::Result<HashMap<String, (String, String, String)>> {
+    ) -> anyhow::Result<HashMap<String, IndexedIdentity>> {
         let CheckoutRef { commit_sha, worktree_id } = checkout;
         let conn = self.storage.connection();
         let mut stmt = conn.prepare(
             "SELECT path, sha256, language, kind FROM main.files
              WHERE repo_id = ?1 AND commit_sha = ?2 AND worktree_id = ?3",
         )?;
-        let rows =
-            stmt.query_map(params![self.active_repo_id, commit_sha, worktree_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?),
-                ))
+        let rows = stmt
+            .query_map(params![self.active_repo_id, commit_sha, worktree_id], |row| {
+                Ok((row.get::<_, String>(0)?, IndexedIdentity::from_row(row, 1)?))
             })?;
         rows.collect::<Result<HashMap<_, _>, _>>().map_err(Into::into)
     }
@@ -174,11 +182,11 @@ impl IndexDatabase {
         // Base-scope identity: path → (language, kind).
         let base_identity: HashMap<PathBuf, (String, String)> = {
             let conn = self.storage.connection();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT path, language, kind FROM main.files
                  WHERE repo_id = ?1 AND commit_sha = ?2 AND worktree_id = '' AND generation = ?3
-                   AND kind != 'deleted'",
-            )?;
+                   AND kind != '{TOMBSTONE_FILE_KIND}'",
+            ))?;
             stmt.query_map(params![self.active_repo_id, base_sha, self.active_generation], |row| {
                 Ok((
                     PathBuf::from(row.get::<_, String>(0)?),

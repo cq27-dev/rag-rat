@@ -19,6 +19,64 @@ pub(crate) struct HistoryCursors {
     pub(super) complete: bool,
 }
 
+impl HistoryCursors {
+    /// The four `repo_meta` keys the snapshot persists under.
+    const KEYS: [&str; 4] = [
+        GIT_HISTORY_INDEXED_HEAD_META,
+        GIT_HISTORY_INDEXED_ROOT_META,
+        GIT_HISTORY_INDEXED_SHALLOW_META.key,
+        GIT_HISTORY_INDEXED_COMPLETE_META.key,
+    ];
+
+    /// Persist the snapshot for `repo_id`.
+    fn write(&self, conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
+        set_repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_HEAD_META, &self.head)?;
+        set_repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_ROOT_META, &self.root_key)?;
+        set_repo_meta_bool(conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META, self.shallow)?;
+        set_repo_meta_bool(conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, self.complete)
+    }
+
+    /// The stored snapshot for `repo_id`, complete or not — `None` when any key is unset or a
+    /// flag holds an unrecognized value.
+    fn read(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<Self>> {
+        let Some(head) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_HEAD_META)? else {
+            return Ok(None);
+        };
+        let Some(root_key) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_ROOT_META)? else {
+            return Ok(None);
+        };
+        let Some(shallow) = repo_meta_bool(conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META)? else {
+            return Ok(None);
+        };
+        let Some(complete) = repo_meta_bool(conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self { head, root_key, shallow, complete }))
+    }
+
+    /// Delete the snapshot's keys for `repo_id`.
+    fn clear(conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
+        for key in Self::KEYS {
+            delete_repo_meta(conn, repo_id, key)?;
+        }
+        Ok(())
+    }
+
+    /// `{head}|{root_key}|{shallow}|{complete}`, the flags in their stored spelling. Derived tables
+    /// compare this against a copy folded into their own stamp, so the format is persisted.
+    fn freshness_key(&self) -> String {
+        let flag = |key: BoolMetaKey, value| key.spelling.encode(value);
+        format!(
+            "{}|{}|{}|{}",
+            self.head,
+            self.root_key,
+            flag(GIT_HISTORY_INDEXED_SHALLOW_META, self.shallow),
+            flag(GIT_HISTORY_INDEXED_COMPLETE_META, self.complete)
+        )
+    }
+}
+
 /// Write the reload-gate cursors — the LAST step of a history apply, split out so the full
 /// rebuild can defer it into the terminal flip transaction while incremental/recovery paths write
 /// it immediately after their rows (live-in-place semantics).
@@ -27,20 +85,18 @@ pub(crate) fn record_history_cursors(
     cursors: &HistoryCursors,
 ) -> anyhow::Result<()> {
     let repo_id = schema::active_repo_id(conn)?;
-    set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_HEAD_META, &cursors.head)?;
-    set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_ROOT_META, &cursors.root_key)?;
-    set_repo_meta(
-        conn,
-        &repo_id,
-        GIT_HISTORY_INDEXED_SHALLOW_META,
-        if cursors.shallow { "1" } else { "0" },
-    )?;
-    let complete = if cursors.complete { "1" } else { "0" };
-    set_repo_meta(conn, &repo_id, GIT_HISTORY_INDEXED_COMPLETE_META, complete)?;
+    cursors.write(conn, &repo_id)?;
     // Coupling's stamp includes the complete cursor snapshot, so materialize only after all four
-    // cursor keys are published. Production callers own the surrounding history transaction.
+    // cursor keys are published.
+    settle_history_derived(conn, &repo_id)
+}
+
+/// Bring what is derived from the history cursors up to date after they moved (written or
+/// cleared): recompute the coupling table against the new snapshot and bump the Lens lanes it
+/// feeds. Production callers own the surrounding history transaction.
+fn settle_history_derived(conn: &Connection, repo_id: &str) -> anyhow::Result<()> {
     crate::index::change_coupling::ensure_coupling_fresh(conn, rag_rat_base::time::now_ms())?;
-    bump_lens_revisions(conn, &repo_id, &[
+    bump_lens_revisions(conn, repo_id, &[
         LENS_ENRICHMENT_REVISION_META,
         LENS_COUPLING_REVISION_META,
     ])?;
@@ -251,37 +307,11 @@ fn insert_history_rows(
     Ok(())
 }
 
-fn raw_history_cursors(conn: &Connection, repo_id: &str) -> anyhow::Result<Option<HistoryCursors>> {
-    let Some(head) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_HEAD_META)? else {
-        return Ok(None);
-    };
-    let Some(root_key) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_ROOT_META)? else {
-        return Ok(None);
-    };
-    let Some(shallow) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_SHALLOW_META)? else {
-        return Ok(None);
-    };
-    let shallow = match shallow.as_str() {
-        "0" => false,
-        "1" => true,
-        _ => return Ok(None),
-    };
-    let Some(complete) = repo_meta(conn, repo_id, GIT_HISTORY_INDEXED_COMPLETE_META)? else {
-        return Ok(None);
-    };
-    let complete = match complete.as_str() {
-        "0" => false,
-        "1" => true,
-        _ => return Ok(None),
-    };
-    Ok(Some(HistoryCursors { head, root_key, shallow, complete }))
-}
-
 pub(super) fn history_cursors(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<HistoryCursors>> {
-    Ok(raw_history_cursors(conn, repo_id)?.filter(|cursor| cursor.complete))
+    Ok(HistoryCursors::read(conn, repo_id)?.filter(|cursor| cursor.complete))
 }
 
 /// The STORED git-history freshness key for `repo_id` — the exact `(head, root_key, shallow,
@@ -295,12 +325,7 @@ pub(crate) fn history_freshness_key(
     conn: &Connection,
     repo_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    Ok(raw_history_cursors(conn, repo_id)?.map(|cursor| {
-        format!(
-            "{}|{}|{}|{}",
-            cursor.head, cursor.root_key, cursor.shallow as u8, cursor.complete as u8
-        )
-    }))
+    Ok(HistoryCursors::read(conn, repo_id)?.map(|cursor| cursor.freshness_key()))
 }
 
 fn expected_history_cursors_match(
@@ -366,18 +391,6 @@ fn clear(conn: &Connection) -> anyhow::Result<()> {
     delete_repo_chunk_blame(conn, &repo_id)?;
     rag_rat_db::schema::rebuild_commit_fts(conn)?;
     // The reload-gate keys moved to `repo_meta` (V039); clear them for the active repo.
-    for key in [
-        GIT_HISTORY_INDEXED_HEAD_META,
-        GIT_HISTORY_INDEXED_ROOT_META,
-        GIT_HISTORY_INDEXED_SHALLOW_META,
-        GIT_HISTORY_INDEXED_COMPLETE_META,
-    ] {
-        delete_repo_meta(conn, &repo_id, key)?;
-    }
-    crate::index::change_coupling::ensure_coupling_fresh(conn, rag_rat_base::time::now_ms())?;
-    bump_lens_revisions(conn, &repo_id, &[
-        LENS_ENRICHMENT_REVISION_META,
-        LENS_COUPLING_REVISION_META,
-    ])?;
-    Ok(())
+    HistoryCursors::clear(conn, &repo_id)?;
+    settle_history_derived(conn, &repo_id)
 }

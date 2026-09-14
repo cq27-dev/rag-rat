@@ -4,7 +4,9 @@
 use rag_rat_base::checkout::CheckoutRef;
 use rag_rat_base::paths::path_string;
 use rag_rat_base::time::now_ms;
+use rag_rat_db::schema::{TOMBSTONE_FILE_KIND, TOMBSTONE_FILE_LANGUAGE};
 
+use super::discovery::IndexedIdentity;
 use super::*;
 
 /// The target identity of an indexed file row — what a heal re-parses the file as.
@@ -30,15 +32,11 @@ pub(super) struct ScopeRowState {
     /// guard false-positive-free: the row's OWN prior stamp is always older-or-equal (edits only
     /// advance mtime), and a tombstone's `modified_at_ms = 0` never blocks a resurrection.
     pub(super) modified_at_ms: i64,
-    /// With `language` and `kind`, the identity the explicit-path no-op skip compares (#659
-    /// review): a CLEAN/reverted `index --paths` file matches and is not needlessly
-    /// removed+reinserted. `language`/`kind` are included so a TARGET identity change with
-    /// UNCHANGED bytes (an extension-precedence upgrade re-languages a path) is NOT skipped —
-    /// mirroring discovery's `(sha256, language, kind)` staleness
-    /// ([`super::discovery::target_for_path`] drift).
-    pub(super) sha256: String,
-    pub(super) language: String,
-    pub(super) kind: String,
+    /// The identity the explicit-path no-op skip compares (#659 review): a CLEAN/reverted
+    /// `index --paths` file matches and is not needlessly removed+reinserted, while a TARGET
+    /// identity change with UNCHANGED bytes (an extension-precedence upgrade re-languages a path)
+    /// is not skipped.
+    pub(super) identity: IndexedIdentity,
 }
 
 impl IndexDatabase {
@@ -151,6 +149,17 @@ impl IndexDatabase {
         Ok(())
     }
 
+    /// The scope a file row lands in: the worktree OVERLAY when the working tree dirtied the file
+    /// — or when there is no base commit to key a committed row by — otherwise the active commit.
+    /// The one statement of this rule for the indexing passes and the read-path heal.
+    pub(super) fn scope_for(&self, is_dirty: bool) -> CheckoutKey {
+        if is_dirty || self.active_commit_sha.is_empty() {
+            CheckoutKey::worktree(self.active_worktree_id.clone())
+        } else {
+            CheckoutKey::commit(self.active_commit_sha.clone())
+        }
+    }
+
     pub(super) fn mark_file_deleted(&self, path: &Path) -> anyhow::Result<()> {
         self.write_tombstone_in_scope(path, &self.active_worktree_id)
     }
@@ -169,14 +178,17 @@ impl IndexDatabase {
         let path = path_string(path);
         self.remove_file_in_scope(Path::new(&path), CheckoutRef::worktree(worktree_id))?;
         self.storage.connection().execute(
-            "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
-             indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id, generation)
-             VALUES (?1, 'unknown', 'deleted', '', 0, 0, ?2, '', '', ?3, ?4, ?5)
+            &format!(
+                "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, generated, \
+                 indexed_at_ms, indexed_revision, commit_sha, worktree_id, repo_id, generation)
+             VALUES (?1, '{TOMBSTONE_FILE_LANGUAGE}', '{TOMBSTONE_FILE_KIND}', '', 0, 0, ?2, '', \
+                 '', ?3, ?4, ?5)
              ON CONFLICT(repo_id, path, commit_sha, worktree_id, generation) DO UPDATE SET
-                kind = 'deleted',
+                kind = '{TOMBSTONE_FILE_KIND}',
                 sha256 = '',
                 modified_at_ms = 0,
-                indexed_at_ms = excluded.indexed_at_ms",
+                indexed_at_ms = excluded.indexed_at_ms"
+            ),
             // A6: the tombstone lands on the connection's live generation, and the ON CONFLICT
             // target matches the V043 UNIQUE (repo_id, path, commit_sha, worktree_id,
             // generation).
@@ -204,8 +216,6 @@ impl IndexDatabase {
         self.stage_logical_rederive_path(&path)?;
         // Direct edges_data writes (#79): these statements touch up to every in-edge of a file's
         // symbols, so they must not pay the view triggers' per-row dictionary probes.
-        // 'NameOnly' is the EdgeConfidence demotion the resolver applies to a target-less edge.
-        let name_only_id = edges::intern_edge_string(self.storage.connection(), "NameOnly")?;
         let repo_id = self.active_repo_id.as_str();
         // Every delete below carries the WRITER'S generation (A6, P2 review): the V043 UNIQUE
         // admits one row per (repo, path, commit, worktree) PER GENERATION, so a scope key alone
@@ -223,20 +233,16 @@ impl IndexDatabase {
         // at FILE granularity (round up in-edge → its source file), so the whole write set
         // stays one file-id set. No-op unless armed by `begin_scoped_edge_rewrite`.
         self.stage_edge_rewrite_inedge_sources(&path, repo_id, generation)?;
-        self.storage.connection().execute(
-            "UPDATE edges_data
-             SET to_symbol_id = NULL,
-                 confidence_id = ?4
-             WHERE to_symbol_id IN (
-                 SELECT symbols.id FROM symbols
-                 JOIN main.files ON main.files.id = symbols.file_id
-                 WHERE main.files.path = ?1
-                   AND main.files.commit_sha = ?2
-                   AND main.files.worktree_id = ?3
-                   AND main.files.repo_id = ?5
-                   AND main.files.generation = ?6
-             )",
-            params![path, commit_sha, worktree_id, name_only_id, repo_id, generation],
+        edges::dangle_edges_to(
+            self.storage.connection(),
+            "SELECT symbols.id FROM symbols
+             JOIN main.files ON main.files.id = symbols.file_id
+             WHERE main.files.path = ?1
+               AND main.files.commit_sha = ?2
+               AND main.files.worktree_id = ?3
+               AND main.files.repo_id = ?4
+               AND main.files.generation = ?5",
+            params![path, commit_sha, worktree_id, repo_id, generation],
         )?;
         self.storage.connection().execute(
             "DELETE FROM edges_data
@@ -387,9 +393,7 @@ impl IndexDatabase {
                 |row| {
                     Ok(ScopeRowState {
                         modified_at_ms: row.get(0)?,
-                        sha256: row.get(1)?,
-                        language: row.get(2)?,
-                        kind: row.get(3)?,
+                        identity: IndexedIdentity::from_row(row, 1)?,
                     })
                 },
             )
@@ -523,21 +527,23 @@ impl IndexDatabase {
         include_retained_commit_fallback: bool,
     ) -> anyhow::Result<usize> {
         let count = self.storage.connection().query_row(
-            "SELECT COUNT(*) FROM (
+            &format!(
+                "SELECT COUNT(*) FROM (
                  SELECT path FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2
-                   AND worktree_id = ?3 AND worktree_id != '' AND kind != 'deleted'
+                   AND worktree_id = ?3 AND worktree_id != '' AND kind != '{TOMBSTONE_FILE_KIND}'
                  UNION
                  SELECT path FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2
-                   AND worktree_id = '' AND kind != 'deleted'
+                   AND worktree_id = '' AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND (
                        commit_sha = ?4
                        OR (
                            ?5 AND ?4 != '' AND commit_sha != '' AND NOT EXISTS (
                                SELECT 1 FROM main.files
                                WHERE repo_id = ?1 AND generation = ?2
-                                 AND worktree_id = '' AND commit_sha = ?4 AND kind != 'deleted'
+                                 AND worktree_id = '' AND commit_sha = ?4 AND kind != \
+                 '{TOMBSTONE_FILE_KIND}'
                            )
                        )
                    )
@@ -546,7 +552,8 @@ impl IndexDatabase {
                        WHERE repo_id = ?1 AND generation = ?2
                          AND worktree_id = ?3 AND worktree_id != ''
                    )
-             )",
+             )"
+            ),
             params![
                 self.active_repo_id,
                 self.active_generation,

@@ -545,7 +545,7 @@ pub(crate) fn prepare_index_content_from_text(
     let parsed =
         structural_eligible.then(|| parser::parse_file(relative_path, language, text)).flatten();
 
-    let symbols = parsed.as_ref().map(|p| symbols::from_parsed(&p.symbols)).unwrap_or_default();
+    let symbols = parsed.as_ref().map(|p| p.symbols.as_slice()).unwrap_or_default();
 
     // Preserve the historical failure signal: a clean parse → None, error nodes → the message, and
     // a hard parse failure on otherwise-eligible code → an error (matches the old parse_error
@@ -582,7 +582,7 @@ pub(crate) fn prepare_index_content_from_text(
     // index, remapped to the real DB id at insert time. Empty when there's no structural parse.
     let edge_candidates = match &parsed {
         Some(p) => {
-            let local = edges::IndexedSymbol::local_from_prepared(language, &symbols);
+            let local = edges::IndexedSymbol::local_from_prepared(language, symbols);
             edges::edge_candidates_from_root(relative_path, language, text, p.root(), &local)
         },
         None => Vec::new(),
@@ -622,7 +622,7 @@ pub(crate) fn prepare_index_content_from_text(
         modified_at_ms,
         sha256,
         chunks,
-        symbols,
+        symbols: parsed.map(|p| p.symbols).unwrap_or_default(),
         edge_candidates,
         symbol_fingerprints,
         parser_failure,

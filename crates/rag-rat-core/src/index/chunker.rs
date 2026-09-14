@@ -131,7 +131,7 @@ pub fn code_chunks_for_symbols(
             continue;
         }
         for (part_idx, part) in
-            split_symbol(span_text, span_start, symbol.start_line, SYMBOL_SPLIT_LINES)
+            split_span_into_parts(span_text, span_start, symbol.start_line, SYMBOL_SPLIT_LINES)
                 .into_iter()
                 .enumerate()
         {
@@ -188,29 +188,41 @@ fn uncovered_code_chunks(
                 path,
                 text,
                 lines,
-                start,
-                line.saturating_sub(1),
-                chunks.len(),
+                UncoveredSpan {
+                    start_line: start,
+                    end_line: line.saturating_sub(1),
+                    context_index: chunks.len(),
+                },
                 &mut chunks,
             );
         }
     }
     if let Some(start) = start_line {
-        push_uncovered_chunk(path, text, lines, start, line_count, chunks.len(), &mut chunks);
+        push_uncovered_chunk(
+            path,
+            text,
+            lines,
+            UncoveredSpan { start_line: start, end_line: line_count, context_index: chunks.len() },
+            &mut chunks,
+        );
     }
     chunks
 }
 
-#[allow(clippy::too_many_arguments)]
+struct UncoveredSpan {
+    start_line: usize,
+    end_line: usize,
+    context_index: usize,
+}
+
 fn push_uncovered_chunk(
     path: &Path,
     text: &str,
     lines: &LineOffsets,
-    start_line: usize,
-    end_line: usize,
-    context_index: usize,
+    span: UncoveredSpan,
     chunks: &mut Vec<Chunk>,
 ) {
+    let UncoveredSpan { start_line, end_line, context_index } = span;
     let Some(range) = lines.byte_range(start_line, end_line) else {
         return;
     };
@@ -220,7 +232,7 @@ fn push_uncovered_chunk(
         return;
     }
     for (part_idx, part) in
-        split_symbol(span_text, span_start, start_line, UNCOVERED_SPAN_SPLIT_LINES)
+        split_span_into_parts(span_text, span_start, start_line, UNCOVERED_SPAN_SPLIT_LINES)
             .into_iter()
             .enumerate()
     {
@@ -244,8 +256,8 @@ fn push_uncovered_chunk(
 /// Byte offsets of each line start, computed once per file so a line range becomes an O(1)
 /// byte-range lookup — replacing the per-symbol from-byte-0 rescan that made chunking
 /// O(symbols × file bytes) (#517). The range slices the raw on-disk bytes (incl. any CRLF), so a
-/// span's length equals its real byte length; `split_symbol` re-normalizes each line when it
-/// builds chunk text, and advances its byte cursor over these raw lengths so code-chunk offsets
+/// span's length equals its real byte length; `split_span_into_parts` re-normalizes each line when
+/// it builds chunk text, and advances its byte cursor over these raw lengths so code-chunk offsets
 /// stay aligned with the tree-sitter symbol offsets `query::graph_meta` joins against.
 pub(crate) struct LineOffsets {
     /// `starts[i]` is the byte offset where 1-based line `i + 1` begins. A trailing `\n` closes
@@ -301,43 +313,20 @@ fn whole_file_chunk(path: &Path, text: &str) -> Vec<Chunk> {
 }
 
 fn split_text_chunks(path: &Path, kind: ChunkKind, text: &str, max_lines: usize) -> Vec<Chunk> {
-    let mut chunks = Vec::new();
-    let mut start_line = 1;
-    let mut start_byte = 0;
-    let mut byte = 0;
-    let mut buffer = String::new();
-    for (idx, raw) in text.split_inclusive('\n').enumerate() {
-        let line = raw.trim_end_matches('\n').trim_end_matches('\r');
-        buffer.push_str(line);
-        buffer.push('\n');
-        byte += raw.len();
-        let line_no = idx + 1;
-        if line_no - start_line + 1 >= max_lines {
-            chunks.push(make_chunk(
+    split_span_into_parts(text, 0, 1, max_lines)
+        .into_iter()
+        .map(|part| {
+            make_chunk(
                 kind,
                 path.file_name().map(|name| name.to_string_lossy().to_string()),
-                start_byte,
-                byte,
-                start_line,
-                line_no,
-                std::mem::take(&mut buffer),
-            ));
-            start_byte = byte;
-            start_line = line_no + 1;
-        }
-    }
-    if !buffer.trim().is_empty() {
-        chunks.push(make_chunk(
-            kind,
-            path.file_name().map(|name| name.to_string_lossy().to_string()),
-            start_byte,
-            text.len(),
-            start_line,
-            text.lines().count().max(start_line),
-            buffer,
-        ));
-    }
-    chunks
+                part.start_byte,
+                part.end_byte,
+                part.start_line,
+                part.end_line,
+                part.text,
+            )
+        })
+        .collect()
 }
 
 fn make_chunk(
@@ -382,7 +371,7 @@ struct ChunkPart {
     text: String,
 }
 
-fn split_symbol(
+fn split_span_into_parts(
     text: &str,
     base_byte: usize,
     base_line: usize,

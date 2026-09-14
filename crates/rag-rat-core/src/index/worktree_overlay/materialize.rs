@@ -418,7 +418,7 @@ impl IndexDatabase {
         // Existing rows in this scope (path → identity) so an UNCHANGED file is skipped: re-running
         // the overlay on a static worktree then writes nothing, so the watcher can refresh overlays
         // every maintenance pass without churn — preserving the idle backstop (#63) and not
-        // tripping the self-sustaining re-index loop. The identity is `(sha256, language, kind)`,
+        // tripping the self-sustaining re-index loop. The identity is the full `IndexedIdentity`,
         // not sha alone: a branch config change that RE-LANGUAGES a byte-identical file
         // must still rewrite the overlay row, mirroring discovery / the base `Paths` flow's
         // staleness (#659).
@@ -432,12 +432,9 @@ impl IndexDatabase {
             let Some((language, kind)) = target_for_path(config, rel) else {
                 continue;
             };
-            if existing.get(path_string(rel).as_str())
-                == Some(&(
-                    hex_sha256(&bytes),
-                    language.as_db_str().to_string(),
-                    kind.as_db_str().to_string(),
-                ))
+            if existing
+                .get(path_string(rel).as_str())
+                .is_some_and(|identity| identity.matches(&hex_sha256(&bytes), language, kind))
             {
                 continue; // unchanged since the last overlay index (content AND target identity)
             }

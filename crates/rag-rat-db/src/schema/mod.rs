@@ -34,6 +34,17 @@ use crate::hooks::MigrationHooks;
 
 pub const LATEST_SCHEMA_VERSION: u32 = 129;
 
+/// The `files.kind` token of a deletion tombstone — the row `mark_file_deleted` /
+/// `write_tombstone_in_scope` leave for a path the checkout no longer serves. It is outside
+/// `TargetKind`'s token set, so a reader of raw `main.files` (or of the bare-open view, which does
+/// not filter tombstones) must exclude it before parsing `kind`. Persisted: SQL predicates, the
+/// scope view and the `content_digest` triggers all spell it through this constant.
+pub const TOMBSTONE_FILE_KIND: &str = "deleted";
+
+/// The `files.language` token a deletion tombstone carries — outside `Language`'s token set, for
+/// the same reason as [`TOMBSTONE_FILE_KIND`].
+pub const TOMBSTONE_FILE_LANGUAGE: &str = "unknown";
+
 /// Every oracle-DERIVED persisted table — the outputs an `oracle run` writes that must OUTLIVE a
 /// reindex.
 ///
@@ -2098,5 +2109,24 @@ mod migration_arming {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tombstone_tokens {
+    use rag_rat_base::config::TargetKind;
+    use rag_rat_base::language::Language;
+
+    use super::{TOMBSTONE_FILE_KIND, TOMBSTONE_FILE_LANGUAGE};
+
+    /// Both tokens are persisted in every index, so they must never change — and they must stay
+    /// outside the vocabularies a live row parses under, or a tombstone would read back as a
+    /// target.
+    #[test]
+    fn tombstone_tokens_are_pinned_and_unparseable_as_a_target() {
+        assert_eq!(TOMBSTONE_FILE_KIND, "deleted");
+        assert_eq!(TOMBSTONE_FILE_LANGUAGE, "unknown");
+        assert!(TOMBSTONE_FILE_KIND.parse::<TargetKind>().is_err());
+        assert!(TOMBSTONE_FILE_LANGUAGE.parse::<Language>().is_err());
     }
 }

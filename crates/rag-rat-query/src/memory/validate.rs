@@ -1,5 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
+use rag_rat_db::schema::TOMBSTONE_FILE_KIND;
+
 use super::*;
 
 pub(crate) fn validate_binding(
@@ -995,8 +997,10 @@ pub(crate) fn validate_path_binding(
     // the binding stayed `current` forever behind it.
     let current_hash = conn
         .query_row(
-            "SELECT sha256 FROM files WHERE path = ?1 AND kind != 'deleted'
-             ORDER BY id DESC LIMIT 1",
+            &format!(
+                "SELECT sha256 FROM files WHERE path = ?1 AND kind != '{TOMBSTONE_FILE_KIND}'
+             ORDER BY id DESC LIMIT 1"
+            ),
             [path],
             |row| row.get::<_, String>(0),
         )
@@ -1098,10 +1102,12 @@ fn path_is_live_in_another_scope(conn: &Connection, path: &str) -> anyhow::Resul
     let live_generation = rag_rat_db::schema::live_files_generation(conn, &active_repo_id)?;
     let active_worktree = context_worktree_id(conn);
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM main.files
-                       WHERE path = ?1 AND kind != 'deleted' AND repo_id = ?2
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM main.files
+                       WHERE path = ?1 AND kind != '{TOMBSTONE_FILE_KIND}' AND repo_id = ?2
                          AND generation = ?3
-                         AND worktree_id != '' AND worktree_id != ?4)",
+                         AND worktree_id != '' AND worktree_id != ?4)"
+        ),
         params![path, active_repo_id, live_generation, active_worktree],
         |r| r.get::<_, i64>(0),
     )? != 0)

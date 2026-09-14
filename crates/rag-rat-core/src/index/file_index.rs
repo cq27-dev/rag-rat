@@ -77,13 +77,7 @@ impl IndexDatabase {
                 return self.mark_file_deleted(path);
             };
 
-            let is_dirty = changes.changed.contains(path);
-            let has_base_commit = !self.active_commit_sha.is_empty();
-            let scope = if !has_base_commit || is_dirty {
-                CheckoutKey::worktree(self.active_worktree_id.clone())
-            } else {
-                CheckoutKey::commit(self.active_commit_sha.clone())
-            };
+            let scope = self.scope_for(changes.changed.contains(path));
             self.remove_file_in_scope(path, scope.borrowed())?;
 
             self.index_file(

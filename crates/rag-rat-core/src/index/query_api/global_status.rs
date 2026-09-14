@@ -224,7 +224,7 @@ fn read_global_fts_status(conn: &Connection) -> anyhow::Result<GlobalFtsStatus> 
     let content_revision = read_meta(conn, "content_revision")?;
     let fts_source_revision = read_meta(conn, "fts_source_revision")?;
     let fts_synced_at_ms = meta::read_meta_i64(conn, "fts_synced_at_ms")?;
-    let fts_dirty = read_meta(conn, "fts_dirty")?.as_deref() == Some("true");
+    let fts_dirty = meta::read_meta_bool(conn, meta::FTS_DIRTY_META)? == Some(true);
     let fts_fresh =
         !fts_dirty && content_revision.is_some() && fts_source_revision == content_revision;
     Ok(GlobalFtsStatus {
@@ -267,7 +267,7 @@ fn repo_status(conn: &Connection, repo: RegisteredRepo) -> anyhow::Result<RepoSt
 fn read_repo_freshness(conn: &Connection, repo_id: &str) -> anyhow::Result<RepoFreshness> {
     Ok(RepoFreshness {
         indexed_head: repo_meta(conn, repo_id, "git_commit")?,
-        git_dirty: repo_meta(conn, repo_id, "git_dirty")?.map(|value| value == "true"),
+        git_dirty: meta::repo_meta_bool(conn, repo_id, meta::GIT_DIRTY_META)?,
         indexed_at_ms: repo_meta(conn, repo_id, "indexed_at_ms")?
             .and_then(|value| value.parse().ok()),
         live_files_generation: schema::live_files_generation(conn, repo_id)?,
@@ -287,10 +287,11 @@ fn list_repo_worktree_overlays(
     repo_id: &str,
     live_generation: i64,
 ) -> anyhow::Result<Vec<WorktreeOverlay>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT worktree_id, COUNT(*) FROM main.files WHERE repo_id = ?1 AND generation = ?2 AND \
-         worktree_id != '' AND kind != 'deleted' GROUP BY worktree_id ORDER BY worktree_id",
-    )?;
+         worktree_id != '' AND kind != '{}' GROUP BY worktree_id ORDER BY worktree_id",
+        schema::TOMBSTONE_FILE_KIND
+    ))?;
     let overlays = stmt
         .query_map(params![repo_id, live_generation], |row| {
             Ok(WorktreeOverlay {
@@ -408,8 +409,11 @@ fn count_repo_content(
     Ok(RepoContent {
         files: count_live_files(
             conn,
-            "SELECT COUNT(*) FROM main.files WHERE repo_id = ?1 AND generation = ?2 AND kind != \
-             'deleted'",
+            &format!(
+                "SELECT COUNT(*) FROM main.files WHERE repo_id = ?1 AND generation = ?2 AND kind \
+                 != '{}'",
+                schema::TOMBSTONE_FILE_KIND
+            ),
             repo_id,
             live_generation,
         )?,

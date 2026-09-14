@@ -569,61 +569,7 @@ impl IndexDatabase {
             // re-resolves so a carried caller's edge re-points at re-derived rowids
             // (#502).
             if effects.any_rows_written() || effects.roots_changed {
-                // #820: a batch whose EVERY change was a key-stable file replacement keeps the
-                // grouped table correct by re-linking members inside this same transaction —
-                // the wholesale rebuild is owed only when a key set changed, or when the pass
-                // mutated grouping-relevant state OUTSIDE the per-file plan (an overlay heal
-                // moves symbols across scopes; a carry re-stamps scope rows; a package-map
-                // change keeps today's rebuild coupling). A pre-existing #819 obligation is
-                // untouched either way — the pass's tail settle below still consumes it.
-                let key_stable_relinks = match logical {
-                    graph_index::LogicalGroupingUpkeep::RelinkMembers(relinks)
-                        if effects.base_files_only() =>
-                        Some(relinks),
-                    _ => None,
-                };
-                match key_stable_relinks {
-                    Some(relinks) => self.apply_logical_member_relinks(&relinks)?,
-                    None => {
-                        progress(IndexProgress::RebuildingLogicalSymbols);
-                        // #826: re-derive ONLY the changed paths' logical groups (staged in
-                        // `temp.logical_rederive_paths`) instead of the whole repo, UNLESS a #493
-                        // drift heal (key-version lag) or a #819 deferred whole-repo rebuild is
-                        // owed — both of which the scoped path cannot
-                        // serve, so they keep the full rebuild.
-                        // A carry / roots-change reaches here (their guard above excludes the
-                        // relink) but does not move any grouping, so its
-                        // captured set is empty and the scoped re-derive is
-                        // a correct no-op; a heal's removed paths ARE captured (via
-                        // `remove_file_in_scope`), so they regroup. Defer: a partial pass must not
-                        // stamp the logical-key version — untouched files' drift is still future.
-                        if self.can_scope_logical_rederive()? {
-                            self.rederive_changed_logical_symbols()?;
-                        } else {
-                            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
-                        }
-                    },
-                }
-                progress(IndexProgress::ResolvingGraph);
-                // #827: narrow the re-resolve to this pass's staged changed files + the source
-                // files of the in-edges its removals NULLed
-                // (`temp.edge_rewrite_files`) — but ONLY when the pass's mutations
-                // are purely per-file symbol/edge changes. A package-map change
-                // (`roots_changed`), a carried scope (`carried`), or an overlay heal (`healed`) can
-                // shift how edges in UNCHANGED files resolve (import scope / row visibility), which
-                // a narrowed write set would silently under-resolve — those keep
-                // the full active-scope pass. The narrowed set re-points every
-                // existing edge (no `find_callers` loss); only a purely NEW binding
-                // from an unchanged source is deferred to the next full pass.
-                let scoped_resolve = indexed > 0 && effects.base_files_only();
-                if scoped_resolve {
-                    self.resolve_changed_edges()?;
-                } else {
-                    self.resolve_edges()?;
-                }
-                self.mark_graph_index_current()?;
-                progress(IndexProgress::SyncingFts);
-                self.sync_fts()?;
+                self.rederive_after_pass(&effects, logical, progress)?;
             }
             // #827: disarm capture for this connection (the staged rows are consumed by the resolve
             // above; the next pass's `begin_scoped_edge_rewrite` clears them). Runs whether or not
@@ -650,6 +596,76 @@ impl IndexDatabase {
         result
     }
 
+    /// The incremental pass's re-derive tail, inside [`Self::apply_pass`]'s transaction: regroup
+    /// logical symbols (relink, scoped re-derive or rebuild), re-resolve edges (narrowed or full),
+    /// mark the graph current and sync FTS. Each gate reads what the pass mutated (`effects`) and
+    /// the batch's grouping verdict (`logical`); statement order is the transaction's contract.
+    fn rederive_after_pass<F>(
+        &self,
+        effects: &PassEffects,
+        logical: graph_index::LogicalGroupingUpkeep,
+        progress: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(IndexProgress),
+    {
+        // #820: a batch whose EVERY change was a key-stable file replacement keeps the
+        // grouped table correct by re-linking members inside this same transaction —
+        // the wholesale rebuild is owed only when a key set changed, or when the pass
+        // mutated grouping-relevant state OUTSIDE the per-file plan (an overlay heal
+        // moves symbols across scopes; a carry re-stamps scope rows; a package-map
+        // change keeps today's rebuild coupling). A pre-existing #819 obligation is
+        // untouched either way — the pass's tail settle still consumes it.
+        let key_stable_relinks = match logical {
+            graph_index::LogicalGroupingUpkeep::RelinkMembers(relinks)
+                if effects.base_files_only() =>
+                Some(relinks),
+            _ => None,
+        };
+        match key_stable_relinks {
+            Some(relinks) => self.apply_logical_member_relinks(&relinks)?,
+            None => {
+                progress(IndexProgress::RebuildingLogicalSymbols);
+                // #826: re-derive ONLY the changed paths' logical groups (staged in
+                // `temp.logical_rederive_paths`) instead of the whole repo, UNLESS a #493
+                // drift heal (key-version lag) or a #819 deferred whole-repo rebuild is
+                // owed — both of which the scoped path cannot
+                // serve, so they keep the full rebuild.
+                // A carry / roots-change reaches here (their guard above excludes the
+                // relink) but does not move any grouping, so its
+                // captured set is empty and the scoped re-derive is
+                // a correct no-op; a heal's removed paths ARE captured (via
+                // `remove_file_in_scope`), so they regroup. Defer: a partial pass must not
+                // stamp the logical-key version — untouched files' drift is still future.
+                if self.can_scope_logical_rederive()? {
+                    self.rederive_changed_logical_symbols()?;
+                } else {
+                    self.rebuild_logical_symbols(graph_index::KeyVersionStamp::Defer)?;
+                }
+            },
+        }
+        progress(IndexProgress::ResolvingGraph);
+        // #827: narrow the re-resolve to this pass's staged changed files + the source
+        // files of the in-edges its removals NULLed
+        // (`temp.edge_rewrite_files`) — but ONLY when the pass's mutations
+        // are purely per-file symbol/edge changes. A package-map change
+        // (`roots_changed`), a carried scope (`carried`), or an overlay heal (`healed`) can
+        // shift how edges in UNCHANGED files resolve (import scope / row visibility), which
+        // a narrowed write set would silently under-resolve — those keep
+        // the full active-scope pass. The narrowed set re-points every
+        // existing edge (no `find_callers` loss); only a purely NEW binding
+        // from an unchanged source is deferred to the next full pass.
+        let scoped_resolve = effects.indexed > 0 && effects.base_files_only();
+        if scoped_resolve {
+            self.resolve_changed_edges()?;
+        } else {
+            self.resolve_edges()?;
+        }
+        self.mark_graph_index_current()?;
+        progress(IndexProgress::SyncingFts);
+        self.sync_fts()
+    }
+
     /// Standalone full-corpus indexing into the CURRENT context — no generation staging, no
     /// pointer flip: the connection's `active_generation` is written directly, so this is only
     /// correct on a scope+generation with no pre-existing file rows (a fresh index). The wave
@@ -663,25 +679,14 @@ impl IndexDatabase {
     pub fn index_targets(&self, config: &Config) -> anyhow::Result<()> {
         let (_, graph) = self.index_targets_with_progress(config, &mut |_| {})?;
         // The standalone twin of the rebuild's Phase-2 + terminal tail, in ONE short transaction
-        // (batch 6 moved base edges + package roots out of the wave loop; batch 7 completed the
-        // twin), mirroring the rebuild's order. Step by step against `rebuild_with_progress`:
-        // - build_chunk_text_store: first-index dict training — `insert_chunks` staged the text
-        //   into `temp.rebuild_chunk_text` when no dict existed; a no-op once a dict exists.
-        // - finalize_base_edges: base package roots + accumulated-edge resolution (batch 6).
-        // - rebuild_logical_symbols: the open-time graph heal re-derives EDGES only, so without
-        //   this fold the standalone pass's symbols stay invisible to symbol_lookup/graph nav (the
-        //   `finalize_overlay_refresh` precedent — every finalize that writes symbols folds).
-        // - apply_staged_parser_failures: THE batch-7 finding — the wave loop stages failures
-        //   (`graph.is_some()` routing), so the finalize must publish them; at this connection's
-        //   own (live) generation, atomic with its edges (no flip exists to defer to).
-        // - refresh_clone_token_df: recompute the LIVE df exactly (the wave ran with
-        //   `BumpDf(false)` — this pass, like the full rebuild, recomputes at finalize instead of
-        //   paying per-token upserts). Restored to the pre-#473 unconditional refresh by #479: the
-        //   persisted clone-graph postings are ordered by their own generation's `clone_df_epoch`,
-        //   so a live refresh no longer desyncs (or invalidates) anything.
-        // - sync_fts + the graph/flags marks: chunk_fts was written inline and the edges/flags were
-        //   just derived in full, so record freshness like the rebuild does — otherwise the very
-        //   next open pays a full (safe but wasted) edge re-derive heal and an FTS rebuild.
+        // and in the rebuild's order: first-index dict training (`build_chunk_text_store`, a no-op
+        // once a dict exists), base package roots + accumulated-edge resolution, then the finalize
+        // steps the rebuild's flip shares — `publish_staged_derivations` (without its symbol fold
+        // the open-time heal re-derives EDGES only, leaving this pass's symbols invisible) and
+        // `mark_derived_freshness_current` — around `sync_fts` (chunk_fts was written inline, so
+        // only freshness is recorded; otherwise the next open pays a wasted edge heal and FTS
+        // rebuild). The staged parser failures publish at this connection's own (live)
+        // generation, atomic with its edges.
         // NOT here, deliberately: the generation carry-forwards, overlay re-resolution, git
         // history/meta/cursors, source_root, the live-generation pointer, and the model seed are
         // PUBLISH authority — a standalone pass writes the live generation in place and owns no
@@ -693,12 +698,12 @@ impl IndexDatabase {
             // FullRederive: the standalone pass indexed the whole corpus (a fresh index — no
             // pre-existing rows, so the drift heal is empty), so it may stamp the logical-key
             // version (#493).
-            self.rebuild_logical_symbols(graph_index::KeyVersionStamp::FullRederive)?;
-            self.apply_staged_parser_failures(self.active_generation)?;
-            self.refresh_clone_token_df()?;
+            self.publish_staged_derivations(
+                graph_index::KeyVersionStamp::FullRederive,
+                self.active_generation,
+            )?;
             self.sync_fts()?;
-            self.mark_graph_index_current()?;
-            self.mark_generated_flags_current()
+            self.mark_derived_freshness_current()
         })();
         if result.is_err() {
             let _ = self.storage.execute_batch("ROLLBACK");
@@ -1011,17 +1016,12 @@ impl IndexDatabase {
         files: Vec<IndexFile>,
         changes: &GitChangedPaths,
     ) -> Vec<IndexFile> {
-        let has_base_commit = !self.active_commit_sha.is_empty();
         files
             .into_iter()
             .map(|mut file| {
-                if !has_base_commit || changes.changed.contains(&file.relative_path) {
-                    file.commit_sha.clear();
-                    file.worktree_id.clone_from(&self.active_worktree_id);
-                } else {
-                    file.commit_sha.clone_from(&self.active_commit_sha);
-                    file.worktree_id.clear();
-                }
+                let scope = self.scope_for(changes.changed.contains(&file.relative_path));
+                file.commit_sha = scope.commit_sha;
+                file.worktree_id = scope.worktree_id;
                 file
             })
             .collect()
@@ -1096,7 +1096,9 @@ impl IndexDatabase {
         // holding one would run a `git status` inside `BEGIN IMMEDIATE`, forever, which is the
         // idle-pass cost #63 exists to keep at zero. Filtering here also keeps the rule in ONE
         // place: below, a surviving tombstone is healable by construction.
-        overlays.retain(|(_, path, _, kind)| kind != "deleted" || reindexed.contains(path));
+        overlays.retain(|(_, path, _, kind)| {
+            kind != schema::TOMBSTONE_FILE_KIND || reindexed.contains(path)
+        });
         // No overlay candidates → nothing to heal and NO walk under the lock (the common clean-tree
         // / idle pass pays nothing).
         if overlays.is_empty() {
@@ -1134,7 +1136,7 @@ impl IndexDatabase {
             // to hand the path back to; with none, the tombstone shadows nothing. It is never
             // re-stamped into the commit scope below: that would publish a deletion marker as the
             // file's committed row.
-            if kind == "deleted" {
+            if kind == schema::TOMBSTONE_FILE_KIND {
                 if self.committed_row_exists(&path)? {
                     self.remove_file_in_scope(
                         Path::new(&path),
@@ -1317,8 +1319,8 @@ impl IndexDatabase {
             // prepares EVERY supplied file — including clean/reverted ones — to scope
             // them, so without this an unchanged file would be needlessly
             // removed+reinserted, churning its id and cascade-dropping its chunk
-            // embeddings. Compares the FULL `(sha256, language, kind)` identity, not sha alone: a
-            // TARGET-identity drift with unchanged bytes (an extension-precedence change
+            // embeddings. Compares the FULL identity (`IndexedIdentity::matches`), not sha alone:
+            // a TARGET-identity drift with unchanged bytes (an extension-precedence change
             // re-languages the path) must still reindex, exactly as discovery's
             // staleness does — a sha-only skip would strand the old parse. Gated to
             // `Paths`: the heal / worktree-overlay callers (`InTransaction`)
@@ -1328,9 +1330,11 @@ impl IndexDatabase {
             if explicit_paths
                 && let Ok(content) = &prepared_file.prepared
                 && let Some(row) = &scope_row
-                && row.sha256 == content.sha256
-                && row.language == prepared_file.file.language.as_db_str()
-                && row.kind == prepared_file.file.kind.as_db_str()
+                && row.identity.matches(
+                    &content.sha256,
+                    prepared_file.file.language,
+                    prepared_file.file.kind,
+                )
             {
                 continue;
             }

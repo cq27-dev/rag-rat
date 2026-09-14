@@ -8,25 +8,6 @@ use rag_rat_db::meta::*;
 use super::*;
 
 impl IndexDatabase {
-    pub(super) fn record_content_revision(&self) -> anyhow::Result<String> {
-        let revision = self.content_revision()?;
-        self.record_content_revision_value(&revision)?;
-        Ok(revision)
-    }
-
-    /// [`Self::record_content_revision`] with the digest already in hand (#821): `sync_fts`
-    /// computes ONE `main.files` digest and stamps both `content_revision` and
-    /// `fts_source_revision` from it instead of paying the full-table scan twice.
-    pub(super) fn record_content_revision_value(&self, revision: &str) -> anyhow::Result<()> {
-        // GLOBAL, not per-repo (V040 reclassification): `content_revision()` digests the WHOLE
-        // `main.files` (no repo filter — see the method below), so its stored value is scope- and
-        // repo-invariant. V039 relocated it to `repo_meta` under the one-DB-per-repo assumption;
-        // per-repo copies would make a consolidated DB's FTS freshness alternate. `set_meta` writes
-        // the global `index_meta`. (V040's `move_repo_meta_keys_to_global` migrates any stale
-        // per-repo copy back; the shared relocate helper no longer re-relocates it.)
-        self.set_meta("content_revision", revision)
-    }
-
     /// Read a per-repo meta value (`repo_meta`) for the repo owning this connection — the ergonomic
     /// per-connection twin of the [`repo_meta`] free primitive, scoped by `self.active_repo_id`
     /// (resolved at open: `register_repo` on a config open, the sole repo on a bare open).
@@ -49,12 +30,32 @@ impl IndexDatabase {
         Ok(set_repo_meta_if_changed(self.storage.connection(), &self.active_repo_id, key, value)?)
     }
 
+    /// Read a boolean per-repo meta value for the repo owning this connection.
+    pub(super) fn repo_meta_bool(&self, key: BoolMetaKey) -> anyhow::Result<Option<bool>> {
+        Ok(repo_meta_bool(self.storage.connection(), &self.active_repo_id, key)?)
+    }
+
+    /// Upsert a boolean per-repo meta value only when it changes — returns whether a write
+    /// happened (issue #63).
+    pub(super) fn set_repo_meta_bool_if_changed(
+        &self,
+        key: BoolMetaKey,
+        value: bool,
+    ) -> anyhow::Result<bool> {
+        Ok(set_repo_meta_bool_if_changed(
+            self.storage.connection(),
+            &self.active_repo_id,
+            key,
+            value,
+        )?)
+    }
+
     pub(crate) fn mark_watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
-        self.set_repo_meta_if_changed(WATCH_SHUTDOWN_RECONCILE_PENDING_META, "1")
+        self.set_repo_meta_bool_if_changed(WATCH_SHUTDOWN_RECONCILE_PENDING_META, true)
     }
 
     pub(crate) fn watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
-        Ok(self.repo_meta(WATCH_SHUTDOWN_RECONCILE_PENDING_META)?.as_deref() == Some("1"))
+        Ok(self.repo_meta_bool(WATCH_SHUTDOWN_RECONCILE_PENDING_META)? == Some(true))
     }
 
     pub(crate) fn clear_watch_shutdown_reconcile_pending(&self) -> anyhow::Result<bool> {
@@ -62,7 +63,7 @@ impl IndexDatabase {
             return Ok(false);
         }
         let conn = self.storage.connection();
-        delete_repo_meta(conn, &self.active_repo_id, WATCH_SHUTDOWN_RECONCILE_PENDING_META)?;
+        delete_repo_meta(conn, &self.active_repo_id, WATCH_SHUTDOWN_RECONCILE_PENDING_META.key)?;
         Ok(true)
     }
 
@@ -168,6 +169,16 @@ impl IndexDatabase {
         Ok(read_meta(self.storage.connection(), key)?)
     }
 
+    /// Upsert a boolean `index_meta` value in its key's spelling.
+    pub(super) fn set_meta_bool(&self, key: BoolMetaKey, value: bool) -> anyhow::Result<()> {
+        self.set_meta(key.key, key.spelling.encode(value))
+    }
+
+    /// Read a boolean `index_meta` value in its key's spelling.
+    pub(super) fn meta_bool(&self, key: BoolMetaKey) -> anyhow::Result<Option<bool>> {
+        Ok(read_meta_bool(self.storage.connection(), key)?)
+    }
+
     /// The content digest over EVERY indexed file row — an O(1) read of the incrementally
     /// maintained `content_digest_state` (#828), rendered `ms1-<64 hex>`. GLOBAL (no repo/scope
     /// filter): the FTS mirror (`chunk_fts`), the `content_revision` meta, and the clone-graph
@@ -219,8 +230,10 @@ impl IndexDatabase {
         let conn = self.storage.connection();
         let mut state = [0u64; 4];
         let mut rows_folded = 0i64;
-        let mut stmt =
-            conn.prepare("SELECT path, sha256 FROM main.files WHERE kind != 'deleted'")?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT path, sha256 FROM main.files WHERE kind != '{}'",
+            rag_rat_db::schema::TOMBSTONE_FILE_KIND
+        ))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;

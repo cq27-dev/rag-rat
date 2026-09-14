@@ -1234,3 +1234,143 @@ fn a_permanent_tombstone_keeps_the_idle_passs_write_txn_walk_free() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// A read-path deletion (`mark_file_deleted_if_not_removed`) commits with no resolve afterwards,
+/// so the in-edges of the deleted file's symbols must be left fully unbound — not with
+/// `to_symbol_id` NULL while the target span and resolution still describe the dead symbol.
+#[test]
+fn deleting_a_target_file_fully_dangles_its_in_edges() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/callee.rs"), "pub fn callee() {}\n").unwrap();
+    fs::write(root.join("src/caller.rs"), "pub fn caller() { callee(); }\n").unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let in_edge = |db: &IndexDatabase| {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT d.to_symbol_id, d.target_start_line, d.target_end_line, conf.value, \
+                 res.value
+                 FROM edges_data d
+                 JOIN files f ON f.id = d.source_file_id
+                 JOIN name_strings tn ON tn.id = d.to_name_id
+                 LEFT JOIN name_strings conf ON conf.id = d.confidence_id
+                 LEFT JOIN name_strings res ON res.id = d.resolution_id
+                 WHERE f.path = 'src/caller.rs' AND tn.value = 'callee'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    assert!(in_edge(&db).0.is_some(), "fixture: the call must bind before its target dies");
+
+    fs::remove_file(root.join("src/callee.rs")).unwrap();
+    db.mark_file_deleted_if_not_removed(Path::new("src/callee.rs")).unwrap();
+
+    assert_eq!(
+        in_edge(&db),
+        (None, None, None, Some("NameOnly".to_string()), Some("unresolved".to_string())),
+        "a dangled in-edge must not keep the dead target's span, confidence or resolution",
+    );
+    crate::index::edges::assert_hidden_agrees_with_visibility(db.storage.connection());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn file_scope_tracks_the_active_checkout_and_preserves_sibling_overlays() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    let linked = unique_temp_root();
+    run_git(&root, &["worktree", "add", "-q", "-b", "scope-linked", linked.to_str().unwrap()]);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let main = super::super::resolve_git_context(&root);
+    let sibling = super::super::resolve_git_context(&linked);
+    assert_ne!(main.worktree_id, sibling.worktree_id);
+    let sentinel = insert_stale_overlay_row(&db, "src/lib.rs", &main.worktree_id);
+    for checkout in [&main, &sibling] {
+        db.set_context(checkout.borrowed()).unwrap();
+        let clean = db.scope_for(false);
+        assert_eq!(clean.commit_sha, checkout.commit_sha);
+        assert!(clean.worktree_id.is_empty());
+        let dirty = db.scope_for(true);
+        assert!(dirty.commit_sha.is_empty());
+        assert_eq!(dirty.worktree_id, checkout.worktree_id);
+    }
+    db.mark_file_deleted(Path::new("src/lib.rs")).unwrap();
+    let owner: String = db
+        .storage
+        .connection()
+        .query_row("SELECT worktree_id FROM main.files WHERE id = ?1", [sentinel], |row| row.get(0))
+        .unwrap();
+    assert_eq!(owner, main.worktree_id);
+    db.active_commit_sha.clear();
+    assert_eq!(db.scope_for(false).worktree_id, sibling.worktree_id);
+    drop(db);
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn deleting_a_linked_target_dangles_only_its_overlay_edges() {
+    let (root, config) = git_fixture_for_overlay_tests();
+    fs::write(root.join("src/callee.rs"), "pub fn callee() {}\n").unwrap();
+    fs::write(root.join("src/caller.rs"), "pub fn caller() { callee(); }\n").unwrap();
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "call graph"]);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let main = super::super::resolve_git_context(&root);
+    let linked = unique_temp_root();
+    run_git(&root, &["worktree", "add", "-q", "-b", "linked-calls", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/callee.rs"), "\npub fn callee() {}\n").unwrap();
+    fs::write(linked.join("src/caller.rs"), "\npub fn caller() { callee(); }\n").unwrap();
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    let linked_scope = super::super::resolve_git_context(&linked);
+    let edge = |worktree_id: &str| {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT d.to_symbol_id, d.target_start_line, d.target_end_line, c.value, r.value, \
+                 d.hidden
+             FROM edges_data d JOIN main.files f ON f.id = d.source_file_id
+             JOIN name_strings n ON n.id = d.to_name_id
+             JOIN name_strings c ON c.id = d.confidence_id
+             JOIN name_strings r ON r.id = d.resolution_id
+             WHERE f.path = 'src/caller.rs' AND f.worktree_id = ?1 AND n.value = 'callee'",
+                [worktree_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let base_edge = edge("");
+    assert!(base_edge.0.is_some());
+    assert!(edge(&linked_scope.worktree_id).0.is_some());
+    db.mark_file_deleted_if_not_removed(Path::new("src/callee.rs")).unwrap();
+    assert_eq!(
+        edge(&linked_scope.worktree_id),
+        (None, None, None, "NameOnly".into(), "unresolved".into(), 0)
+    );
+    assert_eq!(edge(""), base_edge, "the sibling's committed edge is preserved");
+    db.set_context(main.borrowed()).unwrap();
+    crate::index::edges::assert_hidden_agrees_with_visibility(db.storage.connection());
+    drop(db);
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&root);
+}

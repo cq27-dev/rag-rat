@@ -1,5 +1,6 @@
 use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 
+use crate::schema::TOMBSTONE_FILE_KIND;
 use crate::schema::migrations::{add_column_if_missing, column_exists};
 
 /// V085 (#691 A-pre): memory-sync provenance + edge tombstones — the write-path foundation for
@@ -75,7 +76,9 @@ pub fn apply_content_digest_state(conn: &Connection) -> rusqlite::Result<()> {
     let mut state = [0u64; 4];
     let mut rows_folded: i64 = 0;
     {
-        let mut stmt = tx.prepare("SELECT path, sha256 FROM main.files WHERE kind != 'deleted'")?;
+        let mut stmt = tx.prepare(&format!(
+            "SELECT path, sha256 FROM main.files WHERE kind != '{TOMBSTONE_FILE_KIND}'"
+        ))?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let path: String = row.get(0)?;
@@ -97,8 +100,10 @@ pub fn apply_content_digest_state(conn: &Connection) -> rusqlite::Result<()> {
     // 3. Re-stamp the frozen legacy digest -> the new rendered digest wherever it was still
     //    current.
     let legacy_concat: String = tx.query_row(
-        "SELECT COALESCE(group_concat(pv, ','), '') FROM (SELECT path || ':' || sha256 AS pv FROM \
-         main.files WHERE kind != 'deleted' ORDER BY path)",
+        &format!(
+            "SELECT COALESCE(group_concat(pv, ','), '') FROM (SELECT path || ':' || sha256 AS pv \
+             FROM main.files WHERE kind != '{TOMBSTONE_FILE_KIND}' ORDER BY path)"
+        ),
         [],
         |row| row.get(0),
     )?;

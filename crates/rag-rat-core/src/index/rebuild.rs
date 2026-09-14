@@ -1,5 +1,4 @@
-// Re-export the test-only wave barrier (defined at the end of the file so the `#[cfg(test)]`
-// module stays last — clippy::items_after_test_module). `incremental.rs`'s wave loop calls
+// Re-export the test-only wave barrier. `incremental.rs`'s wave loop calls
 // `run_after_wave_commit`; the reader-consistency tests register a database-keyed hook via
 // `set_after_wave_commit` and hold the returned guard.
 use rag_rat_base::checkout::CheckoutRef;
@@ -336,25 +335,22 @@ impl IndexDatabase {
         } else {
             graph_index::KeyVersionStamp::Defer
         };
-        self.rebuild_logical_symbols(stamp)?;
-        // Publish the STAGED `parser_failures` state (upserts for paths that failed this
-        // pass, clears for clean re-parses, an orphan sweep for paths removed from the
-        // tree) atomically with the flip: the waves staged these mutations
-        // in a temp table instead of writing the generation-less table
-        // mid-pass, so readers see the OLD failure state until the pointer
-        // moves and a tail failure rolls the whole reconciliation back with
-        // it. Generation-dead gc deliberately never touches this table.
-        self.apply_staged_parser_failures(target)?;
-        // Recompute clone-token df over the FINAL published set (batch 6 #2): it reads
+        // The staged `parser_failures` state (upserts for paths that failed this pass, clears
+        // for clean re-parses, an orphan sweep for paths removed from the tree) publishes
+        // atomically with the flip: the waves staged these mutations in a temp table instead of
+        // writing the generation-less table mid-pass, so readers see the OLD failure state until
+        // the pointer moves and a tail failure rolls the whole reconciliation back with it.
+        // Generation-dead gc deliberately never touches this table.
+        // The clone-token df is recomputed over the FINAL published set (batch 6 #2): it reads
         // `symbol_fingerprints` at `active_generation == target`, which AFTER the overlay
         // carry-forward above is exactly the generation about to go live (base + carried
         // overlays). Recomputing in Phase 2 (before carry-forward) either omitted carried
         // overlay fingerprints from the df on success, or on a tail failure left the OLD
         // generation's clone queries reading a df computed from the never-published target
-        // — and the df drives sub-block-postings selection +
-        // persisted-postings invalidation, so it is consumed as authority
-        // w.r.t. the published set, not merely a drift-tolerated hint.
-        self.refresh_clone_token_df()?;
+        // — and the df drives sub-block-postings selection + persisted-postings invalidation,
+        // so it is consumed as authority w.r.t. the published set, not merely a
+        // drift-tolerated hint.
+        self.publish_staged_derivations(stamp, target)?;
         // Git-history ROWS + external-content `commit_fts` fold into the flip too (batch 6
         // #1): `git_commits`/`git_file_changes` are read DIRECTLY by
         // `query::orientation::recent_commit_subjects`, lexical churn, and commit search —
@@ -378,10 +374,9 @@ impl IndexDatabase {
         // the git rows it indexes.
         self.finalize_full_rebuild_fts()?;
         progress(IndexProgress::ResolvingGraph);
-        self.mark_graph_index_current()?;
-        // Full rebuild writes correct `files.generated`, so stamp the flags version current
-        // and skip a redundant re-derive on next open (#202).
-        self.mark_generated_flags_current()?;
+        // Full rebuild resolves every edge and writes correct `files.generated`, so stamp both
+        // current and skip a redundant re-derive on next open (#202).
+        self.mark_derived_freshness_current()?;
         // A full rebuild (re)derived every chunk's `embedding_policy` with the current
         // classifier, so certify the column current for this repo — the reconcile
         // skip-summary then reads it via GROUP BY instead of re-parsing
@@ -420,6 +415,29 @@ impl IndexDatabase {
         )?;
         self.storage.execute_batch("COMMIT")?;
         Ok(())
+    }
+
+    /// The staged derivations a full-corpus finalize publishes, in this order: the logical-symbol
+    /// fold (`stamp` gates the #493 key-version stamp), the staged `parser_failures` at
+    /// `generation`, and the exact clone-token df. Shared by the rebuild's terminal flip and the
+    /// standalone `index_targets` finalize so the two cannot drift apart — the wave loop stages
+    /// parser failures for both, and a finalize that skips the publish loses them. NO transaction
+    /// of its own: both callers hold one.
+    pub(super) fn publish_staged_derivations(
+        &self,
+        stamp: graph_index::KeyVersionStamp,
+        generation: i64,
+    ) -> anyhow::Result<()> {
+        self.rebuild_logical_symbols(stamp)?;
+        self.apply_staged_parser_failures(generation)?;
+        self.refresh_clone_token_df()
+    }
+
+    /// Stamp the graph index and the generated-flags version current after a full-corpus finalize
+    /// derived both in full, so the next open skips a redundant heal. NO transaction of its own.
+    pub(super) fn mark_derived_freshness_current(&self) -> anyhow::Result<()> {
+        self.mark_graph_index_current()?;
+        self.mark_generated_flags_current()
     }
 
     /// The generation a full rebuild stages into (A6): STRICTLY ABOVE both every generation the
@@ -727,20 +745,15 @@ impl IndexDatabase {
                 [],
             )?;
         }
+        edges::dangle_edges_to(
+            self.storage.connection(),
+            "SELECT symbols.id
+             FROM main.symbols
+             JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id",
+            &[],
+        )?;
         self.storage.execute_batch(
             "
-            INSERT OR IGNORE INTO main.name_strings(value) VALUES ('unresolved');
-            UPDATE main.edges_data
-            SET to_symbol_id = NULL,
-                target_start_line = NULL,
-                target_end_line = NULL,
-                resolution_id =
-                    (SELECT id FROM main.name_strings WHERE value = 'unresolved')
-            WHERE to_symbol_id IN (
-                SELECT symbols.id
-                FROM main.symbols
-                JOIN temp.staged_file_ids ON staged_file_ids.id = symbols.file_id
-            );
             DELETE FROM main.edges_data
             WHERE source_file_id IN (SELECT id FROM temp.staged_file_ids)
                OR from_symbol_id IN (
@@ -842,55 +855,5 @@ impl IndexDatabase {
 /// path makes concurrent tests inherently isolated (each uses its own temp DB), and registration
 /// returns an RAII [`WaveBarrierGuard`] so the entry is removed even when the test panics.
 #[cfg(test)]
-mod wave_barrier {
-    use std::collections::BTreeMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
-
-    /// `Arc`, not `Box`: [`run_after_wave_commit`] clones the hook out of the registry and RELEASES
-    /// the map lock before calling it — the hook blocks on its test barrier, and holding the map
-    /// lock across that block would serialize (or deadlock) every other test's registration.
-    /// `Sync` is required by the shared `Arc`; hook captures that are `!Sync` (channel endpoints)
-    /// ride in `Mutex`es.
-    pub(crate) type WaveHook = Arc<dyn Fn() + Send + Sync + 'static>;
-
-    static AFTER_WAVE_COMMIT: Mutex<BTreeMap<PathBuf, WaveHook>> = Mutex::new(BTreeMap::new());
-
-    /// Unregisters its database's hook on drop — panic-safe cleanup, so a failing barrier test
-    /// can never leak a hook into a stranger's rebuild.
-    pub(crate) struct WaveBarrierGuard {
-        database: PathBuf,
-    }
-
-    impl Drop for WaveBarrierGuard {
-        fn drop(&mut self) {
-            if let Ok(mut hooks) = AFTER_WAVE_COMMIT.lock() {
-                hooks.remove(&self.database);
-            }
-        }
-    }
-
-    /// Register the after-wave-commit hook for the rebuild whose `config.database` is `database`.
-    /// Hold the returned guard for the duration of the observed rebuild.
-    #[must_use = "dropping the guard unregisters the hook"]
-    pub(crate) fn set_after_wave_commit(database: &Path, hook: WaveHook) -> WaveBarrierGuard {
-        AFTER_WAVE_COMMIT
-            .lock()
-            .expect("wave barrier registry poisoned")
-            .insert(database.to_path_buf(), hook);
-        WaveBarrierGuard { database: database.to_path_buf() }
-    }
-
-    /// Invoked by the full-rebuild wave loop after each wave commits, with the rebuilding
-    /// connection's database path; fires only a hook registered for THAT database.
-    pub(crate) fn run_after_wave_commit(database: &Path) {
-        let hook = AFTER_WAVE_COMMIT
-            .lock()
-            .expect("wave barrier registry poisoned")
-            .get(database)
-            .cloned();
-        if let Some(hook) = hook {
-            hook();
-        }
-    }
-}
+#[path = "rebuild_wave_barrier.rs"]
+mod wave_barrier;

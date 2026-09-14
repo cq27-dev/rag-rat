@@ -13,7 +13,6 @@ use super::c_like_edges;
 use crate::index::edges::extract::{EdgeEmitter, EdgeVisit};
 use crate::index::edges::{EdgeCandidate, IndexedSymbol, SymbolLocator};
 use crate::index::parser::{self, ParserKind};
-use crate::index::symbols;
 
 const C_QUERY_SOURCE: &str = r#"
 (preproc_include) @edge
@@ -51,8 +50,8 @@ fn compiled_query(language: Language) -> Result<&'static Query, &'static str> {
 fn query_edges(path: &Path, language: Language, text: &str) -> anyhow::Result<Vec<EdgeCandidate>> {
     let parsed = parser::parse_file(path, language, text)
         .ok_or_else(|| anyhow::anyhow!("C-family fixture exceeded the parse budget"))?;
-    let prepared = symbols::from_parsed(&parsed.symbols);
-    let indexed = IndexedSymbol::local_from_prepared(language, &prepared);
+    let prepared = &parsed.symbols;
+    let indexed = IndexedSymbol::local_from_prepared(language, prepared);
     query_edges_from_root(path, language, text, parsed.root(), &indexed)
 }
 
@@ -164,8 +163,8 @@ std::vector<Item> make_items() {
         {
             let path = Path::new(path);
             let parsed = parser::parse_file(path, language, source).expect("fixture parse");
-            let prepared = symbols::from_parsed(&parsed.symbols);
-            let indexed = IndexedSymbol::local_from_prepared(language, &prepared);
+            let prepared = &parsed.symbols;
+            let indexed = IndexedSymbol::local_from_prepared(language, prepared);
             let manual = syntactic_edges(path, language, source, &indexed)?;
             let queried = query_edges(path, language, source)?;
             assert_eq!(by_kind(&queried), by_kind(&manual), "{language:?}");
@@ -194,8 +193,8 @@ std::vector<Item> make_items() {
             let source = fs::read_to_string(&path)?;
             let parsed = parser::parse_file(&path, language, &source)
                 .ok_or_else(|| anyhow::anyhow!("{} exceeded parse budget", path.display()))?;
-            let prepared = symbols::from_parsed(&parsed.symbols);
-            let indexed = IndexedSymbol::local_from_prepared(language, &prepared);
+            let prepared = &parsed.symbols;
+            let indexed = IndexedSymbol::local_from_prepared(language, prepared);
             let started = Instant::now();
             let mut manual = Vec::new();
             collect_edges(language, &source, parsed.root(), &indexed, &path, &mut manual);
@@ -244,8 +243,8 @@ std::vector<Item> make_items() {
             .iter()
             .map(|&(path, language, source)| {
                 let parsed = parser::parse_file(path, language, source).expect("fixture parse");
-                let prepared = symbols::from_parsed(&parsed.symbols);
-                let indexed = IndexedSymbol::local_from_prepared(language, &prepared);
+                let prepared = &parsed.symbols;
+                let indexed = IndexedSymbol::local_from_prepared(language, prepared);
                 (path, language, source, parsed, indexed)
             })
             .collect::<Vec<_>>();

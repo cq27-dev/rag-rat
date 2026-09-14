@@ -150,6 +150,71 @@ pub(crate) fn edge_hidden_flag(edge_kind: EdgeKind, resolution: EdgeResolution) 
     i64::from(dispatch_fact || resolution == EdgeResolution::Suppressed)
 }
 
+/// The complete unbound edge shape. The visibility expression mirrors `edge_hidden_flag`:
+/// internal dispatch facts remain hidden, as do suppressed unresolved references.
+const DANGLE_SET: &str = "to_symbol_id = NULL,
+    target_start_line = NULL, target_end_line = NULL,
+    confidence_id = :demotion_confidence, resolution_id = :demotion_resolution,
+    hidden = CASE WHEN edge_kind_id IN (
+        SELECT id FROM main.name_strings WHERE value IN (:dispatch_construct, :dispatch_handle)
+    ) THEN 1 ELSE :demotion_suppressed END";
+
+pub(super) struct EdgeDemotion {
+    pub confidence_id: i64,
+    pub resolution_id: i64,
+    pub resolution: EdgeResolution,
+}
+
+/// Apply one complete demotion without changing the caller's target predicate or transaction.
+/// Predicate parameters occupy numbered slots `?1..?N`; demotion parameters are named.
+pub(super) fn demote_edges(
+    conn: &Connection,
+    predicate: &str,
+    params: &[&dyn rusqlite::ToSql],
+    demotion: EdgeDemotion,
+) -> anyhow::Result<usize> {
+    let mut predicate = predicate.to_owned();
+    for index in (1..=params.len()).rev() {
+        predicate = predicate.replace(&format!("?{index}"), &format!(":target_{index}"));
+    }
+    let sql = format!("UPDATE edges_data SET {DANGLE_SET} WHERE {predicate}");
+    let mut statement = conn.prepare_cached(&sql)?;
+    for (offset, value) in params.iter().enumerate() {
+        let index = statement
+            .parameter_index(&format!(":target_{}", offset + 1))?
+            .expect("target parameter is in predicate");
+        statement.raw_bind_parameter(index, value)?;
+    }
+    let suppressed = edge_hidden_flag(EdgeKind::CallsName, demotion.resolution);
+    for (name, value) in [
+        (":demotion_confidence", &demotion.confidence_id as &dyn rusqlite::ToSql),
+        (":demotion_resolution", &demotion.resolution_id),
+        (":demotion_suppressed", &suppressed),
+        (":dispatch_construct", &EdgeKind::DispatchConstruct.as_db_str()),
+        (":dispatch_handle", &EdgeKind::DispatchHandle.as_db_str()),
+    ] {
+        let index = statement.parameter_index(name)?.expect("demotion parameter is in DANGLE_SET");
+        statement.raw_bind_parameter(index, value)?;
+    }
+    Ok(statement.raw_execute()?)
+}
+
+/// Dangle in-edges before deleting their targets, including read-path deletion with no resolver
+/// afterwards. Intern on demand because staged cascades do not carry a string interner.
+pub(crate) fn dangle_edges_to(
+    conn: &Connection,
+    target_symbols: &str,
+    params: &[&dyn rusqlite::ToSql],
+) -> anyhow::Result<usize> {
+    let confidence_id = intern_edge_string(conn, EdgeConfidence::NameOnly.as_db_str())?;
+    let resolution_id = intern_edge_string(conn, EdgeResolution::Unresolved.as_db_str())?;
+    demote_edges(conn, &format!("to_symbol_id IN ({target_symbols})"), params, EdgeDemotion {
+        confidence_id,
+        resolution_id,
+        resolution: EdgeResolution::Unresolved,
+    })
+}
+
 /// #734 test tripwire: assert `edges_data.hidden` agrees with the visibility predicate it
 /// materializes ([`edge_hidden_flag`]) on EVERY row, whatever writer produced it. A disagreeing
 /// row either leaks an internal/suppressed row into every query-layer read or silently drops a
