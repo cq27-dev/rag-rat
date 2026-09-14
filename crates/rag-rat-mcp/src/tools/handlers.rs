@@ -1,22 +1,5 @@
 use super::*;
 
-/// The one spelling of a symbol tool's [`SymbolSelector`]: every symbol arg struct carries the same
-/// selector fields, and `symbol_id` is never caller-supplied. `language` is spelled at each call
-/// site because only `symbol_lookup` and the `*_for_symbol` ref tools let the caller pin one.
-macro_rules! selector_from {
-    ($args:expr, language: $language:expr) => {
-        SymbolSelector {
-            logical_symbol_id: $args.logical_symbol_id,
-            symbol_id: None,
-            symbol_path: $args.symbol_path,
-            symbol: $args.symbol,
-            language: $language,
-            allow_ambiguous: $args.allow_ambiguous,
-            limit: $args.limit,
-        }
-    };
-}
-
 /// A `select_symbol` outcome collapsed to what a symbol tool answers from. The contract every
 /// symbol tool shares lives here once: a disambiguation list is returned as-is, no match answers
 /// `null`, and a name-level answer is offered only when the caller opted into ambiguous matching
@@ -354,7 +337,8 @@ pub(crate) fn symbol_lookup_tool(
 ) -> anyhow::Result<Value> {
     let include_memories = included(&args.include, SymbolInclude::Memories, true);
     let include_generated = included(&args.include, SymbolInclude::Generated, false);
-    let lookup = db.symbol_candidates(&symbol_selector(args)?, include_generated)?;
+    let selector = args.selector.selector(optional_language(args.language)?, args.limit);
+    let lookup = db.symbol_candidates(&selector, include_generated)?;
     let mut value = json!(lookup);
     if !include_memories {
         return Ok(value);
@@ -400,9 +384,9 @@ pub(crate) fn graph_tool(
         edge_kinds: graph_edge_kinds(args.edge_kinds.as_deref()),
         resolution_mode,
         symbol_id: None,
-        logical_symbol_id: args.logical_symbol_id,
+        logical_symbol_id: args.selector.logical_symbol_id.map(|handle| handle.0),
     };
-    let selector = selector_from!(args, language: None);
+    let selector = args.selector.selector(None, limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) => {
             options.symbol_id = Some(symbol.symbol_id);
@@ -451,7 +435,7 @@ pub(crate) fn docs_for_symbol_tool(
     db: &IndexDatabase,
     args: SymbolGraphArgs,
 ) -> anyhow::Result<Value> {
-    let selector = selector_from!(args, language: None);
+    let selector = args.selector.selector(None, args.limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) =>
             Ok(json!(db.docs_for_selected_symbol(&symbol, args.limit)?)),
@@ -465,7 +449,8 @@ pub(crate) fn compare_graph_to_text_tool(
     args: CompareGraphTextArgs,
     resolution_mode: GraphResolutionMode,
 ) -> anyhow::Result<Value> {
-    let selector = selector_from!(args, language: None);
+    let logical_symbol_id = args.selector.logical_symbol_id.map(|handle| handle.0);
+    let selector = args.selector.selector(None, args.limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) => {
             let options = GraphTraversalOptions {
@@ -480,7 +465,7 @@ pub(crate) fn compare_graph_to_text_tool(
                 edge_kinds: graph_edge_kinds(args.edge_kinds.as_deref()),
                 resolution_mode,
                 symbol_id: Some(symbol.symbol_id),
-                logical_symbol_id: args.logical_symbol_id,
+                logical_symbol_id,
             };
             Ok(json!(db.compare_graph_to_text(
                 &symbol,
@@ -583,7 +568,7 @@ pub(crate) fn git_history_for_symbol_tool(
     db: &IndexDatabase,
     args: SymbolRefArgs,
 ) -> anyhow::Result<Value> {
-    let selector = symbol_ref_selector(args)?;
+    let selector = args.selector.selector(optional_language(args.language)?, args.limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) => Ok(json!(db.git_history_for_symbol(
             &symbol.qualified_name,
@@ -600,7 +585,7 @@ pub(crate) fn papertrail_for_symbol_tool(
     db: &IndexDatabase,
     args: SymbolRefArgs,
 ) -> anyhow::Result<Value> {
-    let selector = symbol_ref_selector(args)?;
+    let selector = args.selector.selector(optional_language(args.language)?, args.limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) =>
             Ok(json!(db.papertrail_for_selected_symbol(&symbol, selector.limit)?)),
@@ -631,8 +616,8 @@ pub(crate) fn impact_tool(
         // so the surface knob does not apply there — there is nothing to render summary-first.
         surface: memory_surface,
     };
-    if args.logical_symbol_id.is_some() || args.symbol_path.is_some() || args.symbol.is_some() {
-        let selector = selector_from!(args, language: None);
+    if args.selector.names_a_symbol() {
+        let selector = args.selector.selector(None, args.limit);
         return match select_for_answer(db, &selector)? {
             // The distilled-records drive-by lane (#705) is now part of the report itself — built,
             // capped, and truncation-signalled in `impact_surface_report_for_selected_symbol`.
@@ -655,7 +640,7 @@ pub(crate) fn memory_for_symbol_tool(
     args: MemoryForSymbolArgs,
     memory_surface: MemorySurface,
 ) -> anyhow::Result<Value> {
-    let selector = selector_from!(args, language: None);
+    let selector = args.selector.selector(None, args.limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) =>
             Ok(json!(db.memory_for_symbol(&symbol, args.limit, memory_surface)?)),
@@ -689,14 +674,6 @@ fn important_symbols_tool(
         personalize,
         auto_seed_from_diff,
     })
-}
-
-pub(crate) fn symbol_selector(args: SymbolArgs) -> anyhow::Result<SymbolSelector> {
-    Ok(selector_from!(args, language: optional_language(args.language)?))
-}
-
-pub(crate) fn symbol_ref_selector(args: SymbolRefArgs) -> anyhow::Result<SymbolSelector> {
-    Ok(selector_from!(args, language: optional_language(args.language)?))
 }
 
 pub(crate) fn resolution_mode(value: Option<McpGraphResolutionMode>) -> GraphResolutionMode {
@@ -795,11 +772,13 @@ mod symbol_lookup_memory_cap_tests {
 
     fn lookup_args() -> SymbolArgs {
         SymbolArgs {
-            symbol: Some("target".to_string()),
-            symbol_path: None,
-            logical_symbol_id: None,
+            selector: SymbolSelectorArgs {
+                symbol: Some("target".to_string()),
+                symbol_path: None,
+                logical_symbol_id: None,
+                allow_ambiguous: false,
+            },
             language: None,
-            allow_ambiguous: false,
             limit: 10,
             include: None,
         }

@@ -303,24 +303,81 @@ pub struct ImportantSymbolsArgs {
     pub personalize: Vec<String>,
 }
 
+/// A logical-symbol handle on an arg struct. The id is a 64-bit content hash > 2^53, so it crosses
+/// the wire as the opaque `sym_<hex>` token a JSON client cannot round (#130), and is advertised
+/// as a plain string. Serialize mirrors deserialize: rmcp round-trips tool args through both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SymHandle(pub i64);
+
+impl Serialize for SymHandle {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        rag_rat_base::serde_big_id::sym_handle::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SymHandle {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        rag_rat_base::serde_big_id::sym_handle::deserialize(deserializer).map(Self)
+    }
+}
+
+impl schemars::JsonSchema for SymHandle {
+    // Inlined, so `Option<SymHandle>` advertises exactly what `Option<String>` does.
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SymHandle".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        String::json_schema(generator)
+    }
+}
+
+// The symbol selector every symbol tool accepts, flattened into its arg struct so the fields and
+// the handle encoding are declared once. `lang` and `limit` stay on the outer structs: only some
+// tools accept a language, and each tool has its own default limit. A plain comment, not a doc
+// comment, so schemars publishes nothing extra for the flattened block.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
-pub struct SymbolArgs {
+pub struct SymbolSelectorArgs {
     pub symbol: Option<String>,
     #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
-    #[serde(rename = "lang")]
-    pub language: Option<String>,
+    #[serde(rename = "id", default)]
+    pub logical_symbol_id: Option<SymHandle>,
     #[serde(default)]
     pub allow_ambiguous: bool,
+}
+
+impl SymbolSelectorArgs {
+    /// The one spelling of a symbol tool's [`SymbolSelector`]; `symbol_id` is never
+    /// caller-supplied.
+    pub(super) fn selector(self, language: Option<Language>, limit: u32) -> SymbolSelector {
+        SymbolSelector {
+            logical_symbol_id: self.logical_symbol_id.map(|handle| handle.0),
+            symbol_id: None,
+            symbol_path: self.symbol_path,
+            symbol: self.symbol,
+            language,
+            allow_ambiguous: self.allow_ambiguous,
+            limit,
+        }
+    }
+
+    /// Whether the caller named a symbol at all (by handle, ref, or name).
+    pub(super) fn names_a_symbol(&self) -> bool {
+        self.logical_symbol_id.is_some() || self.symbol_path.is_some() || self.symbol.is_some()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SymbolArgs {
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
+    #[serde(rename = "lang")]
+    pub language: Option<String>,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
     /// What to include: `memories` (on by default) and/or `generated` (off by default — opts
@@ -335,45 +392,21 @@ pub struct SymbolArgs {
 /// include they silently ignore would be a lie, so they don't carry one (#202 review).
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolRefArgs {
-    pub symbol: Option<String>,
-    #[serde(rename = "ref")]
-    pub symbol_path: Option<String>,
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
     #[serde(rename = "lang")]
     pub language: Option<String>,
-    #[serde(default)]
-    pub allow_ambiguous: bool,
     #[serde(default = "default_symbol_limit")]
     pub limit: u32,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolGraphArgs {
-    pub symbol: Option<String>,
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
-    #[serde(rename = "ref")]
-    pub symbol_path: Option<String>,
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub allow_ambiguous: bool,
     /// What to include: `memories` (on by default); `references`, `unresolved`, `macros`,
     /// `common_methods`, `coverage` (all off by default). Omit to keep defaults; an explicit list
     /// is the exact on-set (so listing `macros` alone also drops the default `memories`).
@@ -386,23 +419,11 @@ pub struct SymbolGraphArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompareGraphTextArgs {
     pub pattern: String,
-    pub symbol: Option<String>,
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
-    #[serde(rename = "ref")]
-    pub symbol_path: Option<String>,
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
     pub resolution: Option<McpGraphResolutionMode>,
     #[serde(default = "default_compare_limit")]
     pub limit: u32,
-    #[serde(default)]
-    pub allow_ambiguous: bool,
     /// What to include: `tests` (on by default); `references`, `unresolved`, `macros`,
     /// `common_methods` (off by default). Omit to keep defaults; an explicit list is the exact
     /// on-set.
@@ -415,21 +436,9 @@ pub struct CompareGraphTextArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ImpactArgs {
     pub query: Option<String>,
-    pub symbol: Option<String>,
-    #[serde(rename = "ref")]
-    pub symbol_path: Option<String>,
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
     pub resolution: Option<McpGraphResolutionMode>,
-    #[serde(default)]
-    pub allow_ambiguous: bool,
     #[serde(default = "default_graph_limit")]
     pub limit: u32,
     /// What to include — `tests`, `docs`, `git`, `papertrail`, `text_fallback`, `memories`, ALL on
@@ -584,15 +593,8 @@ impl McpMemorySource {
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryBindArgs {
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "id", default)]
+    pub logical_symbol_id: Option<SymHandle>,
     pub chunk_id: Option<i64>,
     pub edge_id: Option<i64>,
     pub path: Option<String>,
@@ -604,22 +606,10 @@ pub struct MemoryBindArgs {
     pub tracker: Option<String>,
     pub project: Option<String>,
     pub item_key: Option<String>,
-    #[serde(
-        rename = "start_id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub start_logical_symbol_id: Option<i64>,
-    #[serde(
-        rename = "end_id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub end_logical_symbol_id: Option<i64>,
+    #[serde(rename = "start_id", default)]
+    pub start_logical_symbol_id: Option<SymHandle>,
+    #[serde(rename = "end_id", default)]
+    pub end_logical_symbol_id: Option<SymHandle>,
     pub edge_sequence_hash: Option<String>,
     pub path_summary: Option<String>,
     /// Ordered edge ids (e.g. from `find_callers`/`trace_callees`) for a server-derived call-path
@@ -726,20 +716,8 @@ pub struct RationaleSearchArgs {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MemoryForSymbolArgs {
-    pub symbol: Option<String>,
-    #[serde(rename = "ref")]
-    pub symbol_path: Option<String>,
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
-    #[serde(default)]
-    pub allow_ambiguous: bool,
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
     #[serde(default = "default_search_limit")]
     pub limit: u32,
 }
@@ -1010,17 +988,10 @@ pub struct FindClonesArgs {
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ClonesForSymbolArgs {
-    // 64-bit content hash > 2^53: take it as a string so a JSON client doesn't round it (#130).
-    #[serde(
-        rename = "id",
-        default,
-        serialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::serialize",
-        deserialize_with = "rag_rat_base::serde_big_id::sym_handle_opt::deserialize"
-    )]
-    #[schemars(with = "Option<String>")]
-    pub logical_symbol_id: Option<i64>,
+    #[serde(rename = "id", default)]
+    pub logical_symbol_id: Option<SymHandle>,
     #[serde(rename = "ref")]
-    pub symbol_ref: Option<String>,
+    pub symbol_path: Option<String>,
     pub path: Option<String>,
     pub line: Option<i64>,
 }
@@ -1034,7 +1005,7 @@ impl ClonesForSymbolArgs {
         // is what makes a conflicting `{id, ref}` (or `{id, path, line}`, …) an error instead of a
         // silently-resolved ambiguity.
         let has_id = self.logical_symbol_id.is_some();
-        let has_ref = self.symbol_ref.is_some();
+        let has_ref = self.symbol_path.is_some();
         let has_path_line = match (&self.path, &self.line) {
             (Some(_), Some(_)) => true,
             (Some(_), None) => anyhow::bail!("clones_for_symbol: `path` requires `line`"),
@@ -1049,10 +1020,10 @@ impl ClonesForSymbolArgs {
             );
         }
 
-        if let Some(id) = self.logical_symbol_id {
+        if let Some(SymHandle(id)) = self.logical_symbol_id {
             return Ok(CloneSymbolSelector::Id(rag_rat_base::serde_big_id::format_sym_handle(id)));
         }
-        if let Some(r) = self.symbol_ref {
+        if let Some(r) = self.symbol_path {
             return Ok(CloneSymbolSelector::Ref(r));
         }
         // The exactly-one count guarantees path+line are both present here.
@@ -1066,7 +1037,7 @@ impl ClonesForSymbolArgs {
 impl From<MemoryBindArgs> for RepoMemoryBindTarget {
     fn from(args: MemoryBindArgs) -> Self {
         Self {
-            logical_symbol_id: args.logical_symbol_id,
+            logical_symbol_id: args.logical_symbol_id.map(|handle| handle.0),
             symbol_id: None,
             chunk_id: args.chunk_id,
             edge_id: args.edge_id,
@@ -1077,8 +1048,8 @@ impl From<MemoryBindArgs> for RepoMemoryBindTarget {
             tracker: args.tracker,
             project: args.project,
             item_key: args.item_key,
-            start_logical_symbol_id: args.start_logical_symbol_id,
-            end_logical_symbol_id: args.end_logical_symbol_id,
+            start_logical_symbol_id: args.start_logical_symbol_id.map(|handle| handle.0),
+            end_logical_symbol_id: args.end_logical_symbol_id.map(|handle| handle.0),
             edge_sequence_hash: args.edge_sequence_hash,
             path_summary: args.path_summary,
             edge_path: args.edge_path,
@@ -1118,7 +1089,7 @@ mod tests {
 
     use rag_rat_core::index::CloneSymbolSelector;
 
-    use super::ClonesForSymbolArgs;
+    use super::{ClonesForSymbolArgs, SymHandle};
 
     #[test]
     fn memory_edges_into_target_routes_node_and_github() {
@@ -1190,8 +1161,8 @@ mod tests {
         line: Option<i64>,
     ) -> ClonesForSymbolArgs {
         ClonesForSymbolArgs {
-            logical_symbol_id: id,
-            symbol_ref: symbol_ref.map(str::to_string),
+            logical_symbol_id: id.map(SymHandle),
+            symbol_path: symbol_ref.map(str::to_string),
             path: path.map(str::to_string),
             line,
         }
