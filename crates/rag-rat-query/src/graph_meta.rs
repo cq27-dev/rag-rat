@@ -1,9 +1,10 @@
 use std::collections::BTreeSet;
 
+use rag_rat_db::EdgeConfidence;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
-use crate::graph::{CONFIDENCE_ORDER_SQL, RESOLVED_OPERATOR_ONLY};
+use crate::graph::RESOLVED_OPERATOR_ONLY;
 use crate::{ReadChunk, SearchHit};
 
 const FULL_GRAPH_NOTE: &str = "Call graph is tree-sitter/syntactic, not compiler-resolved.";
@@ -371,6 +372,7 @@ fn callers(
     symbol: &PrimarySymbol,
     limit: u32,
 ) -> anyhow::Result<Vec<CallerEvidence>> {
+    let confidence_order = EdgeConfidence::order_sql();
     let mut stmt = conn.prepare_cached(&format!(
         "
         SELECT DISTINCT
@@ -392,7 +394,7 @@ fn callers(
           AND {RESOLVED_OPERATOR_ONLY}
           AND {CALLER_OF_SYMBOL_OR_NAME}
         ORDER BY
-          {CONFIDENCE_ORDER_SQL},
+          {confidence_order},
           source_files.path,
           source_chunks.start_line
         LIMIT ?3
@@ -426,6 +428,7 @@ fn callers(
 }
 
 fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<CalleeEvidence>> {
+    let confidence_order = EdgeConfidence::order_sql();
     let mut stmt = conn.prepare_cached(&format!(
         "
         SELECT DISTINCT
@@ -456,7 +459,7 @@ fn callees(conn: &Connection, symbol_id: i64, limit: u32) -> anyhow::Result<Vec<
           AND {SURFACED_CALLEE_ONLY}
           AND {RESOLVED_OPERATOR_ONLY}
         ORDER BY
-          {CONFIDENCE_ORDER_SQL},
+          {confidence_order},
           source_chunks.start_line,
           edges.to_name
         LIMIT ?2
@@ -528,6 +531,7 @@ fn referenced_types(
     symbol_id: i64,
     limit: u32,
 ) -> anyhow::Result<Vec<TypeEvidence>> {
+    let confidence_order = EdgeConfidence::order_sql();
     let mut stmt = conn.prepare_cached(&format!(
         "
         SELECT DISTINCT edges.to_name, edges.confidence
@@ -535,7 +539,7 @@ fn referenced_types(
         WHERE edges.from_symbol_id = ?1
           AND edges.edge_kind IN ('references_type', 'implements', 'extends')
         ORDER BY
-          {CONFIDENCE_ORDER_SQL},
+          {confidence_order},
           edges.to_name
         LIMIT ?2
         ",

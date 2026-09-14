@@ -1,4 +1,6 @@
 //! TypeScript graph-edge extraction for the shared structural edge walk.
+use rag_rat_db::EdgeConfidence;
+
 use crate::index::edges::*;
 
 pub(in crate::index::languages) fn typescript_edges(

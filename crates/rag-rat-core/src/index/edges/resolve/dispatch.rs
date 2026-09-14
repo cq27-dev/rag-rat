@@ -15,10 +15,11 @@
 
 use std::collections::HashMap;
 
+use rag_rat_db::EdgeConfidence;
 use rusqlite::{Connection, params};
 
 use super::EdgeWriteScope;
-use crate::index::edges::{EdgeConfidence, EdgeKind, EdgeResolution, EdgeStringInterner};
+use crate::index::edges::{EdgeKind, EdgeResolution, EdgeStringInterner};
 
 /// Cap on constructors × handlers materialized for one variant key. A catch-all message enum used
 /// in many sites would otherwise blow up quadratically into low-value edges; past this we skip the

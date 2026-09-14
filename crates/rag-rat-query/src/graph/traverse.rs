@@ -1,3 +1,5 @@
+use rag_rat_db::EdgeConfidence;
+
 use super::*;
 
 pub fn traverse(
@@ -19,6 +21,7 @@ pub fn traverse_with_options(
     let quoted = quoted_placeholders(edge_kinds.len());
     let unique_short_name = unique_symbol_name(conn, short_name(symbol))?;
     let mode = options.resolution_mode;
+    let confidence_order = EdgeConfidence::order_sql();
     let sql = match direction {
         Direction::Callers => {
             let oracle_edge_ids = reverse_oracle_seeded_edge_ids(conn, symbol, options)?;
@@ -52,7 +55,7 @@ pub fn traverse_with_options(
             WHERE edges.edge_kind IN ({quoted})
               AND ({predicate})
             ORDER BY match_tier,
-                {CONFIDENCE_ORDER_SQL},
+                {confidence_order},
                 edges.edge_kind,
                 edges.from_name
             LIMIT ?5
@@ -92,7 +95,7 @@ pub fn traverse_with_options(
               AND ({target_filter})
               AND ({visibility_filter})
             ORDER BY
-                {CONFIDENCE_ORDER_SQL},
+                {confidence_order},
                 edges.edge_kind,
                 edges.to_name
             LIMIT ?5
@@ -304,29 +307,25 @@ pub(crate) fn count_col(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Resu
 /// snake_case form used everywhere in tool output, so graph traversal, read_chunk, and search all
 /// serialize confidence identically.
 pub fn normalize_confidence(value: &str) -> &'static str {
-    match value {
-        "Exact" => "exact",
-        "Syntactic" => "syntactic",
-        "NameOnly" => "name_only",
-        "Ambiguous" => "ambiguous",
-        _ => "name_only",
-    }
+    // An unknown stored token reads as `name_only`.
+    EdgeConfidence::from_db_str(value).unwrap_or(EdgeConfidence::NameOnly).normalized()
 }
 /// Effective confidence ordering AFTER oracle enrichment, lowest rank = highest priority (so a
 /// stable ascending sort puts the strongest tier first). `compiler` (the SCIP oracle tier) ranks
 /// ABOVE `exact` — that is the whole point of the tier — then the heuristic ladder. Unknown strings
 /// rank last so a future tier can't silently jump the queue. Used to re-sort the overfetched
 /// candidate set before truncating to the caller's limit, so a compiler-upgraded low-confidence
-/// edge isn't dropped by the heuristic `LIMIT` (#82 finding 4).
+/// edge isn't dropped by the heuristic `LIMIT` (#82 finding 4). The heuristic tiers sit one below
+/// [`EdgeConfidence::rank`] — the ladder [`EdgeConfidence::order_sql`] orders SQL by — which
+/// `confidence_order_sql_agrees_with_effective_confidence_rank` pins.
 pub fn effective_confidence_rank(confidence: &str) -> u8 {
-    match confidence {
-        "compiler" => 0,
-        "exact" => 1,
-        "syntactic" => 2,
-        "name_only" => 3,
-        "ambiguous" => 4,
-        _ => 5,
+    if confidence == "compiler" {
+        return 0;
     }
+    <EdgeConfidence as strum::VariantArray>::VARIANTS
+        .iter()
+        .find(|tier| tier.normalized() == confidence)
+        .map_or(5, |tier| tier.rank() + 1)
 }
 /// The overfetch cap for an oracle-aware traversal: traverse this many heuristic candidates so a
 /// compiler-upgraded low-confidence edge — which the heuristic ranks below the `limit` cutoff — is

@@ -48,7 +48,7 @@ pub(crate) fn graph_neighbors(
     // operator. Graph traversal and graph metadata already require a resolved operator target;
     // impact must too.
     let resolved_operator_only = crate::graph::RESOLVED_OPERATOR_ONLY;
-    let confidence_order = crate::graph::CONFIDENCE_ORDER_SQL;
+    let confidence_order = rag_rat_db::EdgeConfidence::order_sql();
     let sql_for = |predicate: &str| {
         format!(
             "

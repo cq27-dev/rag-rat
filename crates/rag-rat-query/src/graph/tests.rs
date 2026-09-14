@@ -547,15 +547,23 @@ fn fuzzy_reaches_a_short_name_caller_that_syntactic_cannot() {
     assert_eq!(name_only.confidence, "name_only");
 }
 
-/// The SQL ladder and the Rust ladder rank the same stored tokens in the same order. The Rust side
-/// adds the oracle `compiler` tier at 0, so every heuristic tier sits exactly one rank lower there.
+/// The SQL ladder, the Rust ladder and the PageRank weights rank the same stored tokens in the same
+/// order. The Rust side adds the oracle `compiler` tier at 0, so every heuristic tier sits exactly
+/// one rank lower there; the weight falls strictly as the rank rises.
 #[test]
 fn confidence_order_sql_agrees_with_effective_confidence_rank() {
     let conn = Connection::open_in_memory().unwrap();
-    let sql = format!("SELECT {CONFIDENCE_ORDER_SQL} FROM (SELECT ?1 AS confidence) AS edges");
+    let sql = format!(
+        "SELECT {} FROM (SELECT ?1 AS confidence) AS edges",
+        rag_rat_db::EdgeConfidence::order_sql()
+    );
+    let mut stronger_weight = f64::INFINITY;
     for token in ["Exact", "Syntactic", "NameOnly", "Ambiguous"] {
         let sql_rank: i64 = conn.query_row(&sql, [token], |row| row.get(0)).unwrap();
         let rust_rank = effective_confidence_rank(normalize_confidence(token));
         assert_eq!(sql_rank + 1, i64::from(rust_rank), "{token}");
+        let weight = crate::pagerank::confidence_factor(token);
+        assert!(weight < stronger_weight, "{token} must weigh less than the tier above it");
+        stronger_weight = weight;
     }
 }
