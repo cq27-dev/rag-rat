@@ -234,14 +234,8 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
         })?
         .clone();
 
-    // Map the corpus's declared tool id to an oracle backend.
-    let tool = rag_rat_oracle::OracleTool::from_db_str(&profile.tool).ok_or_else(|| {
-        anyhow::anyhow!(
-            "corpus `{}` names unknown oracle tool `{}`",
-            profile.corpus_id,
-            profile.tool
-        )
-    })?;
+    // The tool id was parsed when the profiles loaded; an unknown one never gets this far.
+    let tool = profile.tool;
     // A live-only tool (`ra-lsp`) is driven by the watcher, never by a whole-checkout report:
     // the `--scip` branch bypasses `produce_scip_with_tool`'s batch-capability gate, so reject
     // here or a corpus declaring it would persist batch-shaped runs under the live identity and
@@ -251,7 +245,7 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
         "corpus `{}` names live-only oracle tool `{}` — it has no whole-checkout `.scip` to \
          report over (live verdicts come from the watcher under `[oracle.live]`)",
         profile.corpus_id,
-        profile.tool
+        tool.as_db_str()
     );
 
     // Fail closed if the active checkout's target bindings don't match the corpus profile (Codex on
@@ -573,10 +567,10 @@ mod tests {
             bindings.insert("rust".to_string(), dirs.iter().map(|d| d.to_string()).collect());
             CorpusProfile {
                 corpus_id: "rust-semver".to_string(),
-                tier: "small".to_string(),
+                tier: rag_rat_oracle::CorpusTier::Small,
                 repo: "r".to_string(),
                 rev: "v".to_string(),
-                tool: "rust-analyzer".to_string(),
+                tool: rag_rat_oracle::OracleTool::RustAnalyzer,
                 prepare: Vec::new(),
                 bindings,
                 health: CorpusHealth {

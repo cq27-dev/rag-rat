@@ -60,8 +60,8 @@ pub use lsp::position::{LineIndex, LspEncoding, LspPosition};
 pub use manifest::{ToolAvailability, ToolManifest};
 use rag_rat_base::checkout::CheckoutRef;
 pub use report::{
-    CorpusHealth, CorpusProfile, OracleResolutionReport, REPORT_SCHEMA_VERSION, ResolutionBefore,
-    ResolutionDelta, RunProvenance,
+    CorpusHealth, CorpusProfile, CorpusTier, OracleResolutionReport, REPORT_SCHEMA_VERSION,
+    ResolutionBefore, ResolutionDelta, RunProvenance,
 };
 pub use run::{OracleEvalMetrics, OracleRunInput, RecallCalls, ShaSnapshots};
 use rusqlite::Connection;
