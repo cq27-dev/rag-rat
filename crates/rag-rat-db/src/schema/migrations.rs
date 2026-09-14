@@ -6759,6 +6759,40 @@ mod syncable_overlay_migration_tests {
         assert_eq!(rows, vec![(vec![0x41; 32], 3, 7), (vec![0x42; 32], 1, 0)]);
     }
 
+    /// V127 (#1295) creates the tombstone statements table and backfills one statement per
+    /// tombstone at its own identity; a replay never lowers a statement that has since advanced.
+    #[test]
+    fn v127_backfills_one_statement_per_tombstone_and_never_lowers_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        super::super::apply(&conn, &crate::hooks::MigrationHooks::noop()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sync_row_tombstones(
+                 stream_id, repo_id, table_name, row_pk, lamport, device_fingerprint)
+             VALUES (zeroblob(32), 'r', 't', 'p1', 5, 'aa'), (zeroblob(32), 'r', 't', 'p2', 9, \
+             'bb');
+             DELETE FROM sync_tombstone_statements;",
+        )
+        .unwrap();
+        super::apply_tombstone_statements(&conn).unwrap();
+        conn.execute("UPDATE sync_tombstone_statements SET lamport = 40 WHERE row_pk = 'p1'", [])
+            .unwrap();
+        super::apply_tombstone_statements(&conn).unwrap();
+        let rows: Vec<(String, String, i64)> = conn
+            .prepare(
+                "SELECT row_pk, device_fingerprint, lamport FROM sync_tombstone_statements ORDER \
+                 BY row_pk",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, vec![
+            ("p1".to_string(), "aa".to_string(), 40),
+            ("p2".to_string(), "bb".to_string(), 9),
+        ]);
+    }
+
     /// V126 (#1319) creates the per-memory summary table and seeds each memory's newest row from
     /// the retired per-hash table, for repos that exist; a replay adds nothing — including for a
     /// retired id whose repo row adoption has since dropped.
@@ -8628,6 +8662,45 @@ pub fn apply_memory_note_summaries(conn: &Connection) -> rusqlite::Result<()> {
                   AND (newer.generated_at_ms > s.generated_at_ms
                        OR (newer.generated_at_ms = s.generated_at_ms
                            AND newer.content_hash > s.content_hash)));",
+    )
+}
+
+/// V127 — `sync_tombstone_statements`, the delivery half of a row tombstone (#1295).
+///
+/// `sync_row_tombstones` holds the latest delete of a row — merge state, permanent, keyed on the
+/// row. Which ENTRY carries that delete is a separate question with a separate answer per device
+/// chain: retention pins, on every chain that states a current orphan tombstone, the entry at
+/// that chain's newest statement. Until now the only statement was the original `Remove`, so the
+/// entry that first stated a delete could never be reclaimed; a chain now restates its own
+/// deletes at its tail (`Restate`) and this table records where each chain's statement sits.
+///
+/// Keyed on the tombstone's row plus the stating chain; `repo_id` rides along like the other
+/// merge tables so the purge's class-level sweep reaches it. Backfilled with one statement per
+/// tombstone at the tombstone's own identity, whether or not that entry still exists: a
+/// statement whose entry is already gone is exactly the stranded case compaction's mandatory
+/// repair phase carries forward on the local chain, so the backfill preserves that debt rather
+/// than hiding it. Idempotent: `IF NOT EXISTS` and `OR IGNORE`, so a replay never lowers a
+/// statement a restatement has since advanced.
+pub fn apply_tombstone_statements(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_tombstone_statements(
+             stream_id          BLOB    NOT NULL CHECK(length(stream_id) = 32),
+             repo_id            TEXT    NOT NULL,
+             table_name         TEXT    NOT NULL,
+             row_pk             TEXT    NOT NULL,
+             -- The stating chain, in the lowercase hex the merge tables use.
+             device_fingerprint TEXT    NOT NULL,
+             -- The lamport of that chain's newest entry stating the row's current tombstone.
+             lamport            INTEGER NOT NULL,
+             PRIMARY KEY(stream_id, table_name, row_pk, device_fingerprint)
+         ) STRICT;
+         -- Retention reads a chain's statements in lamport order (`chain_pins`).
+         CREATE INDEX IF NOT EXISTS sync_tombstone_statements_chain
+             ON sync_tombstone_statements(stream_id, device_fingerprint, lamport);
+         INSERT OR IGNORE INTO sync_tombstone_statements(
+             stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport)
+         SELECT stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport
+           FROM sync_row_tombstones;",
     )
 }
 

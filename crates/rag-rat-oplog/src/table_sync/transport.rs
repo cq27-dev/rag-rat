@@ -229,8 +229,8 @@ pub fn scope_retention_budget(scope_id: &str) -> Option<u64> {
     }
 }
 
-/// The most pins one compaction pass re-authors on a chain: bounds the pass's signing and transfer
-/// cost. A longer paying run moves over later passes.
+/// The most entries one compaction pass authors on a chain to carry its pins forward: bounds the
+/// pass's signing and transfer cost. A longer paying run moves over later passes.
 const COMPACTION_REAUTHOR_MAX: usize = 64;
 
 /// Compact accepted chain prefixes for scopes whose retention policy bounds them (#1127).
@@ -241,12 +241,14 @@ const COMPACTION_REAUTHOR_MAX: usize = 64;
 /// forward-compat replay (`pending_reason IS NOT NULL`) are neither counted nor dropped.
 ///
 /// Only superseded entries drop (#1277, see the retention module docs): the floor clamps at the
-/// chain's oldest pin. On this device's own chain the driver first re-authors the oldest pins at
-/// the tail — the longest run whose move frees at least twice the entries it authors, at most
-/// [`COMPACTION_REAUTHOR_MAX`] per pass — and re-authors any row a store compacted before the pin
-/// rule left below its floor. A foreign chain is never re-authored. A floor that does not advance
-/// is a steady-state no-op, never an error, so the driver is safely re-runnable on any cadence.
-/// Each stream compacts in its own IMMEDIATE transaction.
+/// chain's oldest pin. On this device's own chain the driver first carries forward,
+/// unconditionally, every pin left below its floor by a store compacted under an older rule, then
+/// carries the oldest pins above the floor to the tail — the longest run whose move frees at least
+/// twice the entries it authors (live rows re-authored one each, stated deletes packed into
+/// `Restate` batches), at most [`COMPACTION_REAUTHOR_MAX`] entries per pass. A foreign chain is
+/// never re-authored. A floor that does not advance is a steady-state no-op, never an error, so the
+/// driver is safely re-runnable on any cadence. Each stream compacts in its own IMMEDIATE
+/// transaction.
 ///
 /// Returns the number of accepted entries reclaimed.
 pub fn table_sync_compact_overdue(
@@ -287,16 +289,25 @@ fn compact_overdue_against(
             now_ms,
             local_writer: Default::default(),
         });
-        // A store compacted before the pin rule may have dropped the entries carrying live rows
-        // below its floor: peers that folded only the retained suffix never received those rows.
-        // Carrying them to the tail repairs that once; afterwards nothing pins below the floor.
-        // Each moves on its own, so a row that cannot be carried today holds back no other.
+        // Mandatory repair first. A store compacted under an older rule may have dropped the
+        // entries carrying live rows or stating deletes below its floor: peers that folded only
+        // the retained suffix never received them. Carrying every below-floor pin to the tail
+        // repairs that once — the whole list in one call, so stated deletes pack together — and
+        // afterwards nothing pins below the floor. A pin that cannot be carried today holds back
+        // no other (`past_stuck`), and the economics never apply here.
         if let Some(ctx) = &ctx
             && let Some(floor) = retention::retained_floor(&tx, stream_id, local)?
         {
-            for pin in retention::chain_pins(&tx, stream_id, local, 0, floor, usize::MAX)? {
-                engine::reauthor_chain_pins(&tx, ctx, &stream.scope_id, stream_id, &[pin])?;
-            }
+            let below = retention::chain_pins(&tx, stream_id, local, 0, floor, usize::MAX)?;
+            engine::reauthor_chain_pins(
+                &tx,
+                ctx,
+                &stream.scope_id,
+                stream_id,
+                &below,
+                usize::MAX,
+                true,
+            )?;
         }
         let chains = {
             let mut stmt = tx.prepare(
@@ -359,13 +370,27 @@ fn compact_overdue_against(
             let floor = match (reauthor, pins.first()) {
                 (_, None) => target,
                 (Some(ctx), Some(_)) => {
-                    let worth = pins_worth_reauthoring(&tx, stream_id, chain, &pins, target)?;
+                    let scoped = repo_registry(registry)
+                        .into_iter()
+                        .filter(|spec| spec.scope_id == stream.scope_id)
+                        .collect::<Vec<_>>();
+                    let worth = pins_worth_reauthoring(
+                        &tx,
+                        stream_id,
+                        chain,
+                        &pins,
+                        target,
+                        &scoped,
+                        COMPACTION_REAUTHOR_MAX,
+                    )?;
                     let moved = engine::reauthor_chain_pins(
                         &tx,
                         ctx,
                         &stream.scope_id,
                         stream_id,
-                        &pins[..worth.min(COMPACTION_REAUTHOR_MAX)],
+                        &pins[..worth],
+                        COMPACTION_REAUTHOR_MAX,
+                        false,
                     )?;
                     pins.get(moved).map_or(target, |pin| pin.lamport)
                 },
@@ -385,19 +410,29 @@ fn compact_overdue_against(
     Ok(compacted)
 }
 
-/// How many of the chain's oldest `pins` are worth re-authoring: the largest `k` whose move frees
-/// at least `2k` entries, so every entry authored reclaims at least one more. Zero when no prefix
-/// pays for itself — a chain that is all pins authors nothing, however far over budget.
+/// How many of the chain's oldest `pins` are worth carrying forward: the largest `k` whose move
+/// frees at least twice the entries it authors, so every entry authored reclaims at least one
+/// more. Moving the first `k` pins authors `live(k)` upserts plus the `Restate` batches the stated
+/// deletes among them pack into — per table, in pin order, regardless of interleaved live pins —
+/// and frees every reclaimable entry below the next pin. Zero when no prefix pays for itself: a
+/// chain that is all statements already packed at the tail authors nothing, however far over
+/// budget, and reports its irreducible footprint by leaving the floor where it is.
 ///
 /// Weighed over the whole run, not the per-pass cap: a paying move longer than the cap proceeds
 /// over several passes, each one freeing at least the entries it authors. Weighing only the capped
-/// prefix would stall for good behind more cold pins than the cap.
+/// prefix would stall for good behind more cold pins than the cap. The run this pass takes is
+/// then the longest prefix of the paying run whose cost fits `cap`, so the pass never spends its
+/// entries on pins it cannot finish. A pin whose table this binary does not register, whose key
+/// does not fit an entry alone, or whose stored coordinates do not parse ends the run — nothing
+/// past it can move this pass, and the authoring side leaves such a pin standing the same way.
 fn pins_worth_reauthoring(
     tx: &Transaction<'_>,
     stream: StreamId,
     chain: crate::op::DeviceFingerprint,
     pins: &[retention::Pin],
     target: u64,
+    scoped: &[TableSpec],
+    cap: usize,
 ) -> anyhow::Result<usize> {
     // Everything below `target` is reclaimable (the target clamps at the lowest pending entry).
     let lamports = tx
@@ -416,14 +451,61 @@ fn pins_worth_reauthoring(
         )?
         .map(|lamport| Ok(u64::try_from(lamport?)?))
         .collect::<anyhow::Result<Vec<u64>>>()?;
+    let payload_max = engine::restate_payload_max();
+    let mut packers: Vec<(&str, super::row_op::RestatePacker)> = Vec::new();
+    let mut live = 0;
     let mut worth = 0;
-    for k in 1..=pins.len() {
+    let mut within_cap = 0;
+    'run: for (index, pin) in pins.iter().enumerate() {
+        match &pin.kind {
+            retention::PinKind::LiveRow { table_name, .. } => {
+                if !scoped.iter().any(|spec| spec.name == *table_name) {
+                    break 'run;
+                }
+                live += 1;
+            },
+            retention::PinKind::Statements(rows) =>
+                for row in rows {
+                    let Some(spec) = scoped.iter().find(|spec| spec.name == row.table_name) else {
+                        break 'run;
+                    };
+                    let (Ok(pk), Ok(device)) = (
+                        super::row_op::row_pk_values(&row.row_pk),
+                        row.device_hex.parse::<crate::op::DeviceFingerprint>(),
+                    ) else {
+                        break 'run;
+                    };
+                    let delete = super::row_op::StatedDelete { pk, device, lamport: row.lamport };
+                    let packer = match packers.iter_mut().find(|(table, _)| *table == spec.name) {
+                        Some((_, packer)) => packer,
+                        None => {
+                            packers.push((
+                                spec.name,
+                                super::row_op::RestatePacker::new(
+                                    spec.name,
+                                    spec.spec_version,
+                                    payload_max,
+                                ),
+                            ));
+                            &mut packers.last_mut().expect("just pushed").1
+                        },
+                    };
+                    if packer.push(&delete) == super::row_op::Placed::Unfit {
+                        break 'run;
+                    }
+                },
+        }
+        let k = index + 1;
+        let cost = live + packers.iter().map(|(_, packer)| packer.batches()).sum::<usize>();
+        if cost <= cap {
+            within_cap = k;
+        }
         let bound = pins.get(k).map_or(target, |pin| pin.lamport);
-        if lamports.partition_point(|&lamport| lamport < bound) >= 2 * k {
+        if lamports.partition_point(|&lamport| lamport < bound) >= 2 * cost {
             worth = k;
         }
     }
-    Ok(worth)
+    Ok(worth.min(within_cap))
 }
 
 /// Recompute an advertised route from local current-incarnation authority and the production
@@ -902,6 +984,7 @@ mod tests {
 
     use super::*;
     use crate::table_sync::registry::{ColumnSpec, ValueType};
+    use crate::table_sync::row_op::DecodedRowOp;
     use crate::table_sync::{Cell, RowOp, TypedValue};
 
     const INCARNATION: [u8; 32] = [0x24; 32];
@@ -1890,16 +1973,20 @@ mod tests {
 
     /// Live rows and orphan tombstones whose carrying entry is gone: what a peer folding only the
     /// retained log can never learn.
+    /// Pins whose carrying entry is gone from the log: a live clock's entry, or a statement's —
+    /// a tombstone is delivered by whichever entry its chain last stated it at, never by its
+    /// identity's entry once that has been restated.
     fn stranded_rows(conn: &Connection) -> i64 {
         conn.query_row(
             "SELECT COUNT(*) FROM (
                  SELECT stream_id, device_fingerprint, lamport FROM sync_row_clocks
                  UNION ALL
-                 SELECT t.stream_id, t.device_fingerprint, t.lamport FROM sync_row_tombstones t
+                 SELECT s.stream_id, s.device_fingerprint, s.lamport FROM \
+             sync_tombstone_statements s
                  WHERE NOT EXISTS (
                      SELECT 1 FROM sync_row_clocks c
-                     WHERE c.stream_id = t.stream_id AND c.table_name = t.table_name
-                       AND c.row_pk = t.row_pk
+                     WHERE c.stream_id = s.stream_id AND c.table_name = s.table_name
+                       AND c.row_pk = s.row_pk
                  )
              ) p
              WHERE NOT EXISTS (
@@ -2268,5 +2355,181 @@ mod tests {
         let peer = peer_of(&a, account);
         sync_chains(&a, &peer, account);
         assert_eq!(live_rows(&peer), live_rows(&a));
+    }
+
+    /// A writer's own orphan tombstones are restated into one entry at the tail before the floor
+    /// moves, so the entries that first stated them are reclaimed and a fresh peer folding only
+    /// the retained suffix still receives every delete. A chain that is all statements packed at
+    /// the tail is its irreducible footprint: a further pass authors nothing.
+    #[test]
+    fn compaction_restates_own_orphan_tombstones_before_taking_the_floor() {
+        let (a, account) = writer_store();
+        for id in ["r0", "r1", "r2", "r3", "r4"] {
+            write(&a, id, id);
+        }
+        author(&a, account); // 0..=4
+        a.execute("DELETE FROM t_transport", []).unwrap();
+        author(&a, account); // removes 5..=9
+        rewrite(&a, account, "h", 8); // 10..=17, only h@17 live
+
+        assert_eq!(compact(&a, account, 2), 16, "everything below the target is reclaimed");
+        assert_eq!(chain_lamports(&a), vec![16, 17, 18], "one restatement carries five deletes");
+        assert_eq!(stranded_rows(&a), 0);
+        let restated: Vec<u8> = a
+            .query_row("SELECT signed_bytes FROM table_sync_entries WHERE lamport = 18", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let signed = crate::entry::decode_signed(&restated).unwrap();
+        let Ok(DecodedRowOp::Known(RowOp::Restate { deletes, .. })) =
+            crate::table_sync::row_op::decode(&signed.entry.op_bytes)
+        else {
+            panic!("the tail entry is a restatement");
+        };
+        assert_eq!(deletes.len(), 5);
+        assert!(deletes.iter().all(|d| (5..=9).contains(&d.lamport)), "at their identities");
+
+        let fresh = peer_of(&a, account);
+        sync_chains(&a, &fresh, account);
+        assert_eq!(live_rows(&fresh), live_rows(&a), "no phantom row on a fresh peer");
+        let tombstones: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM sync_row_tombstones", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tombstones, 5, "every delete reached it");
+
+        // Steady state: the superseded h@16 goes, then nothing pays and nothing is authored.
+        assert_eq!(compact(&a, account, 2), 1);
+        assert_eq!(chain_lamports(&a), vec![17, 18]);
+        assert_eq!(compact(&a, account, 1), 0, "a chain that is all statements authors nothing");
+        assert_eq!(chain_lamports(&a), vec![17, 18]);
+    }
+
+    /// The mandatory phase: statements a store compacted under an older rule left below its
+    /// floor are restated once, whatever the budget, so fresh peers receive the deletes again.
+    #[test]
+    fn mandatory_below_floor_repair_runs_before_the_budget_loop_for_both_pin_kinds() {
+        let (a, account) = writer_store();
+        write(&a, "a", "a");
+        write(&a, "b", "b");
+        author(&a, account); // 0, 1
+        a.execute("DELETE FROM t_transport WHERE id = 'b'", []).unwrap();
+        author(&a, account); // remove b @2
+        rewrite(&a, account, "c", 8); // 3..=10
+        let route = supported_streams_against(&a, account, &[REPO_SPEC]).unwrap().remove(0);
+        let local = crate::load_local_device(&a).unwrap().unwrap().fingerprint();
+        {
+            // What an older compaction to floor 8 left behind: a live row and a statement gone.
+            let tx = Transaction::new_unchecked(&a, TransactionBehavior::Immediate).unwrap();
+            let floor_hash: Vec<u8> = tx
+                .query_row(
+                    "SELECT entry_hash FROM table_sync_entries WHERE lamport = 8",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            tx.execute("DELETE FROM table_sync_entries WHERE lamport < 8", []).unwrap();
+            retention::record_adopted_floor(
+                &tx,
+                StreamId::from_bytes(route.stream_id),
+                local,
+                8,
+                EntryHash::from_bytes(fixed32(floor_hash).unwrap()),
+                0,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(stranded_rows(&a), 2, "a's row and b's delete are unreachable");
+        assert_eq!(compact(&a, account, 100), 0, "within budget, so only the repair runs");
+        assert_eq!(stranded_rows(&a), 0);
+        assert_eq!(chain_lamports(&a), vec![8, 9, 10, 11, 12], "an upsert and a restatement");
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+        assert_eq!(live_rows(&peer), live_rows(&a));
+    }
+
+    /// A chain's statements move only when its own writer restates: a foreign chain clamps at
+    /// its oldest statement, whatever its budget.
+    #[test]
+    fn a_foreign_chain_clamps_at_its_orphan_tombstones_until_its_writer_restates() {
+        let (a, account) = writer_store();
+        write(&a, "r0", "r0");
+        author(&a, account); // 0
+        a.execute("DELETE FROM t_transport WHERE id = 'r0'", []).unwrap();
+        author(&a, account); // remove @1
+        rewrite(&a, account, "h", 6); // 2..=7
+        let peer = peer_of(&a, account);
+        sync_chains(&a, &peer, account);
+        assert_eq!(compact(&peer, account, 2), 1, "only the superseded entry below the statement");
+        let held: Vec<i64> = peer
+            .prepare("SELECT lamport FROM table_sync_entries ORDER BY lamport")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(held, (1..=7).collect::<Vec<_>>(), "clamped at the statement");
+        // The writer restates and compacts; the peer then reclaims past the old statement.
+        assert_eq!(compact(&a, account, 2), 6);
+        sync_chains(&a, &peer, account);
+        assert!(compact(&peer, account, 2) >= 5, "the restatement freed the foreign prefix");
+    }
+
+    /// The economics charge stated deletes as the batches they pack into. Three rows written by
+    /// a peer and deleted here leave this chain with three statements and nothing else below
+    /// the target: per-row costing would refuse the move (3 freed < 2 × 3), batch costing moves
+    /// all three (3 freed ≥ 2 × 1) and the chain compacts to its tail.
+    #[test]
+    fn restating_obeys_the_twice_the_cost_rule_per_batch() {
+        let (a, account) = writer_store();
+        let route = supported_streams_against(&a, account, &[REPO_SPEC]).unwrap().remove(0);
+        // Rows that arrived from a peer: physically present, published, clocked under a foreign
+        // device — so this chain never wrote them, and their deletes are its first entries. The
+        // deletes take lamport 0.. (the stream clock counts entries, and there are none), so
+        // they tie the foreign clock on lamport and win on fingerprint: all-`ff` sorts above any
+        // local device.
+        for id in ["r0", "r1", "r2"] {
+            write(&a, id, id);
+            let pk = [TypedValue::Text("repo-a".to_string()), TypedValue::Text(id.to_string())];
+            let row_pk = crate::table_sync::row_op::row_pk_string(&pk);
+            let tx = Transaction::new_unchecked(&a, TransactionBehavior::Immediate).unwrap();
+            let hash =
+                crate::table_sync::apply::synced_row_hash(&tx, &REPO_SPEC, &pk).unwrap().unwrap();
+            let stream = StreamId::from_bytes(route.stream_id);
+            crate::table_sync::apply::record_published(
+                &tx,
+                stream,
+                "repo-a",
+                REPO_SPEC.name,
+                &row_pk,
+                &hash,
+                REPO_SPEC.spec_version,
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO sync_row_clocks(
+                     stream_id, repo_id, table_name, row_pk, lamport, device_fingerprint)
+                 VALUES (?1, 'repo-a', ?2, ?3, 0, ?4)",
+                params![
+                    route.stream_id.as_slice(),
+                    REPO_SPEC.name,
+                    row_pk,
+                    crate::op::DeviceFingerprint::from_bytes([0xff; 32]).to_string()
+                ],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(chain_lamports(&a), Vec::<i64>::new(), "nothing of this chain's yet");
+        a.execute("DELETE FROM t_transport", []).unwrap();
+        author(&a, account); // removes 0..=2
+        write(&a, "live", "live");
+        author(&a, account); // 3
+        assert_eq!(compact(&a, account, 1), 3, "the three statements moved into one entry");
+        assert_eq!(chain_lamports(&a), vec![3, 4]);
+        assert_eq!(stranded_rows(&a), 0);
+        let fresh = peer_of(&a, account);
+        sync_chains(&a, &fresh, account);
+        assert_eq!(live_rows(&fresh), vec![("live".to_string(), "live".to_string())]);
     }
 }

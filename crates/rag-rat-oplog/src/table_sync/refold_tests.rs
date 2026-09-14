@@ -2459,3 +2459,198 @@ fn the_unsent_local_edit_guard_sees_the_other_openers_committed_write() {
     );
     assert_eq!(refolder.pending_count(), 1, "and the entry stays outstanding rather than lost");
 }
+
+/// A pre-restate binary parks a `Restate` as an unknown kind and retains it; the projector
+/// generation appended for the kind is what makes the first refold after the upgrade replay it —
+/// from the stored bytes, with no redelivery — and the chain's statement moves to it, so the
+/// entry that first stated the delete stops pinning here too.
+#[test]
+fn an_upgrade_replays_parked_restates_without_redelivery() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+    a.conn
+        .execute("INSERT INTO t_demo(id, title, later_col) VALUES ('r1', 'v1', NULL)", [])
+        .unwrap();
+    let create = a.produce(OLD_REGISTRY, "repo"); // 0
+    b.enroll(a.pubkey().fingerprint());
+    b.ingest(OLD_REGISTRY, "repo", &create, &a.pubkey());
+    a.conn.execute("DELETE FROM t_demo WHERE id = 'r1'", []).unwrap();
+    let remove = a.produce(OLD_REGISTRY, "repo"); // 1
+    b.ingest(OLD_REGISTRY, "repo", &remove, &a.pubkey());
+    assert_eq!(b.row(), None);
+    let statement = |b: &Device| -> i64 {
+        b.conn
+            .query_row("SELECT lamport FROM sync_tombstone_statements", [], |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(statement(&b), 1, "the remove states its own delete");
+    // A restates its own delete at the tail, as compaction would.
+    let restate = RowOp::Restate {
+        table: "t_demo".to_string(),
+        spec_version: 1,
+        deletes: vec![crate::table_sync::StatedDelete {
+            pk: vec![TypedValue::Text("r1".to_string())],
+            device: a.local.fingerprint(),
+            lamport: 1,
+        }],
+    };
+    let restated = {
+        let tx = a.conn.transaction().unwrap();
+        let signed = store::author_row_entry(&tx, stream, a.local.secret(), &restate, 0).unwrap();
+        let meta = crate::op::OpMeta {
+            lamport: signed.entry.lamport,
+            device: signed.entry.device_fingerprint,
+        };
+        apply::apply_row_op_on_stream(&tx, &OLD, "repo", stream, &restate, meta).unwrap();
+        tx.commit().unwrap();
+        signed.signed_bytes
+    };
+    // An older binary stores the restatement it cannot read and parks it as an unknown kind
+    // under its own projector version.
+    {
+        let tx = b.conn.transaction().unwrap();
+        let store::AcceptOutcome::Stored { entry_hash, .. } = store::accept_row_entry(
+            &tx,
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream,
+                expected_tables: &["t_demo"],
+                pubkey: &a.pubkey(),
+                now_ms: 0,
+            },
+            &restated,
+            None,
+        )
+        .unwrap() else {
+            panic!("stored");
+        };
+        store::mark_entry_pending(
+            &tx,
+            &entry_hash,
+            PendingReason::UnknownOpKind,
+            TABLE_SYNC_PROJECTOR_VERSION - 1,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert_eq!(statement(&b), 1, "parked, so the statement has not moved");
+    assert_eq!(b.pending_count(), 1);
+
+    assert!(refold_stale_projections_against(&b.conn, OLD_REGISTRY).unwrap(), "owed by the bump");
+    assert_eq!(statement(&b), 2, "the replayed restatement carries the delete now");
+    assert_eq!(b.row(), None);
+    assert_eq!(b.pending_count(), 0);
+    assert_eq!(
+        stored_projector_version(&b.conn).unwrap(),
+        Some(TABLE_SYNC_PROJECTOR_VERSION),
+        "and the store is stamped current"
+    );
+}
+
+/// A restatement parked on one row's unsent work settles the rest of its deletes first. When one
+/// of THOSE fails on a constraint, the entry still parks rather than quarantining: the excluded
+/// delete is still owed, and the whole replay reaches the terminal verdict once it can settle.
+#[test]
+fn a_subset_constraint_failure_parks_the_restate_instead_of_quarantining_it() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    let stream = scope_stream_id("repo", account(), [0x44; 32], "demo/1");
+    for id in ["r1", "r2"] {
+        a.conn
+            .execute("INSERT INTO t_demo(id, title, later_col) VALUES (?1, 'v', NULL)", [id])
+            .unwrap();
+    }
+    let creates = a.produce(OLD_REGISTRY, "repo"); // 0, 1
+    b.enroll(a.pubkey().fingerprint());
+    b.ingest(OLD_REGISTRY, "repo", &creates, &a.pubkey());
+    a.conn.execute("DELETE FROM t_demo", []).unwrap();
+    assert_eq!(a.produce(OLD_REGISTRY, "repo").len(), 2, "removes at 2 and 3");
+    let restate = RowOp::Restate {
+        table: "t_demo".to_string(),
+        spec_version: 1,
+        deletes: ["r1", "r2"]
+            .into_iter()
+            .zip([2u64, 3])
+            .map(|(id, lamport)| crate::table_sync::StatedDelete {
+                pk: vec![TypedValue::Text(id.to_string())],
+                device: a.local.fingerprint(),
+                lamport,
+            })
+            .collect(),
+    };
+    let restated = {
+        let tx = a.conn.transaction().unwrap();
+        let signed = store::author_row_entry(&tx, stream, a.local.secret(), &restate, 0).unwrap();
+        let meta = crate::op::OpMeta {
+            lamport: signed.entry.lamport,
+            device: signed.entry.device_fingerprint,
+        };
+        apply::apply_row_op_on_stream(&tx, &OLD, "repo", stream, &restate, meta).unwrap();
+        tx.commit().unwrap();
+        signed.signed_bytes
+    };
+    // On B: r1 holds an unsent edit (the restate must park on it) and r2 cannot be deleted.
+    b.conn.execute("UPDATE t_demo SET title = 'mine' WHERE id = 'r1'", []).unwrap();
+    b.conn
+        .execute_batch(
+            "CREATE TRIGGER keep_r2 BEFORE DELETE ON t_demo WHEN OLD.id = 'r2'
+             BEGIN SELECT RAISE(ABORT, 'r2 is kept'); END;",
+        )
+        .unwrap();
+    // B stores the restatement without its two removes (a chain served from a floor at the
+    // restatement), then the store-open refold evaluates it.
+    {
+        let tx = b.conn.transaction().unwrap();
+        let store::AcceptOutcome::Stored { entry_hash, .. } = store::accept_row_entry(
+            &tx,
+            &store::AcceptCtx {
+                account_id: account(),
+                expected_stream: stream,
+                expected_tables: &["t_demo"],
+                pubkey: &a.pubkey(),
+                now_ms: 0,
+            },
+            &restated,
+            Some(store::AdvertisedFloor {
+                lamport: 4,
+                entry_hash: crate::entry::decode_signed(&restated).unwrap().entry.entry_hash,
+            }),
+        )
+        .unwrap() else {
+            panic!("stored as the chain root")
+        };
+        store::mark_entry_pending(
+            &tx,
+            &entry_hash,
+            PendingReason::DeferredUnsentEdit,
+            TABLE_SYNC_PROJECTOR_VERSION - 1,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    assert!(refold_stale_projections_against(&b.conn, OLD_REGISTRY).unwrap());
+    assert_eq!(
+        b.pending_mark(),
+        Some((
+            PendingReason::DeferredUnsentEdit.as_db_str().to_string(),
+            TABLE_SYNC_PROJECTOR_VERSION
+        )),
+        "parked on r1's unsent edit, not quarantined on r2's constraint"
+    );
+    let quarantined: i64 = b
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM table_sync_entries WHERE quarantine_reason IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(quarantined, 0);
+    assert_eq!(b.row().unwrap().0, "mine", "r1's unsent edit is untouched");
+    let r2: i64 = b
+        .conn
+        .query_row("SELECT COUNT(*) FROM t_demo WHERE id = 'r2'", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(r2, 1, "r2 could not be deleted and raised no tombstone");
+}

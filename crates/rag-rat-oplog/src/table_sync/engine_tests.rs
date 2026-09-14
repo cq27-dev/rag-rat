@@ -1,3 +1,5 @@
+use rusqlite::OptionalExtension;
+
 use super::*;
 use crate::table_sync::registry::{ColumnSpec, ValueType};
 
@@ -1787,4 +1789,322 @@ fn a_scope_with_multiple_tables_routes_each_op_to_its_table() {
         ("in-a", "in-b"),
         "each op landed in its own table"
     );
+}
+
+// ── re-adoption restates deletes in bounded scopes (#1295) ───────────────────────────────────
+
+const OVERLAY_SPEC: TableSpec = TableSpec { scope_id: "overlay/1", ..SPEC };
+const OVERLAY: &[TableSpec] = &[OVERLAY_SPEC];
+
+fn ctx_on<'a>(device: &'a Device, registry: &'a [TableSpec]) -> SyncCtx<'a> {
+    SyncCtx {
+        repo_id: "repo",
+        account_id: AccountId::from_bytes([42; 32]),
+        incarnation_ref: [0x44; 32],
+        device: &device.local,
+        registry,
+        now_ms: 0,
+        local_writer: Default::default(),
+    }
+}
+
+fn produce_on(device: &Device, registry: &[TableSpec]) -> Vec<Vec<u8>> {
+    let tx = device.conn.unchecked_transaction().unwrap();
+    let out = produce_and_author(&tx, &ctx_on(device, registry)).unwrap();
+    tx.commit().unwrap();
+    out
+}
+
+fn ingest_on(
+    device: &Device,
+    registry: &[TableSpec],
+    entries: &[Vec<u8>],
+    from: &DevicePublic,
+) -> Vec<IngestOutcome> {
+    enroll_writer(&device.conn, AccountId::from_bytes([42; 32]), from.fingerprint());
+    let scope = registry[0].scope_id;
+    let tx = device.conn.unchecked_transaction().unwrap();
+    let ctx = ctx_on(device, registry);
+    let out = entries
+        .iter()
+        .map(|bytes| ingest(&tx, &ctx, scope, bytes, from, None).unwrap().outcome)
+        .collect();
+    tx.commit().unwrap();
+    out
+}
+
+/// Enqueue and drain the removal of `removed` on `stream`, returning the drain's answer.
+fn drain_removal(
+    device: &Device,
+    registry: &[TableSpec],
+    removed: crate::op::DeviceFingerprint,
+    stream: crate::stream::StreamId,
+) -> Option<usize> {
+    let account = AccountId::from_bytes([42; 32]);
+    remove_writer(&device.conn, account, removed);
+    let tx = device.conn.unchecked_transaction().unwrap();
+    store::enqueue_readoption_work(&tx, account, removed, stream, [8; 32], 11, 12).unwrap();
+    let out = process_readoption_work_for_stream(&tx, &ctx_on(device, registry), stream).unwrap();
+    tx.commit().unwrap();
+    out
+}
+
+/// This device's own chain, oldest first, as signed bytes.
+fn own_chain(device: &Device) -> Vec<Vec<u8>> {
+    device
+        .conn
+        .prepare(
+            "SELECT signed_bytes FROM table_sync_entries WHERE device_fingerprint = ?1
+             ORDER BY lamport",
+        )
+        .unwrap()
+        .query_map([device.local.fingerprint().to_bytes().as_slice()], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+fn decoded(bytes: &[u8]) -> RowOp {
+    let signed = crate::entry::decode_signed(bytes).unwrap();
+    match crate::table_sync::row_op::decode(&signed.entry.op_bytes).unwrap() {
+        crate::table_sync::row_op::DecodedRowOp::Known(op) => op,
+        other => panic!("known op, got {other:?}"),
+    }
+}
+
+fn tombstone_identity(device: &Device) -> Option<String> {
+    device
+        .conn
+        .query_row("SELECT device_fingerprint FROM sync_row_tombstones", [], |row| row.get(0))
+        .optional()
+        .unwrap()
+}
+
+fn statements(device: &Device) -> Vec<(String, i64)> {
+    device
+        .conn
+        .prepare(
+            "SELECT device_fingerprint, lamport FROM sync_tombstone_statements ORDER BY lamport",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// In a bounded scope, re-adopting a removed writer's delete restates it at its identity: the
+/// adopter's chain now states the tombstone (so its floor can move past it later), the identity
+/// stays the removed writer's, and a fresh replica folding the adopter's chain alone holds the
+/// delete.
+#[test]
+fn removing_a_writer_adds_the_adopters_statement_and_keeps_the_identity() {
+    let a = Device::new();
+    let c = Device::new();
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], "overlay/1");
+
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
+    let create = produce_on(&a, OVERLAY);
+    ingest_on(&c, OVERLAY, &create, &a.pubkey());
+    a.delete_row();
+    let delete = produce_on(&a, OVERLAY);
+    ingest_on(&c, OVERLAY, &delete, &a.pubkey());
+    let a_hex = a.pubkey().fingerprint().to_string();
+    assert_eq!(statements(&c), vec![(a_hex.clone(), 1)], "A's remove states its delete");
+
+    assert_eq!(drain_removal(&c, OVERLAY, a.pubkey().fingerprint(), stream), Some(1));
+    let chain = own_chain(&c);
+    assert_eq!(chain.len(), 1, "one restatement");
+    let RowOp::Restate { deletes, .. } = decoded(&chain[0]) else { panic!("a restate") };
+    assert_eq!(deletes.len(), 1);
+    assert_eq!((deletes[0].device, deletes[0].lamport), (a.pubkey().fingerprint(), 1));
+    assert_eq!(tombstone_identity(&c).as_deref(), Some(a_hex.as_str()), "identity unchanged");
+    let c_hex = c.local.fingerprint().to_string();
+    assert_eq!(statements(&c), vec![(a_hex.clone(), 1), (c_hex, 2)], "and C states it too");
+    let audits: i64 = c
+        .conn
+        .query_row("SELECT COUNT(*) FROM table_sync_readoption_audit", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(audits, 1);
+
+    // A fresh replica that only ever sees C's chain holds the delete.
+    let d = Device::new();
+    assert_eq!(ingest_on(&d, OVERLAY, &chain, &c.pubkey()), vec![IngestOutcome::Applied]);
+    assert_eq!(d.title(), None);
+    assert_eq!(tombstone_identity(&d).as_deref(), Some(a_hex.as_str()));
+
+    // Draining the same removal again re-signs nothing: C already states it.
+    let tx = c.conn.unchecked_transaction().unwrap();
+    store::enqueue_readoption_work(&tx, account, a.pubkey().fingerprint(), stream, [8; 32], 12, 13)
+        .unwrap();
+    assert_eq!(
+        process_readoption_work_for_stream(&tx, &ctx_on(&c, OVERLAY), stream).unwrap(),
+        Some(0)
+    );
+    tx.commit().unwrap();
+}
+
+/// A fully retained scope keeps today's tail-signed `Remove` for a re-adopted delete: nothing
+/// there is ever compacted, and a restatement would only park on a pre-restate device.
+#[test]
+fn anchors_re_adoption_keeps_the_tail_signed_remove() {
+    let a = Device::new();
+    let c = Device::new();
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
+    let create = produce_on(&a, REGISTRY);
+    ingest_on(&c, REGISTRY, &create, &a.pubkey());
+    a.delete_row();
+    let delete = produce_on(&a, REGISTRY);
+    ingest_on(&c, REGISTRY, &delete, &a.pubkey());
+
+    assert_eq!(drain_removal(&c, REGISTRY, a.pubkey().fingerprint(), stream), Some(1));
+    let chain = own_chain(&c);
+    assert!(matches!(decoded(&chain[0]), RowOp::Remove { .. }), "a tail-signed remove");
+    let c_hex = c.local.fingerprint().to_string();
+    assert_eq!(tombstone_identity(&c).as_deref(), Some(c_hex.as_str()), "the identity moved");
+}
+
+/// A delete parked while its author was still a writer, and replayed after that author's
+/// removal already drained, re-arms the removal: the drain that follows carries the delete under
+/// a live chain. Without this the tombstone would sit under a removed identity no chain states.
+#[test]
+fn replay_after_removal_re_arms_re_adoption() {
+    const BOOL_SPEC: TableSpec = TableSpec {
+        name: "t_typed",
+        scope_id: "overlay/1",
+        spec_version: 1,
+        pk: &[ColumnSpec::required("id", ValueType::Text)],
+        columns: &[ColumnSpec::required("flag", ValueType::Bool)],
+        local_columns: &[],
+        repo_column: None,
+    };
+    const BOOL: &[TableSpec] = &[BOOL_SPEC];
+    let a = Device::new();
+    let c = Device::new();
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], "overlay/1");
+    for device in [&a, &c] {
+        device
+            .conn
+            .execute_batch("CREATE TABLE t_typed(id TEXT PRIMARY KEY, flag INTEGER) STRICT;")
+            .unwrap();
+    }
+    // C owns r1; A deletes it. On C an unreadable cell holds A's delete back.
+    c.conn.execute("INSERT INTO t_typed(id, flag) VALUES ('r1', 1)", []).unwrap();
+    let create = produce_on(&c, BOOL);
+    ingest_on(&a, BOOL, &create, &c.pubkey());
+    a.conn.execute("DELETE FROM t_typed WHERE id = 'r1'", []).unwrap();
+    let delete = produce_on(&a, BOOL);
+    c.conn.execute("UPDATE t_typed SET flag = 2 WHERE id = 'r1'", []).unwrap();
+    assert_eq!(ingest_on(&c, BOOL, &delete, &a.pubkey()), vec![IngestOutcome::Retained(
+        store::PendingReason::DeferredUnreadableRow.as_db_str()
+    )]);
+    // A is removed while its delete is parked: A owns nothing on C, so the drain completes.
+    assert_eq!(drain_removal(&c, BOOL, a.pubkey().fingerprint(), stream), Some(0));
+    // The cell is repaired and the next producer pass replays the delete: it beats C's clock,
+    // and the merge state it leaves is a tombstone under A — a removed writer no chain states.
+    c.conn.execute("UPDATE t_typed SET flag = 1 WHERE id = 'r1'", []).unwrap();
+    assert!(produce_on(&c, BOOL).is_empty(), "nothing local to author; the pass is the replay");
+    let a_hex = a.pubkey().fingerprint().to_string();
+    assert_eq!(tombstone_identity(&c).as_deref(), Some(a_hex.as_str()));
+    let tx = c.conn.unchecked_transaction().unwrap();
+    assert!(
+        store::has_pending_readoption_work(&tx, account, stream).unwrap(),
+        "the completed removal is re-armed by the replay"
+    );
+    assert_eq!(
+        process_readoption_work_for_stream(&tx, &ctx_on(&c, BOOL), stream).unwrap(),
+        Some(1)
+    );
+    tx.commit().unwrap();
+    let c_hex = c.local.fingerprint().to_string();
+    assert!(statements(&c).iter().any(|(device, _)| *device == c_hex), "C states A's delete");
+    let last = own_chain(&c).pop().unwrap();
+    assert!(matches!(decoded(&last), RowOp::Restate { .. }));
+    assert_eq!(tombstone_identity(&c).as_deref(), Some(a_hex.as_str()), "identity unchanged");
+}
+
+/// In a fully retained scope a re-adopted delete is a tail-signed `Remove`, a new identity above
+/// every accepted entry — so, like a re-authored row, it waits while a parked newer write sits
+/// above the tombstone: peers that understand that write have applied it, and the remove would
+/// suppress it there. Only a restatement, which settles at the original identity, is never held.
+#[test]
+fn anchors_re_adoption_holds_a_tail_signed_remove_below_a_parked_newer_write() {
+    let a = Device::new();
+    let c = Device::new();
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], "demo/1");
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'created')", []).unwrap();
+    let create = produce_on(&a, REGISTRY);
+    ingest_on(&c, REGISTRY, &create, &a.pubkey());
+    a.delete_row();
+    let delete = produce_on(&a, REGISTRY);
+    ingest_on(&c, REGISTRY, &delete, &a.pubkey()); // tombstone (A, 1)
+    // A newer write to r1 this binary cannot apply yet, parked above the tombstone.
+    c.conn
+        .execute(
+            "INSERT INTO table_sync_entries(
+                 entry_hash, stream_id, device_fingerprint, lamport, signed_bytes,
+                 received_at_ms, pending_reason
+             ) VALUES (x'77', ?1, ?2, 2, x'00', 0, 'newer_spec_version')",
+            rusqlite::params![stream.to_bytes().as_slice(), [2u8; 32].as_slice()],
+        )
+        .unwrap();
+    assert_eq!(
+        drain_removal(&c, REGISTRY, a.pubkey().fingerprint(), stream),
+        None,
+        "the tail-signed remove waits for the parked write"
+    );
+    assert!(own_chain(&c).is_empty(), "nothing was signed over it");
+    c.conn
+        .execute("UPDATE table_sync_entries SET pending_reason = NULL WHERE entry_hash = x'77'", [])
+        .unwrap();
+    let tx = c.conn.unchecked_transaction().unwrap();
+    assert_eq!(
+        process_readoption_work_for_stream(&tx, &ctx_on(&c, REGISTRY), stream).unwrap(),
+        Some(1)
+    );
+    tx.commit().unwrap();
+    assert!(matches!(decoded(&own_chain(&c)[0]), RowOp::Remove { .. }));
+}
+
+#[test]
+fn readopting_a_statement_carrier_preserves_actual_provenance() {
+    let a = Device::new();
+    let b = Device::new();
+    let c = Device::new();
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], "overlay/1");
+    a.conn.execute("INSERT INTO t_demo(id,title) VALUES ('r1','created')", []).unwrap();
+    ingest_on(&b, OVERLAY, &produce_on(&a, OVERLAY), &a.pubkey());
+    a.delete_row();
+    ingest_on(&b, OVERLAY, &produce_on(&a, OVERLAY), &a.pubkey());
+    assert_eq!(drain_removal(&b, OVERLAY, a.local.fingerprint(), stream), Some(1));
+    let chain = own_chain(&b);
+    let actual = crate::entry::decode_signed(&chain[0]).unwrap();
+    assert_eq!(actual.entry.lamport, 2);
+    ingest_on(&c, OVERLAY, &chain, &b.pubkey());
+    assert_eq!(drain_removal(&c, OVERLAY, b.local.fingerprint(), stream), Some(1));
+    let recorded: (i64, Option<Vec<u8>>) = c
+        .conn
+        .query_row(
+            "SELECT original_lamport, original_entry_hash FROM table_sync_readoption_audit",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        recorded.0 as u64, actual.entry.lamport,
+        "provenance must name B's actual statement, not A's delete lamport"
+    );
+    assert_eq!(recorded.1.as_deref(), Some(actual.entry.entry_hash.as_slice()));
+    assert_eq!(tombstone_identity(&c), Some(a.local.fingerprint().to_string()));
+    let RowOp::Restate { deletes, .. } = decoded(&own_chain(&c)[0]) else {
+        panic!("the adopter must restate the original delete");
+    };
+    assert_eq!(deletes[0].device, a.local.fingerprint());
+    assert_eq!(deletes[0].lamport, 1);
 }

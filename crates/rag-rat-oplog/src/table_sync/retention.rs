@@ -4,15 +4,17 @@
 //! Anchors/1 launches fully retained; the first high-churn scope cannot. Compaction here drops
 //! accepted entries with `lamport < floor` for ONE device chain — and only SUPERSEDED ones. The
 //! invariant (#1277): every entry that still carries a row's merge state stays retained. Those
-//! are the chain's *pins* ([`chain_pins`]): a live whole-row winner, and a tombstone whose pk has
-//! no live row. A fresh peer folds only the retained suffix, so a dropped live winner is a row it
-//! never receives; a re-rooting peer (below) never sees the region between its old tip and the
-//! floor, so a dropped orphan tombstone is a deleted row it keeps. A tombstone whose pk is live
-//! again is not a pin: anything it would suppress also loses to the live clock.
-//! [`compact_chain_prefix`] refuses a floor above a pin; the driver
-//! (`table_sync_compact_overdue`) clamps its floor at the oldest pin, and on this device's own
-//! chain first re-authors the oldest pins at the tail when that frees at least twice what it
-//! authors.
+//! are the chain's *pins* ([`chain_pins`]): a live whole-row winner, and this chain's newest
+//! statement of a tombstone whose pk has no live row (`sync_tombstone_statements`, #1295). A
+//! fresh peer folds only the retained suffix, so a dropped live winner is a row it never
+//! receives; a re-rooting peer (below) never sees the region between its old tip and the floor,
+//! so a dropped statement is a deleted row it keeps. A tombstone whose pk is live again is not a
+//! pin: anything it would suppress also loses to the live clock. [`compact_chain_prefix`] refuses
+//! a floor above a pin; the driver (`table_sync_compact_overdue`) clamps its floor at the oldest
+//! pin, and on this device's own chain first carries the oldest pins to the tail — a live row
+//! re-authored, its stated deletes restated in batches — when that frees at least twice what it
+//! authors. A chain's statement moves only when its own writer restates, so no chain's delivery
+//! of a delete ever depends on another chain.
 //!
 //! The floor is recorded durably (`table_sync_retained_floors`) and advertised on the wire: a
 //! FRESH peer (no local chain) accepts the floor entry as its local root on exact
@@ -35,10 +37,11 @@
 //! Accepted horizons, named rather than hidden:
 //!
 //! - **Pins are the retention floor.** A chain holds at least its pins, whatever the budget: live
-//!   rows past the budget, or orphan tombstones (nothing collects them yet), keep the chain over
-//!   budget honestly instead of dropping what a peer needs. A foreign chain is never re-authored —
-//!   only its writer can carry its rows forward — so it reclaims only the superseded prefix below
-//!   its oldest pin.
+//!   rows past the budget, or its statements of orphan tombstones, keep the chain over budget
+//!   honestly instead of dropping what a peer needs. A foreign chain is never re-authored — only
+//!   its writer can carry its rows forward — so it reclaims only the superseded prefix below its
+//!   oldest pin. Tombstone rows and their statements are permanent: a chain that is all statements
+//!   packed at the tail is its irreducible footprint.
 //! - **A re-authored pin is a new write.** It carries the row's current cells at the tail, so it
 //!   competes under LWW with a concurrent edit to that row this device has not received yet, and
 //!   can win it — the cost re-adoption already accepts.
@@ -125,18 +128,46 @@ pub(crate) fn record_adopted_floor(
     Ok(())
 }
 
-/// A row whose current merge state is carried by one entry on a device chain: a live whole-row
-/// winner, or a tombstone whose pk has no live row. Compaction never drops the entry at `lamport`
-/// while the pin stands.
+/// One entry on a device chain that still carries merge state, so compaction never drops it while
+/// the pin stands: the live whole-row winner it wrote, or this chain's statement of one or more
+/// tombstones whose pk has no live row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Pin {
+    pub lamport: u64,
+    pub kind: PinKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PinKind {
+    /// The entry's upsert owns the row.
+    LiveRow { table_name: String, row_pk: String },
+    /// The entry is this chain's newest statement of each of these current orphan tombstones — a
+    /// `Remove` states one, a `Restate` many.
+    Statements(Vec<StatedRow>),
+}
+
+/// A tombstone one chain states: the row, and the delete identity it competes under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatedRow {
     pub table_name: String,
     pub row_pk: String,
+    /// The identity's device, in the lowercase hex the merge tables use.
+    pub device_hex: String,
     pub lamport: u64,
 }
 
+impl Pin {
+    /// How many rows the pin holds — one for a live row, one per stated tombstone.
+    pub(crate) fn held(&self) -> usize {
+        match &self.kind {
+            PinKind::LiveRow { .. } => 1,
+            PinKind::Statements(rows) => rows.len(),
+        }
+    }
+}
+
 /// The pins on `device`'s chain in `stream` with `from <= lamport < below`, oldest first, at most
-/// `limit` of them.
+/// `limit` of them — one per entry, its stated rows gathered.
 pub(crate) fn chain_pins(
     tx: &Transaction<'_>,
     stream: StreamId,
@@ -145,40 +176,79 @@ pub(crate) fn chain_pins(
     below: u64,
     limit: usize,
 ) -> anyhow::Result<Vec<Pin>> {
-    // The merge tables store the winner's fingerprint as the lowercase hex the applier wrote. A
-    // live clock owns its row whatever tombstone sits beside it; a tombstone pins only without one.
+    // The merge tables store fingerprints as the lowercase hex the applier wrote. A live clock owns
+    // its row whatever tombstone sits beside it; a statement pins only while its tombstone is
+    // current (a statement never outlives its tombstone row — the join is that guarantee) and the
+    // pk has no live clock.
     let mut stmt = tx.prepare(
-        "SELECT table_name, row_pk, lamport FROM sync_row_clocks
+        "SELECT lamport, table_name, row_pk, NULL, NULL FROM sync_row_clocks
          WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport >= ?3 AND lamport < ?4
          UNION ALL
-         SELECT t.table_name, t.row_pk, t.lamport FROM sync_row_tombstones t
-         WHERE t.stream_id = ?1 AND t.device_fingerprint = ?2 AND t.lamport >= ?3
-           AND t.lamport < ?4
+         SELECT s.lamport, s.table_name, s.row_pk, t.device_fingerprint, t.lamport
+           FROM sync_tombstone_statements s
+           JOIN sync_row_tombstones t
+             ON t.stream_id = s.stream_id AND t.table_name = s.table_name AND t.row_pk = s.row_pk
+         WHERE s.stream_id = ?1 AND s.device_fingerprint = ?2 AND s.lamport >= ?3
+           AND s.lamport < ?4
            AND NOT EXISTS (
                SELECT 1 FROM sync_row_clocks c
-               WHERE c.stream_id = t.stream_id AND c.table_name = t.table_name
-                 AND c.row_pk = t.row_pk
+               WHERE c.stream_id = s.stream_id AND c.table_name = s.table_name
+                 AND c.row_pk = s.row_pk
            )
-         ORDER BY lamport, table_name, row_pk
-         LIMIT ?5",
+         ORDER BY 1, 2, 3",
     )?;
-    let pins = stmt
-        .query_map(
-            params![
-                stream.to_bytes().as_slice(),
-                device.to_string(),
-                i64::try_from(from)?,
-                i64::try_from(below)?,
-                i64::try_from(limit).unwrap_or(i64::MAX),
-            ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?)),
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    pins.into_iter()
-        .map(|(table_name, row_pk, lamport)| {
-            Ok(Pin { table_name, row_pk, lamport: u64::try_from(lamport)? })
-        })
-        .collect()
+    // Stepped lazily: a caller wanting only the oldest pin stops as soon as the next entry
+    // begins, without materialising the rest.
+    let rows = stmt.query_map(
+        params![
+            stream.to_bytes().as_slice(),
+            device.to_string(),
+            i64::try_from(from)?,
+            i64::try_from(below)?,
+        ],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+            ))
+        },
+    )?;
+    let mut pins: Vec<Pin> = Vec::new();
+    for row in rows {
+        let (lamport, table_name, row_pk, identity_device, identity_lamport) = row?;
+        let lamport = u64::try_from(lamport)?;
+        let stated = match (identity_device, identity_lamport) {
+            (Some(device_hex), Some(identity_lamport)) => Some(StatedRow {
+                table_name: table_name.clone(),
+                row_pk: row_pk.clone(),
+                device_hex,
+                lamport: u64::try_from(identity_lamport)?,
+            }),
+            _ => None,
+        };
+        match (pins.last_mut(), stated) {
+            // One entry states many tombstones; one entry writes one row.
+            (Some(Pin { lamport: last, kind: PinKind::Statements(rows) }), Some(row))
+                if *last == lamport =>
+                rows.push(row),
+            (_, Some(row)) => {
+                if pins.len() >= limit {
+                    break;
+                }
+                pins.push(Pin { lamport, kind: PinKind::Statements(vec![row]) });
+            },
+            (_, None) => {
+                if pins.len() >= limit {
+                    break;
+                }
+                pins.push(Pin { lamport, kind: PinKind::LiveRow { table_name, row_pk } });
+            },
+        }
+    }
+    Ok(pins)
 }
 
 /// Drop every accepted entry on `device`'s chain in `stream` with `lamport < floor_lamport`.
@@ -227,12 +297,15 @@ pub(crate) fn compact_chain_prefix(
     if let Some(pin) =
         chain_pins(tx, stream, device, current.unwrap_or(0), floor_lamport, 1)?.first()
     {
+        let (what, table_name, row_pk) = match &pin.kind {
+            PinKind::LiveRow { table_name, row_pk } => ("carries", table_name, row_pk),
+            PinKind::Statements(rows) =>
+                ("states the delete of", &rows[0].table_name, &rows[0].row_pk),
+        };
         anyhow::bail!(
             "table-sync compaction floor {floor_lamport} would drop the entry at lamport {} that \
-             still carries `{}` row {} — only superseded entries are reclaimable",
+             still {what} `{table_name}` row {row_pk} — only superseded entries are reclaimable",
             pin.lamport,
-            pin.table_name,
-            pin.row_pk
         );
     }
     let dropped_entries = tx.execute(

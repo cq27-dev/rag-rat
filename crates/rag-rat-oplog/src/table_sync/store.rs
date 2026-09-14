@@ -1317,34 +1317,51 @@ pub(crate) fn has_pending_readoption_work(
     )? == 1)
 }
 
-/// Every row whose whole-row LWW winner is the removed device on this stream, with the winning
-/// entry's provenance when that entry is still retained.
+/// Every row the removed device carries on this stream — the rows whose whole-row LWW winner it
+/// is, and the tombstones whose identity or any statement is its — that the local writer
+/// (`local_hex`) does not already state, with the removed carrier's entry provenance when it is
+/// still retained. A drain that leaves other rows pending never re-signs a delete it already
+/// carries.
 ///
-/// Derived from the MERGE STATE (`sync_row_clocks` / `sync_row_tombstones`), not the entry log:
-/// the repair verdict reads the winner from those same tables, and they are the authoritative
-/// record that survives accepted-entry compaction (#1127). Enumerating `table_sync_entries`
-/// instead would silently shrink the candidate set after a compaction dropped the removed
-/// writer's prefix, completing the removal while compacted winners are never re-authored. Bounded
-/// by the device's surviving merge-state footprint — never a scan of unrelated rows.
+/// Derived from the MERGE STATE (`sync_row_clocks` / `sync_row_tombstones` /
+/// `sync_tombstone_statements`), not the entry log: the repair verdict reads the winner from
+/// those same tables, and they are the authoritative record that survives accepted-entry
+/// compaction (#1127). Enumerating `table_sync_entries` instead would silently shrink the
+/// candidate set after a compaction dropped the removed writer's prefix, completing the removal
+/// while compacted winners are never re-authored. Bounded by the device's surviving merge-state
+/// footprint — never a scan of unrelated rows.
 pub(crate) fn readoption_candidates(
     tx: &Transaction<'_>,
     stream: StreamId,
     device_fingerprint: DeviceFingerprint,
+    local_hex: &str,
 ) -> anyhow::Result<Vec<ReadoptionCandidate>> {
     let device_hex = device_fingerprint.to_string();
+    // A carrier can restate another writer's delete: provenance belongs to the carrier's
+    // statement clock, while row_repair_op reads the original deletion identity for LWW.
+    // An identity with no statement still names its original Remove, including legacy state.
     let mut stmt = tx.prepare(
         "SELECT table_name, row_pk, MAX(lamport) FROM (
              SELECT table_name, row_pk, lamport FROM sync_row_clocks
               WHERE stream_id = ?1 AND device_fingerprint = ?2
              UNION ALL
-             SELECT table_name, row_pk, lamport FROM sync_row_tombstones
-              WHERE stream_id = ?1 AND device_fingerprint = ?2
+             SELECT t.table_name, t.row_pk, COALESCE(s.lamport, t.lamport)
+               FROM sync_row_tombstones t
+               LEFT JOIN sync_tombstone_statements s
+                 ON s.stream_id = t.stream_id AND s.table_name = t.table_name
+                AND s.row_pk = t.row_pk AND s.device_fingerprint = ?2
+              WHERE t.stream_id = ?1
+                AND (t.device_fingerprint = ?2 OR s.device_fingerprint IS NOT NULL)
+                AND NOT EXISTS (
+                        SELECT 1 FROM sync_tombstone_statements l
+                         WHERE l.stream_id = t.stream_id AND l.table_name = t.table_name
+                           AND l.row_pk = t.row_pk AND l.device_fingerprint = ?3)
          )
          GROUP BY table_name, row_pk
          ORDER BY MAX(lamport)",
     )?;
     let rows = stmt
-        .query_map(params![stream.to_bytes().as_slice(), device_hex], |row| {
+        .query_map(params![stream.to_bytes().as_slice(), device_hex, local_hex], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1407,6 +1424,31 @@ pub(crate) fn record_readoption_audit(
         ],
     )?;
     Ok(())
+}
+
+/// Re-open a COMPLETED removal's stream repair for `device_fingerprint` (#1295 rule 7): replay
+/// materialised merge state — a tombstone identity or a live clock — belonging to a device that
+/// is no longer an effective writer, after the drain for its removal had already run. A device
+/// with no removal fact has no row and gets none here, so a stray identity a `Restate` names
+/// cannot launder itself onto honest chains. Separate from [`enqueue_readoption_work`]'s epoch
+/// monotonicity: this invents no removal, only re-arms the one recorded. Returns whether a row
+/// was re-opened.
+pub(crate) fn reopen_readoption_work(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    stream: StreamId,
+) -> anyhow::Result<bool> {
+    Ok(tx.execute(
+        "UPDATE table_sync_readoption_work SET processed_at_ms = NULL
+         WHERE account_id = ?1 AND device_fingerprint = ?2 AND stream_id = ?3
+           AND processed_at_ms IS NOT NULL",
+        params![
+            account_id.to_bytes().as_slice(),
+            device_fingerprint.to_bytes().as_slice(),
+            stream.to_bytes().as_slice(),
+        ],
+    )? > 0)
 }
 
 /// Mark one removal's stream repair complete. The work row remains as the durable witness that
@@ -1597,6 +1639,29 @@ mod tests {
             table: "t".to_string(),
             pk: vec![TypedValue::Text(id.to_string())],
         }
+    }
+
+    /// What a restatement may pack is the transport limit less this bound, so the bound must
+    /// cover the real envelope at its widest: a linked entry, a full-width lamport, the domains,
+    /// the fingerprint, the signature and every CBOR header. A bound that fell short would not
+    /// error — `author_row_entry_if_it_fits` would decline the batch and the pin would never move.
+    #[test]
+    fn an_envelope_never_adds_more_than_the_overhead_bound() {
+        let secret = crate::device::DeviceSecret::from_seed(&[0x51; 32]);
+        let op_bytes = vec![0xAB; super::super::TABLE_SYNC_ENTRY_MAX_BYTES - 1];
+        let signed = entry::sign_entry_from_op_bytes(
+            &secret,
+            StreamId::from_bytes([0x33; 32]),
+            Some(EntryHash::from_bytes([0x44; 32])),
+            MAX_ENTRY_LAMPORT - 1,
+            op_bytes.clone(),
+        );
+        let overhead = signed.signed_bytes.len() - op_bytes.len();
+        assert!(
+            overhead <= super::super::TABLE_SYNC_ENTRY_OVERHEAD_MAX,
+            "the envelope adds {overhead} bytes, over the {} bound",
+            super::super::TABLE_SYNC_ENTRY_OVERHEAD_MAX
+        );
     }
 
     #[test]

@@ -561,6 +561,21 @@ pub(crate) const SYNCABLE_TABLES: &[TableSpec] = &[
 /// plus the scope's specific lane. Returned to the apply-side and refold bump sites, which cannot
 /// always name the applied table but always know the stream/entry's `scope_id`. An unknown scope
 /// advances nothing. Keep in sync with the scopes in [`SYNCABLE_TABLES`].
+/// Advance the Lens lanes `scope_id` feeds after an applied entry changed `repo_id`'s derived
+/// state. Gated on repo registration: `repo_meta` has a foreign key to `repos`, so an ungated
+/// bump for a placeholder id would fail rather than no-op.
+pub(crate) fn bump_scope_lanes(
+    tx: &rusqlite::Transaction<'_>,
+    scope_id: &str,
+    repo_id: &str,
+) -> anyhow::Result<()> {
+    let lens_metas = scope_lens_metas(scope_id);
+    if !lens_metas.is_empty() && rag_rat_db::schema::repo_id_is_registered(tx, repo_id)? {
+        rag_rat_db::meta::bump_lens_revisions(tx, repo_id, lens_metas)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn scope_lens_metas(scope_id: &str) -> &'static [&'static str] {
     match scope_id {
         // anchors/1 and overlay/1 are memory-facing scopes.
@@ -902,6 +917,22 @@ pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
     ],
     // v9: the per-memory summary table joins overlay/1 (#1319); `memory_summaries` stays, retired.
     // Whole-registry snapshot: v8's nine tables plus the new one, in `SYNCABLE_TABLES` order.
+    &[
+        REPO_MEMORY_BINDINGS_V1,
+        MEMORY_REALITY_V1,
+        MEMORY_SUMMARIES_V1,
+        PAPERTRAIL_DISTILL_V1,
+        PAPERTRAIL_DISTILL_EDGES_V1,
+        PAPERTRAIL_DISTILL_ALTERNATIVES_V1,
+        PAPERTRAIL_DISTILL_RECORD_COMMITS_V1,
+        PAPERTRAIL_DISTILL_EVIDENCE_V1,
+        PAPERTRAIL_DISTILL_ANCHORS_V1,
+        MEMORY_NOTE_SUMMARIES_V1,
+    ],
+    // v10: the `restate` row-op kind (#1295) — a widening that is not a registry change, so the
+    // snapshot repeats v9. The bump is what schedules the replay of entries an older binary parked
+    // as `UnknownOpKind`, which is how a row deleted below a floor that binary adopted goes once
+    // it upgrades.
     &[
         REPO_MEMORY_BINDINGS_V1,
         MEMORY_REALITY_V1,

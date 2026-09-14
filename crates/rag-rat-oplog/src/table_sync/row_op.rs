@@ -1,7 +1,9 @@
 //! The table→log sync engine's row op + its canonical CBOR wire form.
 //!
 //! A [`RowOp`] is one replicated row mutation on a syncable table: an `Upsert` (a row identity plus
-//! its synced cells) or a `Remove` (a row identity). It mirrors [`super::super::op`]'s discipline —
+//! its synced cells), a `Remove` (a row identity), or a `Restate` (a batch of earlier deletes at
+//! their original identities, re-carried so the entries that first stated them can be reclaimed).
+//! It mirrors [`super::super::op`]'s discipline —
 //! a domain-tagged, definite-length, deterministic envelope `[domain, op-kind, payload]`, versioned
 //! (`"rag-rat/table-op/1"`) so a future format can never collide — but its vocabulary is
 //! **self-describing**: the op carries the table name, the column names, and each value's type
@@ -19,6 +21,7 @@ use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
 use crate::cbor::{self, INFALLIBLE, VecEncoder};
+use crate::op::DeviceFingerprint;
 
 /// Domain tag + version, the envelope's first element. Bump the version to evolve the wire format
 /// deliberately (an old binary then rejects the new domain rather than misreading it).
@@ -63,27 +66,53 @@ pub enum RowOp {
     /// only the row identity, so no column set is involved and no default can apply. Gating a
     /// deletion on a version skew would delay it for no benefit.
     Remove { table: String, spec_version: u32, pk: Vec<TypedValue> },
+    /// Re-state a batch of earlier deletes at their ORIGINAL identities (#1295). The signer asserts
+    /// nothing a `Remove` at its tail could not, and strictly less: each delete settles under LWW
+    /// exactly as the entry that first stated it did, so a newer write to the row still wins.
+    /// What the restatement changes is delivery — the signer's chain now carries these deletes at
+    /// this entry, so the entries that carried them before can be compacted away.
+    ///
+    /// `spec_version` is carried like `Remove`'s and never gated on. `deletes` is canonical:
+    /// sorted by row identity, unique, non-empty; every `lamport` must be strictly below the
+    /// carrying entry's own, which the applier checks (the wire cannot).
+    Restate { table: String, spec_version: u32, deletes: Vec<StatedDelete> },
+}
+
+/// One delete a [`RowOp::Restate`] re-carries: the row identity and the `(device, lamport)` the
+/// delete was originally signed at, which is the identity it competes under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatedDelete {
+    pub pk: Vec<TypedValue>,
+    pub device: DeviceFingerprint,
+    pub lamport: u64,
 }
 
 impl RowOp {
     /// The table this op mutates.
     pub fn table(&self) -> &str {
         match self {
-            Self::Upsert { table, .. } | Self::Remove { table, .. } => table,
+            Self::Upsert { table, .. }
+            | Self::Remove { table, .. }
+            | Self::Restate { table, .. } => table,
         }
     }
 
-    /// The op's `pk` cells.
-    pub fn pk(&self) -> &[TypedValue] {
-        match self {
-            Self::Upsert { pk, .. } | Self::Remove { pk, .. } => pk,
-        }
+    /// Every row identity the op names: one for an `Upsert` or `Remove`, each stated delete's for
+    /// a `Restate`.
+    pub fn pks(&self) -> impl Iterator<Item = &[TypedValue]> {
+        let (one, many): (Option<&[TypedValue]>, &[StatedDelete]) = match self {
+            Self::Upsert { pk, .. } | Self::Remove { pk, .. } => (Some(pk), &[]),
+            Self::Restate { deletes, .. } => (None, deletes),
+        };
+        one.into_iter().chain(many.iter().map(|delete| delete.pk.as_slice()))
     }
 
     /// The synced column set this op was authored against.
     pub fn spec_version(&self) -> u32 {
         match self {
-            Self::Upsert { spec_version, .. } | Self::Remove { spec_version, .. } => *spec_version,
+            Self::Upsert { spec_version, .. }
+            | Self::Remove { spec_version, .. }
+            | Self::Restate { spec_version, .. } => *spec_version,
         }
     }
 
@@ -92,6 +121,7 @@ impl RowOp {
         match self {
             Self::Upsert { .. } => "upsert",
             Self::Remove { .. } => "remove",
+            Self::Restate { .. } => "restate",
         }
     }
 }
@@ -136,6 +166,27 @@ fn encode_payload(enc: &mut VecEncoder<'_>, op: &RowOp) {
             enc.u32(*spec_version).expect(INFALLIBLE);
             encode_values(enc, pk);
         },
+        RowOp::Restate { table, spec_version, deletes } => {
+            enc.array(3).expect(INFALLIBLE);
+            enc.str(table).expect(INFALLIBLE);
+            enc.u32(*spec_version).expect(INFALLIBLE);
+            encode_deletes(enc, deletes);
+        },
+    }
+}
+
+/// Encode stated deletes sorted by row identity (the canonical order), each as a
+/// `[pk, device, lamport]` triple. Sorted by the identity's canonical bytes — the same order
+/// [`row_pk_string`] induces — so the bytes are stable regardless of the producer's order.
+fn encode_deletes(enc: &mut VecEncoder<'_>, deletes: &[StatedDelete]) {
+    let mut sorted: Vec<&StatedDelete> = deletes.iter().collect();
+    sorted.sort_by_cached_key(|delete| row_pk_string(&delete.pk));
+    enc.array(sorted.len() as u64).expect(INFALLIBLE);
+    for delete in sorted {
+        enc.array(3).expect(INFALLIBLE);
+        encode_values(enc, &delete.pk);
+        enc.bytes(&delete.device.to_bytes()).expect(INFALLIBLE);
+        enc.u64(delete.lamport).expect(INFALLIBLE);
     }
 }
 
@@ -207,6 +258,13 @@ fn decode_envelope(bytes: &[u8]) -> Result<DecodedRowOp, CborError> {
             let pk = decode_values(&mut d)?;
             Some(RowOp::Remove { table, spec_version, pk })
         },
+        "restate" => {
+            cbor::expect_array(&mut d, 3)?;
+            let table = d.str()?.to_string();
+            let spec_version = d.u32()?;
+            let deletes = decode_deletes(&mut d)?;
+            Some(RowOp::Restate { table, spec_version, deletes })
+        },
         // A future op-kind this binary doesn't know — retained opaque, canonicity checked below.
         _ => None,
     };
@@ -275,6 +333,31 @@ fn decode_cells(d: &mut Decoder<'_>) -> Result<Vec<Cell>, CborError> {
     Ok(cells)
 }
 
+/// Decode stated deletes, enforcing strictly-ascending unique row identities (the canonical
+/// order) and a non-empty batch: an empty restatement states nothing and has no reason to exist
+/// on a chain. The batch length and each identity's arity are both under the element cap.
+fn decode_deletes(d: &mut Decoder<'_>) -> Result<Vec<StatedDelete>, CborError> {
+    let len = capped_len(d)?;
+    if len == 0 {
+        return Err(CborError::message("a restate batch names no deletes"));
+    }
+    let mut deletes = Vec::with_capacity(len);
+    let mut prev: Option<String> = None;
+    for _ in 0..len {
+        cbor::expect_array(d, 3)?;
+        let pk = decode_values(d)?;
+        let identity = row_pk_string(&pk);
+        if prev.as_ref().is_some_and(|p| &identity <= p) {
+            return Err(CborError::message("restate deletes not sorted or duplicated"));
+        }
+        let device = DeviceFingerprint::from_bytes(cbor::fixed_bytes::<32>(d.bytes()?, "device")?);
+        let lamport = d.u64()?;
+        prev = Some(identity);
+        deletes.push(StatedDelete { pk, device, lamport });
+    }
+    Ok(deletes)
+}
+
 fn decode_value(d: &mut Decoder<'_>) -> Result<TypedValue, CborError> {
     match d.datatype()? {
         Type::Null => {
@@ -294,6 +377,138 @@ fn decode_value(d: &mut Decoder<'_>) -> Result<TypedValue, CborError> {
         Type::String => Ok(TypedValue::Text(d.str()?.to_string())),
         other =>
             Err(CborError::message(format!("unexpected CBOR type for a row-op value: {other:?}"))),
+    }
+}
+
+impl StatedDelete {
+    /// The bytes this delete adds to a `Restate` payload: its `[pk, device, lamport]` triple.
+    fn encoded_len(&self) -> usize {
+        let mut buf = Vec::with_capacity(64);
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(3).expect(INFALLIBLE);
+            encode_values(&mut enc, &self.pk);
+            enc.bytes(&self.device.to_bytes()).expect(INFALLIBLE);
+            enc.u64(self.lamport).expect(INFALLIBLE);
+        }
+        buf.len()
+    }
+}
+
+/// `deletes` packed, in the order given, into the fewest `Restate` ops on `table` whose encoded
+/// payload stays within `payload_max` bytes and [`MAX_ROW_OP_ELEMENTS`] deletes each: greedy, in
+/// order, so a prefix of the input fills the leading batches. Each batch carries the input
+/// indices it holds; a delete that does not fit a batch alone is left out and reported, so it can
+/// leave its pin standing without stalling the rest.
+pub(crate) struct PackedRestates {
+    pub batches: Vec<(RowOp, Vec<usize>)>,
+    pub unfit: Vec<usize>,
+}
+
+pub(crate) fn pack_restates(
+    table: &str,
+    spec_version: u32,
+    deletes: &[StatedDelete],
+    payload_max: usize,
+) -> PackedRestates {
+    let mut packer = RestatePacker::new(table, spec_version, payload_max);
+    let mut packed = PackedRestates { batches: Vec::new(), unfit: Vec::new() };
+    let mut batch: Vec<usize> = Vec::new();
+    let flush = |batch: &mut Vec<usize>, packed: &mut PackedRestates| {
+        if batch.is_empty() {
+            return;
+        }
+        let op = RowOp::Restate {
+            table: table.to_string(),
+            spec_version,
+            deletes: batch.iter().map(|&i| deletes[i].clone()).collect(),
+        };
+        packed.batches.push((op, std::mem::take(batch)));
+    };
+    for (index, delete) in deletes.iter().enumerate() {
+        match packer.push(delete) {
+            Placed::Unfit => packed.unfit.push(index),
+            Placed::NewBatch => {
+                flush(&mut batch, &mut packed);
+                batch.push(index);
+            },
+            Placed::SameBatch => batch.push(index),
+        }
+    }
+    flush(&mut batch, &mut packed);
+    packed
+}
+
+/// Where the packer put a delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placed {
+    /// Into the batch being filled.
+    SameBatch,
+    /// The batch being filled was closed and a new one opened for it.
+    NewBatch,
+    /// It does not fit a batch alone; left out.
+    Unfit,
+}
+
+/// The arithmetic behind [`pack_restates`], usable on its own to COUNT the batches a sequence of
+/// deletes would need without building them — what the compaction economics ask, once per prefix.
+pub(crate) struct RestatePacker {
+    /// Everything but the deletes array's own header and elements, which the per-batch
+    /// arithmetic adds back: the header grows with the element count (1, 2 or 3 bytes).
+    base: usize,
+    payload_max: usize,
+    batches: usize,
+    batch_len: usize,
+    batch_bytes: usize,
+}
+
+impl RestatePacker {
+    pub(crate) fn new(table: &str, spec_version: u32, payload_max: usize) -> Self {
+        let empty = RowOp::Restate { table: table.to_string(), spec_version, deletes: vec![] };
+        Self {
+            base: encode(&empty).len() - 1,
+            payload_max,
+            batches: 0,
+            batch_len: 0,
+            batch_bytes: 0,
+        }
+    }
+
+    fn array_header(n: usize) -> usize {
+        if n < 24 {
+            1
+        } else if n < 256 {
+            2
+        } else {
+            3
+        }
+    }
+
+    pub(crate) fn push(&mut self, delete: &StatedDelete) -> Placed {
+        let len = delete.encoded_len();
+        if self.base + Self::array_header(1) + len > self.payload_max {
+            return Placed::Unfit;
+        }
+        let would_be = self.base + Self::array_header(self.batch_len + 1) + self.batch_bytes + len;
+        let placed = if self.batch_len == 0 {
+            self.batches += 1;
+            Placed::NewBatch
+        } else if would_be > self.payload_max || self.batch_len as u64 >= MAX_ROW_OP_ELEMENTS {
+            self.batches += 1;
+            self.batch_len = 0;
+            self.batch_bytes = 0;
+            Placed::NewBatch
+        } else {
+            Placed::SameBatch
+        };
+        self.batch_len += 1;
+        self.batch_bytes += len;
+        placed
+    }
+
+    /// Batches opened so far.
+    pub(crate) fn batches(&self) -> usize {
+        self.batches
     }
 }
 
@@ -398,6 +613,139 @@ mod tests {
     fn remove_golden_vector() {
         let bytes = encode(&sample_remove());
         assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_REMOVE_HEX);
+    }
+
+    fn sample_restate() -> RowOp {
+        // Deliberately out of identity order — encode must canonicalize.
+        RowOp::Restate {
+            spec_version: 3,
+            table: "t_demo".to_string(),
+            deletes: vec![
+                StatedDelete {
+                    pk: vec![TypedValue::Text("r".to_string()), TypedValue::I64(9)],
+                    device: DeviceFingerprint::from_bytes([0x22; 32]),
+                    lamport: 41,
+                },
+                StatedDelete {
+                    pk: vec![TypedValue::Text("r".to_string()), TypedValue::I64(7)],
+                    device: DeviceFingerprint::from_bytes([0x11; 32]),
+                    lamport: 40,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn restate_round_trips_canonically() {
+        let op = sample_restate();
+        let bytes = encode(&op);
+        let DecodedRowOp::Known(decoded) = decode(&bytes).unwrap() else {
+            panic!("known op");
+        };
+        let RowOp::Restate { deletes, .. } = &decoded else { panic!("restate") };
+        let lamports: Vec<u64> = deletes.iter().map(|d| d.lamport).collect();
+        assert_eq!(lamports, [40, 41], "deletes decode in identity order");
+        assert_eq!(encode(&decoded), bytes, "canonical identity");
+        assert_eq!(decoded.pks().count(), 2, "every stated identity is a pk of the op");
+    }
+
+    /// Golden vector for `Restate`, held to the same discipline as [`upsert_golden_vector`].
+    #[test]
+    fn restate_golden_vector() {
+        let bytes = encode(&sample_restate());
+        assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_RESTATE_HEX);
+    }
+
+    /// Hand-encode a restate envelope with `deletes` given as pre-built `[pk, device, lamport]`
+    /// triples, past the encoder's sort.
+    fn restate_envelope(
+        triples: &[(&[TypedValue], u8, u64)],
+        declared_len: Option<u64>,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("restate").unwrap();
+            enc.array(3).unwrap();
+            enc.str("t_demo").unwrap();
+            enc.u32(1).unwrap();
+            enc.array(declared_len.unwrap_or(triples.len() as u64)).unwrap();
+            for (pk, device, lamport) in triples {
+                enc.array(3).unwrap();
+                encode_values(&mut enc, pk);
+                enc.bytes(&[*device; 32]).unwrap();
+                enc.u64(*lamport).unwrap();
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn an_empty_duplicate_or_unsorted_restate_is_rejected() {
+        let seven = [TypedValue::I64(7)];
+        let nine = [TypedValue::I64(9)];
+        let err = decode(&restate_envelope(&[], None)).unwrap_err().to_string();
+        assert!(err.contains("names no deletes"), "{err}");
+        let err = decode(&restate_envelope(&[(&seven, 1, 1), (&seven, 2, 2)], None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not sorted or duplicated"), "{err}");
+        let err = decode(&restate_envelope(&[(&nine, 1, 1), (&seven, 2, 2)], None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not sorted or duplicated"), "{err}");
+    }
+
+    #[test]
+    fn restate_obeys_the_element_caps_for_the_batch_and_each_pk() {
+        // The batch header is capped before it sizes an allocation …
+        let err =
+            decode(&restate_envelope(&[], Some(MAX_ROW_OP_ELEMENTS + 1))).unwrap_err().to_string();
+        assert!(err.contains("exceeds the protocol cap"), "{err}");
+        // … and so is each identity's header inside the batch.
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("restate").unwrap();
+            enc.array(3).unwrap();
+            enc.str("t_demo").unwrap();
+            enc.u32(1).unwrap();
+            enc.array(1).unwrap();
+            enc.array(3).unwrap();
+            enc.array(MAX_ROW_OP_ELEMENTS + 1).unwrap();
+        }
+        let err = decode(&buf).unwrap_err().to_string();
+        assert!(err.contains("exceeds the protocol cap"), "{err}");
+    }
+
+    /// Batches fill greedily in input order under the byte budget; a key that does not fit alone
+    /// is reported, not silently dropped or forced.
+    #[test]
+    fn restate_packing_obeys_the_signed_byte_limit() {
+        let key = |n: usize| StatedDelete {
+            pk: vec![TypedValue::Text("k".repeat(n))],
+            device: DeviceFingerprint::from_bytes([1; 32]),
+            lamport: 1,
+        };
+        let one = key(10).encoded_len();
+        let base =
+            encode(&RowOp::Restate { table: "t".to_string(), spec_version: 1, deletes: vec![] })
+                .len();
+        // Room for exactly two ten-byte keys per batch.
+        let budget = base + 2 * one;
+        let deletes = vec![key(10), key(10), key(10), key(10), key(10), key(200)];
+        let packed = pack_restates("t", 1, &deletes, budget);
+        let sizes: Vec<usize> = packed.batches.iter().map(|(_, members)| members.len()).collect();
+        assert_eq!(sizes, [2, 2, 1]);
+        assert_eq!(packed.unfit, [5], "the oversized key is left out");
+        for (op, _) in &packed.batches {
+            assert!(encode(op).len() <= budget, "every batch fits the budget");
+        }
+        assert_eq!(packed.batches[0].1, [0, 1], "batches keep input order");
     }
 
     #[test]
@@ -532,6 +880,8 @@ mod tests {
         let bytes = encode(&sample_upsert());
         assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_UPSERT_HEX);
     }
+
+    const GOLDEN_RESTATE_HEX: &str = "83727261672d7261742f7461626c652d6f702f3167726573746174658366745f64656d6f038283826172075820111111111111111111111111111111111111111111111111111111111111111118288382617209582022222222222222222222222222222222222222222222222222222222222222221829";
 
     const GOLDEN_REMOVE_HEX: &str =
         "83727261672d7261742f7461626c652d6f702f316672656d6f76658366745f64656d6f0782617207";

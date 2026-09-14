@@ -348,7 +348,7 @@ fn a_type_mismatch_quarantines_the_op_and_writes_nothing() {
         device: device(2),
     })
     .unwrap();
-    assert!(matches!(out, ApplyOutcome::Quarantined(_)));
+    assert!(matches!(out, ApplyOutcome::Quarantined { .. }));
     tx.commit().unwrap();
     assert_eq!(title(&c), None, "a quarantined op leaves the table untouched");
 }
@@ -875,7 +875,7 @@ fn an_op_naming_a_foreign_repo_is_quarantined() {
     // Applied on repo A's stream but naming repo B → rejected, nothing written.
     let out = apply_row_op(&tx, &SCOPED, "A", &foreign, OpMeta { lamport: 1, device: device(2) })
         .unwrap();
-    assert!(matches!(out, ApplyOutcome::Quarantined(_)), "a foreign-repo op is rejected");
+    assert!(matches!(out, ApplyOutcome::Quarantined { .. }), "a foreign-repo op is rejected");
     let count: i64 = tx.query_row("SELECT COUNT(*) FROM t_scoped", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0, "no cross-repo row was written");
     // The matching-repo op applies.
@@ -903,7 +903,7 @@ fn a_null_primary_key_is_quarantined() {
     };
     let out =
         apply_row_op(&tx, &SPEC, "repo", &op, OpMeta { lamport: 1, device: device(2) }).unwrap();
-    assert!(matches!(out, ApplyOutcome::Quarantined(_)), "a null pk is not addressable");
+    assert!(matches!(out, ApplyOutcome::Quarantined { .. }), "a null pk is not addressable");
     let count: i64 = tx.query_row("SELECT COUNT(*) FROM t_demo", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0, "a quarantined null-pk op writes nothing");
 }
@@ -924,7 +924,7 @@ fn a_pk_value_of_the_wrong_type_is_quarantined() {
     let out =
         apply_row_op(&tx, &SPEC, "repo", &op, OpMeta { lamport: 1, device: device(2) }).unwrap();
     assert!(
-        matches!(out, ApplyOutcome::Quarantined(_)),
+        matches!(out, ApplyOutcome::Quarantined { .. }),
         "a pk value that disagrees with its declared type is quarantined"
     );
     let count: i64 = tx.query_row("SELECT COUNT(*) FROM t_demo", [], |r| r.get(0)).unwrap();
@@ -960,7 +960,7 @@ fn a_null_in_a_not_null_column_is_quarantined_not_a_fatal_error() {
     let out = apply_row_op(&tx, &NOT_NULL, "repo", &op, OpMeta { lamport: 1, device: device(2) })
         .unwrap();
     assert!(
-        matches!(out, ApplyOutcome::Quarantined(_)),
+        matches!(out, ApplyOutcome::Quarantined { .. }),
         "a constraint violation is quarantined, not a fatal error"
     );
     let count: i64 = tx.query_row("SELECT COUNT(*) FROM t_nn", [], |r| r.get(0)).unwrap();
@@ -1244,10 +1244,227 @@ fn a_remove_blocked_by_a_foreign_key_is_quarantined_not_wedged() {
     let out =
         apply_row_op(&tx, &PARENT, "repo", &op, OpMeta { lamport: 1, device: device(2) }).unwrap();
     assert!(
-        matches!(out, ApplyOutcome::Quarantined(_)),
+        matches!(out, ApplyOutcome::Quarantined { .. }),
         "an FK-blocked delete quarantines, it does not error: {out:?}"
     );
     let n: i64 =
         tx.query_row("SELECT COUNT(*) FROM parent WHERE id = 'r'", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 1, "the FK-blocked parent row is left untouched");
+}
+
+// ── restatements (#1295) ─────────────────────────────────────────────────────────────────────
+
+fn stated(id: &str, seed: u8, lamport: u64) -> StatedDelete {
+    StatedDelete { pk: vec![TypedValue::Text(id.to_string())], device: device(seed), lamport }
+}
+
+fn restate(deletes: Vec<StatedDelete>) -> RowOp {
+    RowOp::Restate { spec_version: 1, table: "t_demo".to_string(), deletes }
+}
+
+fn apply(tx: &Transaction<'_>, op: &RowOp, lamport: u64, seed: u8) -> ApplyOutcome {
+    apply_row_op(tx, &SPEC, "repo", op, OpMeta { lamport, device: device(seed) }).unwrap()
+}
+
+fn r1_key() -> String {
+    row_op::row_pk_string(&[TypedValue::Text("r1".to_string())])
+}
+
+fn statement(tx: &Transaction<'_>, seed: u8) -> Option<u64> {
+    let row_pk = r1_key();
+    let key = RowKey {
+        stream: StreamId::from_bytes([0; 32]),
+        repo_id: "repo",
+        table: "t_demo",
+        row_pk: &row_pk,
+    };
+    statement_on_stream(tx, &key, &device(seed).to_string()).unwrap()
+}
+
+fn tombstone(tx: &Transaction<'_>) -> Option<(u64, String)> {
+    let row_pk = r1_key();
+    let key = RowKey {
+        stream: StreamId::from_bytes([0; 32]),
+        repo_id: "repo",
+        table: "t_demo",
+        row_pk: &row_pk,
+    };
+    current_tombstone(tx, &key).unwrap()
+}
+
+/// A stated delete settles at ITS identity exactly as the `Remove` that first stated it would:
+/// it wins a row written before it, is idempotent, keeps a row written after it, is a no-op once
+/// a newer delete owns the row — and moves only the signer's statement, never the identity.
+#[test]
+fn a_restated_delete_settles_exactly_like_its_remove() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    apply(&tx, &upsert(&[("title", TypedValue::Text("v1".to_string()))]), 3, 2);
+
+    // Device 5 restates device 2's delete at lamport 5, signed at 9: the delete beats the write.
+    let op = restate(vec![stated("r1", 2, 5)]);
+    assert_eq!(apply(&tx, &op, 9, 5), ApplyOutcome::Applied);
+    assert_eq!(title(&tx), None, "the delete wins the row written before it");
+    assert_eq!(tombstone(&tx), Some((5, device(2).to_string())), "identity is the delete's");
+    assert_eq!(statement(&tx, 5), Some(9), "the signer states it at its own entry");
+    assert_eq!(statement(&tx, 2), None, "the identity's device never stated it here");
+    assert!(current_row_clock(&tx, "repo", "t_demo", &r1_key()).unwrap().is_none());
+
+    assert_eq!(apply(&tx, &op, 9, 5), ApplyOutcome::Superseded, "a redelivery changes nothing");
+
+    // A write after the delete resurrects the row; the same stated delete now keeps it, but the
+    // signer's statement of the (still current) identity advances.
+    assert_eq!(
+        apply(&tx, &upsert(&[("title", TypedValue::Text("v2".to_string()))]), 7, 2),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(apply(&tx, &op, 11, 5), ApplyOutcome::Applied);
+    assert_eq!(title(&tx).as_deref(), Some("v2"), "a newer write keeps the row");
+    assert_eq!(statement(&tx, 5), Some(11));
+
+    // A newer delete takes the identity, and the old identity's statements go with it.
+    assert_eq!(apply(&tx, &remove(), 12, 3), ApplyOutcome::Applied);
+    assert_eq!(tombstone(&tx), Some((12, device(3).to_string())));
+    assert_eq!(statement(&tx, 5), None, "statements of the outranked identity are gone");
+    assert_eq!(statement(&tx, 3), Some(12));
+
+    // Restating the outranked identity is a no-op: nothing moves, and the signer gains nothing.
+    assert_eq!(apply(&tx, &op, 13, 5), ApplyOutcome::Superseded);
+    assert_eq!(statement(&tx, 5), None);
+}
+
+/// The guard asks a restatement only about the rows it would physically remove: an unpublished
+/// local row a stated delete would destroy defers the entry, exactly as a `Remove` of it would;
+/// a stated delete whose row is absent, or whose clock beats it, cannot park anything.
+#[test]
+fn a_restate_is_deferred_only_by_unsent_work_on_a_row_it_would_change() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    let stream = StreamId::from_bytes([0; 32]);
+    // r1: a raw local row nothing has published — the delete would remove it.
+    tx.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'unsent')", []).unwrap();
+    let over_r1 = restate(vec![stated("r1", 2, 5)]);
+    assert_eq!(
+        unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &over_r1).unwrap(),
+        Some(PendingReason::DeferredUnsentEdit)
+    );
+    assert_eq!(
+        pre_apply(&tx, &SPEC, "repo", stream, &over_r1, 20, RowDoubt::DeferOnAnyDoubt).unwrap(),
+        PreApply::Park(PendingReason::DeferredUnsentEdit)
+    );
+    // r2: absent — nothing to destroy, whatever the tombstone table says.
+    let over_r2 = restate(vec![stated("r2", 2, 5)]);
+    assert_eq!(unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &over_r2).unwrap(), None);
+    // r1 again, but now published under a clock the stated delete cannot beat: not touched.
+    apply(&tx, &upsert(&[("title", TypedValue::Text("v9".to_string()))]), 9, 2);
+    assert_eq!(unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &over_r1).unwrap(), None);
+    assert_eq!(apply(&tx, &over_r1, 20, 5), ApplyOutcome::Applied, "the tombstone is still raised");
+    assert_eq!(title(&tx).as_deref(), Some("v9"));
+}
+
+/// A stated lamport at or above the carrying entry's own is a delete identity the signer's chain
+/// never held; the wire cannot see it, so the applier quarantines the entry with no effect.
+#[test]
+fn accept_and_replay_reject_a_stated_lamport_at_or_above_the_entrys() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    apply(&tx, &upsert(&[("title", TypedValue::Text("v1".to_string()))]), 3, 2);
+    let op = restate(vec![stated("r1", 2, 5)]);
+    let ApplyOutcome::Quarantined { why, .. } = apply(&tx, &op, 5, 5) else {
+        panic!("quarantined")
+    };
+    assert!(why.contains("at or above its own lamport"), "{why}");
+    assert_eq!(title(&tx).as_deref(), Some("v1"), "nothing was written");
+    assert_eq!(tombstone(&tx), None);
+}
+
+/// One malformed element quarantines the whole batch before anything is written.
+#[test]
+fn an_invalid_element_quarantines_the_batch_without_partial_effects() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    apply(&tx, &upsert(&[("title", TypedValue::Text("v1".to_string()))]), 3, 2);
+    let bad = StatedDelete { pk: vec![TypedValue::I64(1)], device: device(2), lamport: 4 };
+    let op = restate(vec![stated("r1", 2, 5), bad]);
+    assert!(matches!(apply(&tx, &op, 9, 5), ApplyOutcome::Quarantined { .. }));
+    assert_eq!(title(&tx).as_deref(), Some("v1"), "the valid element did not apply either");
+    assert_eq!(tombstone(&tx), None);
+    assert_eq!(statement(&tx, 5), None);
+}
+
+/// A constraint failure on one stated delete quarantines the entry AFTER every other row settled,
+/// and the outcome says whether anything moved: true the first time (the sibling delete raised
+/// its tombstone), false on a redelivery (nothing left to settle), which is what lets a caller
+/// sweep once and never again.
+#[test]
+fn a_quarantined_restate_settles_its_other_rows_and_reports_whether_anything_moved() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    for id in ["r1", "r2"] {
+        tx.execute("INSERT INTO t_demo(id, title) VALUES (?1, 'v')", [id]).unwrap();
+    }
+    tx.execute_batch(
+        "CREATE TRIGGER t_demo_keep_r2 BEFORE DELETE ON t_demo WHEN OLD.id = 'r2'
+         BEGIN SELECT RAISE(ABORT, 'r2 is kept'); END;",
+    )
+    .unwrap();
+    let op = restate(vec![stated("r1", 2, 5), stated("r2", 2, 6)]);
+    assert!(matches!(apply(&tx, &op, 9, 5), ApplyOutcome::Quarantined { changed: true, .. }));
+    assert_eq!(title(&tx), None, "r1 settled although r2 could not");
+    assert_eq!(tombstone(&tx), Some((5, device(2).to_string())));
+    assert_eq!(statement(&tx, 5), Some(9));
+    let kept: i64 =
+        tx.query_row("SELECT COUNT(*) FROM t_demo WHERE id = 'r2'", [], |r| r.get(0)).unwrap();
+    assert_eq!(kept, 1, "the failing delete left its row and raised no tombstone");
+    assert!(matches!(apply(&tx, &op, 9, 5), ApplyOutcome::Quarantined { changed: false, .. }));
+}
+
+/// The batch is exempted or deferred as a whole, so the verdict is the STRONGEST blocker over
+/// every stated row: an unprovable verdict on one row (a stale-version publication whose winning
+/// entry is gone) must not hide a later row's proven unsent edit, which the removal exemption
+/// would otherwise apply straight over.
+#[test]
+fn a_proven_unsent_edit_on_one_stated_row_outranks_an_unprovable_verdict_on_another() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    let stream = StreamId::from_bytes([0; 32]);
+    // a1: published under an older column set, with a clock whose entry is not retained — the
+    // guard cannot prove anything about it.
+    tx.execute("INSERT INTO t_demo(id, title) VALUES ('a1', 'old')", []).unwrap();
+    let a1 = row_op::row_pk_string(&[TypedValue::Text("a1".to_string())]);
+    record_published(&tx, stream, "repo", "t_demo", &a1, "stale-hash", 0).unwrap();
+    tx.execute(
+        "INSERT INTO sync_row_clocks(
+             stream_id, repo_id, table_name, row_pk, lamport, device_fingerprint)
+         VALUES (?1, 'repo', 't_demo', ?2, 1, ?3)",
+        rusqlite::params![stream.to_bytes().as_slice(), a1, device(2).to_string()],
+    )
+    .unwrap();
+    // b1: a raw local row nothing has published — a proven unsent edit.
+    tx.execute("INSERT INTO t_demo(id, title) VALUES ('b1', 'unsent')", []).unwrap();
+    let op = restate(vec![stated("a1", 2, 5), stated("b1", 2, 6)]);
+    assert_eq!(
+        unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &op).unwrap(),
+        Some(PendingReason::DeferredUnsentEdit),
+        "the proven blocker wins over a1's unresolved winner"
+    );
+    assert_eq!(
+        pre_apply(&tx, &SPEC, "repo", stream, &op, 9, RowDoubt::DeferExceptUnprovableRemoval)
+            .unwrap(),
+        PreApply::Park(PendingReason::DeferredUnsentEdit),
+        "and the removal exemption does not apply"
+    );
+    // With b1 published, only the unprovable verdict remains and the exemption applies.
+    let b1 = row_op::row_pk_string(&[TypedValue::Text("b1".to_string())]);
+    let hash = synced_row_hash(&tx, &SPEC, &[TypedValue::Text("b1".to_string())]).unwrap().unwrap();
+    record_published(&tx, stream, "repo", "t_demo", &b1, &hash, SPEC.spec_version).unwrap();
+    assert_eq!(
+        unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &op).unwrap(),
+        Some(PendingReason::DeferredUnresolvedWinner)
+    );
+    assert_eq!(
+        pre_apply(&tx, &SPEC, "repo", stream, &op, 9, RowDoubt::DeferExceptUnprovableRemoval)
+            .unwrap(),
+        PreApply::Apply
+    );
 }

@@ -1451,6 +1451,120 @@ async fn a_deleted_overlay_verdict_is_removed_on_the_peer() {
 }
 
 #[tokio::test]
+async fn overlay_deletes_compact_below_budget_and_a_fresh_peer_holds_no_phantom_row() {
+    use rag_rat_sync::{
+        AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, accept_and_dispatch,
+        connect_and_table_sync,
+    };
+
+    let owner = fresh_db();
+    let account = local_account(&owner, NOW).unwrap();
+    let joiner = fresh_db();
+    let (owner_endpoint, joiner_endpoint) = loopback_endpoints().await;
+    enroll_member_over_endpoint(
+        &owner_endpoint,
+        &joiner_endpoint,
+        &owner,
+        &joiner,
+        account,
+        "https://relay.example",
+    )
+    .await;
+
+    owner
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms)
+             VALUES ('repo-a', 'repo-a', 0)",
+            [],
+        )
+        .unwrap();
+    rag_rat_oplog::ensure_repo_incarnation(&owner, "repo-a", NOW + 1).unwrap().unwrap();
+    for memory in ["memory-a", "memory-b", "memory-c"] {
+        owner
+            .execute(
+                "INSERT INTO memory_reality(
+                     memory_id, repo_id, content_hash, verdict, direction, checked_inputs_hash,
+                     evidence_json, model_id, prompt_version, checked_at_ms)
+                 VALUES (?1, 'repo-a', 'hash', 'confirmed', 'note_ahead', 'inputs', '[]',
+                         'model-x', 'v1', ?2)",
+                rusqlite::params![memory, NOW + 2],
+            )
+            .unwrap();
+    }
+    rag_rat_oplog::table_sync_author_pending(&owner, account, NOW + 2).unwrap(); // 0..=2
+    owner.execute("DELETE FROM memory_reality", []).unwrap();
+    rag_rat_oplog::table_sync_author_pending(&owner, account, NOW + 2).unwrap(); // removes 3..=5
+    // Churn on one summary row so the chain has superseded entries worth reclaiming.
+    for round in 0..6 {
+        owner
+            .execute(
+                "INSERT INTO memory_note_summaries(
+                     repo_id, memory_id, content_hash, summary, model_id, prompt_version,
+                     generated_at_ms)
+                 VALUES ('repo-a', 'memory-s', ?1, 'summary', 'model-x', 'v1', ?2)
+                 ON CONFLICT(repo_id, memory_id) DO UPDATE SET content_hash = \
+                 excluded.content_hash,
+                     generated_at_ms = excluded.generated_at_ms",
+                rusqlite::params![format!("h{round}"), NOW + 3 + round],
+            )
+            .unwrap();
+        rag_rat_oplog::table_sync_author_pending(&owner, account, NOW + 2).unwrap(); // 6..=11
+    }
+    let compacted = rag_rat_oplog::table_sync_compact_overdue(&owner, account, NOW + 9, &|scope| {
+        (scope == "overlay/1").then_some(2)
+    })
+    .unwrap();
+    assert!(compacted >= 9, "the deletes' original entries are reclaimed too: {compacted}");
+    let chain: Vec<i64> = owner
+        .prepare("SELECT lamport FROM table_sync_entries ORDER BY lamport")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(chain, vec![10, 11, 12], "the tail: the live summary and one restatement");
+    for entry in account_entries_for_sync(&owner, account).unwrap() {
+        rag_rat_oplog::account_ingest(&joiner, &entry.signed_bytes, NOW + 2).unwrap();
+    }
+
+    let mut account_store = OplogSyncStore::new(&owner, account, || NOW);
+    let mut content_store = OplogContentSyncStore::new(&owner, account, || NOW);
+    let mut table_store = OplogTableSyncStore::new(&joiner, account, || NOW);
+    let server = accept_and_dispatch(
+        &owner_endpoint,
+        &mut account_store,
+        &mut content_store,
+        AuthPolicy::Closed,
+        || NOW,
+    );
+    let client = connect_and_table_sync(
+        &joiner_endpoint,
+        direct_addr(&owner_endpoint),
+        &mut table_store,
+        NOW,
+    );
+    let (server, client) = tokio::join!(server, client);
+    server.unwrap();
+    let report = client.unwrap();
+    assert_eq!(report.entries_newly_stored, 3, "only the retained suffix transfers");
+    let phantoms: i64 =
+        joiner.query_row("SELECT COUNT(*) FROM memory_reality", [], |row| row.get(0)).unwrap();
+    assert_eq!(phantoms, 0, "a fresh peer folding the compacted chain has no deleted row");
+    let tombstones: i64 = joiner
+        .query_row(
+            "SELECT COUNT(*) FROM sync_row_tombstones WHERE table_name = 'memory_reality'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tombstones, 3, "and holds every delete, so an older upsert can never resurrect");
+    let summary: String = joiner
+        .query_row("SELECT content_hash FROM memory_note_summaries", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(summary, "h5");
+}
+
+#[tokio::test]
 async fn production_distill_records_replicate_and_regenerate() {
     use rag_rat_sync::{
         AuthPolicy, OplogContentSyncStore, OplogTableSyncStore, TABLE_SYNC_ALPN,

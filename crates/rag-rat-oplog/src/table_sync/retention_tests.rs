@@ -1,7 +1,7 @@
 use super::*;
 use crate::table_sync::registry::{ColumnSpec, TableSpec, ValueType};
 use crate::table_sync::store::{self, record_stream_context};
-use crate::table_sync::{Cell, RowOp, TypedValue, apply};
+use crate::table_sync::{Cell, RowOp, TypedValue, apply, row_op};
 use crate::{AccountId, LocalDevice};
 
 const SPEC: TableSpec = TableSpec {
@@ -339,7 +339,8 @@ fn a_winner_whose_entry_is_gone_is_still_a_repair_candidate() {
     };
     let candidates = {
         let tx = c.transaction().unwrap();
-        let out = store::readoption_candidates(&tx, stream(), work.device_fingerprint).unwrap();
+        let out =
+            store::readoption_candidates(&tx, stream(), work.device_fingerprint, "local").unwrap();
         tx.commit().unwrap();
         out
     };
@@ -755,4 +756,112 @@ fn a_reoffered_entry_below_the_floor_is_idempotent_not_a_fork() {
     .unwrap();
     assert_eq!(outcome, store::AcceptOutcome::AlreadyPresent);
     tx.commit().unwrap();
+}
+
+// ── statements as pins (#1295) ───────────────────────────────────────────────────────────────
+
+fn restate_of(id: &str, device: &LocalDevice, lamport: u64) -> RowOp {
+    RowOp::Restate {
+        spec_version: 1,
+        table: "t_demo".to_string(),
+        deletes: vec![crate::table_sync::StatedDelete {
+            pk: vec![TypedValue::Text(id.to_string())],
+            device: device.fingerprint(),
+            lamport,
+        }],
+    }
+}
+
+fn pins(conn: &mut rusqlite::Connection, device: &LocalDevice) -> Vec<Pin> {
+    let tx = conn.transaction().unwrap();
+    chain_pins(&tx, stream(), device.fingerprint(), 0, 1 << 40, usize::MAX).unwrap()
+}
+
+/// An orphan tombstone pins the entry at this chain's STATEMENT of it: the original `Remove`
+/// until the writer restates it at its tail, then the restatement — and the entry that first
+/// stated it can go. A row live again stops the statement pinning, and the live write pins.
+#[test]
+fn a_restated_tombstone_frees_the_original_entry() {
+    let mut c = conn();
+    let device = crate::local_device(&c, 0).unwrap();
+    author(&mut c, &device, &[upsert("r1", "v1"), remove("r1")]); // 0, 1
+    assert_eq!(pins(&mut c, &device), vec![Pin {
+        lamport: 1,
+        kind: PinKind::Statements(vec![StatedRow {
+            table_name: "t_demo".to_string(),
+            row_pk: row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]),
+            device_hex: device.fingerprint().to_string(),
+            lamport: 1,
+        }]),
+    }]);
+    author(&mut c, &device, &[upsert("r2", "x"), restate_of("r1", &device, 1)]); // 2, 3
+    let after = pins(&mut c, &device);
+    assert_eq!(after.iter().map(|pin| pin.lamport).collect::<Vec<_>>(), vec![2, 3]);
+    assert!(matches!(after[1].kind, PinKind::Statements(ref rows) if rows.len() == 1));
+    // The entry at 1 is superseded now: compaction past it is allowed.
+    let tx = c.transaction().unwrap();
+    compact_chain_prefix(&tx, stream(), device.fingerprint(), 2, 0).unwrap();
+    tx.commit().unwrap();
+    // Live again: the statement stops pinning and the live write pins instead.
+    author(&mut c, &device, &[upsert("r1", "back")]); // 4
+    assert_eq!(pins(&mut c, &device).iter().map(|pin| pin.lamport).collect::<Vec<_>>(), vec![2, 4]);
+}
+
+/// One restatement of several deletes is ONE pin holding them all, and a chain's statements are
+/// its own: a second chain stating the same tombstone pins on that chain, not this one.
+#[test]
+fn shared_statements_count_as_one_entry_per_chain() {
+    let mut c = conn();
+    let device = crate::local_device(&c, 0).unwrap();
+    author(&mut c, &device, &[upsert("r1", "a"), upsert("r2", "b"), remove("r1"), remove("r2")]); // 0..3
+    let both = RowOp::Restate {
+        spec_version: 1,
+        table: "t_demo".to_string(),
+        deletes: ["r1", "r2"]
+            .into_iter()
+            .zip([2u64, 3])
+            .map(|(id, lamport)| crate::table_sync::StatedDelete {
+                pk: vec![TypedValue::Text(id.to_string())],
+                device: device.fingerprint(),
+                lamport,
+            })
+            .collect(),
+    };
+    author(&mut c, &device, &[both]); // 4
+    let after = pins(&mut c, &device);
+    assert_eq!(after.len(), 1, "one entry states both");
+    assert_eq!(after[0].lamport, 4);
+    assert_eq!(after[0].held(), 2);
+    // Another chain's statement of r1 (identity unchanged) is that chain's pin, not this one's.
+    let other = crate::op::DeviceFingerprint::from_bytes([0xff; 32]);
+    let tx = c.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO sync_tombstone_statements(
+             stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport)
+         VALUES (?1, 'repo', 't_demo', ?2, ?3, 40)",
+        params![
+            stream().to_bytes().as_slice(),
+            row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]),
+            other.to_string(),
+        ],
+    )
+    .unwrap();
+    let theirs = chain_pins(&tx, stream(), other, 0, 1 << 40, usize::MAX).unwrap();
+    assert_eq!(theirs.len(), 1);
+    assert_eq!(theirs[0].lamport, 40);
+    let ours = chain_pins(&tx, stream(), device.fingerprint(), 0, 1 << 40, usize::MAX).unwrap();
+    assert_eq!(ours[0].held(), 2, "unchanged by the other chain's statement");
+}
+
+/// The migration's backfill and a live `Remove` agree on what pins: one statement per tombstone
+/// at its own identity.
+#[test]
+fn statement_backfill_keeps_chain_pins_parity() {
+    let mut c = conn();
+    let device = crate::local_device(&c, 0).unwrap();
+    author(&mut c, &device, &[upsert("r1", "v1"), remove("r1"), upsert("r2", "v2"), remove("r2")]);
+    let live = pins(&mut c, &device);
+    c.execute("DELETE FROM sync_tombstone_statements", []).unwrap();
+    rag_rat_db::schema::migrations::apply_tombstone_statements(&c).unwrap();
+    assert_eq!(pins(&mut c, &device), live);
 }
