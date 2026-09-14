@@ -790,18 +790,14 @@ impl OracleTool {
     /// The batch tool whose `logical_symbol_monikers` rows a LIVE tool copies into its own
     /// `edge_oracle.scip_symbol` values, so live verdicts are byte-identical to what the batch
     /// pass would write (clone-collapse + memory anchoring treat them as one evidence set, #534).
-    /// `None` for a batch tool (it mints monikers itself).
+    /// `None` for a batch tool (it mints monikers itself). Declared on the tool's [`LiveBackend`]
+    /// entry, so a new live backend cannot exist without naming its source.
     ///
     /// The copy is safe even where the batch tool's monikers are rewritten on the way in
     /// (`stabilize_moniker_version` is non-identity for `ScipTypescript`): the source is the
     /// STORED `logical_symbol_monikers` row, which the batch pass already wrote in its final form.
     pub fn batch_moniker_source(self) -> Option<OracleTool> {
-        match self {
-            Self::RaLsp => Some(Self::RustAnalyzer),
-            Self::TsLsp => Some(Self::ScipTypescript),
-            Self::ClangdLsp => Some(Self::ScipClang),
-            _ => None,
-        }
+        LiveBackend::for_tool(self).map(|backend| backend.moniker_source)
     }
 
     /// Whether this backend's non-zero EXIT CODE reflects source DIAGNOSTICS rather than indexing

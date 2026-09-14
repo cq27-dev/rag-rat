@@ -17,6 +17,10 @@ use crate::lsp::readiness::ReadinessPolicy;
 pub struct LiveBackend {
     /// The persisted tool id its verdicts are written under. Always a non-`batch_capable` tool.
     pub tool: OracleTool,
+    /// The batch tool whose `logical_symbol_monikers` rows this backend copies into its verdicts'
+    /// `scip_symbol`, so live and batch rows are one evidence set. Always a `batch_capable` tool
+    /// indexing the same languages — see [`OracleTool::batch_moniker_source`].
+    pub(crate) moniker_source: OracleTool,
     /// The languages whose files this backend resolves. Drives the watcher's worklist filter, so a
     /// backend never sees a path it cannot open. Usually one, but a single server can own several:
     /// clangd serves C and C++ from one session.
@@ -166,6 +170,7 @@ impl LiveBackend {
         match tool {
             OracleTool::RaLsp => Some(Self {
                 tool,
+                moniker_source: OracleTool::RustAnalyzer,
                 languages: &[Language::Rust],
                 // rust-analyzer speaks LSP on stdio with no flag.
                 stdio_args: &[],
@@ -177,6 +182,7 @@ impl LiveBackend {
             }),
             OracleTool::TsLsp => Some(Self {
                 tool,
+                moniker_source: OracleTool::ScipTypescript,
                 languages: &[Language::TypeScript],
                 // Without a transport flag the program prints usage and exits, so the spawn would
                 // fail with an opaque EOF instead of yielding a session.
@@ -202,6 +208,7 @@ impl LiveBackend {
             // translation units; see the manifest entry for what that costs.
             OracleTool::ClangdLsp => Some(Self {
                 tool,
+                moniker_source: OracleTool::ScipClang,
                 languages: &[Language::C, Language::Cpp],
                 // clangd's own default, PINNED because it is load-bearing: it is what resolves a
                 // call across translation units. With it off clangd answers with the header
