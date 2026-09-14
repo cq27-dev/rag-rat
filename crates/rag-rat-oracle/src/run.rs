@@ -789,8 +789,9 @@ fn count_low_confidence_upgrades(
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     let count: i64 = conn.query_row(
         &format!(
-            "SELECT COUNT(*){} AND edge_oracle.kind = 'upgrade' AND edges.confidence IN {}",
+            "SELECT COUNT(*){} AND edge_oracle.kind = {} AND edges.confidence IN {}",
             store::edge_oracle_scope_join(conn)?,
+            OracleResolutionKind::UPGRADE_SQL,
             store::HeuristicConfidence::LOW_SQL,
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],
@@ -815,9 +816,9 @@ fn count_upgradeable_low_confidence(
     let CheckoutRef { commit_sha, worktree_id } = checkout;
     let count: i64 = conn.query_row(
         &format!(
-            "SELECT COUNT(*){} AND edge_oracle.kind IN ('upgrade', 'resolved-external') AND \
-             edges.confidence IN {}",
+            "SELECT COUNT(*){} AND edge_oracle.kind IN {} AND edges.confidence IN {}",
             store::edge_oracle_scope_join(conn)?,
+            OracleResolutionKind::UPGRADEABLE_SQL,
             store::HeuristicConfidence::LOW_SQL,
         ),
         rusqlite::params![tool.as_db_str(), tool_version, commit_sha, worktree_id],

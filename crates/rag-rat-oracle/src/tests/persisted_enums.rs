@@ -46,6 +46,20 @@ fn persisted_enums_round_trip_through_db_strings() {
     assert_eq!(OracleResolutionKind::from_db_str("nonsense"), None);
 }
 
+/// The `edge_oracle.kind` SQL lists spliced into the metric and seed queries are rebuilt from
+/// `as_db_str`, so a renamed variant fails here instead of silently counting zero rows.
+#[test]
+fn resolution_kind_sql_lists_spell_the_persisted_tokens() {
+    use OracleResolutionKind::{Confirm, ResolvedExternal, Upgrade};
+    let quoted = |kind: OracleResolutionKind| format!("'{}'", kind.as_db_str());
+    let list = |kinds: &[OracleResolutionKind]| {
+        format!("({})", kinds.iter().map(|&kind| quoted(kind)).collect::<Vec<_>>().join(", "))
+    };
+    assert_eq!(OracleResolutionKind::UPGRADE_SQL, quoted(Upgrade));
+    assert_eq!(OracleResolutionKind::UPGRADEABLE_SQL, list(&[Upgrade, ResolvedExternal]));
+    assert_eq!(OracleResolutionKind::IN_CORPUS_SQL, list(&[Upgrade, Confirm]));
+}
+
 /// `RunStatus` is persisted as `oracle_runs.status` and rides `stats_json`, so its tokens are
 /// schema too — and `rag-rat-core`'s eval asserts the stored `Completed` literally. Pinned as
 /// literals, through both the DB string and the serde form, for the same reason as above.
