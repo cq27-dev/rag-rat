@@ -76,6 +76,89 @@ pub struct ExpectedQuery {
     pub should_include_papertrail_kinds: Vec<String>,
 }
 
+impl EvalQuery {
+    /// The eight expectation lanes, in the order [`ExpectedQuery::lanes`] shares. The exhaustive
+    /// destructure makes a new field a compile error here rather than a lane nobody merges.
+    fn lanes_mut(&mut self) -> [&mut Vec<String>; 8] {
+        let Self {
+            id: _,
+            text: _,
+            evidence_class: _,
+            requires_papertrail_cache: _,
+            must_include_paths,
+            must_include_symbols,
+            must_include_graph_targets,
+            must_include_impact_categories,
+            must_include_impact_paths,
+            must_include_impact_symbols,
+            should_include_git_subjects,
+            should_include_papertrail_kinds,
+        } = self;
+        [
+            must_include_paths,
+            must_include_symbols,
+            must_include_graph_targets,
+            must_include_impact_categories,
+            must_include_impact_paths,
+            must_include_impact_symbols,
+            should_include_git_subjects,
+            should_include_papertrail_kinds,
+        ]
+    }
+}
+
+impl ExpectedQuery {
+    /// The eight expectation lanes, in the order [`EvalQuery::lanes_mut`] shares.
+    fn lanes(&self) -> [&Vec<String>; 8] {
+        let Self {
+            id: _,
+            must_include_paths,
+            must_include_symbols,
+            must_include_graph_targets,
+            must_include_impact_categories,
+            must_include_impact_paths,
+            must_include_impact_symbols,
+            should_include_git_subjects,
+            should_include_papertrail_kinds,
+        } = self;
+        [
+            must_include_paths,
+            must_include_symbols,
+            must_include_graph_targets,
+            must_include_impact_categories,
+            must_include_impact_paths,
+            must_include_impact_symbols,
+            should_include_git_subjects,
+            should_include_papertrail_kinds,
+        ]
+    }
+
+    /// The eight expectation lanes, in the order [`EvalQuery::lanes_mut`] shares.
+    fn lanes_mut(&mut self) -> [&mut Vec<String>; 8] {
+        let Self {
+            id: _,
+            must_include_paths,
+            must_include_symbols,
+            must_include_graph_targets,
+            must_include_impact_categories,
+            must_include_impact_paths,
+            must_include_impact_symbols,
+            should_include_git_subjects,
+            should_include_papertrail_kinds,
+        } = self;
+        [
+            must_include_paths,
+            must_include_symbols,
+            must_include_graph_targets,
+            must_include_impact_categories,
+            must_include_impact_paths,
+            must_include_impact_symbols,
+            should_include_git_subjects,
+            should_include_papertrail_kinds,
+        ]
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct EvalOptions {
     pub queries_path: PathBuf,
@@ -209,6 +292,20 @@ pub struct EvalQueryReport {
     pub current_source_violations: Vec<CurrentSourceViolation>,
     pub latency_ms: f64,
     pub top_hits: Vec<EvalSearchHit>,
+}
+
+impl EvalQueryReport {
+    /// Evidence lanes after paths and symbols, which the baseline derives from all top hits.
+    fn hit_lanes(&self) -> [&Vec<String>; 6] {
+        [
+            &self.graph_target_hits,
+            &self.impact_category_hits,
+            &self.impact_path_hits,
+            &self.impact_symbol_hits,
+            &self.git_subject_hits,
+            &self.papertrail_kind_hits,
+        ]
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -618,42 +715,14 @@ fn load_expected(path: &Path) -> anyhow::Result<BTreeMap<String, ExpectedQuery>>
     Ok(suite.expected.into_iter().map(|expected| (expected.id.clone(), expected)).collect())
 }
 
-fn merge_expected(query: EvalQuery, expected: Option<&ExpectedQuery>) -> EvalQuery {
+fn merge_expected(mut query: EvalQuery, expected: Option<&ExpectedQuery>) -> EvalQuery {
     let Some(expected) = expected else {
         return query;
     };
-    EvalQuery {
-        id: query.id,
-        text: query.text,
-        evidence_class: query.evidence_class,
-        requires_papertrail_cache: query.requires_papertrail_cache,
-        must_include_paths: union(query.must_include_paths, &expected.must_include_paths),
-        must_include_symbols: union(query.must_include_symbols, &expected.must_include_symbols),
-        must_include_graph_targets: union(
-            query.must_include_graph_targets,
-            &expected.must_include_graph_targets,
-        ),
-        must_include_impact_categories: union(
-            query.must_include_impact_categories,
-            &expected.must_include_impact_categories,
-        ),
-        must_include_impact_paths: union(
-            query.must_include_impact_paths,
-            &expected.must_include_impact_paths,
-        ),
-        must_include_impact_symbols: union(
-            query.must_include_impact_symbols,
-            &expected.must_include_impact_symbols,
-        ),
-        should_include_git_subjects: union(
-            query.should_include_git_subjects,
-            &expected.should_include_git_subjects,
-        ),
-        should_include_papertrail_kinds: union(
-            query.should_include_papertrail_kinds,
-            &expected.should_include_papertrail_kinds,
-        ),
+    for (lane, extra) in query.lanes_mut().into_iter().zip(expected.lanes()) {
+        *lane = union(std::mem::take(lane), extra);
     }
+    query
 }
 
 fn union(mut values: Vec<String>, extra: &[String]) -> Vec<String> {
@@ -1181,17 +1250,21 @@ fn observed_expected(report: &EvalQueryReport) -> ExpectedQuery {
     let mut symbols =
         report.top_hits.iter().filter_map(|hit| hit.symbol_path.clone()).collect::<Vec<_>>();
     dedup(&mut symbols);
-    ExpectedQuery {
+    let mut expected = ExpectedQuery {
         id: report.id.clone(),
         must_include_paths: paths,
         must_include_symbols: symbols,
-        must_include_graph_targets: report.graph_target_hits.clone(),
-        must_include_impact_categories: report.impact_category_hits.clone(),
-        must_include_impact_paths: report.impact_path_hits.clone(),
-        must_include_impact_symbols: report.impact_symbol_hits.clone(),
-        should_include_git_subjects: report.git_subject_hits.clone(),
-        should_include_papertrail_kinds: report.papertrail_kind_hits.clone(),
+        must_include_graph_targets: Vec::new(),
+        must_include_impact_categories: Vec::new(),
+        must_include_impact_paths: Vec::new(),
+        must_include_impact_symbols: Vec::new(),
+        should_include_git_subjects: Vec::new(),
+        should_include_papertrail_kinds: Vec::new(),
+    };
+    for (lane, hits) in expected.lanes_mut().into_iter().skip(2).zip(report.hit_lanes()) {
+        lane.clone_from(hits);
     }
+    expected
 }
 
 fn dedup(values: &mut Vec<String>) {
@@ -1216,6 +1289,35 @@ mod tests {
 
     use super::*;
     use crate::IndexDatabase;
+
+    #[test]
+    fn observed_baseline_preserves_top_hits_and_evidence_lane_order() {
+        let query: EvalQuery = toml::from_str("id = 'case'\ntext = 'query'").unwrap();
+        let mut report = skipped_report(&query, "fixture");
+        report.path_hits = vec!["filtered-path".into()];
+        report.symbol_hits = vec!["filtered-symbol".into()];
+        for (path, symbol) in [("b", Some("B")), ("a", None), ("b", Some("B"))] {
+            report.top_hits.push(EvalSearchHit {
+                rank: 1,
+                chunk_id: 1,
+                path: path.into(),
+                symbol_path: symbol.map(str::to_owned),
+                start_line: 1,
+                end_line: 1,
+                score: 1.0,
+            });
+        }
+        report.graph_target_hits = vec!["graph".into(), "graph".into()];
+        report.impact_category_hits = vec!["category".into()];
+        report.impact_path_hits = vec!["impact-path".into()];
+        report.impact_symbol_hits = vec!["impact-symbol".into()];
+        report.git_subject_hits = vec!["subject".into()];
+        report.papertrail_kind_hits = vec!["kind".into()];
+        assert_eq!(
+            serde_json::to_string(&observed_expected(&report)).unwrap(),
+            r#"{"id":"case","must_include_paths":["b","a"],"must_include_symbols":["B"],"must_include_graph_targets":["graph","graph"],"must_include_impact_categories":["category"],"must_include_impact_paths":["impact-path"],"must_include_impact_symbols":["impact-symbol"],"should_include_git_subjects":["subject"],"should_include_papertrail_kinds":["kind"]}"#
+        );
+    }
 
     #[test]
     fn replay_eval_query_maps_commit_to_query() {
