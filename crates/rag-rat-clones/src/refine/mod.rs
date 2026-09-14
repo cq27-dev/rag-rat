@@ -17,6 +17,9 @@ pub mod cache;
 
 pub mod score;
 
+#[cfg(test)]
+mod test_support;
+
 /// Input to the LCS-based variation-point analysis for one clone-class member (#215 Plan 4a Task
 /// 2, extended in Plan 4b Task 5b).
 ///

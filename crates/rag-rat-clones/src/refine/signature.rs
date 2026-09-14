@@ -611,49 +611,13 @@ fn render_signature(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::Arc;
 
     use rag_rat_base::language::Language;
-    use rag_rat_core::index::parser;
 
     use super::*;
-    use crate::normalize::normalize_baseline_spanned;
     use crate::refine::antiunify::{align_to_anchor, anti_unify, resolve_anchor_idx};
-    use crate::tokens;
-
-    /// Build a `RefineMember` from a Rust snippet (mirrors the `member` helper in antiunify tests).
-    fn member(symbol_id: i64, src: &str) -> RefineMember {
-        let text: Arc<str> = Arc::from(src);
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, &text).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
-        let struct_hash = tokens::struct_hash(&seq);
-        RefineMember {
-            callee_monikers: Default::default(),
-            symbol_id,
-            lang: Language::Rust,
-            struct_hash,
-            seq,
-            node_spans,
-            text,
-        }
-    }
-
-    /// Canonical-order sort — matches the loader guarantee. Production keys on the REINDEX-STABLE
-    /// `(struct_hash, path, start_byte)` (see `canonical_member_order_key`); `RefineMember` (a test
-    /// fixture) lacks `path`/`start_byte`, so this helper sorts `struct_hash` then `symbol_id`,
-    /// with the fixtures' `symbol_id` arranged to coincide with `(path, start_byte)` (same
-    /// order on these inputs). The production guard is `refine_member_order_is_reindex_stable`,
-    /// not this sort.
-    fn canonical(mut members: Vec<RefineMember>) -> Vec<RefineMember> {
-        members.sort_by(|a, b| {
-            a.struct_hash.cmp(&b.struct_hash).then_with(|| a.symbol_id.cmp(&b.symbol_id))
-        });
-        members
-    }
+    use crate::refine::test_support::{canonical, member};
 
     /// Parse + align + anti-unify, then derive the proposed signature.
     fn make_sig(srcs: &[&str]) -> (Vec<RefineMember>, Template, ProposedSignature) {

@@ -425,16 +425,14 @@ pub fn invalidate_scip_refinements(conn: &Connection) -> anyhow::Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
     use std::sync::Arc;
 
     use rag_rat_base::language::Language;
-    use rag_rat_core::index::parser;
 
     use super::*;
-    use crate::normalize::{NodeSpan, normalize_baseline_spanned};
+    use crate::normalize::NodeSpan;
     use crate::refine::align::LCS_MAX_SEQ_TOKENS;
-    use crate::tokens;
+    use crate::refine::test_support::member;
 
     /// A `rust` baseline request at the unit similarity floor with no medoid — the shape nearly
     /// every cache test refines.
@@ -446,29 +444,6 @@ mod tests {
             members,
             similarity_min: 1.0,
             medoid_symbol_id: None,
-        }
-    }
-
-    /// Build a `RefineMember` from a Rust snippet, mirroring `load_refine_members`: parse, descend
-    /// to the first `function` symbol, span-normalize (so `node_spans.len() == seq.len()`),
-    /// compute the faithfulness struct_hash. This is what feeds the 4b anti-unify path — empty
-    /// `node_spans` would index out of bounds.
-    fn member(symbol_id: i64, src: &str) -> RefineMember {
-        let text: Arc<str> = Arc::from(src);
-        let parsed = parser::parse_file(Path::new("t.rs"), Language::Rust, &text).expect("parse");
-        let func = parsed.symbols.iter().find(|s| s.kind == "function").expect("a function symbol");
-        let node =
-            parsed.root().descendant_for_byte_range(func.start_byte, func.end_byte).expect("node");
-        let (seq, node_spans) = normalize_baseline_spanned(node, &text, Language::Rust);
-        let struct_hash = tokens::struct_hash(&seq);
-        RefineMember {
-            callee_monikers: Default::default(),
-            symbol_id,
-            lang: Language::Rust,
-            struct_hash,
-            seq,
-            node_spans,
-            text,
         }
     }
 
