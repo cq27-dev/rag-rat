@@ -89,8 +89,7 @@ fn forward_visibility_filter_admits_exactly_its_truth_table() {
 
 /// `is_qualified_symbol` gates the by-short-name fallback (`?4`) in the non-fuzzy predicates, so a
 /// shape whose answer flips widens or narrows `find_callers`. The seed is caller-supplied, so a
-/// `file.ext:name` seed can reach it; only the `.rs:` / `.ts:` / `.tsx:` / `.kt:` forms count as
-/// qualified today.
+/// `file.ext:name` seed can reach it; every registered language extension counts as qualified.
 #[test]
 fn is_qualified_symbol_classifies_every_seed_shape() {
     for (seed, qualified) in [
@@ -101,7 +100,7 @@ fn is_qualified_symbol_classifies_every_seed_shape() {
         ("app.ts:run", true),
         ("view.tsx:run", true),
         ("Main.kt:run", true),
-        ("main.py:run", false),
+        ("main.py:run", true),
         ("Type.method", false),
         ("run", false),
     ] {
@@ -587,5 +586,38 @@ fn confidence_order_sql_agrees_with_effective_confidence_rank() {
         let weight = crate::pagerank::confidence_factor(token);
         assert!(weight < stronger_weight, "{token} must weigh less than the tier above it");
         stronger_weight = weight;
+    }
+}
+
+/// Bare filenames are valid path-qualified graph seeds, including languages without a legacy
+/// extension arm. Their qualification must follow the same registry used for indexing.
+#[test]
+fn qualified_graph_seeds_cover_registered_extensions() {
+    for language in rag_rat_base::language::Language::all() {
+        for extension in language.simple_extensions() {
+            for suffix in ["run", "1-5"] {
+                let seed = format!("file.{extension}:{suffix}");
+                assert!(is_qualified_symbol(&seed), "{seed}");
+                for mode in [
+                    GraphResolutionMode::Exact,
+                    GraphResolutionMode::Syntactic,
+                    GraphResolutionMode::Fuzzy,
+                ] {
+                    let options =
+                        GraphTraversalOptions { resolution_mode: mode, ..Default::default() };
+                    let params = traversal_params(&seed, 10, &[], &options, false);
+                    assert_eq!(
+                        params[3],
+                        rusqlite::types::Value::Text(
+                            (mode == GraphResolutionMode::Fuzzy).to_string()
+                        ),
+                        "{seed}: {mode:?}"
+                    );
+                }
+            }
+        }
+    }
+    for seed in ["file.unknown:run", "Type.method", "run"] {
+        assert!(!is_qualified_symbol(seed), "{seed}");
     }
 }

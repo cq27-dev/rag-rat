@@ -645,9 +645,11 @@ pub(crate) fn short_name(symbol: &str) -> &str {
 }
 pub(crate) fn is_qualified_symbol(symbol: &str) -> bool {
     symbol.contains("::")
-        || symbol.contains(".rs:")
-        || symbol.contains(".ts:")
-        || symbol.contains(".tsx:")
-        || symbol.contains(".kt:")
         || symbol.contains('/')
+        || rag_rat_base::language::Language::all().iter().any(|language| {
+            language
+                .simple_extensions()
+                .iter()
+                .any(|extension| symbol.contains(&format!(".{extension}:")))
+        })
 }
