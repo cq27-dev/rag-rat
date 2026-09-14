@@ -965,3 +965,6 @@ pub(crate) fn event_targets_binary(fleet_bin: Option<&Path>, event: &Event) -> b
     };
     event.paths.iter().any(|path| path == bin)
 }
+
+#[cfg(test)]
+mod tests;

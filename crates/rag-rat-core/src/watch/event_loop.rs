@@ -731,3 +731,6 @@ pub(crate) fn shutdown_discover(config: &Config) -> anyhow::Result<bool> {
         None => Ok(false),
     }
 }
+
+#[cfg(test)]
+mod tests;

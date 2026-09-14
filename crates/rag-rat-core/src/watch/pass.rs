@@ -829,3 +829,6 @@ pub(crate) fn base_embedding_backlog_needs_tail(
     }
     budget.next_options().is_some_and(|options| pending_embedding_jobs(&options))
 }
+
+#[cfg(test)]
+mod tests;

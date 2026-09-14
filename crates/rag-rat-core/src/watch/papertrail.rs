@@ -76,3 +76,6 @@ pub(crate) fn spawn_papertrail_worker(
         LoopMsg::PapertrailDone
     })
 }
+
+#[cfg(test)]
+mod tests;
