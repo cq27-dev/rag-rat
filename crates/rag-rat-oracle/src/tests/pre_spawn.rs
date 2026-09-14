@@ -30,16 +30,10 @@ fn run_with_pins(
         [("caller.rs".to_string(), caller_sha.clone()), ("defs.rs".to_string(), defs_sha.clone())]
             .into();
     let pre = pre_spawn(&caller_sha, &defs_sha);
-    let report = run_oracle(
-        &h.conn,
-        TOOL,
-        VERSION,
-        CHECKOUT,
-        &bytes,
-        h.root(),
-        Some(&production),
-        Some(&pre),
-    )
+    let report = run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots {
+        production: Some(&production),
+        pre_spawn: Some(&pre),
+    })
     .unwrap();
     let moniker_written = h.moniker(1001).is_some();
     assert_eq!(

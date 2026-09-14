@@ -30,33 +30,41 @@ pub struct OracleRunInput<'a> {
     /// Checkout root: document paths in the `.scip` are joined against this to read current bytes
     /// for position-encoding conversion.
     pub checkout_root: &'a Path,
-    /// `relative_path -> hex sha256` of the disk bytes captured the instant the tool finished
-    /// producing the `.scip`, for a tool-driven run; `None` for a pre-built `--scip` (no
-    /// production moment we control). When present it adds the scip-vs-disk leg of the content
-    /// gate (#82 TOCTOU): the `.scip`'s occurrence offsets describe the bytes the subprocess saw,
-    /// so the join only trusts them for a document whose disk content is STILL that snapshot. Both
-    /// documents a verdict depends on are pinned against it — the call-site document
-    /// (pre-classify) AND the resolved symbol's definition document (post-classify) — since
-    /// the watcher reindexing EITHER in the lock-free window corrupts the join while `disk_sha
-    /// == file_sha` (both the new content) still passes the index-vs-disk gate. See
-    /// [`super::ScipProduction::Produced`].
-    pub production_sha: Option<&'a HashMap<String, String>>,
-    /// The indexed `(path -> files.sha256)` snapshot taken **before the tool subprocess was
-    /// spawned** (#83); `None` for a pre-built `--scip` (no spawn). The post-exit
-    /// `production_sha` gate cannot see INSIDE the subprocess: the tool reads each source near
-    /// the start of a run that can take tens of seconds, so a file edited mid-run and
-    /// reindexed before the join leaves `.scip` describing the OLD content while
-    /// `files.sha256`, the disk bytes, and `production_sha` are all the NEW content — every
-    /// post-exit gate passes and a stale verdict persists. Requiring the join-time indexed sha
-    /// to ALSO equal this pre-spawn snapshot asserts the watcher reindexed nothing across the
-    /// ENTIRE window (spawn → join), for both the call-site and definition documents. Residual
-    /// ABA (an edit reverted to byte-identical content) is acceptable — the verdict is then
-    /// correct anyway.
-    pub pre_spawn_sha: Option<&'a HashMap<String, String>>,
+    /// The snapshots that arm the tool-driven drift gates; [`ShaSnapshots::default`] for a
+    /// pre-built `--scip`.
+    pub shas: ShaSnapshots<'a>,
     /// Unix-epoch ms when the run actually BEGAN (the pre-spawn snapshot moment), recorded as
     /// `oracle_runs.started_at`. Must be the start, not completion: the auto-run staleness gate
     /// keys on it (#145).
     pub started_at_ms: i64,
+}
+
+/// The two document-hash snapshots that arm the oracle's tool-driven drift gates (#82 / #83),
+/// keyed by repo-relative path. A pre-built `--scip` has no production moment and no spawn, so it
+/// arms neither ([`Self::default`]). Named so the two same-typed snapshots cannot be passed in
+/// the wrong order — a transposed pair still compiles and silently swaps the two gates.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShaSnapshots<'a> {
+    /// `relative_path -> hex sha256` of the disk bytes captured the instant the tool finished
+    /// producing the `.scip`. It adds the scip-vs-disk leg of the content gate (#82 TOCTOU): the
+    /// `.scip`'s occurrence offsets describe the bytes the subprocess saw, so the join only trusts
+    /// them for a document whose disk content is STILL that snapshot. Both documents a verdict
+    /// depends on are pinned against it — the call-site document (pre-classify) AND the resolved
+    /// symbol's definition document (post-classify) — since the watcher reindexing EITHER in the
+    /// lock-free window corrupts the join while `disk_sha == file_sha` (both the new content)
+    /// still passes the index-vs-disk gate. See [`super::ScipProduction::Produced`].
+    pub production: Option<&'a HashMap<String, String>>,
+    /// The indexed `(path -> files.sha256)` snapshot taken **before the tool subprocess was
+    /// spawned** (#83). The post-exit `production` gate cannot see INSIDE the subprocess: the
+    /// tool reads each source near the start of a run that can take tens of seconds, so a file
+    /// edited mid-run and reindexed before the join leaves `.scip` describing the OLD content
+    /// while `files.sha256`, the disk bytes, and `production` are all the NEW content — every
+    /// post-exit gate passes and a stale verdict persists. Requiring the join-time indexed sha to
+    /// ALSO equal this pre-spawn snapshot asserts the watcher reindexed nothing across the ENTIRE
+    /// window (spawn → join), for both the call-site and definition documents. Residual ABA (an
+    /// edit reverted to byte-identical content) is acceptable — the verdict is then correct
+    /// anyway.
+    pub pre_spawn: Option<&'a HashMap<String, String>>,
 }
 
 /// Run the oracle join over all current edge candidates and persist verdicts + a run row.
@@ -135,8 +143,8 @@ pub(crate) fn run_in_tx(
     let gates = DriftGates {
         disk_sha: &disk_sha,
         indexed_shas: &indexed_shas,
-        production_sha: input.production_sha,
-        pre_spawn_sha: input.pre_spawn_sha,
+        production_sha: input.shas.production,
+        pre_spawn_sha: input.shas.pre_spawn,
     };
 
     // Cache symbol spans per source path (resolve_symbol is called per candidate). RefCell so the

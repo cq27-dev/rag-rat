@@ -109,9 +109,9 @@ pub use query_api::{
     LensFileMemories, LensFileMemory, LensFilePapertrail, LensFileSymbolGraph, LensFileSymbols,
     LensGraphCallerCounts, LensHopResolvedBy, LensHopSelector, LensLaneVersions, LensPapertrailRef,
     LensStatus, LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion, MemoryCounts,
-    MemoryKindCounts, OracleShaSnapshots, PapertrailCursor, RepoContent, RepoFreshness,
-    RepoPapertrail, RepoStatus, RoiFactors, SearchRequest, SyncCatchUpReport, TextCloneMatch,
-    WAL_CHECKPOINT_MIN_BYTES, WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
+    MemoryKindCounts, PapertrailCursor, RepoContent, RepoFreshness, RepoPapertrail, RepoStatus,
+    RoiFactors, SearchRequest, SyncCatchUpReport, TextCloneMatch, WAL_CHECKPOINT_MIN_BYTES,
+    WalCheckpointReport, WorktreeOverlay, reclaim_freelist_at,
 };
 pub use schema::RegisteredRepo;
 #[cfg(test)]

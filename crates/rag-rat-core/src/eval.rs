@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use rag_rat_base::config::Config;
-use rag_rat_oracle::{OracleEvalMetrics, OracleTool, RecallCalls};
+use rag_rat_oracle::{OracleEvalMetrics, OracleTool, RecallCalls, ShaSnapshots};
 use serde::{Deserialize, Serialize};
 
 use crate::IndexDatabase;
-use crate::index::{OracleShaSnapshots, git_history};
+use crate::index::git_history;
 
 const TOP_K: usize = 10;
 
@@ -588,7 +588,7 @@ fn run_oracle_eval(
         OracleTool::RustAnalyzer,
         EVAL_ORACLE_TOOL_VERSION,
         &scip_bytes,
-        OracleShaSnapshots::default(),
+        ShaSnapshots::default(),
     )?;
     // Both recall sides come from the run, occurrence-counted over the call population.
     let recall_calls =

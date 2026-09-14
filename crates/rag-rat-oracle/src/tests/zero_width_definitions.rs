@@ -36,8 +36,7 @@ fn zero_width_definition_produces_no_receiver_verdict() {
         CHECKOUT,
         &index.write_to_bytes().unwrap(),
         h.root(),
-        None,
-        None,
+        ShaSnapshots::default(),
     )
     .unwrap();
 
