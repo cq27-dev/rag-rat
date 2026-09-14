@@ -76,7 +76,7 @@ use render::render_template;
 #[cfg(test)]
 use spans::any_member_inserts_within;
 #[cfg(test)]
-use types::{ClassAlignment, EmittedSpan, RunMetavar};
+use types::{ClassAlignment, ClassView, EmittedSpan, RunMetavar};
 pub(crate) use types::{MetavarKind, Template, VariationPoint};
 #[cfg(test)]
 use values::recover_values;

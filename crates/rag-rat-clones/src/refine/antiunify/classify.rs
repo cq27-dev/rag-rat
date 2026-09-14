@@ -1,7 +1,7 @@
 use super::super::RefineMember;
 use super::super::score::Confidence;
 use super::spans;
-use super::types::{ClassAlignment, MetavarKind};
+use super::types::{ClassView, MetavarKind};
 use super::values::{self, aligned_values};
 use super::widen::is_string_node_kind;
 use crate::normalize::NodeSpan;
@@ -82,12 +82,8 @@ pub(super) enum ReopenRole {
 ///   value locals (a renamed lifetime/label/field is a Type-2 equivalent, not a clone difference),
 ///   and none is a literal / type-name / callee position, so the reopen never fires on them. Left
 ///   fixed deliberately — same alpha-rename-equivalence rationale as value locals.
-pub(super) fn matched_column_reopen(
-    anchor: &RefineMember,
-    col: usize,
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-) -> Option<ReopenRole> {
+pub(super) fn matched_column_reopen(view: ClassView<'_>, col: usize) -> Option<ReopenRole> {
+    let anchor = view.anchor;
     let role = if anchor.leaf_is_literal(col) {
         ReopenRole::ValueLiteral
     } else if anchor_leaf_is_type_identifier(anchor, col) {
@@ -99,7 +95,7 @@ pub(super) fn matched_column_reopen(
     };
     // The erasure only matters when the recovered source values actually differ (C1 up front): a
     // same-callee / same-type / same-literal column stays fixed.
-    if !matched_source_values_differ(members, alignment, col) {
+    if !matched_source_values_differ(view, col) {
         return None;
     }
     // SCIP moniker collapse (#275, Plan 3): a callee column whose members SPELL the callee
@@ -109,7 +105,7 @@ pub(super) fn matched_column_reopen(
     // point, no `differing_callee`. Only fires when EVERY contributing member carries a moniker
     // for its span (attached only in scip refine mode) — one missing resolution vetoes the
     // collapse, so oracle staleness degrades to today's conservative reopen, never a wrong fix.
-    if role == ReopenRole::Callee && matched_callee_monikers_agree(members, alignment, col) {
+    if role == ReopenRole::Callee && matched_callee_monikers_agree(view, col) {
         return None;
     }
     Some(role)
@@ -122,11 +118,8 @@ pub(super) fn matched_column_reopen(
 /// [`matched_source_values_differ`]. `local N` monikers never reach here
 /// (`current_callee_monikers` drops them — document-scoped identity must not equate across
 /// files).
-fn matched_callee_monikers_agree(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    col: usize,
-) -> bool {
+fn matched_callee_monikers_agree(view: ClassView<'_>, col: usize) -> bool {
+    let ClassView { members, alignment, .. } = view;
     let mut monikers: Vec<&str> = Vec::new();
     for (m_idx, member) in members.iter().enumerate() {
         if !alignment.aligned[m_idx] {
@@ -177,11 +170,8 @@ fn anchor_leaf_is_type_identifier(anchor: &RefineMember, col: usize) -> bool {
 /// caller only flips columns the base fixedness already deemed matched-by-all-aligned). Recovers
 /// each member's source via the same `text.get(span..)` UTF-8-guarded path as `recover_values`; a
 /// slice miss is treated as "no opinion" (skipped) so a UTF-8 edge can't manufacture a variation.
-fn matched_source_values_differ(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    col: usize,
-) -> bool {
+fn matched_source_values_differ(view: ClassView<'_>, col: usize) -> bool {
+    let ClassView { members, alignment, .. } = view;
     let matched_values =
         members.iter().enumerate().filter(|&(m_idx, _)| alignment.aligned[m_idx]).filter_map(
             |(m_idx, member)| {
@@ -207,13 +197,12 @@ pub(super) struct RunClass {
 /// Classify a run's extraction role (§1.8), precedence `gapped > closure_param > type_param >
 /// value_param`.
 pub(super) fn classify_run(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    anchor: &RefineMember,
+    view: ClassView<'_>,
     lo: usize,
     hi: usize,
     per_member_values: &[String],
 ) -> RunClass {
+    let ClassView { alignment, anchor, .. } = view;
     // (1) gapped — any ALIGNED member gaps the run (empty value). Low.
     // Skipped (cost-capped) members are excluded via `aligned_values`: their `""` is "value unknown
     // (too long to align)", NOT a genuine indel gap — a skipped member must not demote an
@@ -245,9 +234,7 @@ pub(super) fn classify_run(
     // value_param, like any consistently-equivalent rename), never `differing_callee`. Scope is
     // deliberately same-call-syntax only (finding 2): a multi-token or cross-syntax run
     // (`a::b::foo()` vs `foo()`) fails the single-leaf gate and keeps today's verdict.
-    if run_callees_differ(per_member_values)
-        && !run_callee_monikers_agree(members, alignment, lo, hi)
-    {
+    if run_callees_differ(per_member_values) && !run_callee_monikers_agree(view, lo, hi) {
         if opens_call_head(anchor_kind) {
             // The run snapped to the call node itself — generic differing call subtree, Low.
             return RunClass {
@@ -297,8 +284,8 @@ pub(super) fn classify_run(
     // falls through to (3)     and is classified type_param, not value_param.
     if run_len == 1 && anchor.node_spans[lo].is_leaf && !is_type_position(anchor_kind) {
         let anchor_tok = &anchor.seq[lo];
-        if is_value_leaf_token(anchor_tok) && every_member_single_leaf(members, alignment, lo, hi) {
-            let type_hint = uniform_literal_bucket(members, alignment, lo);
+        if is_value_leaf_token(anchor_tok) && every_member_single_leaf(view, lo, hi) {
+            let type_hint = uniform_literal_bucket(view, lo);
             return RunClass {
                 kind: MetavarKind::ValueParam,
                 type_hint,
@@ -519,12 +506,8 @@ fn is_value_leaf_token(tok: &str) -> bool {
 /// tokens here, failing the `idxs.len() == 1` check and demoting every leaf swap to `ClosureParam`
 /// — the same class of wrong result the `gapped` check has. Mirror the `alignment.aligned[m]`
 /// exclusion used throughout (P1 fix).
-fn every_member_single_leaf(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    lo: usize,
-    hi: usize,
-) -> bool {
+fn every_member_single_leaf(view: ClassView<'_>, lo: usize, hi: usize) -> bool {
+    let ClassView { members, alignment, .. } = view;
     members.iter().enumerate().all(|(m_idx, member)| {
         // Skipped members cannot witness the single-leaf property — ignore them.
         if !alignment.aligned[m_idx] {
@@ -537,11 +520,8 @@ fn every_member_single_leaf(
 
 /// When every member's single-leaf value is the SAME literal bucket, return it as a `type_hint`
 /// (e.g. all `LIT_INTEGER_LITERAL`). Mixed literal kinds, or any identifier, yield `None`.
-fn uniform_literal_bucket(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    lo: usize,
-) -> Option<String> {
+fn uniform_literal_bucket(view: ClassView<'_>, lo: usize) -> Option<String> {
+    let ClassView { members, alignment, .. } = view;
     let mut bucket: Option<&str> = None;
     for (m_idx, member) in members.iter().enumerate() {
         // Skipped (cost-capped) members have an all-gap col_map and no insert keyed at `lo`, so the
@@ -582,12 +562,8 @@ fn uniform_literal_bucket(
 /// or a leaf WITHOUT a moniker returns `false` (finding 2's same-call-syntax scope + the
 /// no-evidence veto); a member that gapped the run contributes no opinion, mirroring
 /// [`run_callees_differ`]'s empty-value skip.
-fn run_callee_monikers_agree(
-    members: &[RefineMember],
-    alignment: &ClassAlignment,
-    lo: usize,
-    hi: usize,
-) -> bool {
+fn run_callee_monikers_agree(view: ClassView<'_>, lo: usize, hi: usize) -> bool {
+    let ClassView { members, alignment, .. } = view;
     let mut monikers: Vec<&str> = Vec::new();
     for (m_idx, member) in members.iter().enumerate() {
         if !alignment.aligned[m_idx] {

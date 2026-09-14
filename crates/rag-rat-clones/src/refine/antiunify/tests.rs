@@ -2987,7 +2987,7 @@ fn call_node_differing_callee_classifies_low_with_flag() {
         spent_cells: 0,
     };
 
-    let class = classify_run(&members, &alignment, &members[0], 0, 0, &[
+    let class = classify_run(ClassView::new(&members, &alignment), 0, 0, &[
         "foo()".to_string(),
         "bar()".to_string(),
     ]);
@@ -3043,9 +3043,10 @@ fn split_helper_defensive_paths_are_covered() {
         }],
         text: Arc::from("é"),
     };
-    assert_eq!(recover_values(&[invalid_utf8_slice], &one_member_alignment, 0, 0), vec![
-        "ID0".to_string()
-    ]);
+    assert_eq!(
+        recover_values(ClassView::new(&[invalid_utf8_slice], &one_member_alignment), 0, 0),
+        vec!["ID0".to_string()]
+    );
 
     let empty_anchor = RefineMember {
         callee_monikers: Default::default(),

@@ -1,10 +1,8 @@
-use std::ops::RangeInclusive;
-
 use super::super::RefineMember;
 use super::alignment::{align_to_anchor_with_budget, resolve_anchor_idx};
 use super::build::{Descent, anti_unify_with_budget};
 use super::spans::direct_children;
-use super::types::{ClassAlignment, EmittedSpan};
+use super::types::{ClassAlignment, ClassView, EmittedSpan};
 use crate::normalize::NodeSpan;
 
 /// `true` for a statement-like node kind — the granularity an inserted/removed statement snaps to.
@@ -264,9 +262,8 @@ impl Descent<'_> {
     ///   one),
     /// - a member-only inserted statement becomes ONE zero-width gapped metavar attributed at the
     ///   anchor position it follows.
-    pub(super) fn emit_block_statement_indel(&mut self, span: RangeInclusive<usize>) -> bool {
-        let (lo, hi) = (*span.start(), *span.end());
-        let (members, alignment, anchor) = (self.members, self.alignment, self.anchor);
+    pub(super) fn emit_block_statement_indel(&mut self, lo: usize, hi: usize) -> bool {
+        let ClassView { members, alignment, anchor } = self.view;
         let stmt_children = anchor_statement_children(anchor, lo, hi);
         if stmt_children.is_empty() {
             return false;
@@ -383,13 +380,13 @@ impl Descent<'_> {
                 // per-class `budget`: once it is exhausted it leaves the statement whole-fixed (no
                 // extra exact DP) and latches `sampled` so the class is honestly
                 // flagged.
-                self.emit_matched_statement_redescent(&per_member, si, slo..=shi);
+                self.emit_matched_statement_redescent(&per_member, si, slo, shi);
             }
         }
 
         // Member-only inserted statements (anchor lacks them entirely) → zero-width gapped
         // metavars.
-        emit_member_only_inserts(&stmt_children, &per_member, members.len(), &mut self.out);
+        self.emit_member_only_inserts(&stmt_children, &per_member);
         true
     }
 
@@ -422,10 +419,10 @@ impl Descent<'_> {
         &mut self,
         per_member: &[Option<MemberStmtAlign>],
         si: usize,
-        span: RangeInclusive<usize>,
+        slo: usize,
+        shi: usize,
     ) {
-        let (slo, shi) = (*span.start(), *span.end());
-        let (members, parent_anchor_idx) = (self.members, self.alignment.anchor_idx);
+        let (members, parent_anchor_idx) = (self.view.members, self.view.alignment.anchor_idx);
         // Aggregate cell budget (shared with the parent star-align): once the per-class budget is
         // exhausted, STOP re-descending matched statements — leave this one whole-fixed (the
         // documented pre-Fix-2 behavior: an inner diff inside it is not surfaced as a VP)
@@ -555,58 +552,58 @@ impl Descent<'_> {
             }
         }
     }
-}
 
-/// Emit zero-width gapped metavars for member-only inserted statements — statements present in some
-/// members' source but ABSENT from the anchor (anchor is the shorter member). Each distinct
-/// follow-position becomes one metavar attributed at the END column of the anchor statement it
-/// follows (or the first statement's start when it leads), with per-member values = the inserted
-/// source (or `""`).
-fn emit_member_only_inserts(
-    stmt_children: &[(usize, usize)],
-    per_member: &[Option<MemberStmtAlign>],
-    member_count: usize,
-    out: &mut Vec<EmittedSpan>,
-) {
-    let mut positions: Vec<usize> = per_member
-        .iter()
-        .flatten()
-        .flat_map(|a| a.inserts.iter().map(|&(after, _)| after))
-        .collect();
-    positions.sort_unstable();
-    positions.dedup();
-
-    for after in positions {
-        let per_member_values: Vec<String> = (0..member_count)
-            .map(|m| match per_member[m].as_ref() {
-                Some(a) => a
-                    .inserts
-                    .iter()
-                    .filter(|&&(p, _)| p == after)
-                    .map(|(_, s)| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                None => String::new(),
-            })
+    /// Emit zero-width gapped metavars for member-only inserted statements — statements present in
+    /// some members' source but ABSENT from the anchor (anchor is the shorter member). Each
+    /// distinct follow-position becomes one metavar attributed at the END column of the anchor
+    /// statement it follows (or the first statement's start when it leads), with per-member
+    /// values = the inserted source (or `""`).
+    fn emit_member_only_inserts(
+        &mut self,
+        stmt_children: &[(usize, usize)],
+        per_member: &[Option<MemberStmtAlign>],
+    ) {
+        let member_count = self.view.members.len();
+        let mut positions: Vec<usize> = per_member
+            .iter()
+            .flatten()
+            .flat_map(|a| a.inserts.iter().map(|&(after, _)| after))
             .collect();
-        // Attach at the END column of the statement this insert follows (renders right after it),
-        // or the first statement's lo when it leads. `after` is a statement INDEX;
-        // `after-1` precedes.
-        let attach = if after == 0 {
-            stmt_children.first().map(|&(slo, _)| slo).unwrap_or(0)
-        } else {
-            stmt_children
-                .get(after - 1)
-                .map(|&(_, shi)| shi)
-                .or_else(|| stmt_children.last().map(|&(_, shi)| shi))
-                .unwrap_or(0)
-        };
-        out.push(EmittedSpan::Statement {
-            lo: attach,
-            hi: attach,
-            per_member_values,
-            zero_width: true,
-        });
+        positions.sort_unstable();
+        positions.dedup();
+
+        for after in positions {
+            let per_member_values: Vec<String> = (0..member_count)
+                .map(|m| match per_member[m].as_ref() {
+                    Some(a) => a
+                        .inserts
+                        .iter()
+                        .filter(|&&(p, _)| p == after)
+                        .map(|(_, s)| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    None => String::new(),
+                })
+                .collect();
+            // Attach at the END column of the statement this insert follows (renders right after
+            // it), or the first statement's lo when it leads. `after` is a statement
+            // INDEX; `after-1` precedes.
+            let attach = if after == 0 {
+                stmt_children.first().map(|&(slo, _)| slo).unwrap_or(0)
+            } else {
+                stmt_children
+                    .get(after - 1)
+                    .map(|&(_, shi)| shi)
+                    .or_else(|| stmt_children.last().map(|&(_, shi)| shi))
+                    .unwrap_or(0)
+            };
+            self.out.push(EmittedSpan::Statement {
+                lo: attach,
+                hi: attach,
+                per_member_values,
+                zero_width: true,
+            });
+        }
     }
 }
 
@@ -698,8 +695,15 @@ mod coverage_tests {
                 inserts: vec![(0, "lead();".to_string()), (2, "tail();".to_string())],
             }),
         ];
-        let mut emitted = Vec::new();
-        emit_member_only_inserts(&[(10, 12), (20, 22)], &per_member, 2, &mut emitted);
+        let two_members = vec![
+            fixture_member(1, "a", vec!["ID0"], vec![span(0, 1, "identifier", true)]),
+            fixture_member(2, "b", vec!["ID0"], vec![span(0, 1, "identifier", true)]),
+        ];
+        let alignment = anchor_only_alignment();
+        let mut budget = CellBudget::new(100);
+        let mut descent = Descent::new(ClassView::new(&two_members, &alignment), &[], &mut budget);
+        descent.emit_member_only_inserts(&[(10, 12), (20, 22)], &per_member);
+        let emitted = descent.out;
 
         assert_eq!(statement_parts(&EmittedSpan::Raw(0, 0)), None);
         assert_eq!(emitted.len(), 2);
@@ -726,12 +730,11 @@ mod coverage_tests {
         };
         let mut budget = CellBudget::new(100);
         let mut descent = Descent::new(
-            std::slice::from_ref(&lone_leaf),
-            &one_member_alignment,
+            ClassView::new(std::slice::from_ref(&lone_leaf), &one_member_alignment),
             &[true],
             &mut budget,
         );
-        assert!(!descent.emit_block_statement_indel(0..=0));
+        assert!(!descent.emit_block_statement_indel(0, 0));
 
         let anchor =
             fixture_member(10, "{a;}", vec!["block", "expression_statement", "ID0", ";"], vec![
@@ -763,10 +766,13 @@ mod coverage_tests {
             spent_cells: 0,
         };
         let mut budget = CellBudget::new(100);
-        let mut descent =
-            Descent::new(&members, &alignment, &[true, true, true, true], &mut budget);
+        let mut descent = Descent::new(
+            ClassView::new(&members, &alignment),
+            &[true, true, true, true],
+            &mut budget,
+        );
 
-        assert!(descent.emit_block_statement_indel(0..=3));
+        assert!(descent.emit_block_statement_indel(0, 3));
 
         let emitted = descent.out;
         assert_eq!(emitted.len(), 1);
@@ -789,8 +795,12 @@ mod coverage_tests {
         })];
         let alignment = anchor_only_alignment();
         let mut budget = CellBudget::new(100);
-        let mut descent = Descent::new(std::slice::from_ref(&short), &alignment, &[], &mut budget);
-        descent.emit_matched_statement_redescent(&malformed, 0, 0..=0);
+        let mut descent = Descent::new(
+            ClassView::new(std::slice::from_ref(&short), &alignment),
+            &[],
+            &mut budget,
+        );
+        descent.emit_matched_statement_redescent(&malformed, 0, 0, 0);
         assert!(descent.out.is_empty());
 
         let sparse_anchor =
@@ -810,8 +820,9 @@ mod coverage_tests {
             None,
         ];
         let mut budget = CellBudget::new(100);
-        let mut descent = Descent::new(&sparse_members, &alignment, &[], &mut budget);
-        descent.emit_matched_statement_redescent(&sparse, 0, 0..=0);
+        let mut descent =
+            Descent::new(ClassView::new(&sparse_members, &alignment), &[], &mut budget);
+        descent.emit_matched_statement_redescent(&sparse, 0, 0, 0);
         assert!(descent.out.is_empty());
 
         let parent_anchor = fixture_member(30, "ab", vec!["fixed", "A"], vec![
@@ -842,8 +853,9 @@ mod coverage_tests {
             }),
         ];
         let mut budget = CellBudget::new(100);
-        let mut descent = Descent::new(&parent_members, &alignment, &[], &mut budget);
-        descent.emit_matched_statement_redescent(&per_member, 0, 0..=0);
+        let mut descent =
+            Descent::new(ClassView::new(&parent_members, &alignment), &[], &mut budget);
+        descent.emit_matched_statement_redescent(&per_member, 0, 0, 0);
         assert!(
             descent.out.is_empty(),
             "a sub-template occurrence beyond the parent span is defensively ignored"
