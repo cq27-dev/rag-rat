@@ -9,8 +9,8 @@ use rag_rat_base::locks::{self};
 use super::live_oracle::LiveOracleTail;
 use super::overlay::{OverlayScope, ReconcileBudget, refresh_worktree_overlays};
 use super::placement::WatchPlacementCounters;
-use crate::index::IndexDatabase;
 use crate::index::ai::ReconcileOptions;
+use crate::index::{CloneDeltaStatus, IndexDatabase};
 
 pub(crate) const GC_EVERY_PASSES: u64 = 20;
 pub(crate) const PASS_RECONCILE_MAX_SECONDS: u64 = 60;
@@ -547,7 +547,8 @@ fn run_pass(
             db.apply_clone_graph_delta_hinted(crate::index::CLONE_DELTA_MAX_FILES, hint)
         });
         let clone_full_rebuild_owed = match &delta {
-            Ok(d) if d.status == "Applied" || d.status == "Noop" => d.full_rebuild_owed,
+            Ok(d) if matches!(d.status, CloneDeltaStatus::Applied | CloneDeltaStatus::Noop) =>
+                d.full_rebuild_owed,
             _ => true,
         };
         // #830: a gc-cadence `SelfHeal` that ESCALATED while the graph is still FRESH against the
@@ -558,8 +559,8 @@ fn run_pass(
         // `source_revision != content_revision` (stale), so the quiet gate handles it as usual and
         // this bypass does not weaken that thrash-prevention; a `Paths` delta only escalates on a
         // moved revision, so it is never fresh here.
-        let force_revision_neutral_rebuild =
-            matches!(&delta, Ok(d) if d.status == "Escalate") && !db.clone_graph_stale()?;
+        let force_revision_neutral_rebuild = matches!(&delta, Ok(d) if matches!(d.status, CloneDeltaStatus::Escalate))
+            && !db.clone_graph_stale()?;
         if clone_full_rebuild_owed
             && (clone_graph_due || force_revision_neutral_rebuild)
             && let Some(options) = budget.next_options()

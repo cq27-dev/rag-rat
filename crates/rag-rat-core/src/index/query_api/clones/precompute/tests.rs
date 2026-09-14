@@ -630,7 +630,8 @@ fn an_empty_generation_without_epoch_rows_stays_current() {
     let (db, _changed) = crate::IndexDatabase::index_discover_reporting(&config).unwrap();
     let report = db.apply_clone_graph_delta(64).unwrap();
     assert_eq!(
-        report.status, "NotEligible",
+        report.status,
+        crate::index::CloneDeltaStatus::NotEligible,
         "the delta must not create first postings on an epoch-less generation: {report:?}"
     );
     assert_eq!(db.precompute_clone_graph(None).unwrap().status, "Complete");
@@ -661,7 +662,8 @@ fn a_generation_without_epoch_rows_is_not_servable() {
     );
     let report = db.apply_clone_graph_delta(64).unwrap();
     assert_eq!(
-        report.status, "NotEligible",
+        report.status,
+        crate::index::CloneDeltaStatus::NotEligible,
         "the delta must not patch postings whose build order is unknown: {report:?}"
     );
     // The self-heal loop must CLOSE (Codex review of this change): the unservable state has
