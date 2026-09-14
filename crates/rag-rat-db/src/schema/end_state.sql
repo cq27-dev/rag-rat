@@ -2179,6 +2179,14 @@ CREATE TABLE sync_tombstone_statements(
          ) STRICT;
 CREATE INDEX sync_tombstone_statements_chain
              ON sync_tombstone_statements(stream_id, device_fingerprint, lamport);
+CREATE TABLE table_sync_row_diagnostics(
+             stream_id BLOB NOT NULL CHECK(length(stream_id) = 32),
+             repo_id TEXT NOT NULL,
+             table_name TEXT NOT NULL,
+             row_pk TEXT NOT NULL,
+             cause TEXT NOT NULL,
+             PRIMARY KEY(stream_id, repo_id, table_name, row_pk)
+         ) STRICT;
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('001_sqlite_storage_baseline',1789374675829,'sha256:rag-rat-sqlite-baseline-v1','SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('002_embedding_vector_metadata',1789374675829,'sha256:rag-rat-embedding-vector-metadata-v2','Add embedding model dimension metadata and per-vector dimensions for hybrid vector search');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('003_derived_artifact_reconcile_metadata',1789374675829,'sha256:rag-rat-derived-artifact-reconcile-metadata-v3','Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation');
@@ -2306,5 +2314,6 @@ INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALU
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('125_refold_for_concurrent_cut_vouch',1789374676265,'sha256:rag-rat-refold-for-concurrent-cut-vouch-v125','Refold every account and queue every /3 content stream for an acceptance refold, so control ops authored concurrently with a revoking cut and parked auth_len_ahead behind the ops it condemned are re-judged with the cut vouching for them (#1301)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('126_memory_note_summaries',1789374676265,'sha256:rag-rat-memory-note-summaries-v126','Add memory_note_summaries, the summary of a memory''s current note keyed (repo_id, memory_id) with content_hash as a synced column, seeded with each memory''s newest row from memory_summaries, so a regeneration syncs as one upsert instead of a delete plus an insert (#1319); memory_summaries stays for the entries that name it');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('127_tombstone_statements',1789374676265,'sha256:rag-rat-tombstone-statements-v127','Add sync_tombstone_statements: per chain that states a row''s current tombstone, the lamport of that chain''s newest statement, so a writer can restate its own deletes at its tail and retention can reclaim the entries that first stated them (#1295); backfilled with one statement per tombstone at its own identity');
+INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('128_table_sync_row_diagnostics',1789402525979,'sha256:rag-rat-table-sync-row-diagnostics-v128','Persist local per-row table-sync diagnostic causes independently of pending entries (#1020)');
 INSERT INTO "repos"("repo_id","display_name","registered_at_ms") VALUES('__unassigned__','',0);
 INSERT INTO "content_digest_state"("id","state","rows_folded") VALUES(1,'0000000000000000000000000000000000000000000000000000000000000000',0);

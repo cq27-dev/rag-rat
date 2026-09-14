@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{OptionalExtension, Transaction, params_from_iter};
 
+use super::diagnostics::{self, TableSyncRowCause};
 use super::registry::{self, DefaultValue, TableSpec, ValueType};
 use super::row_op::{self, Cell, RowOp, StatedDelete, TypedValue};
 use super::store::PendingReason;
@@ -999,10 +1000,11 @@ pub(crate) enum StaleRow {
     /// The row differs from its winning op: a local change nothing has authored yet.
     LocallyChanged,
     /// Nothing can be concluded — the winning entry is gone, or does not project here.
-    Unknown,
+    Unknown(TableSyncRowCause),
 }
 
 /// Compare a stale-version row against its own winning op, projected under the CURRENT spec.
+/// Persists or clears its local diagnostic observation in the caller's transaction; not read-only.
 ///
 /// This is what lets a column-set change resolve instead of freezing. The published hash and the
 /// current hash cover different cell lists, so comparing them proves nothing — but the row's
@@ -1021,6 +1023,24 @@ pub(crate) fn stale_row_disposition(
     pk_vals: &[TypedValue],
     current: &[Cell],
 ) -> anyhow::Result<StaleRow> {
+    let outcome = compare_stale_row(tx, spec, repo_id, stream, pk_vals, current)?;
+    let row_pk = row_op::row_pk_string(pk_vals);
+    let key = RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk };
+    match outcome {
+        StaleRow::Unknown(cause) => diagnostics::record(tx, &key, cause)?,
+        StaleRow::Unchanged | StaleRow::LocallyChanged => diagnostics::clear(tx, &key)?,
+    }
+    Ok(outcome)
+}
+
+fn compare_stale_row(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    pk_vals: &[TypedValue],
+    current: &[Cell],
+) -> anyhow::Result<StaleRow> {
     let row_pk = row_op::row_pk_string(pk_vals);
     let Some(clock) = current_row_clock_on_stream(tx, &RowKey {
         stream,
@@ -1029,13 +1049,11 @@ pub(crate) fn stale_row_disposition(
         row_pk: &row_pk,
     })?
     else {
-        return Ok(StaleRow::Unknown);
+        return Ok(StaleRow::Unknown(TableSyncRowCause::MissingClock));
     };
-    let Some(op) = super::store::winning_entry_op(tx, stream, &clock.device_hex, clock.lamport)?
-    else {
-        // The entry is gone. Retention never drops a live winner (the pin rule, #1277), so only a
-        // store compacted before that rule reaches this arm — and re-authoring repairs it.
-        return Ok(StaleRow::Unknown);
+    let op = match super::store::winning_entry_op(tx, stream, &clock.device_hex, clock.lamport)? {
+        Ok(op) => op,
+        Err(cause) => return Ok(StaleRow::Unknown(cause)),
     };
     // The entry is located by `(stream, device, lamport)`, which identifies it uniquely WITHIN a
     // stream — so the hit is this row's op only while the row's clock and the stream being queried
@@ -1051,10 +1069,13 @@ pub(crate) fn stale_row_disposition(
     // replay straight over it.
     // A winning REMOVE clears the row clock, so a live clock can only ever point at an upsert.
     let RowOp::Upsert { spec_version, cells, pk, .. } = &op else {
-        return Ok(StaleRow::Unknown);
+        return Ok(StaleRow::Unknown(TableSyncRowCause::WrongOperation));
     };
-    if op.table() != spec.name || pk != pk_vals {
-        return Ok(StaleRow::Unknown);
+    if op.table() != spec.name {
+        return Ok(StaleRow::Unknown(TableSyncRowCause::WrongTable));
+    }
+    if pk != pk_vals {
+        return Ok(StaleRow::Unknown(TableSyncRowCause::WrongKey));
     }
     match project_cells(spec, *spec_version, cells) {
         Projection::Complete(projected) => {
@@ -1068,7 +1089,8 @@ pub(crate) fn stale_row_disposition(
                 StaleRow::LocallyChanged
             })
         },
-        Projection::Park(_) | Projection::Quarantine(_) => Ok(StaleRow::Unknown),
+        Projection::Park(_) | Projection::Quarantine(_) =>
+            Ok(StaleRow::Unknown(TableSyncRowCause::UnprojectableWinner)),
     }
 }
 
@@ -1213,6 +1235,7 @@ fn unsent_work_on_row(
     let current_cells = match read_synced_cells(tx, spec, pk_vals)? {
         SyncedRow::Cells(cells) => cells,
         SyncedRow::Absent => {
+            diagnostics::clear(tx, &RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk })?;
             // No row — but a surviving published identity means the row was DELETED locally and not
             // yet authored. That is precisely what the producer's `Remove` branch keys on, so
             // replaying an upsert here would recreate the row and discard the unsent deletion for
@@ -1240,8 +1263,14 @@ fn unsent_work_on_row(
         // and repairs nothing, so a winning remove would destroy an unsent local edit that merely
         // happens to be unreadable. Deferring it is the safe stuck state: the row survives, and the
         // entry replays on the merits once the cell is repaired.
-        SyncedRow::Unreadable(_) =>
-            return Ok(removing.then_some(PendingReason::DeferredUnreadableRow)),
+        SyncedRow::Unreadable(_) => {
+            diagnostics::record(
+                tx,
+                &RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk },
+                TableSyncRowCause::UnreadableRow,
+            )?;
+            return Ok(removing.then_some(PendingReason::DeferredUnreadableRow));
+        },
     };
     let current = row_op::cells_hash(&current_cells);
     Ok(
@@ -1252,8 +1281,15 @@ fn unsent_work_on_row(
             row_pk: &row_pk,
         })? {
             // Comparable: a differing hash is a demonstrably unsent local change.
-            Some((published, version)) if version == spec.spec_version =>
-                (published != current).then_some(PendingReason::DeferredUnsentEdit),
+            Some((published, version)) if version == spec.spec_version => {
+                diagnostics::clear(tx, &RowKey {
+                    stream,
+                    repo_id,
+                    table: spec.name,
+                    row_pk: &row_pk,
+                })?;
+                (published != current).then_some(PendingReason::DeferredUnsentEdit)
+            },
             // Published under a different column set, so the hashes cannot be compared — but the
             // row's WINNING op can be, projected under this spec. This proof path is
             // required, not an optimization: once an older-spec op can be filled from
@@ -1263,12 +1299,20 @@ fn unsent_work_on_row(
             Some(_) =>
                 match stale_row_disposition(tx, spec, repo_id, stream, pk_vals, &current_cells)? {
                     StaleRow::LocallyChanged => Some(PendingReason::DeferredUnsentEdit),
-                    StaleRow::Unknown => Some(PendingReason::DeferredUnresolvedWinner),
+                    StaleRow::Unknown(_) => Some(PendingReason::DeferredUnresolvedWinner),
                     StaleRow::Unchanged => None,
                 },
             // A live row no apply ever published is purely local: the only content there came from
             // this device, and no peer has seen it.
-            None => Some(PendingReason::DeferredUnsentEdit),
+            None => {
+                diagnostics::clear(tx, &RowKey {
+                    stream,
+                    repo_id,
+                    table: spec.name,
+                    row_pk: &row_pk,
+                })?;
+                Some(PendingReason::DeferredUnsentEdit)
+            },
         },
     )
 }
@@ -1459,6 +1503,7 @@ pub(crate) fn record_published(
             spec_version,
         ],
     )?;
+    diagnostics::clear(tx, key)?;
     Ok(())
 }
 
@@ -1468,6 +1513,7 @@ fn clear_published(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()>
           WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
         rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
     )?;
+    diagnostics::clear(tx, key)?;
     Ok(())
 }
 

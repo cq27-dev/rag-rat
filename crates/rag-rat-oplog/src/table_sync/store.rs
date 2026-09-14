@@ -1035,15 +1035,16 @@ pub(crate) fn clear_entry_pending(
 ///
 /// The clock stores the fingerprint as lowercase hex while the entry log stores raw bytes; the
 /// fingerprint type round-trips between them, and an unparseable value simply resolves to nothing.
-/// Returns `None` when the entry is absent or its payload no longer decodes to a known op.
+/// An unresolved lookup returns a typed local cause; SQL failures remain errors.
 pub(crate) fn winning_entry_op(
     tx: &Transaction<'_>,
     stream: StreamId,
     device_hex: &str,
     lamport: u64,
-) -> anyhow::Result<Option<RowOp>> {
+) -> anyhow::Result<Result<RowOp, super::diagnostics::TableSyncRowCause>> {
+    use super::diagnostics::TableSyncRowCause as Cause;
     let Ok(device) = device_hex.parse::<DeviceFingerprint>() else {
-        return Ok(None);
+        return Ok(Err(Cause::InvalidClockDevice));
     };
     let signed_bytes: Option<Vec<u8>> = tx
         .query_row(
@@ -1058,14 +1059,15 @@ pub(crate) fn winning_entry_op(
         )
         .optional()?;
     let Some(signed_bytes) = signed_bytes else {
-        return Ok(None);
+        return Ok(Err(Cause::MissingEntry));
     };
     let Ok(signed) = entry::decode_signed(&signed_bytes) else {
-        return Ok(None);
+        return Ok(Err(Cause::UndecodableEntry));
     };
     Ok(match row_op::decode(&signed.entry.op_bytes) {
-        Ok(DecodedRowOp::Known(op)) => Some(op),
-        _ => None,
+        Ok(DecodedRowOp::Known(op)) => Ok(op),
+        Ok(DecodedRowOp::Unknown { .. }) => Err(Cause::UnknownOperation),
+        Err(_) => Err(Cause::UndecodableEntry),
     })
 }
 

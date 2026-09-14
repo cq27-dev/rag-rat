@@ -1026,6 +1026,7 @@ mod repo_registry;
 mod schema_migrations;
 mod swift_corpus;
 mod symbol_search_lookup;
+mod sync_diagnostics;
 mod watch_placement;
 mod worktree_overlay;
 mod worktree_purge;

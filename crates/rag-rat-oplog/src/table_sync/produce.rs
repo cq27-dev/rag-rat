@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use rusqlite::{Transaction, params};
 
 use super::apply::{self, RowKey};
+use super::diagnostics::{self, TableSyncRowCause};
 use super::registry::TableSpec;
 use super::row_op::{self, RowOp};
 use crate::stream::StreamId;
@@ -43,7 +44,13 @@ pub(crate) fn produce_row_ops(
             // authors a `Remove` for: an unreadable cell on one device would then delete the row on
             // every peer.
             apply::ScannedRow::Unpublishable { pk } => {
-                live.insert(row_op::row_pk_string(&pk));
+                let row_pk = row_op::row_pk_string(&pk);
+                diagnostics::record(
+                    tx,
+                    &RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk },
+                    TableSyncRowCause::UnreadableRow,
+                )?;
+                live.insert(row_pk);
                 continue;
             },
             // No pk means no identity to keep alive, so this row is deliberately NOT added to
@@ -58,7 +65,10 @@ pub(crate) fn produce_row_ops(
         let changed = match apply::published_hash_on_stream(tx, &key)? {
             // Published under THIS binary's column set: a differing hash is a real local
             // change.
-            Some((published, version)) if version == spec.spec_version => published != hash,
+            Some((published, version)) if version == spec.spec_version => {
+                diagnostics::clear(tx, &key)?;
+                published != hash
+            },
             // Published under a DIFFERENT column set: the two hashes cover different cell
             // lists, so comparing them says nothing (they differ structurally
             // whether or not the row changed). Resolve it against the op that
@@ -93,10 +103,13 @@ pub(crate) fn produce_row_ops(
                     // makes the next pass cheap), and at
                     // best it publishes an edit that would otherwise have been lost. Not
                     // authoring has no such floor.
-                    apply::StaleRow::Unknown => true,
+                    apply::StaleRow::Unknown(_) => true,
                 },
             // Never published: a genuinely new local row.
-            None => true,
+            None => {
+                diagnostics::clear(tx, &key)?;
+                true
+            },
         };
         if changed {
             ops.push(RowOp::Upsert {
@@ -121,6 +134,7 @@ pub(crate) fn produce_row_ops(
             });
         }
     }
+    diagnostics::clear_absent(tx, stream, repo_id, spec.name, &live)?;
     Ok(ops)
 }
 

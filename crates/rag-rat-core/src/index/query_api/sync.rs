@@ -22,6 +22,40 @@ pub struct PublishSeedReport {
 }
 
 impl IndexDatabase {
+    /// Last observed table-sync row failures for this checkout's active repository. This report
+    /// reads local observations; it does not mint an account, trigger authoring or scan tables.
+    pub fn sync_row_diagnostics(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<rag_rat_oplog::TableSyncRowDiagnostic>> {
+        let conn = self.storage.connection();
+        let Some(account) = rag_rat_oplog::read_local_account(conn)? else {
+            return Ok(Vec::new());
+        };
+        let repo_id = memory::memory_repo_scope(conn)?
+            .context("sync diagnostics requires an active repo scope")?;
+        let mut rows = Vec::new();
+        let limit = limit.min(1000);
+        for stream in rag_rat_oplog::table_sync_supported_streams(conn, account)? {
+            if stream.repo_id != repo_id {
+                continue;
+            }
+            if rows.len() == limit {
+                break;
+            }
+            rows.extend(rag_rat_oplog::table_sync_row_diagnostics(
+                conn,
+                &rag_rat_oplog::TableSyncDiagnosticQuery {
+                    stream_id: stream.stream_id,
+                    repo_id: &repo_id,
+                    after: None,
+                    limit: limit - rows.len(),
+                },
+            )?);
+        }
+        Ok(rows)
+    }
+
     /// Permanently enable sealed local memory authoring for this repo. Existing suite-0 history is
     /// retained; subsequent live and reconcile entries use suite 1.
     pub fn sync_enable(&self) -> anyhow::Result<bool> {

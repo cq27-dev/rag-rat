@@ -309,3 +309,18 @@ Neither grants access to data. Every peer, discovered or configured, still passe
 authorization before a single log entry moves, and a removed device fails it at any host that has
 folded the removal. Pin your hosts in `server_peers` and set `discovery = false` if you would rather
 the tag not be in the path at all.
+
+## Unresolved table rows
+
+`rag-rat sync diagnostics --limit 100` lists the active repository's last observed local table-row
+failures, including a missing clock or winner entry, an undecodable winner, a wrong operation,
+table or key, an unprojectable winner, an unreadable local row, or a superseded self-apply.
+The limit is 1–1000 rows across current table streams. `limit_reached` means the bounded report may
+have more rows; the library's `table_sync_row_diagnostics` API also supports keyset pagination.
+
+These observations are local diagnostics, not replicated authority or a reason to delete a row.
+They survive restart and failed authoring rollback. Successful publication or deletion clears them;
+a raw local repair becomes visible on the next producer scan or replay. A row with an unreadable
+primary key has no addressable row identity and is not included in this per-row report. The command
+reads existing observations; it does not trigger a scan or author entries. An empty report therefore
+means no observations were found for the current streams, not proof that every row was scanned.

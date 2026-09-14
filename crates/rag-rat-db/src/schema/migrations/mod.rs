@@ -98,7 +98,7 @@ pub use steps::table_sync::{
     apply_lens_lane_revisions, apply_sync_invites, apply_sync_invites_normalized_receipts,
     apply_sync_origin_and_edge_tombstone, apply_table_sync_gapped_entries,
     apply_table_sync_projection_state, apply_table_sync_repo_incarnations,
-    apply_table_sync_spec_version, apply_table_sync_tables,
+    apply_table_sync_row_diagnostics, apply_table_sync_spec_version, apply_table_sync_tables,
 };
 
 pub(crate) fn applied_migrations(conn: &Connection) -> anyhow::Result<Vec<AppliedMigration>> {

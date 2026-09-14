@@ -336,6 +336,12 @@ pub(crate) enum SyncCommand {
     },
     /// Print this store's local account id — the identity an owner grants with `sync grant`.
     Whoami,
+    /// List locally observed unresolved table rows for the active repository.
+    Diagnostics {
+        /// Maximum rows across the repository's current table streams.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
     /// Grant another identity Writer authority on this repo's shared memories (owner-only).
     #[command(long_about = "Authors a Writer grant so a SEPARATE identity (its own account) may \
                             author memories into this repo's shared set under its own identity. \
@@ -1190,6 +1196,21 @@ mod tests {
                 assert_eq!(seed.as_deref(), Some(std::path::Path::new("/src/idx.sqlite"))),
             other => panic!("expected sync publish --seed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_diagnostics_has_a_bounded_limit() {
+        let cli = Cli::try_parse_from(["rag-rat", "sync", "diagnostics"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync(SyncArgs { command: SyncCommand::Diagnostics { limit: 100 } })
+        ));
+        for limit in ["0", "1001"] {
+            assert!(
+                Cli::try_parse_from(["rag-rat", "sync", "diagnostics", "--limit", limit]).is_err()
+            );
+        }
+        assert!(Cli::try_parse_from(["rag-rat", "sync", "diagnostics", "--limit", "1000"]).is_ok());
     }
 
     #[test]
