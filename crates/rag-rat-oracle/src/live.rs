@@ -948,7 +948,7 @@ fn write_verdict_for_definition(
 
     // Moniker: the target's batch moniker verbatim, else the content-stable local
     // sentinel (module docs — NEVER the LSP moniker string). A DB failure propagates.
-    if let std::collections::hash_map::Entry::Vacant(slot) = moniker_cache.entry(symbol_id) {
+    if let Entry::Vacant(slot) = moniker_cache.entry(symbol_id) {
         slot.insert(store::batch_moniker_for_symbol(conn, symbol_id, moniker_source)?);
     }
     let scip_symbol = moniker_cache
