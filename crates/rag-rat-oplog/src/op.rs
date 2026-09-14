@@ -149,7 +149,8 @@ impl fmt::Display for DeviceFingerprint {
 /// A memory-node lifecycle status — the validated `repo_memories.status` set, mirrored as a closed
 /// enum so the fold can carry it typed. The db tokens are pinned by test against
 /// `query::memory::validate_status`; do not add a token without that gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum NodeStatus {
     Active,
     Stale,
@@ -166,24 +167,13 @@ impl Default for NodeStatus {
 
 impl NodeStatus {
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Stale => "stale",
-            Self::Obsolete => "obsolete",
-            Self::Rejected => "rejected",
-        }
+        self.into()
     }
 
     /// `None` for an unrecognized token — the caller treats that as a forward-compat status this
     /// binary can't project (→ [`DecodedOp::Unknown`]), not a decode error.
     pub fn from_db_str(value: &str) -> Option<Self> {
-        Some(match value {
-            "active" => Self::Active,
-            "stale" => Self::Stale,
-            "obsolete" => Self::Obsolete,
-            "rejected" => Self::Rejected,
-            _ => return None,
-        })
+        value.parse().ok()
     }
 }
 
