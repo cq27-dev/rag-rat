@@ -15,27 +15,33 @@ use super::super::branch::{self, BranchSelection, Candidate, ChainLink};
 use super::super::candidate::{self, CutCoordinate, HeaderView};
 use super::super::cut::Cut;
 use super::super::envelope::AccountEntryHeader;
+#[cfg(test)]
 use super::super::fold::SECRETS_LOG;
 use crate::op::DeviceFingerprint;
 
 type AccountEntryHash = [u8; 32];
 
-/// The chain one secrets cut bounds: `(account, device)` on `log: SECRETS_LOG`.
+/// The full account-log coordinate; log identity is part of every forged-link check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(in crate::account) struct SecretsCoordinate {
     pub(super) account_id: AccountId,
+    pub(super) log_id: u8,
     pub(super) device_fingerprint: DeviceFingerprint,
 }
 
 impl SecretsCoordinate {
     fn of(header: &AccountEntryHeader) -> Self {
-        Self { account_id: header.account_id, device_fingerprint: header.device_fingerprint }
+        Self {
+            account_id: header.account_id,
+            log_id: header.log_id,
+            device_fingerprint: header.device_fingerprint,
+        }
     }
 
     fn cut_coordinate(&self) -> CutCoordinate {
         CutCoordinate {
             account: self.account_id,
-            log: SECRETS_LOG,
+            log: self.log_id,
             device: self.device_fingerprint,
         }
     }
@@ -49,8 +55,7 @@ pub(super) type SecretsCandidate = Candidate<AccountEntryHeader>;
 /// PROMOTES it, which is what makes an off-branch condemnation of the other fork enforceable.
 pub(super) type BranchPin = branch::BranchPin<SecretsCoordinate>;
 
-/// An account header seen as a link on its SECRETS chain — this module only ever walks log-1
-/// candidates, whose chain is `(account, device)`.
+/// An account header linked only within its full `(account, log, device)` coordinate.
 impl ChainLink for AccountEntryHeader {
     type Coordinate = SecretsCoordinate;
 
@@ -105,6 +110,7 @@ mod tests {
     fn chain() -> SecretsCoordinate {
         SecretsCoordinate {
             account_id: AccountId::from_bytes(ACCOUNT),
+            log_id: SECRETS_LOG,
             device_fingerprint: DeviceFingerprint::from_bytes(DEVICE),
         }
     }
@@ -148,6 +154,23 @@ mod tests {
 
     fn all(view: &HashMap<AccountEntryHash, AccountEntryHeader>) -> HashSet<AccountEntryHash> {
         view.keys().copied().collect()
+    }
+
+    #[test]
+    fn a_control_log_predecessor_is_not_on_the_secrets_chain() {
+        let mut view = linear();
+        view.get_mut(&[0x0a; 32]).unwrap().log_id = super::super::super::fold::CONTROL_LOG;
+        let mut reached = false;
+        let end = branch::walk_back(
+            &[0x0c; 32],
+            |hash| view.get(hash),
+            |hash, _| {
+                reached |= *hash == [0x0a; 32];
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        assert!(matches!(end, branch::WalkEnd::ForgedLink));
+        assert!(!reached, "reject the foreign coordinate before visiting its target");
     }
 
     #[test]

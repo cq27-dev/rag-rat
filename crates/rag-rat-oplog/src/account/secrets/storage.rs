@@ -429,6 +429,7 @@ fn branch_pins(resolved: &[ResolvedSecretsEntry]) -> Vec<BranchPin> {
         };
         let coordinate = SecretsCoordinate {
             account_id: r.header.account_id,
+            log_id: r.header.log_id,
             device_fingerprint: r.header.device_fingerprint,
         };
         for boundary in [owner.device_boundary, owner.incarnation_boundary] {
@@ -454,6 +455,7 @@ fn prefix_closed_accepted(
         if selection.accepted.contains(&r.entry_hash) {
             let coordinate = SecretsCoordinate {
                 account_id: r.header.account_id,
+                log_id: r.header.log_id,
                 device_fingerprint: r.header.device_fingerprint,
             };
             chains.entry(coordinate).or_default().push((
