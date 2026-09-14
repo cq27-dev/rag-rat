@@ -1,3 +1,4 @@
+use crate::memory::fixtures::{self, MemorySeed};
 
 /// A fresh in-memory index at the current schema. `MigrationHooks::noop()` is the
 /// documented-sound choice on a fresh scratch DB, keeping these tests engine-free.
@@ -24,25 +25,12 @@ use super::*;
 
 /// Seed an active memory under the connection's active repo. Returns its id.
 fn seed_memory(c: &Connection, id: &str, title: &str, body: &str, repo_id: &str) {
-    c.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
-         (?1,'Invariant',?2,?3,'high','active','agent',1,1,'agent','v1',?4)",
-        rusqlite::params![id, title, body, repo_id],
-    )
-    .unwrap();
+    fixtures::seed_memory(c, MemorySeed { id, title, body, repo_id, ..MemorySeed::default() });
 }
 
 /// Seed a file + one chunk carrying `text`, under `repo_id`. Returns the file id.
 fn seed_file(c: &Connection, path: &str, text: &str, repo_id: &str) -> i64 {
-    c.execute(
-        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-         commit_sha, worktree_id, repo_id, generation) VALUES \
-         (?1,'rust','source',?2,0,0,'','',?3,0)",
-        rusqlite::params![path, format!("sha-{path}"), repo_id],
-    )
-    .unwrap();
-    let file_id = c.last_insert_rowid();
+    let file_id = fixtures::seed_file(c, path, repo_id);
     let line_count = text.split('\n').count() as i64;
     c.execute(
         "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \

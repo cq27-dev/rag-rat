@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn base_parts<'a>(receiver_type_hint: Option<&'a str>) -> EdgeFingerprintParts<'a> {

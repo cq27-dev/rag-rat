@@ -1,6 +1,8 @@
 mod api;
 pub mod edges;
 pub mod evidence;
+#[cfg(test)]
+pub(crate) mod fixtures;
 mod hydrate;
 mod moniker;
 mod resolve;

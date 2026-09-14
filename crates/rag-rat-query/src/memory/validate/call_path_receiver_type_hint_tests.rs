@@ -1,5 +1,5 @@
-
 use super::*;
+use crate::memory::fixtures::{self, MemorySeed};
 
 fn mem_db() -> Connection {
     let c = Connection::open_in_memory().unwrap();
@@ -20,24 +20,11 @@ fn set_repo(c: &Connection, repo_id: &str) {
 }
 
 fn seed_file(c: &Connection, path: &str, repo_id: &str) -> i64 {
-    c.execute(
-        "INSERT INTO main.files(path, language, kind, sha256, modified_at_ms, indexed_at_ms, \
-         commit_sha, worktree_id, repo_id, generation) VALUES \
-         (?1,'rust','source',?2,0,0,'','',?3,0)",
-        rusqlite::params![path, format!("sha-{path}"), repo_id],
-    )
-    .unwrap();
-    c.last_insert_rowid()
+    fixtures::seed_file(c, path, repo_id)
 }
 
 fn seed_memory(c: &Connection, id: &str, repo_id: &str) {
-    c.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_by, \
-         created_at_ms, updated_at_ms, source, memory_version, repo_id) VALUES \
-         (?1,'Invariant','t','b','high','active','agent',1,1,'agent','v1',?2)",
-        rusqlite::params![id, repo_id],
-    )
-    .unwrap();
+    fixtures::seed_memory(c, MemorySeed { id, repo_id, ..MemorySeed::default() });
 }
 
 fn seed_target(c: &Connection, file_id: i64, name: &str, logical_id: i64) -> i64 {

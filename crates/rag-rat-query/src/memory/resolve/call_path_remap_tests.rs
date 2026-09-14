@@ -1,5 +1,5 @@
-
 use super::*;
+use crate::memory::fixtures::{self, MemorySeed};
 
 fn remap_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
@@ -16,13 +16,13 @@ fn remap_db() -> Connection {
         [],
     )
     .unwrap();
-    conn.execute(
-        "INSERT INTO repo_memories(id, kind, title, body, confidence, status, created_at_ms,
-                    updated_at_ms, source, memory_version, repo_id)
-             VALUES ('m', 'Invariant', 't', 'b', 'high', 'active', 0, 0, 'agent', 'v1', 'r')",
-        [],
-    )
-    .unwrap();
+    fixtures::seed_memory(&conn, MemorySeed {
+        id: "m",
+        created_by: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        ..MemorySeed::default()
+    });
     conn
 }
 

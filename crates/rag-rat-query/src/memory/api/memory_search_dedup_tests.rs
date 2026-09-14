@@ -1,5 +1,5 @@
-
 use super::*;
+use crate::memory::fixtures::{self, MemorySeed};
 
 /// A corpus where one memory's FTS mirror carries a stray SECOND row — what an interrupted
 /// heal, or an import that inserts before its scoped DELETE, leaves behind. The bodies differ,
@@ -13,14 +13,15 @@ fn conn_with_duplicated_fts_row() -> Connection {
     )
     .unwrap();
     let insert_memory = |id: &str, body: &str| {
-        conn.execute(
-            "INSERT INTO repo_memories(id, kind, title, body, confidence, status,
-                        created_at_ms, updated_at_ms, source, memory_version, repo_id)
-                 VALUES (?1, 'Invariant', 'Quokkaform routing', ?2, 'high', 'active', 0, 0,
-                         'agent', 'v1', 'r')",
-            [id, body],
-        )
-        .unwrap();
+        fixtures::seed_memory(&conn, MemorySeed {
+            id,
+            title: "Quokkaform routing",
+            body,
+            created_by: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            ..MemorySeed::default()
+        });
         conn.execute(
             "INSERT INTO repo_memory_fts(repo_id, memory_id, title, body, kind, tags)
                  VALUES ('r', ?1, 'Quokkaform routing', ?2, 'Invariant', '')",
