@@ -379,7 +379,9 @@ impl IndexDatabase {
     }
 
     /// Remove overlay rows of `worktree_id` whose path is no longer in the delta (the file matches
-    /// the base again), so the scope view falls back to the base row for them. Returns the count.
+    /// the base again), so the scope view falls back to the base row for them. Returns the pruned
+    /// paths: un-shadowing a base row changes what this checkout serves, so per-checkout consumers
+    /// need the paths rather than just their count (#1010).
     pub(super) fn prune_overlay_rows_not_in_delta(
         &self,
         worktree_id: &str,
