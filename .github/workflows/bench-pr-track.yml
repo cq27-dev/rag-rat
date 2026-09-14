@@ -68,6 +68,8 @@ jobs:
           artifact-ids: ${{ steps.artifact.outputs.artifact_id }}
           run-id: ${{ steps.artifact.outputs.run_id }}
           github-token: ${{ github.token }}
+          # ID selection is not a single-name download in v4; flatten this one selected artifact.
+          merge-multiple: true
           path: benchmark-input
 
       - name: Extract PR metadata from the saved event
