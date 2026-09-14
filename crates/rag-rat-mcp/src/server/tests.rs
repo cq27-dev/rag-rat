@@ -397,7 +397,7 @@ fn get_info_advertises_tool_capability() {
 }
 
 #[test]
-fn call_dispatches_every_read_tool_and_rejects_unknown() {
+fn call_dispatches_a_representative_read_tool_set_and_rejects_unknown() {
     let (root, svc) = service_over_temp_repo();
     // The chokepoint `call()` funnels every tool: success path (render to TOON text) across a
     // representative read-tool set, plus the error mapping for an unknown tool.
