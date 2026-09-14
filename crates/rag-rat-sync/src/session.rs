@@ -164,7 +164,9 @@ pub struct SessionLimits<F = fn() -> i64> {
     /// The shared GLOBAL egress cap. `None` leaves the session unmetered (the dialer paths and
     /// tests).
     pub egress: Option<std::sync::Arc<std::sync::Mutex<crate::GlobalEgressLimiter>>>,
-    /// The clock the egress budget refills against; read only when `egress` is `Some`.
+    /// The clock the egress budget refills against; read only when `egress` is `Some`. The
+    /// `Default` clock always answers 0, so a caller that sets `egress` must set this too —
+    /// `SessionLimits { egress: Some(..), ..Default::default() }` would meter against the epoch.
     pub now_ms: F,
 }
 
