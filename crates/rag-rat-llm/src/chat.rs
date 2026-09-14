@@ -14,8 +14,6 @@
 use rag_rat_base::config::RemoteDreamConfig;
 use serde::{Deserialize, Serialize};
 
-use crate::openai::resolve_auth_header;
-
 /// A single-turn chat model: given a fully-rendered prompt, return the model's raw completion text.
 /// Object-safe so a pass takes a `&dyn ChatModel` and a test can swap in a mock.
 pub trait ChatModel {
@@ -136,8 +134,9 @@ impl HttpChatModel {
             .unwrap_or("http://localhost:11434")
             .trim()
             .trim_end_matches('/');
-        let auth_header =
-            resolve_auth_header(cfg.auth_env.as_deref(), |var| std::env::var(var).ok())?;
+        let auth_header = crate::http::resolve_auth_header(cfg.auth_env.as_deref(), |var| {
+            std::env::var(var).ok()
+        })?;
         Ok(Self::build(endpoint, cfg.model.trim(), auth_header, cfg.request_timeout_s))
     }
 
@@ -149,11 +148,7 @@ impl HttpChatModel {
     /// with [`provision_chat_model`], which keeps the `ProvisionedBox` alive for the model's
     /// lifetime.
     pub fn from_provisioned(params: ProvisionedChatParams<'_>) -> Self {
-        let auth_header = params
-            .auth_token
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-            .map(|t| format!("Bearer {t}"));
+        let auth_header = crate::http::bearer_header(params.auth_token);
         Self::build(
             params.endpoint.trim().trim_end_matches('/'),
             params.model.trim(),

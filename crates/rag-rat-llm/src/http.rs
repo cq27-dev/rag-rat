@@ -108,9 +108,74 @@ pub(crate) fn url_authority(url: &str) -> &str {
     authority.rsplit_once('@').map_or(authority, |(_, host_port)| host_port)
 }
 
+/// The `Authorization` header for a DIRECT bearer token (the ephemeral box's handshake credential,
+/// or a token already resolved from the env): trimmed, `None` when absent or blank, else
+/// `"Bearer <token>"`.
+pub(crate) fn bearer_header(token: Option<&str>) -> Option<String> {
+    token.map(str::trim).filter(|t| !t.is_empty()).map(|t| format!("Bearer {t}"))
+}
+
+/// Resolve the `Authorization` header from the configured `auth_env` name, looking the value up
+/// through `lookup` (the env in production; a fake closure in tests). `None`/empty `auth_env` → no
+/// auth (`Ok(None)`); a named-but-missing/empty value → `Err` (the operator asked for auth but the
+/// token isn't there). Closure-injected so the env-mutation footgun (unsafe + flaky under nextest's
+/// parallel runner in Rust 2024) never enters the test path.
+pub(crate) fn resolve_auth_header(
+    auth_env: Option<&str>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(var) = auth_env.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let token =
+        lookup(var).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "auth env var `{var}` is set in config but missing or empty in the environment"
+            )
+        })?;
+    Ok(bearer_header(Some(&token)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::endpoint_is_loopback;
+    use super::{bearer_header, endpoint_is_loopback, resolve_auth_header};
+
+    #[test]
+    fn bearer_header_trims_and_rejects_blank_tokens() {
+        assert_eq!(bearer_header(None), None);
+        assert_eq!(bearer_header(Some("   ")), None);
+        assert_eq!(bearer_header(Some(" sekret ")).as_deref(), Some("Bearer sekret"));
+    }
+
+    #[test]
+    fn resolve_auth_header_none_when_auth_env_absent_or_empty() {
+        // Lookup must never run when there's no var name to resolve.
+        let lookup = |_: &str| -> Option<String> { panic!("lookup should not be called") };
+        assert_eq!(resolve_auth_header(None, lookup).unwrap(), None);
+        assert_eq!(resolve_auth_header(Some("  "), lookup).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_auth_header_errors_when_named_var_unset() {
+        // Closure-injected lookup — no process-env mutation, safe under nextest's parallel runner.
+        let err = resolve_auth_header(Some("OLLAMA_TOKEN"), |_| None)
+            .expect_err("named-but-unset var errors");
+        assert!(err.to_string().contains("auth env"), "{err}");
+    }
+
+    #[test]
+    fn resolve_auth_header_errors_when_named_var_empty() {
+        let err = resolve_auth_header(Some("OLLAMA_TOKEN"), |_| Some("   ".to_string()))
+            .expect_err("named-but-empty var errors");
+        assert!(err.to_string().contains("auth env"), "{err}");
+    }
+
+    #[test]
+    fn resolve_auth_header_builds_bearer_from_looked_up_token() {
+        let header =
+            resolve_auth_header(Some("OLLAMA_TOKEN"), |_| Some("sekret".to_string())).unwrap();
+        assert_eq!(header.as_deref(), Some("Bearer sekret"));
+    }
 
     #[test]
     fn endpoint_is_loopback_classifies_hosts() {
