@@ -727,10 +727,11 @@ fn acquire_dual_repo_locks(
 }
 
 /// The direct-scoped tables whose rows the LATE-upgrade merge DELETES under the retiring `local:`
-/// id (its DERIVED data): the A5 periphery list minus 8 entries. Five are AUTHORED and are MOVED
-/// onto the target id instead — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`,
-/// `repo_memory_parked_baselines`, and `repo_node_edges`. The remaining three are the dream-v2
-/// verification siblings
+/// id (its DERIVED data): exactly the leading entries of [`A5_PERIPHERY_DIRECT_SCOPED_TABLES`], in
+/// the same order (pinned by `late_merge_derived_periphery_is_the_a5_prefix`). The eight A5
+/// entries after them are not dropped. Five are AUTHORED and are MOVED onto the target id instead
+/// — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`, `repo_memory_parked_baselines`,
+/// and `repo_node_edges`. The remaining three are the dream-v2 verification siblings
 /// (`memory_reality`, `memory_note_summaries`, `memory_model_failures`): this merge neither moves
 /// nor deletes them (parked pending a ruling — see `LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED`).
 /// The retired `memory_summaries` is left where it lies on both paths.
@@ -816,12 +817,12 @@ fn late_upgrade_is_proven(
 /// tolerate (it does converge: the proof re-holds and the merge re-runs over the already-drained
 /// rows). That is the sketched escape hatch if the stall ever bites in practice.
 ///
-/// TABLE COVERAGE: [`DIRECT_SCOPED_ADOPTION_TABLES`] + [`LATE_MERGE_DERIVED_PERIPHERY_TABLES`]
-/// were audited complete against every `repo_id`-carrying table at V044; V045 widened the github
-/// CHILD tables' keys without adding a new `repo_id` table, and V060's papertrail_* successors
-/// replaced the github_* entries in the direct list 1:1, so the disposition is unchanged. A
-/// future migration adding a NEW
-/// `repo_id`-scoped table must add it to one of these lists (or the authored-move set above).
+/// TABLE COVERAGE: every `repo_id`-carrying table has exactly one disposition on this path — the
+/// [`DIRECT_SCOPED_ADOPTION_TABLES`] or [`LATE_MERGE_DERIVED_PERIPHERY_TABLES`] DELETE loops, the
+/// authored-move set above, or a declared FK-carried or parked set. That is enforced, not audited:
+/// `every_repo_id_table_declares_a_late_merge_disposition` (and its in-place twin
+/// `every_repo_id_table_declares_an_in_place_adoption_disposition`) range over the live schema's
+/// own `repo_id` tables, so a new one fails a test until its disposition is declared.
 fn merge_local_incumbent_into_registered(
     conn: &Connection,
     identity: &RepoIdentity,
@@ -1473,10 +1474,9 @@ pub fn is_root_already_indexed_conn(
     Ok(false)
 }
 
-/// TRIPWIRE (#571): the adoption coverage lists in this module are HAND-AUDITED against every
-/// `repo_id`-carrying table, and the audit note dates the last full pass to V044. V056
-/// (`git_change_couplings`) shipped absent from both lists with the full suite green: no test
-/// could see the omission. These tests turn the audit into a gate.
+/// TRIPWIRE (#571): the adoption coverage lists in this module are hand-written, and a hand audit
+/// is what let V056 (`git_change_couplings`) ship absent from both lists with the full suite
+/// green: no test could see the omission. These tests turn the audit into a gate.
 ///
 /// The enumeration comes from the FRESHLY BOOTSTRAPPED SCHEMA ITSELF —
 /// [`super::repo_scoped_table_names`], the same `sqlite_master` × `PRAGMA table_info` sweep the
@@ -1729,6 +1729,18 @@ mod repo_id_scope_coverage {
              matching its disposition (or, if an FK or an explicit statement already carries it, \
              to `LATE_MERGE_HANDLED_ELSEWHERE` with that reason).",
             set_names(&sets),
+        );
+    }
+
+    /// The late merge DELETEs the leading, DERIVED slice of the A5 periphery list; the rest of that
+    /// list is authored or parked. Pinned so a derived periphery table cannot be added to one list
+    /// and not the other — re-pointed on adoption but never dropped on a late merge, or vice versa.
+    #[test]
+    fn late_merge_derived_periphery_is_the_a5_prefix() {
+        assert!(
+            A5_PERIPHERY_DIRECT_SCOPED_TABLES.starts_with(LATE_MERGE_DERIVED_PERIPHERY_TABLES),
+            "`LATE_MERGE_DERIVED_PERIPHERY_TABLES` must be the leading slice of \
+             `A5_PERIPHERY_DIRECT_SCOPED_TABLES`, in the same order",
         );
     }
 
