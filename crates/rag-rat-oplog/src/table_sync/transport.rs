@@ -34,6 +34,31 @@ pub enum TableSyncIngestOutcome {
     NoChange,
 }
 
+/// One position in a device chain: an entry's lamport and the entry hash at it. Raw bytes, like the
+/// rest of this surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableSyncChainCursor {
+    pub lamport: u64,
+    pub entry_hash: [u8; 32],
+}
+
+impl TableSyncChainCursor {
+    /// A stored `(lamport, entry_hash)` row.
+    fn from_row(lamport: i64, entry_hash: Vec<u8>) -> anyhow::Result<Self> {
+        Ok(Self {
+            lamport: u64::try_from(lamport)?,
+            entry_hash: cbor::sql_fixed(entry_hash, "entry_hash")?,
+        })
+    }
+
+    fn to_store(self) -> store::ChainCursor {
+        store::ChainCursor {
+            lamport: self.lamport,
+            entry_hash: EntryHash::from_bytes(self.entry_hash),
+        }
+    }
+}
+
 /// The accepted tip of one device chain in a table stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableSyncChainHead {
@@ -43,7 +68,7 @@ pub struct TableSyncChainHead {
     /// The retained floor this chain was compacted below, if any (#1127). Routing advice only:
     /// a receiver with no local chain may accept the floor entry as its local root; a receiver
     /// with chain state ignores it entirely.
-    pub floor: Option<(u64, [u8; 32])>,
+    pub floor: Option<TableSyncChainCursor>,
 }
 
 /// Durable receiver progress for one offered device chain.
@@ -51,31 +76,24 @@ pub struct TableSyncChainHead {
 pub enum TableSyncFrontier {
     Empty,
     /// Entries strictly after this accepted tail are missing.
-    Accepted {
-        lamport: u64,
-        entry_hash: [u8; 32],
-    },
+    Accepted(TableSyncChainCursor),
     /// Repository purge retained this witness but removed the accepted tip itself. The witnessed
     /// entry must be offered inclusively to restore local authoring continuity.
-    Restore {
-        lamport: u64,
-        entry_hash: [u8; 32],
-    },
+    Restore(TableSyncChainCursor),
 }
 
 /// Where a causal page of one device chain starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TableSyncEntryStart {
     Beginning,
-    After { lamport: u64, entry_hash: [u8; 32] },
-    At { lamport: u64, entry_hash: [u8; 32] },
+    After(TableSyncChainCursor),
+    At(TableSyncChainCursor),
 }
 
 /// One accepted entry plus the cursor needed to request the next page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSyncChainEntry {
-    pub lamport: u64,
-    pub entry_hash: [u8; 32],
+    pub cursor: TableSyncChainCursor,
     pub signed_bytes: Vec<u8>,
 }
 
@@ -561,7 +579,7 @@ pub fn table_sync_chain_entries(
 pub struct TableSyncReceived<'a> {
     pub expected_device: [u8; 32],
     pub signed_bytes: &'a [u8],
-    pub advertised_floor: Option<(u64, [u8; 32])>,
+    pub advertised_floor: Option<TableSyncChainCursor>,
 }
 
 /// Feed one untrusted signed envelope through the existing table-sync authority, chain and payload
@@ -707,13 +725,13 @@ fn accepted_chain_page(
         let (device, lamport, hash, floor_lamport, floor_hash) = row?;
         let floor = floor_lamport
             .map(|l| -> anyhow::Result<_> {
-                Ok((
-                    u64::try_from(l)?,
-                    cbor::sql_fixed(
+                Ok(TableSyncChainCursor {
+                    lamport: u64::try_from(l)?,
+                    entry_hash: cbor::sql_fixed(
                         floor_hash.expect("floor row carries its entry hash"),
                         "entry_hash",
                     )?,
-                ))
+                })
             })
             .transpose()?;
         Ok(TableSyncChainHead {
@@ -740,22 +758,21 @@ fn chain_frontier(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?
-        .map(|(lamport, hash)| -> anyhow::Result<_> {
-            Ok((u64::try_from(lamport)?, cbor::sql_fixed(hash, "entry_hash")?))
-        })
+        .map(|(lamport, hash)| TableSyncChainCursor::from_row(lamport, hash))
         .transpose()?;
     match (accepted, witness) {
         (None, None) => Ok(TableSyncFrontier::Empty),
-        (Some((lamport, entry_hash)), None) =>
-            Ok(TableSyncFrontier::Accepted { lamport, entry_hash }),
-        (None, Some((lamport, entry_hash))) =>
-            Ok(TableSyncFrontier::Restore { lamport, entry_hash }),
+        (Some(accepted), None) => Ok(TableSyncFrontier::Accepted(accepted)),
+        (None, Some(witness)) => Ok(TableSyncFrontier::Restore(witness)),
         (Some(accepted), Some(witness)) if accepted == witness =>
-            Ok(TableSyncFrontier::Accepted { lamport: accepted.0, entry_hash: accepted.1 }),
-        (Some(accepted), Some(witness)) if witness.0 > accepted.0 =>
-            Ok(TableSyncFrontier::Restore { lamport: witness.0, entry_hash: witness.1 }),
+            Ok(TableSyncFrontier::Accepted(accepted)),
+        (Some(accepted), Some(witness)) if witness.lamport > accepted.lamport =>
+            Ok(TableSyncFrontier::Restore(witness)),
+        // Rendered as `(lamport, hash)` tuples: the wording this error has always had.
         (Some(accepted), Some(witness)) => anyhow::bail!(
-            "table-sync chain tip witness {witness:?} conflicts with accepted tail {accepted:?}"
+            "table-sync chain tip witness {:?} conflicts with accepted tail {:?}",
+            (witness.lamport, witness.entry_hash),
+            (accepted.lamport, accepted.entry_hash)
         ),
     }
 }
@@ -764,7 +781,7 @@ fn accepted_chain_tail(
     conn: &Connection,
     stream_id: [u8; 32],
     device_fingerprint: [u8; 32],
-) -> anyhow::Result<Option<(u64, [u8; 32])>> {
+) -> anyhow::Result<Option<TableSyncChainCursor>> {
     conn.query_row(
         "SELECT lamport, entry_hash FROM table_sync_entries
           WHERE stream_id = ?1 AND device_fingerprint = ?2
@@ -773,9 +790,7 @@ fn accepted_chain_tail(
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
     )
     .optional()?
-    .map(|(lamport, hash)| -> anyhow::Result<_> {
-        Ok((u64::try_from(lamport)?, cbor::sql_fixed(hash, "entry_hash")?))
-    })
+    .map(|(lamport, hash)| TableSyncChainCursor::from_row(lamport, hash))
     .transpose()
 }
 
@@ -786,26 +801,22 @@ fn accepted_chain_entries(
     start: TableSyncEntryStart,
     limit: usize,
 ) -> anyhow::Result<Vec<TableSyncChainEntry>> {
+    let stream = StreamId::from_bytes(stream_id);
+    let device = crate::op::DeviceFingerprint::from_bytes(device_fingerprint);
     let (minimum_lamport, inclusive) = match start {
         TableSyncEntryStart::Beginning => (None, false),
-        TableSyncEntryStart::After { lamport, entry_hash } => {
+        TableSyncEntryStart::After(cursor) => {
             anyhow::ensure!(
-                cursor_matches(conn, stream_id, device_fingerprint, lamport, entry_hash)?,
+                cursor_matches(conn, stream, device, cursor.to_store())?,
                 "table-sync accepted chain cursor is not present locally"
             );
-            (Some(lamport), false)
+            (Some(cursor.lamport), false)
         },
-        TableSyncEntryStart::At { lamport, entry_hash } => {
-            if cursor_matches(conn, stream_id, device_fingerprint, lamport, entry_hash)? {
-                (Some(lamport), true)
+        TableSyncEntryStart::At(cursor) => {
+            if cursor_matches(conn, stream, device, cursor.to_store())? {
+                (Some(cursor.lamport), true)
             } else {
-                let successor = direct_successor_lamport(
-                    conn,
-                    stream_id,
-                    device_fingerprint,
-                    lamport,
-                    entry_hash,
-                )?;
+                let successor = direct_successor_lamport(conn, stream, device, cursor.to_store())?;
                 let Some(successor) = successor else {
                     anyhow::bail!(
                         "table-sync restore cursor has neither its tip nor a direct successor"
@@ -835,8 +846,7 @@ fn accepted_chain_entries(
     .map(|row| {
         let (lamport, hash, signed_bytes) = row?;
         Ok(TableSyncChainEntry {
-            lamport: u64::try_from(lamport)?,
-            entry_hash: cbor::sql_fixed(hash, "entry_hash")?,
+            cursor: TableSyncChainCursor::from_row(lamport, hash)?,
             signed_bytes,
         })
     })
@@ -845,20 +855,19 @@ fn accepted_chain_entries(
 
 fn direct_successor_lamport(
     conn: &Connection,
-    stream_id: [u8; 32],
-    device_fingerprint: [u8; 32],
-    witness_lamport: u64,
-    entry_hash: [u8; 32],
+    stream: StreamId,
+    device: crate::op::DeviceFingerprint,
+    witness: store::ChainCursor,
 ) -> anyhow::Result<Option<u64>> {
     conn.query_row(
         "SELECT lamport FROM table_sync_entries
           WHERE stream_id = ?1 AND device_fingerprint = ?2 AND prev_hash = ?3 AND lamport > ?4
           ORDER BY lamport LIMIT 1",
         params![
-            stream_id.as_slice(),
-            device_fingerprint.as_slice(),
-            entry_hash.as_slice(),
-            i64::try_from(witness_lamport)?,
+            stream.to_bytes().as_slice(),
+            device.to_bytes().as_slice(),
+            witness.entry_hash.as_slice(),
+            i64::try_from(witness.lamport)?,
         ],
         |row| row.get::<_, i64>(0),
     )
@@ -870,23 +879,27 @@ fn direct_successor_lamport(
 
 fn cursor_matches(
     conn: &Connection,
-    stream_id: [u8; 32],
-    device_fingerprint: [u8; 32],
-    lamport: u64,
-    entry_hash: [u8; 32],
+    stream: StreamId,
+    device: crate::op::DeviceFingerprint,
+    cursor: store::ChainCursor,
 ) -> anyhow::Result<bool> {
     let stored = conn
         .query_row(
             "SELECT entry_hash FROM table_sync_entries
               WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport = ?3",
-            params![stream_id.as_slice(), device_fingerprint.as_slice(), i64::try_from(lamport)?,],
+            params![
+                stream.to_bytes().as_slice(),
+                device.to_bytes().as_slice(),
+                i64::try_from(cursor.lamport)?,
+            ],
             |row| row.get::<_, Vec<u8>>(0),
         )
         .optional()?;
     let Some(stored) = stored else { return Ok(false) };
     anyhow::ensure!(
-        cbor::sql_fixed(stored, "entry_hash")? == entry_hash,
-        "table-sync chain cursor hash conflicts at lamport {lamport}"
+        EntryHash::try_from_sql(stored)? == cursor.entry_hash,
+        "table-sync chain cursor hash conflicts at lamport {}",
+        cursor.lamport
     );
     Ok(true)
 }
@@ -906,7 +919,7 @@ fn ingest_against(
     expected_device: crate::op::DeviceFingerprint,
     signed_bytes: &[u8],
     now_ms: i64,
-    advertised_floor: Option<(u64, [u8; 32])>,
+    advertised_floor: Option<TableSyncChainCursor>,
     local_writer: &LocalWriterMemo,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
     let IngestRoute { account_id, stream, registry } = *route;
@@ -953,10 +966,7 @@ fn ingest_against(
         scope,
         signed_bytes,
         &pubkey,
-        advertised_floor.map(|(lamport, entry_hash)| store::AdvertisedFloor {
-            lamport,
-            entry_hash: EntryHash::from_bytes(entry_hash),
-        }),
+        advertised_floor.map(TableSyncChainCursor::to_store),
     )?;
     // An applied row on this stream changed derived state, so advance the Lens lanes that scope
     // feeds (the explicit replacement for the row triggers the synced scopes dropped). All entries
@@ -1456,7 +1466,7 @@ mod tests {
         assert_eq!(second[0].device_fingerprint, [4; 32]);
         assert_eq!(
             chain_frontier(&conn, stream.stream_id, [2; 32]).unwrap(),
-            TableSyncFrontier::Accepted { lamport: 3, entry_hash: [13; 32] }
+            TableSyncFrontier::Accepted(TableSyncChainCursor { lamport: 3, entry_hash: [13; 32] })
         );
 
         let page = accepted_chain_entries(
@@ -1472,7 +1482,7 @@ mod tests {
             &conn,
             stream.stream_id,
             [2; 32],
-            TableSyncEntryStart::After { lamport: 1, entry_hash: [11; 32] },
+            TableSyncEntryStart::After(TableSyncChainCursor { lamport: 1, entry_hash: [11; 32] }),
             10,
         )
         .unwrap();
@@ -1482,7 +1492,10 @@ mod tests {
                 &conn,
                 stream.stream_id,
                 [2; 32],
-                TableSyncEntryStart::After { lamport: 1, entry_hash: [99; 32] },
+                TableSyncEntryStart::After(TableSyncChainCursor {
+                    lamport: 1,
+                    entry_hash: [99; 32]
+                }),
                 10,
             )
             .unwrap_err()
@@ -1521,18 +1534,21 @@ mod tests {
         }
 
         let frontier = chain_frontier(&destination, destination_stream.stream_id, device).unwrap();
-        assert_eq!(frontier, TableSyncFrontier::Restore { lamport: 7, entry_hash: tip });
-        let TableSyncFrontier::Restore { lamport, entry_hash } = frontier else { unreachable!() };
+        assert_eq!(
+            frontier,
+            TableSyncFrontier::Restore(TableSyncChainCursor { lamport: 7, entry_hash: tip })
+        );
+        let TableSyncFrontier::Restore(witness) = frontier else { unreachable!() };
         let restored = accepted_chain_entries(
             &source,
             source_stream.stream_id,
             device,
-            TableSyncEntryStart::At { lamport, entry_hash },
+            TableSyncEntryStart::At(witness),
             1,
         )
         .unwrap();
         assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].entry_hash, tip);
+        assert_eq!(restored[0].cursor.entry_hash, tip);
 
         let successor_source = database();
         let successor_stream =
@@ -1557,12 +1573,12 @@ mod tests {
             &successor_source,
             successor_stream.stream_id,
             device,
-            TableSyncEntryStart::At { lamport, entry_hash },
+            TableSyncEntryStart::At(witness),
             1,
         )
         .unwrap();
         assert_eq!(successor.len(), 1);
-        assert_eq!(successor[0].entry_hash, [10; 32]);
+        assert_eq!(successor[0].cursor.entry_hash, [10; 32]);
     }
 
     #[test]
@@ -2041,10 +2057,7 @@ mod tests {
     fn sync_chains(source: &Connection, peer: &Connection, account: AccountId) {
         let route = supported_streams_against(source, account, &[REPO_SPEC]).unwrap().remove(0);
         for head in accepted_chain_page(source, route.stream_id, None, 16).unwrap() {
-            let start =
-                head.floor.map_or(TableSyncEntryStart::Beginning, |(lamport, entry_hash)| {
-                    TableSyncEntryStart::At { lamport, entry_hash }
-                });
+            let start = head.floor.map_or(TableSyncEntryStart::Beginning, TableSyncEntryStart::At);
             for entry in accepted_chain_entries(
                 source,
                 route.stream_id,
@@ -2054,7 +2067,7 @@ mod tests {
             )
             .unwrap()
             {
-                let floor = head.floor.filter(|(lamport, _)| *lamport == entry.lamport);
+                let floor = head.floor.filter(|floor| floor.lamport == entry.cursor.lamport);
                 ingest_against(
                     peer,
                     &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },

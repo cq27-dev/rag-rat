@@ -613,7 +613,7 @@ pub(crate) fn ingest(
     scope_id: ScopeId,
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
-    advertised_floor: Option<store::AdvertisedFloor>,
+    advertised_floor: Option<store::ChainCursor>,
 ) -> anyhow::Result<IngestReport> {
     store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     let device = pubkey.fingerprint();
@@ -725,7 +725,7 @@ fn ingest_one(
     tx: &Transaction<'_>,
     scope: &IngestScope<'_>,
     signed_bytes: &[u8],
-    advertised_floor: Option<store::AdvertisedFloor>,
+    advertised_floor: Option<store::ChainCursor>,
 ) -> anyhow::Result<(IngestOutcome, Option<AcceptedEntry>)> {
     let IngestScope { ctx, scope_id, pubkey } = *scope;
     // Same refusal as the producer: an older binary must not re-park, under its own version, an

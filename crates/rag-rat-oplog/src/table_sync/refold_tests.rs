@@ -2623,7 +2623,7 @@ fn a_subset_constraint_failure_parks_the_restate_instead_of_quarantining_it() {
                 now_ms: 0,
             },
             &restated,
-            Some(store::AdvertisedFloor {
+            Some(store::ChainCursor {
                 lamport: 4,
                 entry_hash: crate::entry::decode_signed(&restated).unwrap().entry.entry_hash,
             }),
