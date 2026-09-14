@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-pub use catalog::*;
+pub use catalog::{TOOL_NAMES, description, list_tools, schema};
 pub(crate) use defaults::*;
 pub(crate) use handlers::*;
 use rag_rat_base::config::{Config, MemorySurface};
@@ -23,7 +23,7 @@ use rag_rat_query::impact::ImpactSurfaceOptions;
 use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryUpdate};
 use rag_rat_query::repo_brief::{RepoBriefMode, RepoBriefOptions};
 use rag_rat_query::symbol::SymbolSelector;
-pub use requests::*;
+pub(crate) use requests::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
