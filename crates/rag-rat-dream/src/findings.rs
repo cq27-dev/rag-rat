@@ -361,14 +361,14 @@ pub(super) fn stale_reference(conn: &Connection) -> rusqlite::Result<Vec<DreamFi
 
     let mut out = Vec::new();
     // 'stale'-status memories are still LIVE (just flagged) and are the ones most likely to hold a
-    // moved/deleted path — scan them too, matching the memory layer's status IN ('active','stale').
+    // moved/deleted path — scan them too, matching the memory layer's live-status predicate.
     // Scoped to the ACTIVE repo (V042): a sibling repo's memory referencing a path that does not
     // resolve in THIS repo's index must not surface as this repo's stale_reference finding.
     let scope = rag_rat_db::schema::periphery_repo_scope(conn, "repo_memories")?;
     let repo_clause = rag_rat_db::schema::periphery_repo_scope_clause(&scope, "repo_memories");
-    let mut stmt = conn.prepare(&format!(
-        "SELECT id, body FROM repo_memories WHERE status IN ('active', 'stale'){repo_clause}"
-    ))?;
+    let live = rag_rat_query::memory::live_memory_status_sql("repo_memories");
+    let mut stmt =
+        conn.prepare(&format!("SELECT id, body FROM repo_memories WHERE {live}{repo_clause}"))?;
     let mems: Vec<(String, String)> =
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
     for (id, body) in mems {
