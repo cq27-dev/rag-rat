@@ -145,7 +145,7 @@ fn oracle_run(config: &Config, args: &OracleRunArgs) -> anyhow::Result<()> {
                     tool,
                     &version,
                     &bytes,
-                    rag_rat_core::index::OracleShaSnapshots {
+                    rag_rat_oracle::ShaSnapshots {
                         production: Some(&production_sha),
                         pre_spawn: Some(&pre_spawn_sha),
                     },
@@ -298,7 +298,7 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
                 &provenance,
                 tool,
                 &scip_bytes,
-                rag_rat_core::index::OracleShaSnapshots::default(),
+                rag_rat_oracle::ShaSnapshots::default(),
                 rag_rat_base::time::now_ms(),
             )
         })?
@@ -346,7 +346,7 @@ fn oracle_report(config: &Config, args: &OracleReportArgs) -> anyhow::Result<()>
                         &provenance,
                         tool,
                         &bytes,
-                        rag_rat_core::index::OracleShaSnapshots {
+                        rag_rat_oracle::ShaSnapshots {
                             production: Some(&production_sha),
                             pre_spawn: Some(&pre_spawn_sha),
                         },

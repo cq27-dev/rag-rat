@@ -6,40 +6,28 @@ use std::path::Path;
 use anyhow::Context as _;
 use rag_rat_base::time::now_ms;
 use rag_rat_oracle::{
-    self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls, ToolManifest,
+    self, OracleEvalMetrics, OracleReport, OracleStatus, OracleTool, RecallCalls, ShaSnapshots,
+    ToolManifest,
 };
 
 use super::*;
 
-/// The two indexed-sha snapshots that arm the oracle's content-drift gates (#82/#83): `production`
-/// is the scip-vs-disk pin taken at the tool subprocess's exit; `pre_spawn` is the indexed-sha pin
-/// taken before the spawn, covering the subprocess interior the post-exit pin can't see. A
-/// pre-built `--scip` arms neither ([`OracleShaSnapshots::default`]). Named so the two same-typed
-/// snapshots can't be passed in the wrong order (the positional pair was transposable).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OracleShaSnapshots<'a> {
-    pub production: Option<&'a std::collections::HashMap<String, String>>,
-    pub pre_spawn: Option<&'a std::collections::HashMap<String, String>>,
-}
-
 impl IndexDatabase {
     /// Run a SCIP-oracle pass from a pre-built `.scip` over the current (active commit/worktree)
     /// edge candidates, writing `edge_oracle` verdicts. The heuristic resolution on the `edges`
-    /// row is never touched. Phase 1 (#68): eval-only, no CLI/MCP surface. Requires a `source_root`
+    /// row is never touched. Requires a `source_root`
     /// (the checkout whose bytes back the SCIP document position-encoding conversion).
-    /// `production_sha` is the per-document disk-hash snapshot a tool-driven run captured the
-    /// instant its `.scip` was produced (`Some`), arming the scip-vs-disk content gate (#82
-    /// TOCTOU); a pre-built `--scip` has no production moment and passes `None`.
-    /// The `shas.pre_spawn` snapshot is taken before the tool subprocess was spawned (see
+    /// `shas.production` is the per-document disk-hash snapshot a tool-driven run captured the
+    /// instant its `.scip` was produced, arming the scip-vs-disk content gate (#82 TOCTOU).
+    /// `shas.pre_spawn` is taken before the tool subprocess was spawned (see
     /// [`Self::oracle_pre_spawn_snapshot`]), arming the pre-spawn gate that covers the subprocess
-    /// interior (#83); a pre-built `--scip` has no spawn and passes
-    /// [`OracleShaSnapshots::default`].
+    /// interior (#83). A pre-built `--scip` has neither and passes [`ShaSnapshots::default`].
     pub fn run_oracle(
         &self,
         tool: OracleTool,
         tool_version: &str,
         scip_bytes: &[u8],
-        shas: OracleShaSnapshots<'_>,
+        shas: ShaSnapshots<'_>,
     ) -> anyhow::Result<OracleReport> {
         self.run_oracle_at(tool, tool_version, scip_bytes, shas, now_ms())
     }
@@ -53,7 +41,7 @@ impl IndexDatabase {
         tool: OracleTool,
         tool_version: &str,
         scip_bytes: &[u8],
-        shas: OracleShaSnapshots<'_>,
+        shas: ShaSnapshots<'_>,
         started_at_ms: i64,
     ) -> anyhow::Result<OracleReport> {
         let Some(root) = self.storage.source_root() else {
@@ -68,8 +56,7 @@ impl IndexDatabase {
             checkout: self.active_checkout(),
             scip_bytes,
             checkout_root: &root,
-            production_sha: shas.production,
-            pre_spawn_sha: shas.pre_spawn,
+            shas,
             started_at_ms,
         })
     }
@@ -218,7 +205,7 @@ impl IndexDatabase {
         provenance: &rag_rat_oracle::RunProvenance,
         tool: OracleTool,
         scip_bytes: &[u8],
-        shas: OracleShaSnapshots<'_>,
+        shas: ShaSnapshots<'_>,
         started_at_ms: i64,
     ) -> anyhow::Result<(
         rag_rat_oracle::OracleResolutionReport,
@@ -232,15 +219,16 @@ impl IndexDatabase {
         let root = root.to_path_buf();
         rag_rat_oracle::run_oracle_report(
             self.storage.connection(),
-            profile,
-            provenance,
-            tool,
-            self.active_checkout(),
-            scip_bytes,
-            &root,
-            shas.production,
-            shas.pre_spawn,
-            started_at_ms,
+            &rag_rat_oracle::OracleReportInput {
+                profile,
+                provenance,
+                tool,
+                checkout: self.active_checkout(),
+                scip_bytes,
+                checkout_root: &root,
+                shas,
+                started_at_ms,
+            },
         )
     }
 
@@ -295,7 +283,7 @@ impl IndexDatabase {
     ) -> anyhow::Result<rag_rat_oracle::OracleReport> {
         // A pre-built `--scip` carries no production moment or spawn we control, so neither the
         // scip-vs-disk nor the pre-spawn gate can arm — only the index-vs-disk gate applies.
-        self.run_oracle(tool, tool_version, scip_bytes, OracleShaSnapshots::default())
+        self.run_oracle(tool, tool_version, scip_bytes, ShaSnapshots::default())
     }
 
     /// Probe whether an oracle tool can actually run here, for `oracle status`. Config-backed

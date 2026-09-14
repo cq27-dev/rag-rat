@@ -14,7 +14,8 @@ fn run_with_empty_scip_completes_with_no_verdicts() {
 
     let empty = Index::default().write_to_bytes().unwrap();
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &empty, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &empty, h.root(), ShaSnapshots::default())
+            .unwrap();
 
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1, "no document → no occurrence bucket");
@@ -47,7 +48,8 @@ fn candidate_outside_any_occurrence_counts_no_occurrence() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.no_occurrence, 1);
     assert_eq!(report.rows_written, 0);
@@ -90,7 +92,8 @@ fn run_aggregates_counts_and_recall_gap() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
     assert_eq!(report.edges_examined, 1);
     assert_eq!(report.upgraded, 1);
     assert_eq!(report.rows_written, 1);
@@ -131,7 +134,8 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
         ..Default::default()
     });
     let bytes = index.write_to_bytes().unwrap();
-    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+        .unwrap();
     assert_eq!(
         h.verdict(edge).map(|(k, _, _)| k).as_deref(),
         Some("upgrade"),
@@ -150,7 +154,8 @@ fn rerun_clears_stale_verdict_for_dropped_edge() {
                 SymbolRole::UnspecifiedSymbolRole as i32,
             ),
         ]);
-    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &empty_doc, h.root(), None, None).unwrap();
+    run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &empty_doc, h.root(), ShaSnapshots::default())
+        .unwrap();
 
     assert!(h.verdict(edge).is_none(), "the dropped edge's stale verdict was cleared on rerun");
     let total: i64 =
@@ -199,7 +204,8 @@ fn recall_gap_counts_only_call_like_occurrences() {
     };
     let bytes = index.write_to_bytes().unwrap();
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
 
     // Only the one uncovered callable reference is the recall gap; the import + type ref are not.
     assert_eq!(report.oracle_only_calls, 1, "only the call-like uncovered reference counts");

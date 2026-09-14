@@ -347,7 +347,7 @@ fn spawn_detached_oracle_auto_run(config: &rag_rat_base::config::Config) {
                         tool,
                         &version,
                         &bytes,
-                        rag_rat_core::index::OracleShaSnapshots {
+                        rag_rat_oracle::ShaSnapshots {
                             production: Some(&production_sha),
                             pre_spawn: Some(&pre_spawn_sha),
                         },

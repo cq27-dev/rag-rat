@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use ::protobuf::{EnumOrUnknown, Message};
 use ::scip::types::{Document, Index, Occurrence, PositionEncoding, SymbolRole};
 use rag_rat_base::config::ResolvedTarget;
-use rag_rat_oracle::OracleTool;
+use rag_rat_oracle::{OracleTool, ShaSnapshots};
 
 use super::*;
 
@@ -196,7 +196,7 @@ fn pre_spawn_snapshot_round_trips_through_run_oracle() {
     let symbol = "scip-rust crate held-mini `target`().";
     let scip = scip_with(&path, cs, ce, symbol, Some(&path), Some((29, 35)));
     let report = db
-        .run_oracle(OracleTool::RustAnalyzer, "v-test", &scip, OracleShaSnapshots {
+        .run_oracle(OracleTool::RustAnalyzer, "v-test", &scip, ShaSnapshots {
             production: None,
             pre_spawn: Some(&snapshot),
         })
@@ -207,7 +207,7 @@ fn pre_spawn_snapshot_round_trips_through_run_oracle() {
     let mut stale = snapshot.clone();
     stale.insert(path.clone(), "pre-spawn-old".to_string());
     let report = db
-        .run_oracle(OracleTool::RustAnalyzer, "v-test2", &scip, OracleShaSnapshots {
+        .run_oracle(OracleTool::RustAnalyzer, "v-test2", &scip, ShaSnapshots {
             production: None,
             pre_spawn: Some(&stale),
         })
@@ -876,8 +876,7 @@ fn gc_prunes_oracle_runs_for_dead_contexts() {
         db.active_checkout(),
         &Index::default().write_to_bytes().unwrap(),
         &root,
-        None,
-        None,
+        ShaSnapshots::default(),
     )
     .unwrap();
     db.storage

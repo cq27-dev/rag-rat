@@ -303,7 +303,8 @@ fn oracle_run_then_reindex_then_compare_graph_to_scip_nonempty() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
     assert_eq!(report.rows_written, 1, "the run wrote one verdict");
 
     // Compare surface is non-empty before reindex (sanity).
@@ -544,7 +545,7 @@ fn recall_gap_excludes_definitions_in_unindexed_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
             .unwrap()
             .oracle_only_calls
     };
@@ -603,7 +604,7 @@ fn recall_gap_excludes_occurrences_in_unindexed_source_files() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
             .unwrap()
             .oracle_only_calls
     };
@@ -701,7 +702,8 @@ fn exact_in_corpus_edge_contradicted_by_external_scip_resolution() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
 
     let (kind, resolved, scip) = h.verdict(edge).expect("verdict written");
     assert_eq!(
@@ -743,7 +745,8 @@ fn name_only_edge_with_external_scip_stays_resolved_external() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
 
     let (kind, _, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
@@ -792,7 +795,8 @@ fn scip_definition_outside_indexed_corpus_resolves_external() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
     let (kind, resolved, _) = h.verdict(edge).expect("verdict written");
     assert_eq!(kind, OracleResolutionKind::ResolvedExternal.as_db_str());
     assert_eq!(resolved, None, "def maps to no indexed symbol → external");
@@ -816,7 +820,8 @@ fn reference_without_definition_or_package_yields_no_verdict() {
     ]);
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
     assert!(h.verdict(edge).is_none(), "no definition + no package → no verdict");
     assert_eq!(report.rows_written, 0);
     assert_eq!(report.no_occurrence, 1, "dropped into the no-actionable bucket");
@@ -859,7 +864,7 @@ fn recall_gap_excludes_field_const_term_reads() {
             ..Default::default()
         };
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
             .unwrap()
             .oracle_only_calls
     };
@@ -914,7 +919,8 @@ fn covered_side_ignores_references_type_confirmation() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
     // BOTH edges got verdicts (both carry callee ranges and join)…
     assert!(h.verdict(call_edge).is_some(), "call edge verdicted");
     assert!(h.verdict(type_edge).is_some(), "type-ref edge verdicted");
@@ -985,7 +991,8 @@ fn covered_side_requires_a_callable_scip_symbol() {
     let bytes = index.write_to_bytes().unwrap();
 
     let report =
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+            .unwrap();
     // Both edges still get verdicts (both join + resolve in-corpus)…
     assert!(h.verdict(call_edge).is_some(), "call edge verdicted");
     assert!(h.verdict(ctor_edge).is_some(), "constructor edge verdicted");
@@ -1046,7 +1053,8 @@ fn drifted_file_sha_is_skipped_not_verdicted() {
         let _ = target_sym;
         let bytes = index.write_to_bytes().unwrap();
         let report =
-            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+                .unwrap();
         (h.verdict(edge), report.skipped_drifted, report.rows_written)
     };
 
@@ -1144,9 +1152,11 @@ fn stale_production_snapshot_is_skipped_not_verdicted() {
             },
         }
 
-        let report =
-            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), Some(&production), None)
-                .unwrap();
+        let report = run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots {
+            production: Some(&production),
+            pre_spawn: None,
+        })
+        .unwrap();
         (h.verdict(edge), report.skipped_drifted, report.rows_written)
     };
 
@@ -1242,7 +1252,8 @@ fn prebuilt_scip_skips_a_verdict_whose_definition_document_drifted() {
         let bytes = index.write_to_bytes().unwrap();
 
         let report =
-            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None).unwrap();
+            run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
+                .unwrap();
         (h.verdict(edge), report.skipped_drifted, report.rows_written)
     };
 
@@ -1346,7 +1357,7 @@ fn deleted_file_occurrences_do_not_inflate_gap() {
             ..Default::default()
         });
         let bytes = index.write_to_bytes().unwrap();
-        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), None, None)
+        run_oracle(&h.conn, TOOL, VERSION, CHECKOUT, &bytes, h.root(), ShaSnapshots::default())
             .unwrap()
             .oracle_only_calls
     };

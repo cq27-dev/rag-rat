@@ -59,7 +59,6 @@ pub use lens::{
     LensStatus, LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion,
 };
 pub use memory::SyncCatchUpReport;
-pub use oracle_runs::OracleShaSnapshots;
 pub use search::SearchRequest;
 
 /// Volume cap on the memories `read_chunk` attaches as drive-by context. The binding is

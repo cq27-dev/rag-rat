@@ -62,7 +62,7 @@ pub use report::{
     CorpusHealth, CorpusProfile, OracleResolutionReport, REPORT_SCHEMA_VERSION, ResolutionBefore,
     ResolutionDelta, RunProvenance,
 };
-pub use run::{OracleEvalMetrics, OracleRunInput, RecallCalls};
+pub use run::{OracleEvalMetrics, OracleRunInput, RecallCalls, ShaSnapshots};
 use rusqlite::Connection;
 use serde::Serialize;
 pub use status::OracleStatus;
@@ -76,21 +76,11 @@ pub use store::{
 /// `checkout_root` is the source root whose bytes are read for per-document position-encoding
 /// conversion (the `.scip` document paths are relative to it).
 ///
-/// `production_sha` is the per-document disk-hash snapshot captured when a TOOL produced this
-/// `.scip` (`None` for a pre-built `--scip`). When present it arms the scip-vs-disk content gate
-/// (#82 TOCTOU); see [`OracleRunInput::production_sha`].
+/// `shas` arms the tool-driven drift gates (#82 / #83); a pre-built `--scip` passes
+/// [`ShaSnapshots::default`]. See [`ShaSnapshots`].
 ///
-/// `pre_spawn_sha` is the indexed `(path -> files.sha256)` snapshot taken BEFORE the tool
-/// subprocess was spawned (`None` for a pre-built `--scip`). It arms the pre-spawn gate (#83),
-/// which covers the subprocess INTERIOR the post-exit `production_sha` cannot; see
-/// [`OracleRunInput::pre_spawn_sha`].
 /// Run + record stamped at `now_ms()` — for callers without a controlled spawn moment (a pre-built
 /// `--scip`, tests). The tool-driven path uses [`run_oracle_at`] with the real start time (#145).
-#[allow(
-    clippy::too_many_arguments,
-    reason = "positional convenience over OracleRunInput that stamps now_ms(); the struct form is \
-              run_oracle_at"
-)]
 pub fn run_oracle(
     conn: &Connection,
     tool: OracleTool,
@@ -98,8 +88,7 @@ pub fn run_oracle(
     checkout: CheckoutRef<'_>,
     scip_bytes: &[u8],
     checkout_root: &Path,
-    production_sha: Option<&HashMap<String, String>>,
-    pre_spawn_sha: Option<&HashMap<String, String>>,
+    shas: ShaSnapshots<'_>,
 ) -> anyhow::Result<OracleReport> {
     run_oracle_at(conn, &OracleRunInput {
         tool,
@@ -107,8 +96,7 @@ pub fn run_oracle(
         checkout,
         scip_bytes,
         checkout_root,
-        production_sha,
-        pre_spawn_sha,
+        shas,
         started_at_ms: rag_rat_base::time::now_ms(),
     })
 }
@@ -132,19 +120,20 @@ pub fn run_oracle_at(conn: &Connection, input: &OracleRunInput) -> anyhow::Resul
 /// `provenance.tool_version` is the run's content-addressed version — the single source for the run
 /// row, the metric scope, and the report envelope. Returns the report (always, for stdout) and the
 /// health violations (empty = committed; non-empty = rolled back).
-#[allow(clippy::too_many_arguments)]
 pub fn run_oracle_report(
     conn: &Connection,
-    profile: &report::CorpusProfile,
-    provenance: &report::RunProvenance,
-    tool: OracleTool,
-    checkout: CheckoutRef<'_>,
-    scip_bytes: &[u8],
-    checkout_root: &Path,
-    production_sha: Option<&HashMap<String, String>>,
-    pre_spawn_sha: Option<&HashMap<String, String>>,
-    started_at_ms: i64,
+    input: &OracleReportInput<'_>,
 ) -> anyhow::Result<(report::OracleResolutionReport, Vec<HealthViolation>)> {
+    let OracleReportInput {
+        profile,
+        provenance,
+        tool,
+        checkout,
+        scip_bytes,
+        checkout_root,
+        shas,
+        started_at_ms,
+    } = *input;
     let tx = conn.unchecked_transaction()?;
     let run = run::run_in_tx(conn, &OracleRunInput {
         tool,
@@ -152,8 +141,7 @@ pub fn run_oracle_report(
         checkout,
         scip_bytes,
         checkout_root,
-        production_sha,
-        pre_spawn_sha,
+        shas,
         started_at_ms,
     })?;
     let report = resolution_report(conn, profile, provenance, tool, checkout, &run)?;
@@ -163,6 +151,26 @@ pub fn run_oracle_report(
     }
     // Unhealthy → `tx` drops uncommitted → the whole run (clear + writes + run row) rolls back.
     Ok((report, violations))
+}
+
+/// Inputs for one provisional corpus-report run ([`run_oracle_report`]). There is deliberately no
+/// `tool_version`: the run's version is `provenance.tool_version`, the single source for the run
+/// row, the metric scope, and the report envelope.
+#[derive(Clone, Copy)]
+pub struct OracleReportInput<'a> {
+    pub profile: &'a report::CorpusProfile,
+    pub provenance: &'a report::RunProvenance,
+    pub tool: OracleTool,
+    /// The checkout the edges are scoped to (and which the `.scip` was built against).
+    pub checkout: CheckoutRef<'a>,
+    /// Serialized `.scip` bytes.
+    pub scip_bytes: &'a [u8],
+    /// Checkout root the `.scip` document paths are relative to.
+    pub checkout_root: &'a Path,
+    /// The tool-driven drift-gate snapshots; [`ShaSnapshots::default`] for a pre-built `--scip`.
+    pub shas: ShaSnapshots<'a>,
+    /// Unix-epoch ms when the run began, recorded as `oracle_runs.started_at` (#145).
+    pub started_at_ms: i64,
 }
 
 /// The indexed `(path -> files.sha256)` map for the active checkout — the pre-spawn snapshot
@@ -492,8 +500,10 @@ pub fn run_oracle_with_tool(
                 checkout,
                 scip_bytes: &bytes,
                 checkout_root,
-                production_sha: Some(&production_sha),
-                pre_spawn_sha: Some(&pre_spawn_sha),
+                shas: ShaSnapshots {
+                    production: Some(&production_sha),
+                    pre_spawn: Some(&pre_spawn_sha),
+                },
                 started_at_ms,
             })?;
             Ok(OracleRunOutcome::Completed {
