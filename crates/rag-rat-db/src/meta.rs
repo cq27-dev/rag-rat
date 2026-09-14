@@ -205,6 +205,12 @@ pub fn read_meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<String
         .optional()
 }
 
+/// Read an `index_meta` value stored as a decimal `i64` (a millisecond timestamp). A missing key
+/// and a value that does not parse both read as `None`.
+pub fn read_meta_i64(conn: &Connection, key: &str) -> rusqlite::Result<Option<i64>> {
+    Ok(read_meta(conn, key)?.and_then(|value| value.parse::<i64>().ok()))
+}
+
 pub fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO index_meta(key, value) VALUES (?1, ?2)
@@ -212,6 +218,11 @@ pub fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<(
         params![key, value],
     )?;
     Ok(())
+}
+
+/// Store `value` as its decimal text, the representation [`read_meta_i64`] reads back.
+pub fn set_meta_i64(conn: &Connection, key: &str, value: i64) -> rusqlite::Result<()> {
+    set_meta(conn, key, &value.to_string())
 }
 
 /// Remove an `index_meta` key (the global-scope companion to [`delete_repo_meta`]). Idempotent:

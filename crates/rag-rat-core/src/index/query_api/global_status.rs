@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rag_rat_db::meta::{read_meta, repo_meta};
+use rag_rat_db::meta::{self, read_meta, repo_meta};
 use rag_rat_db::schema::{self, RegisteredRepo};
 use rag_rat_db::storage::IndexConnection;
 use rusqlite::{Connection, params};
@@ -223,8 +223,7 @@ impl IndexDatabase {
 fn read_global_fts_status(conn: &Connection) -> anyhow::Result<GlobalFtsStatus> {
     let content_revision = read_meta(conn, "content_revision")?;
     let fts_source_revision = read_meta(conn, "fts_source_revision")?;
-    let fts_synced_at_ms =
-        read_meta(conn, "fts_synced_at_ms")?.and_then(|value| value.parse().ok());
+    let fts_synced_at_ms = meta::read_meta_i64(conn, "fts_synced_at_ms")?;
     let fts_dirty = read_meta(conn, "fts_dirty")?.as_deref() == Some("true");
     let fts_fresh =
         !fts_dirty && content_revision.is_some() && fts_source_revision == content_revision;
