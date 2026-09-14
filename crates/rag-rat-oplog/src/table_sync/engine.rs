@@ -16,7 +16,7 @@ use super::apply::{self, ApplyOutcome};
 use super::registry::TableSpec;
 use super::retention::{Pin, PinKind};
 use super::row_op::{self, RowOp, StatedDelete};
-use super::scope_stream::scope_stream_id;
+use super::scope_stream::{ScopeId, scope_stream_id};
 use super::store::{self, AcceptOutcome};
 use super::{produce, refold};
 use crate::device::DevicePublic;
@@ -97,7 +97,7 @@ pub(crate) fn produce_and_author(
             ctx.repo_id,
             ctx.account_id,
             ctx.incarnation_ref,
-            spec.scope_id,
+            spec.scope_id.as_db_str(),
         )?;
         for op in produce::produce_row_ops(tx, spec, ctx.repo_id, stream)? {
             let signed = store::author_row_entry(tx, stream, ctx.device.secret(), &op, ctx.now_ms)?;
@@ -244,11 +244,9 @@ pub(crate) fn process_readoption_work_for_stream(
     };
     for candidate in store::readoption_candidates(tx, stream, work.device_fingerprint, &local_hex)?
     {
-        let Some(spec) = ctx
-            .registry
-            .iter()
-            .find(|spec| spec.scope_id == context.scope_id && spec.name == candidate.table_name)
-        else {
+        let Some(spec) = ctx.registry.iter().find(|spec| {
+            spec.scope_id.as_db_str() == context.scope_id && spec.name == candidate.table_name
+        }) else {
             continue;
         };
         let op = match row_repair_op(
@@ -366,7 +364,7 @@ pub(crate) fn reauthor_chain_pins(
     refold::assert_projector_not_newer(tx)?;
     let device_hex = ctx.device.fingerprint().to_string();
     let spec_for = |table: &str| {
-        ctx.registry.iter().find(|spec| spec.scope_id == scope_id && spec.name == table)
+        ctx.registry.iter().find(|spec| spec.scope_id.as_db_str() == scope_id && spec.name == table)
     };
     let mut authored = 0;
     // Per pin: rows still to author, and whether it is stuck today.
@@ -612,7 +610,7 @@ fn row_repair_op(
 pub(crate) fn ingest(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
-    scope_id: &str,
+    scope_id: ScopeId,
     signed_bytes: &[u8],
     pubkey: &DevicePublic,
     advertised_floor: Option<store::AdvertisedFloor>,
@@ -669,7 +667,7 @@ pub(crate) struct IngestReport {
 #[derive(Clone, Copy)]
 struct IngestScope<'a> {
     ctx: &'a SyncCtx<'a>,
-    scope_id: &'a str,
+    scope_id: ScopeId,
     pubkey: &'a DevicePublic,
 }
 
@@ -742,7 +740,7 @@ fn ingest_one(
         ctx.repo_id,
         ctx.account_id,
         ctx.incarnation_ref,
-        scope_id,
+        scope_id.as_db_str(),
     )?;
     let scope_tables: Vec<&str> =
         ctx.registry.iter().filter(|s| s.scope_id == scope_id).map(|s| s.name).collect();
@@ -821,7 +819,11 @@ fn ingest_one(
                             // settled already and bumps nothing.
                             ApplyOutcome::Applied
                             | ApplyOutcome::Quarantined { changed: true, .. } =>
-                                super::registry::bump_scope_lanes(tx, scope_id, ctx.repo_id)?,
+                                super::registry::bump_scope_lanes(
+                                    tx,
+                                    scope_id.as_db_str(),
+                                    ctx.repo_id,
+                                )?,
                             ApplyOutcome::Superseded
                             | ApplyOutcome::Quarantined { changed: false, .. }
                             | ApplyOutcome::Unprojectable(_) => {},
@@ -852,7 +854,11 @@ fn ingest_one(
                         // A restatement quarantines on one row's constraint failure after
                         // settling every other stated delete, which changed derived state.
                         if changed {
-                            super::registry::bump_scope_lanes(tx, scope_id, ctx.repo_id)?;
+                            super::registry::bump_scope_lanes(
+                                tx,
+                                scope_id.as_db_str(),
+                                ctx.repo_id,
+                            )?;
                         }
                         store::record_entry_quarantine(tx, &entry_hash, &why)?;
                         IngestOutcome::Quarantined(why)

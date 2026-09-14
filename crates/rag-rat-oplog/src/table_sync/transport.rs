@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use super::apply::LocalWriterMemo;
 use super::engine::{self, IngestOutcome, SyncCtx};
 use super::registry::{SYNCABLE_TABLES, TableSpec, scope_lens_metas};
-use super::scope_stream::scope_stream_id;
+use super::scope_stream::{ScopeId, scope_stream_id};
 use super::{retention, store};
 use crate::AccountId;
 use crate::account::{self, RepoIncarnationState};
@@ -222,9 +222,9 @@ pub const OVERLAY_ACCEPTED_RETENTION: u64 = 256;
 pub const DISTILL_ACCEPTED_RETENTION: u64 = 512;
 
 pub fn scope_retention_budget(scope_id: &str) -> Option<u64> {
-    match scope_id {
-        "overlay/1" => Some(OVERLAY_ACCEPTED_RETENTION),
-        "distill/1" => Some(DISTILL_ACCEPTED_RETENTION),
+    match ScopeId::from_db_str(scope_id) {
+        Some(ScopeId::OVERLAY) => Some(OVERLAY_ACCEPTED_RETENTION),
+        Some(ScopeId::DISTILL) => Some(DISTILL_ACCEPTED_RETENTION),
         _ => None,
     }
 }
@@ -372,7 +372,7 @@ fn compact_overdue_against(
                 (Some(ctx), Some(_)) => {
                     let scoped = repo_registry(registry)
                         .into_iter()
-                        .filter(|spec| spec.scope_id == stream.scope_id)
+                        .filter(|spec| spec.scope_id.as_db_str() == stream.scope_id)
                         .collect::<Vec<_>>();
                     let worth = pins_worth_reauthoring(
                         &tx,
@@ -598,7 +598,7 @@ fn supported_streams_against(
     account_id: AccountId,
     registry: &[TableSpec],
 ) -> anyhow::Result<Vec<TableSyncStream>> {
-    let scopes: BTreeSet<&str> = registry
+    let scopes: BTreeSet<ScopeId> = registry
         .iter()
         .filter(|spec| spec.repo_column.is_some())
         .map(|spec| spec.scope_id)
@@ -623,13 +623,13 @@ fn supported_streams_against(
         let incarnation_ref: [u8; 32] = incarnation.try_into().map_err(|got: Vec<u8>| {
             anyhow::anyhow!("stored repository incarnation must be 32 bytes, got {}", got.len())
         })?;
-        for scope_id in &scopes {
+        for &scope_id in &scopes {
             streams.push(TableSyncStream {
                 stream_id: scope_stream_id(&repo_id, account_id, incarnation_ref, scope_id)
                     .to_bytes(),
                 repo_id: repo_id.clone(),
                 incarnation_ref,
-                scope_id: (*scope_id).to_string(),
+                scope_id: scope_id.as_db_str().to_string(),
             });
         }
     }
@@ -642,16 +642,32 @@ fn validate_stream_against(
     stream: &TableSyncStream,
     registry: &[TableSpec],
 ) -> anyhow::Result<bool> {
-    if !registry.iter().any(|spec| spec.repo_column.is_some() && spec.scope_id == stream.scope_id) {
-        return Ok(false);
-    }
+    Ok(validated_scope(conn, account_id, stream, registry)?.is_some())
+}
+
+/// The registered scope an advertised route resolves to, or `None` when the route is not current:
+/// its scope names no repo-scoped spec in `registry`, its incarnation is not the account's current
+/// one, or its stream id does not re-derive from the rest.
+fn validated_scope(
+    conn: &Connection,
+    account_id: AccountId,
+    stream: &TableSyncStream,
+    registry: &[TableSpec],
+) -> anyhow::Result<Option<ScopeId>> {
+    let Some(scope) = registry
+        .iter()
+        .filter(|spec| spec.repo_column.is_some())
+        .map(|spec| spec.scope_id)
+        .find(|scope| scope.as_db_str() == stream.scope_id)
+    else {
+        return Ok(None);
+    };
     let current = account::repo_incarnation_state(conn, account_id, &stream.repo_id)?;
     if current != RepoIncarnationState::Current(stream.incarnation_ref) {
-        return Ok(false);
+        return Ok(None);
     }
-    Ok(scope_stream_id(&stream.repo_id, account_id, stream.incarnation_ref, &stream.scope_id)
-        .to_bytes()
-        == stream.stream_id)
+    let derived = scope_stream_id(&stream.repo_id, account_id, stream.incarnation_ref, scope);
+    Ok((derived.to_bytes() == stream.stream_id).then_some(scope))
 }
 
 fn accepted_chain_page(
@@ -901,9 +917,9 @@ fn ingest_against(
     local_writer: &LocalWriterMemo,
 ) -> anyhow::Result<TableSyncIngestOutcome> {
     let IngestRoute { account_id, stream, registry } = *route;
-    if !validate_stream_against(conn, account_id, stream, registry)? {
+    let Some(scope) = validated_scope(conn, account_id, stream, registry)? else {
         return Ok(TableSyncIngestOutcome::NoChange);
-    }
+    };
     let Ok(signed) = crate::entry::decode_signed(signed_bytes) else {
         return Ok(TableSyncIngestOutcome::NoChange);
     };
@@ -941,7 +957,7 @@ fn ingest_against(
     let report = engine::ingest(
         &tx,
         &ctx,
-        &stream.scope_id,
+        scope,
         signed_bytes,
         &pubkey,
         advertised_floor.map(|(lamport, entry_hash)| store::AdvertisedFloor {
@@ -995,7 +1011,7 @@ mod tests {
 
     const REPO_SPEC: TableSpec = TableSpec {
         name: "t_transport",
-        scope_id: "anchors/1",
+        scope_id: ScopeId::ANCHORS,
         spec_version: 1,
         pk: &[
             ColumnSpec::required("repo_id", ValueType::Text),
@@ -1007,7 +1023,7 @@ mod tests {
     };
     const GLOBAL_SPEC: TableSpec = TableSpec {
         name: "t_global",
-        scope_id: "global/1",
+        scope_id: ScopeId::new("global/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("title", ValueType::Text)],

@@ -40,7 +40,7 @@ pub(crate) use registry::{ColumnSpec, TableSpec, ValueType};
 #[cfg(test)]
 pub(crate) use row_op::{Cell, RowOp, StatedDelete, TypedValue};
 #[cfg(test)]
-pub(crate) use scope_stream::scope_stream_id;
+pub(crate) use scope_stream::{ScopeId, scope_stream_id};
 pub(crate) use store::enqueue_readoption_work;
 #[cfg(test)]
 pub(crate) use store::{

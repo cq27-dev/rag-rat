@@ -157,10 +157,11 @@ mod tests {
     use crate::table_sync::apply::apply_row_op;
     use crate::table_sync::registry::{ColumnSpec, TableSpec, ValueType};
     use crate::table_sync::row_op::{Cell, TypedValue};
+    use crate::table_sync::scope_stream::ScopeId;
 
     const SPEC: TableSpec = TableSpec {
         name: "t_demo",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("title", ValueType::Text)],
@@ -253,7 +254,7 @@ mod tests {
     fn a_repo_scoped_producer_emits_only_the_current_repo() {
         const SCOPED: TableSpec = TableSpec {
             name: "t_scoped",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[
                 ColumnSpec::required("repo_id", ValueType::Text),
@@ -286,7 +287,7 @@ mod tests {
     /// leave unreadable (#1017).
     const FLAGGED: TableSpec = TableSpec {
         name: "t_flagged",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("flag", ValueType::Bool)],
@@ -353,7 +354,7 @@ mod tests {
         // row this device can never speak about again.
         const FLAG_PK: TableSpec = TableSpec {
             name: "t_flag",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("active", ValueType::Bool)],
             columns: &[ColumnSpec::required("label", ValueType::Text)],

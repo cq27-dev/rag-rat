@@ -15,6 +15,7 @@ use std::collections::BTreeSet;
 use rusqlite::Connection;
 
 use super::schema_facts::{self, CheckVerdict, PhysicalColumn};
+use super::scope_stream::ScopeId;
 
 /// The storage/wire type of a synced column. A cell whose runtime value disagrees with its column's
 /// declared type is quarantined by the applier rather than silently coerced.
@@ -103,7 +104,7 @@ impl ColumnSpec {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TableSpec {
     pub name: &'static str,
-    pub scope_id: &'static str,
+    pub scope_id: ScopeId,
     /// Which synced column set this binary authors against — stamped into every op it produces, so
     /// a receiver can tell an OLDER producer's complete row from a NEWER producer's partial
     /// one (#1002). BUMP whenever `columns` changes; `local_columns` never cross the wire, so
@@ -248,7 +249,7 @@ pub(crate) fn reset_on_upsert_keeps(spec: &TableSpec) -> Option<&'static str> {
 
 const MEMORY_BINDINGS: TableSpec = TableSpec {
     name: "repo_memory_bindings",
-    scope_id: "anchors/1",
+    scope_id: ScopeId::ANCHORS,
     spec_version: 1,
     pk: MEMORY_BINDING_PK,
     columns: MEMORY_BINDING_COLUMNS,
@@ -280,7 +281,7 @@ const MEMORY_REALITY_COLUMNS: &[ColumnSpec] = &[
 
 const MEMORY_REALITY: TableSpec = TableSpec {
     name: "memory_reality",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 1,
     pk: MEMORY_REALITY_PK,
     columns: MEMORY_REALITY_COLUMNS,
@@ -309,7 +310,7 @@ const MEMORY_SUMMARIES_COLUMNS: &[ColumnSpec] = &[
 
 const MEMORY_SUMMARIES: TableSpec = TableSpec {
     name: "memory_summaries",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 1,
     pk: MEMORY_SUMMARIES_PK,
     columns: MEMORY_SUMMARIES_COLUMNS,
@@ -337,7 +338,7 @@ const MEMORY_NOTE_SUMMARIES_COLUMNS: &[ColumnSpec] = &[
 
 const MEMORY_NOTE_SUMMARIES: TableSpec = TableSpec {
     name: "memory_note_summaries",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 1,
     pk: MEMORY_NOTE_SUMMARIES_PK,
     columns: MEMORY_NOTE_SUMMARIES_COLUMNS,
@@ -384,7 +385,7 @@ const DISTILL_RECORD_COLUMNS: &[ColumnSpec] = &[
 
 const DISTILL_RECORD: TableSpec = TableSpec {
     name: "papertrail_distill",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     pk: DISTILL_RECORD_PK,
     columns: DISTILL_RECORD_COLUMNS,
@@ -411,7 +412,7 @@ const DISTILL_EDGE_COLUMNS: &[ColumnSpec] =
 
 const DISTILL_EDGES: TableSpec = TableSpec {
     name: "papertrail_distill_edges",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     pk: DISTILL_EDGE_PK,
     columns: DISTILL_EDGE_COLUMNS,
@@ -436,7 +437,7 @@ const DISTILL_ALTERNATIVE_COLUMNS: &[ColumnSpec] = &[
 
 const DISTILL_ALTERNATIVES: TableSpec = TableSpec {
     name: "papertrail_distill_alternatives",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     pk: DISTILL_ALTERNATIVE_PK,
     columns: DISTILL_ALTERNATIVE_COLUMNS,
@@ -461,7 +462,7 @@ const DISTILL_RECORD_COMMIT_COLUMNS: &[ColumnSpec] =
 
 const DISTILL_RECORD_COMMITS: TableSpec = TableSpec {
     name: "papertrail_distill_record_commits",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     pk: DISTILL_RECORD_COMMIT_PK,
     columns: DISTILL_RECORD_COMMIT_COLUMNS,
@@ -498,7 +499,7 @@ const DISTILL_EVIDENCE_COLUMNS: &[ColumnSpec] = &[
 
 const DISTILL_EVIDENCE: TableSpec = TableSpec {
     name: "papertrail_distill_evidence",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     pk: DISTILL_EVIDENCE_PK,
     columns: DISTILL_EVIDENCE_COLUMNS,
@@ -532,7 +533,7 @@ const DISTILL_ANCHOR_LOCAL_COLUMNS: &[&str] = &["logical_symbol_id", "resolved"]
 
 const DISTILL_ANCHORS: TableSpec = TableSpec {
     name: "papertrail_distill_anchors",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     pk: DISTILL_ANCHOR_PK,
     columns: DISTILL_ANCHOR_COLUMNS,
@@ -576,13 +577,13 @@ pub(crate) fn bump_scope_lanes(
 }
 
 pub(crate) fn scope_lens_metas(scope_id: &str) -> &'static [&'static str] {
-    match scope_id {
+    match ScopeId::from_db_str(scope_id) {
         // anchors/1 and overlay/1 are memory-facing scopes.
-        "anchors/1" | "overlay/1" => &[
+        Some(ScopeId::ANCHORS | ScopeId::OVERLAY) => &[
             rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
             rag_rat_db::meta::LENS_MEMORIES_REVISION_META,
         ],
-        "distill/1" => &[
+        Some(ScopeId::DISTILL) => &[
             rag_rat_db::meta::LENS_ENRICHMENT_REVISION_META,
             rag_rat_db::meta::LENS_PAPERTRAIL_REVISION_META,
         ],
@@ -606,7 +607,7 @@ pub(crate) fn scope_lens_metas(scope_id: &str) -> &'static [&'static str] {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct TableGeneration {
     pub table: &'static str,
-    pub scope_id: &'static str,
+    pub scope_id: ScopeId,
     pub spec_version: u32,
     pub repo_column: Option<&'static str>,
     /// `(column, value_type)` per identity column, in registry order.
@@ -622,7 +623,7 @@ pub(crate) struct TableGeneration {
 // exactly like the generation list itself.
 const REPO_MEMORY_BINDINGS_V1: TableGeneration = TableGeneration {
     table: "repo_memory_bindings",
-    scope_id: "anchors/1",
+    scope_id: ScopeId::ANCHORS,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -649,7 +650,7 @@ const REPO_MEMORY_BINDINGS_V1: TableGeneration = TableGeneration {
 
 const MEMORY_REALITY_V1: TableGeneration = TableGeneration {
     table: "memory_reality",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[("repo_id", ValueType::Text), ("memory_id", ValueType::Text)],
@@ -668,7 +669,7 @@ const MEMORY_REALITY_V1: TableGeneration = TableGeneration {
 
 const MEMORY_SUMMARIES_V1: TableGeneration = TableGeneration {
     table: "memory_summaries",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -686,7 +687,7 @@ const MEMORY_SUMMARIES_V1: TableGeneration = TableGeneration {
 
 const MEMORY_NOTE_SUMMARIES_V1: TableGeneration = TableGeneration {
     table: "memory_note_summaries",
-    scope_id: "overlay/1",
+    scope_id: ScopeId::OVERLAY,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[("repo_id", ValueType::Text), ("memory_id", ValueType::Text)],
@@ -701,7 +702,7 @@ const MEMORY_NOTE_SUMMARIES_V1: TableGeneration = TableGeneration {
 
 const PAPERTRAIL_DISTILL_V1: TableGeneration = TableGeneration {
     table: "papertrail_distill",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -738,7 +739,7 @@ const PAPERTRAIL_DISTILL_V1: TableGeneration = TableGeneration {
 
 const PAPERTRAIL_DISTILL_EDGES_V1: TableGeneration = TableGeneration {
     table: "papertrail_distill_edges",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -756,7 +757,7 @@ const PAPERTRAIL_DISTILL_EDGES_V1: TableGeneration = TableGeneration {
 
 const PAPERTRAIL_DISTILL_ALTERNATIVES_V1: TableGeneration = TableGeneration {
     table: "papertrail_distill_alternatives",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -772,7 +773,7 @@ const PAPERTRAIL_DISTILL_ALTERNATIVES_V1: TableGeneration = TableGeneration {
 
 const PAPERTRAIL_DISTILL_RECORD_COMMITS_V1: TableGeneration = TableGeneration {
     table: "papertrail_distill_record_commits",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -788,7 +789,7 @@ const PAPERTRAIL_DISTILL_RECORD_COMMITS_V1: TableGeneration = TableGeneration {
 
 const PAPERTRAIL_DISTILL_EVIDENCE_V1: TableGeneration = TableGeneration {
     table: "papertrail_distill_evidence",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -816,7 +817,7 @@ const PAPERTRAIL_DISTILL_EVIDENCE_V1: TableGeneration = TableGeneration {
 
 const PAPERTRAIL_DISTILL_ANCHORS_V1: TableGeneration = TableGeneration {
     table: "papertrail_distill_anchors",
-    scope_id: "distill/1",
+    scope_id: ScopeId::DISTILL,
     spec_version: 1,
     repo_column: Some("repo_id"),
     pk: &[
@@ -1496,7 +1497,7 @@ mod tests {
     fn the_anchors_scope_columns_match_the_portable_anchor_op_fields() {
         let spec = SYNCABLE_TABLES
             .iter()
-            .find(|spec| spec.scope_id == "anchors/1")
+            .find(|spec| spec.scope_id == ScopeId::ANCHORS)
             .expect("the anchors/1 scope is registered");
         // The op omits the `(repo_id, memory_id)` head of the pk: the repo is the drain's context
         // and the memory is the op's own node id, so neither is repeated per anchor.
@@ -1513,7 +1514,7 @@ mod tests {
     const DEMO_LOCAL: &[&str] = &["resolved_rowid"];
     const DEMO_SPEC: TableSpec = TableSpec {
         name: "t_demo",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: DEMO_PK,
         columns: DEMO_COLUMNS,
@@ -1559,9 +1560,9 @@ mod tests {
     fn every_registered_scope_maps_to_a_lens_lane() {
         for spec in SYNCABLE_TABLES {
             assert!(
-                !scope_lens_metas(spec.scope_id).is_empty(),
+                !scope_lens_metas(spec.scope_id.as_db_str()).is_empty(),
                 "scope `{}` (table `{}`) has no scope_lens_metas entry",
-                spec.scope_id,
+                spec.scope_id.as_db_str(),
                 spec.name,
             );
         }
@@ -1575,7 +1576,7 @@ mod tests {
     /// can be reduced to.
     type TableShape = (
         &'static str,                                        // table
-        &'static str,                                        // scope_id
+        ScopeId,                                             // scope_id
         u32,                                                 // spec_version
         Option<&'static str>,                                // repo_column
         Vec<(&'static str, ValueType)>,                      // pk
@@ -1695,11 +1696,14 @@ mod tests {
                 //     sibling table's entry (guarded, but only down to "cannot resolve").
                 // Moving a table between scopes is a data migration, not a registry edit.
                 assert_eq!(
-                    old.scope_id, new.scope_id,
+                    old.scope_id,
+                    new.scope_id,
                     "`{}` moved from scope `{}` to `{}` by generation {version} — its stream, and \
                      with it every retained entry and row clock, is derived from that scope; a \
                      scope change means a NEW TABLE",
-                    old.table, old.scope_id, new.scope_id
+                    old.table,
+                    old.scope_id.as_db_str(),
+                    new.scope_id.as_db_str()
                 );
                 // The repo dimension decides WHICH rows this table replicates and which incoming
                 // ops are accepted, while the bookkeeping it writes stays keyed by the caller's
@@ -1808,7 +1812,7 @@ mod tests {
         ($later:expr) => {
             TableSpec {
                 name: "t_demo",
-                scope_id: "demo/1",
+                scope_id: ScopeId::new("demo/1"),
                 spec_version: 2,
                 pk: DEMO_PK,
                 columns: &[
@@ -1904,7 +1908,7 @@ mod tests {
             };
             let spec = TableSpec {
                 name: "t_demo",
-                scope_id: "demo/1",
+                scope_id: ScopeId::new("demo/1"),
                 spec_version: 2,
                 pk: DEMO_PK,
                 // `columns` is `&'static`, and these vary per iteration — leaking a test-sized
@@ -2130,7 +2134,7 @@ mod tests {
             .unwrap();
         const QUOTED: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 2,
             pk: DEMO_PK,
             columns: &[
@@ -2160,7 +2164,7 @@ mod tests {
             .unwrap();
         const SHADOWING: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 2,
             pk: DEMO_PK,
             columns: &[
@@ -2412,7 +2416,7 @@ mod tests {
         .unwrap();
         const SPEC: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 2,
             pk: DEMO_PK,
             columns: &[
@@ -2502,7 +2506,7 @@ mod tests {
         .unwrap();
         const SPEC: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 2,
             pk: DEMO_PK,
             columns: &[
@@ -2740,7 +2744,7 @@ mod tests {
         .unwrap();
         const SPEC: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 2,
             pk: DEMO_PK,
             columns: &[
@@ -2801,7 +2805,7 @@ mod tests {
         .unwrap();
         const SPEC: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 2,
             pk: DEMO_PK,
             columns: &[
@@ -2869,7 +2873,7 @@ mod tests {
         // replication while silently dropping every older op.
         const GROWN_KEY: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 2,
             pk: &[
                 ColumnSpec::required("id", ValueType::Text),
@@ -2979,7 +2983,7 @@ mod tests {
     fn a_column_classified_twice_fails() {
         const DOUBLED: TableSpec = TableSpec {
             name: "t_demo",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: DEMO_PK,
             // `title` is both a synced column and (wrongly) a local column.
@@ -2998,7 +3002,7 @@ mod tests {
             .unwrap();
         const BAD: TableSpec = TableSpec {
             name: "t_x",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("repo_id", ValueType::Text)],
@@ -3022,7 +3026,7 @@ mod tests {
         .unwrap();
         const KEY_ONLY: TableSpec = TableSpec {
             name: "t_members",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[
                 ColumnSpec::required("group_id", ValueType::Text),
@@ -3052,7 +3056,7 @@ mod tests {
         .unwrap();
         const WRONG_PK: TableSpec = TableSpec {
             name: "t_pk",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("a", ValueType::Text)],
             columns: &[
@@ -3110,7 +3114,7 @@ mod tests {
         .unwrap();
         const NN_LOCAL: TableSpec = TableSpec {
             name: "t_nn_local",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("syn", ValueType::Text)],
@@ -3136,7 +3140,7 @@ mod tests {
         .unwrap();
         const DEF_LOCAL: TableSpec = TableSpec {
             name: "t_def_local",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("syn", ValueType::Text)],
@@ -3154,7 +3158,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE t_np(id TEXT PRIMARY KEY, v TEXT);").unwrap();
         const NP: TableSpec = TableSpec {
             name: "t_np",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -3178,7 +3182,7 @@ mod tests {
         .unwrap();
         const FK: TableSpec = TableSpec {
             name: "t_fk",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[
@@ -3203,7 +3207,7 @@ mod tests {
         .unwrap();
         const U: TableSpec = TableSpec {
             name: "t_u",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("email", ValueType::Text)],
@@ -3222,7 +3226,7 @@ mod tests {
         conn.execute_batch("CREATE TABLE t_ns(id TEXT NOT NULL PRIMARY KEY, v TEXT);").unwrap();
         const NS: TableSpec = TableSpec {
             name: "t_ns",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -3241,7 +3245,7 @@ mod tests {
             .unwrap();
         const TM: TableSpec = TableSpec {
             name: "t_tm",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("n", ValueType::Text)],
@@ -3259,7 +3263,7 @@ mod tests {
     fn a_table_registered_under_two_scopes_fails() {
         const A: TableSpec = TableSpec {
             name: "t_dup",
-            scope_id: "scope-a/1",
+            scope_id: ScopeId::new("scope-a/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -3268,7 +3272,7 @@ mod tests {
         };
         const B: TableSpec = TableSpec {
             name: "t_dup",
-            scope_id: "scope-b/1",
+            scope_id: ScopeId::new("scope-b/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -3292,7 +3296,7 @@ mod tests {
         .unwrap();
         const RI: TableSpec = TableSpec {
             name: "t_ri",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[
                 ColumnSpec::required("rid", ValueType::I64),
@@ -3320,7 +3324,7 @@ mod tests {
         .unwrap();
         const REF: TableSpec = TableSpec {
             name: "t_ref",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -3342,7 +3346,7 @@ mod tests {
         .unwrap();
         const CI: TableSpec = TableSpec {
             name: "t_ci",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[ColumnSpec::required("v", ValueType::Text)],
@@ -3367,7 +3371,7 @@ mod tests {
         .unwrap();
         const TRIG: TableSpec = TableSpec {
             name: "t_trig",
-            scope_id: "demo/1",
+            scope_id: ScopeId::new("demo/1"),
             spec_version: 1,
             pk: &[ColumnSpec::required("id", ValueType::Text)],
             columns: &[

@@ -1,12 +1,13 @@
 use super::*;
 use crate::table_sync::registry::{ColumnSpec, TableSpec, ValueType};
+use crate::table_sync::scope_stream::ScopeId;
 use crate::table_sync::store::{self, record_stream_context};
 use crate::table_sync::{Cell, RowOp, TypedValue, apply, row_op};
 use crate::{AccountId, LocalDevice};
 
 const SPEC: TableSpec = TableSpec {
     name: "t_demo",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     spec_version: 1,
     pk: &[ColumnSpec::required("id", ValueType::Text)],
     columns: &[ColumnSpec::required("title", ValueType::Text)],

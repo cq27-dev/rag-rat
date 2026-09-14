@@ -1,10 +1,11 @@
 use super::*;
 use crate::op::DeviceFingerprint;
 use crate::table_sync::registry::ColumnSpec;
+use crate::table_sync::scope_stream::ScopeId;
 
 const SPEC: TableSpec = TableSpec {
     name: "t_demo",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     spec_version: 1,
     pk: &[ColumnSpec::required("id", ValueType::Text)],
     columns: &[ColumnSpec::required("title", ValueType::Text)],
@@ -233,7 +234,7 @@ fn whole_row_lww_the_winner_takes_the_whole_row_no_per_column_merge() {
     // differ.
     const TWO_COL: TableSpec = TableSpec {
         name: "t_two",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[
@@ -359,7 +360,7 @@ fn a_partial_upsert_missing_a_synced_column_is_parked() {
     // cleanly replaced, so the op is quarantined rather than applied as a hybrid row.
     const TWO_COL: TableSpec = TableSpec {
         name: "t_two",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[
@@ -427,7 +428,7 @@ fn a_cell_newer_than_the_ops_own_claimed_version_is_a_misstamp() {
     // receiver can verify against its own registry.
     const WIDE: TableSpec = TableSpec {
         name: "t_demo",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 2,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[
@@ -459,7 +460,7 @@ fn every_default_variant_fills_its_own_typed_value() {
     // diverges from the migration's backfill at the same clock.
     const TYPED: TableSpec = TableSpec {
         name: "t_typed",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 2,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[
@@ -494,7 +495,7 @@ fn the_default_fill_window_is_per_column_not_merely_older_than_the_spec() {
     // older than the column's OWN introducing version may be filled.
     const THREE: TableSpec = TableSpec {
         name: "t_three",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 3,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[
@@ -804,7 +805,7 @@ fn a_delete_races_the_row_write_clock_on_a_content_addressed_row() {
     // write clock like any other, so a stale delete loses and a newer one wins.
     const HASHED: TableSpec = TableSpec {
         name: "t_io",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("hash", ValueType::Text)],
@@ -847,7 +848,7 @@ fn a_delete_races_the_row_write_clock_on_a_content_addressed_row() {
 fn an_op_naming_a_foreign_repo_is_quarantined() {
     const SCOPED: TableSpec = TableSpec {
         name: "t_scoped",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[
             ColumnSpec::required("repo_id", ValueType::Text),
@@ -938,7 +939,7 @@ fn a_null_in_a_not_null_column_is_quarantined_not_a_fatal_error() {
     // ingest loop.
     const NOT_NULL: TableSpec = TableSpec {
         name: "t_nn",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("title", ValueType::Text)],
@@ -973,7 +974,7 @@ fn the_producer_reads_a_bool_pk_as_bool_and_the_applier_accepts_it() {
     // `I64`), or the op it signs fails the applier's typed-pk check and self-quarantines.
     const FLAG: TableSpec = TableSpec {
         name: "t_flag",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("active", ValueType::Bool)],
         columns: &[ColumnSpec::required("label", ValueType::Text)],
@@ -1018,7 +1019,7 @@ fn the_producer_reads_a_bool_pk_as_bool_and_the_applier_accepts_it() {
 /// unreadable (#1017).
 const FLAGGED: TableSpec = TableSpec {
     name: "t_flagged",
-    scope_id: "demo/1",
+    scope_id: ScopeId::new("demo/1"),
     spec_version: 1,
     pk: &[ColumnSpec::required("id", ValueType::Text)],
     columns: &[ColumnSpec::required("flag", ValueType::Bool)],
@@ -1072,7 +1073,7 @@ fn a_bool_pk_holding_a_non_boolean_int_leaves_the_row_unaddressable() {
     // pk the row has no identity at all, so there is nothing to keep alive.
     const FLAG_PK: TableSpec = TableSpec {
         name: "t_flag",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("active", ValueType::Bool)],
         columns: &[ColumnSpec::required("label", ValueType::Text)],
@@ -1096,7 +1097,7 @@ fn guard_stream() -> StreamId {
         "repo",
         crate::AccountId::from_bytes([7; 32]),
         [0x44; 32],
-        "demo/1",
+        ScopeId::new("demo/1"),
     )
 }
 
@@ -1155,7 +1156,7 @@ fn a_text_column_holding_invalid_utf8_is_unreadable_too() {
     // mapping is total over (declared type, storage class) rather than argued from STRICT.
     const LABELLED: TableSpec = TableSpec {
         name: "t_labelled",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("label", ValueType::Text)],
@@ -1186,7 +1187,7 @@ fn a_storage_class_that_does_not_match_the_declared_type_is_unreadable() {
     // version fail an open, so the mapping covers it as a value instead of assuming it away.
     const LABELLED: TableSpec = TableSpec {
         name: "t_loose",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("label", ValueType::Text)],
@@ -1217,7 +1218,7 @@ fn a_remove_blocked_by_a_foreign_key_is_quarantined_not_wedged() {
     // return a hard error, which would roll back the already-stored entry and wedge the chain.
     const PARENT: TableSpec = TableSpec {
         name: "parent",
-        scope_id: "demo/1",
+        scope_id: ScopeId::new("demo/1"),
         spec_version: 1,
         pk: &[ColumnSpec::required("id", ValueType::Text)],
         columns: &[ColumnSpec::required("v", ValueType::Text)],
