@@ -108,43 +108,9 @@ impl Outcome {
         match self {
             Outcome::Effective { .. } => (EntryStatus::Effective, None),
             Outcome::RetainedUnfolded => (EntryStatus::RetainedUnfolded, None),
-            Outcome::Condemned(reason) => (
-                EntryStatus::Condemned,
-                Some(match reason {
-                    CondemnedReason::BeyondCut => "beyond_cut",
-                    CondemnedReason::OffBranch => "off_branch",
-                    CondemnedReason::ClosedIncarnation => "closed_incarnation",
-                }),
-            ),
-            Outcome::Parked(reason) => (
-                EntryStatus::Parked,
-                Some(match reason {
-                    ParkReason::UnknownOwnerRef => "unknown_owner_ref",
-                    ParkReason::UnknownCutTarget => "unknown_cut_target",
-                    ParkReason::IncompleteCutAncestry => "incomplete_cut_ancestry",
-                    ParkReason::ContestedSubject => "contested_subject",
-                    ParkReason::AuthLenAhead => "auth_len_ahead",
-                    ParkReason::DeferredStreamAuthorization => "deferred_stream_authorization",
-                }),
-            ),
-            Outcome::Rejected(reason) => (
-                EntryStatus::Rejected,
-                Some(match reason {
-                    RejectReason::StaleAuthority => "stale_authority",
-                    RejectReason::GenesisSelfHash => "genesis_self_hash",
-                    RejectReason::DuplicateGenesis => "duplicate_genesis",
-                    RejectReason::DuplicateAdd => "duplicate_add",
-                    RejectReason::TombstoneReAdd => "tombstone_re_add",
-                    RejectReason::BadPromote => "bad_promote",
-                    RejectReason::LastOwner => "last_owner",
-                    RejectReason::CutTargetMismatch => "cut_target_mismatch",
-                    RejectReason::WrongDevice => "wrong_device",
-                    RejectReason::Malformed => "malformed",
-                    RejectReason::NonGenesisOrigin => "non_genesis_origin",
-                    RejectReason::InvalidStreamSpec => "invalid_stream_spec",
-                    RejectReason::Ineffective => "ineffective",
-                }),
-            ),
+            Outcome::Condemned(reason) => (EntryStatus::Condemned, Some(reason.into())),
+            Outcome::Parked(reason) => (EntryStatus::Parked, Some(reason.into())),
+            Outcome::Rejected(reason) => (EntryStatus::Rejected, Some(reason.into())),
         }
     }
 }
@@ -152,7 +118,8 @@ impl Outcome {
 /// Why an entry was killed by a revocation register (§11.2). `BeyondCut` is seq-only (I11) and
 /// RECOVERABLE (a later `CutExtend` re-blesses); `OffBranch` is the permanent equivocation-loser
 /// class (L2); `ClosedIncarnation` is a mint whose own authorizing incarnation was condemned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(super) enum CondemnedReason {
     BeyondCut,
     OffBranch,
@@ -160,7 +127,8 @@ pub(super) enum CondemnedReason {
 }
 
 /// A control op that will never be effective — a permanent state precondition failure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(super) enum RejectReason {
     /// The author's cited incarnation is not live (e.g. laundered, or cross-account — P3).
     StaleAuthority,
@@ -200,7 +168,8 @@ pub(super) enum RejectReason {
 }
 
 /// A control op undecided until more entries arrive (a *withheld* input parks, never flips — I11).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(super) enum ParkReason {
     /// The cited `authority_ref` owner-incarnation is not resolvable in this account.
     UnknownOwnerRef,

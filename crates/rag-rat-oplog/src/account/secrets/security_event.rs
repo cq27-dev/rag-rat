@@ -18,7 +18,8 @@ use crate::stream::StreamId;
 
 /// The closed set of sealing-adoption audit event kinds, persisted as the `kind` TEXT column via
 /// [`as_db_str`](Self::as_db_str). The machine strings are stable schema — a rename is a migration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(super) enum SyncSecurityEventKind {
     /// A wrap naming this device unwrapped cleanly, but the recovered key's `key_id` disagrees with
     /// the op's signed `key_id` (the residual a valid authority gate can't catch: a wrong key
@@ -32,18 +33,11 @@ pub(super) enum SyncSecurityEventKind {
 
 impl SyncSecurityEventKind {
     pub(super) fn as_db_str(self) -> &'static str {
-        match self {
-            Self::WrapKeyIdMismatch => "wrap_key_id_mismatch",
-            Self::WrapUnwrapFailed => "wrap_unwrap_failed",
-        }
+        self.into()
     }
 
     pub(super) fn from_db_str(value: &str) -> Option<Self> {
-        match value {
-            "wrap_key_id_mismatch" => Some(Self::WrapKeyIdMismatch),
-            "wrap_unwrap_failed" => Some(Self::WrapUnwrapFailed),
-            _ => None,
-        }
+        value.parse().ok()
     }
 }
 

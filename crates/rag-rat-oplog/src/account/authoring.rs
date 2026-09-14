@@ -535,7 +535,8 @@ pub fn author_stream_grant_in_tx(
 /// departing reasons keep prior accepted work valid via chain-tail cuts taken from the OWNER's
 /// own store, which the revoked device cannot rewrite. The token is the frozen wire `reason`
 /// string; tests pin the exact spellings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum RevokeReason {
     Departed,
     Rotated,
@@ -545,25 +546,16 @@ pub enum RevokeReason {
 
 impl RevokeReason {
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            Self::Departed => "departed",
-            Self::Rotated => "rotated",
-            Self::Superseded => "superseded",
-            Self::Compromised => "compromised",
-        }
+        self.into()
     }
 
     pub fn from_db_str(token: &str) -> anyhow::Result<Self> {
-        match token {
-            "departed" => Ok(Self::Departed),
-            "rotated" => Ok(Self::Rotated),
-            "superseded" => Ok(Self::Superseded),
-            "compromised" => Ok(Self::Compromised),
-            other => anyhow::bail!(
-                "unknown revoke reason `{other}` — one of: departed, rotated, superseded, \
+        token.parse().map_err(|_| {
+            anyhow::anyhow!(
+                "unknown revoke reason `{token}` — one of: departed, rotated, superseded, \
                  compromised"
-            ),
-        }
+            )
+        })
     }
 
     /// Hard revocation: no self-reported boundary is trusted, everything from the grantee is
@@ -1048,7 +1040,10 @@ mod tests {
             assert_eq!(RevokeReason::from_db_str(token).unwrap(), reason);
         }
         let err = RevokeReason::from_db_str("fired").unwrap_err().to_string();
-        assert!(err.contains("departed, rotated, superseded, compromised"), "{err}");
+        assert_eq!(
+            err,
+            "unknown revoke reason `fired` — one of: departed, rotated, superseded, compromised"
+        );
     }
 
     #[test]

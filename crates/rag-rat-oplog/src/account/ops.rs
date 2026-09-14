@@ -48,7 +48,8 @@ pub(super) mod entry_type {
 /// incarnation so it cannot author control ops either. Read-only is the default an enrolling owner
 /// grants (least privilege). Roles are exact-matched, never ordered — the wire/DB tags carry no
 /// rank.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum DeviceRole {
     ReadOnly,
     Member,
@@ -65,20 +66,11 @@ impl DeviceRole {
     }
 
     pub fn as_db_str(self) -> &'static str {
-        match self {
-            DeviceRole::ReadOnly => "read_only",
-            DeviceRole::Member => "member",
-            DeviceRole::Owner => "owner",
-        }
+        self.into()
     }
 
     pub fn from_db_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "read_only" => Ok(DeviceRole::ReadOnly),
-            "member" => Ok(DeviceRole::Member),
-            "owner" => Ok(DeviceRole::Owner),
-            other => anyhow::bail!("unknown persisted device role `{other}`"),
-        }
+        value.parse().map_err(|_| anyhow::anyhow!("unknown persisted device role `{value}`"))
     }
 
     // The DeviceAdd payload carries the role as this u8 tag — a frozen wire constant. Tags 1/2 are
@@ -108,7 +100,8 @@ impl DeviceRole {
 
 /// A cross-account grant's role on a stream (§9). Reader = wrap recipient (sealed) / free (public);
 /// writer = reader + content accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumString, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub enum GrantRole {
     Reader,
     Writer,
@@ -116,18 +109,11 @@ pub enum GrantRole {
 
 impl GrantRole {
     pub(super) fn as_db_str(self) -> &'static str {
-        match self {
-            GrantRole::Reader => "reader",
-            GrantRole::Writer => "writer",
-        }
+        self.into()
     }
 
     pub(super) fn from_db_str(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "reader" => Ok(GrantRole::Reader),
-            "writer" => Ok(GrantRole::Writer),
-            other => anyhow::bail!("unknown persisted grant role `{other}`"),
-        }
+        value.parse().map_err(|_| anyhow::anyhow!("unknown persisted grant role `{value}`"))
     }
 
     pub(in crate::account) fn as_u8(self) -> u8 {
