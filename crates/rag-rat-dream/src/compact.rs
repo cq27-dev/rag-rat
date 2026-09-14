@@ -75,7 +75,7 @@ pub(super) fn run_compact_pass(
         return Ok(());
     }
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or("__unassigned__");
+    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
 
     let mut processed = 0usize;
     for entry in queue {
@@ -201,7 +201,7 @@ pub(super) fn compaction_pending(
         return Ok(false);
     }
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or("__unassigned__");
+    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
     for entry in compaction_queue(conn)? {
         let content_hash = super::verify::note_content_hash(&entry.title, &entry.body);
         let failure_stamp = FailureStamp {

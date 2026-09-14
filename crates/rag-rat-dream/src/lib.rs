@@ -267,7 +267,8 @@ pub(crate) fn removal_guarded_write_tx(
 /// transport), so the only lane movement is the one the code chooses. Call it on the SAME
 /// connection as the write (inside [`removal_guarded_write_tx`]) so Lens's same-transaction
 /// invariant holds. Gated on repo registration to match the dropped triggers (which fired only for
-/// a known repo) and to avoid phantom `repo_meta` rows under the `'__unassigned__'` sentinel.
+/// a known repo) and to avoid phantom `repo_meta` rows under the
+/// [`rag_rat_base::repo_identity::LEGACY_REPO_ID`] sentinel.
 pub(crate) fn bump_memory_lens_lanes(conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
     if rag_rat_db::schema::repo_id_is_registered(conn, repo_id)? {
         rag_rat_db::meta::bump_lens_revisions(conn, repo_id, &[

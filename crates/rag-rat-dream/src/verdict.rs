@@ -175,7 +175,7 @@ pub(super) fn run_verdict_pass(
         return Ok(());
     }
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or("__unassigned__");
+    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
     // Informational only: the commit the index is currently at, recorded so a note describing
     // unmerged in-flight work is reviewable rather than looking arbitrarily stale.
     let checked_against_commit = indexed_commit(conn, &scope)?;
@@ -278,7 +278,7 @@ pub(super) fn verification_pending(
     model_id: &str,
 ) -> anyhow::Result<bool> {
     let scope = schema::periphery_repo_scope(conn, "repo_memories")?;
-    let repo_id = scope.as_deref().unwrap_or("__unassigned__");
+    let repo_id = scope.as_deref().unwrap_or(rag_rat_base::repo_identity::LEGACY_REPO_ID);
     let mut considered = 0usize;
     for entry in verification_queue(conn, now_ms)? {
         if considered >= budget {
