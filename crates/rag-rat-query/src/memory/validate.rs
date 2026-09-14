@@ -146,7 +146,7 @@ pub(crate) fn validate_logical_symbol_binding(
     }
     // Cross-file move: bare name + content hash fallback (same path as symbol binding).
     if let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? {
-        let short = short_symbol_name(&current, binding.path.as_deref()).to_string();
+        let short = binding_leaf_name(&current, binding.path.as_deref()).to_string();
         if let Some(m) = relocate_symbol_by_name(conn, &short, &hash)? {
             // The resolution becomes the relocated member symbol's qualified_name, not a
             // logical_symbols.qualified_name. The stable logical_symbol_id arm re-matches on the
@@ -547,7 +547,7 @@ pub(crate) fn validate_symbol_binding(
     }
     // Cross-file move: qualified_name changed with the path. Match by bare name + content hash.
     if let Some(hash) = source_hash_for_memory(conn, &binding.memory_id)? {
-        let short = short_symbol_name(&current, binding.path.as_deref()).to_string();
+        let short = binding_leaf_name(&current, binding.path.as_deref()).to_string();
         if let Some(m) = relocate_symbol_by_name(conn, &short, &hash)? {
             binding.set_resolved_binding_id(m.binding_id);
             binding.symbol_id = Some(m.symbol_id);

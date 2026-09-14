@@ -794,7 +794,7 @@ fn live_symbol_candidates(
     stored_kind: Option<&str>,
     stored_sig: Option<&str>,
 ) -> Vec<String> {
-    let short = short_symbol_name(binding_id, path);
+    let short = binding_leaf_name(binding_id, path);
     // Run the same bare-name query as relocate_symbol_by_name, but WITHOUT the hash filter —
     // we want all live symbols with this name, ranked by quality, not filtered by content.
     let mut stmt = match conn.prepare(

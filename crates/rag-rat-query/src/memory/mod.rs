@@ -36,10 +36,10 @@ pub(crate) use moniker::{relocate_binding_by_moniker, validate_moniker_binding};
 use rag_rat_base::hash::hex_sha256;
 use rag_rat_base::time::now_ms;
 pub(crate) use resolve::{
-    RelocateMatch, call_path_edge_by_id, chunk_by_id, chunk_for_logical_symbol, chunk_for_symbol,
-    chunk_ids_for_symbol, compute_edge_sequence_hash, dir_has_files, edge_by_fingerprint,
-    edge_by_id, edge_id_matches_fingerprint_in_linked_worktree, logical_symbol_id_for_symbol,
-    relocate_chunk_by_hash, relocate_symbol_by_name, short_symbol_name, symbol_signal,
+    RelocateMatch, binding_leaf_name, call_path_edge_by_id, chunk_by_id, chunk_for_logical_symbol,
+    chunk_for_symbol, chunk_ids_for_symbol, compute_edge_sequence_hash, dir_has_files,
+    edge_by_fingerprint, edge_by_id, edge_id_matches_fingerprint_in_linked_worktree,
+    logical_symbol_id_for_symbol, relocate_chunk_by_hash, relocate_symbol_by_name, symbol_signal,
 };
 pub use resolve::{
     insert_binding, logical_symbol_id_for_chunk, remap_call_path_callee_logical_symbol_ids,

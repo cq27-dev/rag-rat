@@ -87,6 +87,28 @@ fn forward_visibility_filter_admits_exactly_its_truth_table() {
     }
 }
 
+/// `is_qualified_symbol` gates the by-short-name fallback (`?4`) in the non-fuzzy predicates, so a
+/// shape whose answer flips widens or narrows `find_callers`. The seed is caller-supplied, so a
+/// `file.ext:name` seed can reach it; only the `.rs:` / `.ts:` / `.tsx:` / `.kt:` forms count as
+/// qualified today.
+#[test]
+fn is_qualified_symbol_classifies_every_seed_shape() {
+    for (seed, qualified) in [
+        ("crates/a/src/lib.rs::Type::run", true),
+        ("module::function", true),
+        ("src/lib.rs", true),
+        ("lib.rs:run", true),
+        ("app.ts:run", true),
+        ("view.tsx:run", true),
+        ("Main.kt:run", true),
+        ("main.py:run", false),
+        ("Type.method", false),
+        ("run", false),
+    ] {
+        assert_eq!(is_qualified_symbol(seed), qualified, "{seed}");
+    }
+}
+
 fn scoped_conn() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     schema::apply(&conn, &rag_rat_core::index::migration_hooks()).unwrap();
