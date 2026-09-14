@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn disabled_config_creates_no_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("logging");
         let config = test_config(dir.path(), false);
         let _handle = init_logging(&config, Role::Cli("gc".into()));
         let empty = !config.log.dir.exists()
@@ -186,7 +186,7 @@ mod tests {
     // guard-less no-op handle and see no file. Keep this the sole enabled case in this module.
     #[test]
     fn enabled_config_writes_a_per_process_file_with_startup_event() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_scratch::ScratchDir::new("logging");
         let config = test_config(dir.path(), true);
         {
             let _handle = init_logging(&config, Role::Hook);

@@ -70,10 +70,10 @@ pub fn command(dir: &Path, args: &[&str]) -> Command {
     cmd
 }
 
-/// Whether a `git` binary is runnable at all — the skip guard for fixtures on machines without
-/// git. `--version` reads no configuration, so it needs none of [`command`]'s isolation.
+/// Whether a `git` binary runs and succeeds — the skip guard for fixtures on machines without a
+/// working git. `--version` reads no configuration, so it needs none of [`command`]'s isolation.
 pub fn available() -> bool {
-    Command::new("git").arg("--version").output().is_ok()
+    Command::new("git").arg("--version").output().is_ok_and(|out| out.status.success())
 }
 
 /// Run `git` to completion, panicking with the captured stderr on failure.

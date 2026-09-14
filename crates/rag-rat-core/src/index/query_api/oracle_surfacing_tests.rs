@@ -1207,7 +1207,7 @@ fn multi_match_name_seeds_all_in_scope_symbols() {
 /// yields a personalized result whose seed provenance is `git_diff`.
 #[test]
 fn auto_seed_from_diff_picks_changed_symbols() {
-    if std::process::Command::new("git").arg("--version").output().is_err() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let (_root, db) = checkout_with_dirty_indexed_symbol();
@@ -1229,7 +1229,7 @@ fn auto_seed_from_diff_picks_changed_symbols() {
 /// diff counts, NOT a silent fall-through.
 #[test]
 fn diff_without_symbols_falls_back_to_global_with_reason() {
-    if std::process::Command::new("git").arg("--version").output().is_err() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let root = temp_root();
@@ -1261,7 +1261,7 @@ fn diff_without_symbols_falls_back_to_global_with_reason() {
 /// Deleted and generated changed paths are counted in `skipped`, not seeded.
 #[test]
 fn deleted_and_generated_paths_counted_in_skipped() {
-    if std::process::Command::new("git").arg("--version").output().is_err() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let root = temp_root();
@@ -1333,7 +1333,7 @@ fn deleted_and_generated_paths_counted_in_skipped() {
 /// divergence — easy to "clean up" into uniformity by accident, so it's pinned.
 #[test]
 fn mcp_auto_seeds_but_cli_stays_global_on_a_nonempty_diff() {
-    if std::process::Command::new("git").arg("--version").output().is_err() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let (_root, db) = checkout_with_dirty_indexed_symbol();
@@ -1429,7 +1429,7 @@ fn find_callers_without_oracle_matches_heuristic_order() {
 /// tests both degenerate past.
 #[test]
 fn oracle_surfaces_compiler_tier_on_a_real_git_checkout() {
-    if std::process::Command::new("git").arg("--version").output().is_err() {
+    if !rag_rat_base::test_git::available() {
         return; // no git on PATH — skip rather than fail.
     }
     let root = temp_root();

@@ -63,7 +63,7 @@ fn index_allow_empty_permits_zero_discovered_files() {
 /// — the same-identity-join hint, exercised through the real CLI so the warning wiring is covered.
 #[test]
 fn index_warns_when_a_clone_joins_an_indexed_repo() {
-    if !git_available() {
+    if !rag_rat_base::test_git::available() {
         return; // identity resolution needs git; skip rather than fail.
     }
     let dir = TempDir::new().unwrap();
@@ -97,7 +97,7 @@ fn index_warns_when_a_clone_joins_an_indexed_repo() {
 /// re-anchor hint, exercised through the real CLI.
 #[test]
 fn index_warns_when_root_names_a_linked_worktree() {
-    if !git_available() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -140,7 +140,7 @@ fn index_warns_when_root_names_a_linked_worktree() {
 /// registrations.
 #[test]
 fn index_allows_an_already_indexed_repo_to_go_empty() {
-    if !git_available() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -178,7 +178,7 @@ fn index_allows_an_already_indexed_repo_to_go_empty() {
 /// the persisted `source_root` — here a not-yet-adopted placeholder index (indexed while non-git).
 #[test]
 fn full_rebuild_prunes_an_existing_placeholder_index_instead_of_refusing() {
-    if !git_available() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -226,7 +226,7 @@ fn full_rebuild_prunes_an_existing_placeholder_index_instead_of_refusing() {
 /// otherwise adoption records B's root and a later check would wave the empty registration through.
 #[test]
 fn index_discover_refuses_a_first_time_empty_repo_against_an_existing_db() {
-    if !git_available() {
+    if !rag_rat_base::test_git::available() {
         return;
     }
     let dir = TempDir::new().unwrap();
@@ -403,10 +403,6 @@ fn index_watch_on_empty_target_dirs_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("target_bindings"), "stderr should name target_bindings: {stderr}");
     assert!(!db.exists() || is_empty_db_absent(&db), "must not register an empty index");
-}
-
-fn git_available() -> bool {
-    Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 fn git_init_commit(dir: &Path) {
