@@ -530,11 +530,8 @@ pub fn live_oracle_pass(
     report.database_governs_nothing = session.layout_governs_nothing_indexed();
     report.database_unreadable = session.layout_has_unreadable_database();
     let tool = session.tool();
-    // The batch tool whose monikers live copies (rust-analyzer for ra-lsp, scip-typescript for
-    // ts-lsp) — always `Some` for a live tool; the join is vacuous without it.
-    let Some(moniker_source) = tool.batch_moniker_source() else {
-        anyhow::bail!("live_oracle_pass requires a live (non-batch) tool");
-    };
+    // The batch tool whose monikers this backend copies, declared on its registry entry.
+    let moniker_source = session.backend.moniker_source;
 
     let candidates = store::edge_join_candidates_for_paths(conn, input.checkout, input.worklist)?;
     let mut by_path: HashMap<&str, Vec<&store::EdgeJoinCandidate>> = HashMap::new();

@@ -616,10 +616,7 @@ fn every_live_backend_copies_monikers_from_a_batch_tool_for_its_own_language() {
     // resolved different languages the copy would be meaningless, so the pairing is asserted
     // rather than assumed.
     for backend in LiveBackend::all() {
-        let source = backend
-            .tool
-            .batch_moniker_source()
-            .unwrap_or_else(|| panic!("{} has no moniker source", backend.tool.as_db_str()));
+        let source = backend.moniker_source;
         assert!(source.batch_capable(), "a moniker source must be a batch tool");
         let batch_languages = crate::ToolManifest::for_tool(source).languages;
         for language in backend.languages {
