@@ -153,8 +153,9 @@ struct InEdgeContribution {
     compiler: bool,
 }
 
-/// Apply an in-edge's oracle verdict to its heuristic weight, mirroring
-/// `pagerank::important_symbols`'s per-edge logic so the two scales agree on what a verdict does.
+/// Apply an in-edge's oracle verdict to its heuristic weight, mirroring the per-edge logic of
+/// `pagerank::build_adjacency` so the two scales agree on what a verdict does (pinned by
+/// `build_adjacency_agrees_with_in_edge_contribution_for_every_verdict`).
 /// `to_symbol_id` is the symbol being scored (S) — the heuristic target the in-edge query selected
 /// on (`WHERE d.to_symbol_id = S`):
 /// - `Drop` (contradict / resolved-external) → the edge is a phantom, it contributes nothing;
@@ -185,6 +186,19 @@ fn in_edge_contribution(
             compiler: false,
         }),
     }
+}
+
+/// Expose only the contribution weight for the cross-module PageRank parity test.
+#[cfg(test)]
+pub(crate) fn in_edge_weight_for_test(
+    kind: &str,
+    confidence: &str,
+    edge_id: i64,
+    to_symbol_id: i64,
+    oracle: &OracleContext<'_>,
+) -> Option<f64> {
+    in_edge_contribution(kind, confidence, edge_id, to_symbol_id, oracle)
+        .map(|contribution| contribution.weight)
 }
 
 /// Compute the scoped weighted fan-in for a single symbol: the sum of its in-edges' weights, where
