@@ -17,10 +17,10 @@
 
 use anyhow::Context;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, SharedSecret, StaticSecret};
 use zeroize::Zeroizing;
 
+use super::cbor;
 use super::op::DeviceFingerprint;
 
 /// A device's ed25519 secret key — the signing capability, built deterministically from a 32-byte
@@ -89,9 +89,7 @@ impl DevicePublic {
     /// The opaque device fingerprint the op model carries: `sha256(pubkey_bytes)`. A 32-byte hash
     /// of the key, so a signed entry binds to a key without embedding the whole pubkey.
     pub(super) fn fingerprint(&self) -> DeviceFingerprint {
-        let mut fp = [0u8; 32];
-        fp.copy_from_slice(&Sha256::digest(self.to_bytes()));
-        DeviceFingerprint::from_bytes(fp)
+        DeviceFingerprint::from_bytes(cbor::sha256(&self.to_bytes()))
     }
 
     /// Verify `sig` over `msg` under this key with `verify_strict` (rejects malleable / small-order
@@ -246,6 +244,8 @@ fn is_small_order(bytes: &[u8; 32]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use sha2::{Digest, Sha256};
+
     use super::*;
 
     #[test]

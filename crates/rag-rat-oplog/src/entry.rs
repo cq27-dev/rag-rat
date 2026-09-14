@@ -35,7 +35,7 @@ use minicbor::Encoder;
 use minicbor::data::Type;
 use minicbor::decode::{Decoder, Error as CborError};
 
-use super::cbor::{self, INFALLIBLE};
+use super::cbor::{self, VecEncoderExt};
 use super::device::{DevicePublic, DeviceSecret};
 use super::op::{self, DeviceFingerprint, MemoryOp};
 use super::stream::{EntryHash, StreamId};
@@ -220,18 +220,18 @@ fn encode_body(parts: &BodyParts<'_>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(128);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(6).expect(INFALLIBLE);
-        enc.str(ENTRY_DOMAIN).expect(INFALLIBLE);
-        enc.bytes(&parts.stream_id.to_bytes()).expect(INFALLIBLE);
+        enc.put_array(6);
+        enc.put_str(ENTRY_DOMAIN);
+        enc.put_bytes(&parts.stream_id.to_bytes());
         match parts.prev_hash {
             // A 32-byte bstr for a linked entry, CBOR null for the genesis — an unambiguous,
             // distinct "no predecessor" marker (not an all-zero hash).
-            Some(hash) => enc.bytes(hash.as_slice()).expect(INFALLIBLE),
-            None => enc.null().expect(INFALLIBLE),
+            Some(hash) => enc.put_bytes(hash.as_slice()),
+            None => enc.put_null(),
         };
-        enc.u64(parts.lamport).expect(INFALLIBLE);
-        enc.bytes(&parts.device_fingerprint.to_bytes()).expect(INFALLIBLE);
-        enc.bytes(parts.op_bytes).expect(INFALLIBLE);
+        enc.put_u64(parts.lamport);
+        enc.put_bytes(&parts.device_fingerprint.to_bytes());
+        enc.put_bytes(parts.op_bytes);
     }
     buf
 }
@@ -242,10 +242,10 @@ fn encode_signed(body_bytes: &[u8], signature: &[u8; 64]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(body_bytes.len() + 96);
     {
         let mut enc = Encoder::new(&mut buf);
-        enc.array(3).expect(INFALLIBLE);
-        enc.str(SIGNED_DOMAIN).expect(INFALLIBLE);
-        enc.bytes(body_bytes).expect(INFALLIBLE);
-        enc.bytes(signature).expect(INFALLIBLE);
+        enc.put_array(3);
+        enc.put_str(SIGNED_DOMAIN);
+        enc.put_bytes(body_bytes);
+        enc.put_bytes(signature);
     }
     buf
 }
