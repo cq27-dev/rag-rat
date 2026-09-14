@@ -8,6 +8,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::hooks::MigrationHooks;
 
+#[cfg(test)]
+#[path = "registry_verification_tests.rs"]
+mod registry_verification_tests;
+
 /// The `temp.connection_context` key under which the scope view stashes the active repo id (beside
 /// `commit_sha` / `worktree_id`). [`active_repo_id`] reads it; `install_scope_view` writes it.
 pub const CONNECTION_CONTEXT_REPO_KEY: &str = "repo_id";
@@ -727,13 +731,15 @@ fn acquire_dual_repo_locks(
 }
 
 /// The direct-scoped tables whose rows the LATE-upgrade merge DELETES under the retiring `local:`
-/// id (its DERIVED data): the A5 periphery list minus 8 entries. Five are AUTHORED and are MOVED
-/// onto the target id instead — `repo_memories`, `repo_memory_bindings`, `repo_memory_fts`,
-/// `repo_memory_parked_baselines`, and `repo_node_edges`. The remaining three are the dream-v2
-/// verification siblings
-/// (`memory_reality`, `memory_note_summaries`, `memory_model_failures`): this merge neither moves
-/// nor deletes them (parked pending a ruling — see `LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED`).
-/// The retired `memory_summaries` is left where it lies on both paths.
+/// id (its DERIVED data): the A5 periphery list minus five authored tables moved onto the
+/// target instead. Verification results are discarded: moving them could overwrite target
+/// results checked against different inputs. The target's results survive and missing results
+/// can be regenerated. The retired `memory_summaries` stays where it lies on both paths.
+///
+/// This deletion requires the live root/boundary proof checked by `late_upgrade_is_proven`.
+/// Historical absent registrations are not proof of retirement: imported table rows need not
+/// have a local registration. Do not sweep those rows, or erase their sync publication records
+/// (which preserve pending deletions), as an orphan repair.
 /// Children fall via `ON DELETE CASCADE` (`clone_edges`/`clone_subblock_postings` off
 /// `clone_graph_generations`, `logical_symbol_members` off `logical_symbols` — deleted via
 /// [`DIRECT_SCOPED_ADOPTION_TABLES`]).
@@ -749,6 +755,9 @@ const LATE_MERGE_DERIVED_PERIPHERY_TABLES: &[&str] = &[
     "external_symbols",
     "reconcile_attempts",
     "dream_findings",
+    "memory_reality",
+    "memory_note_summaries",
+    "memory_model_failures",
 ];
 
 /// Whether the conflicting `owner` of the incoming root is a `local:` incumbent that PROVES a
@@ -1595,25 +1604,6 @@ mod repo_id_scope_coverage {
         ),
     ];
 
-    /// `(table, what is unresolved)` — the dream-v2 verification siblings on the LATE-MERGE path
-    /// only. The live ones are in [`A5_PERIPHERY_DIRECT_SCOPED_TABLES`], so the in-place adoption
-    /// re-points them (the retired `memory_summaries` is abandoned on that path too, see
-    /// [`ADOPTION_ABANDONED_TABLES`]); the merge neither moves nor deletes them, and no FK reaches
-    /// them. Since the memories
-    /// they annotate DO move onto the target id, their verdicts/summaries are left behind under
-    /// the retiring id — where a per-active-repo gc sweep never reaches. Parked pending a ruling
-    /// (move with the memories, or drop as derived like `dream_findings`).
-    const LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED: &[(&str, &str)] = &[
-        ("memory_reality", "keyed `(repo_id, memory_id)`; neither moved nor deleted"),
-        (
-            "memory_summaries",
-            "retired (#1319), keyed `(repo_id, memory_id, content_hash)`; neither moved nor \
-             deleted",
-        ),
-        ("memory_note_summaries", "keyed `(repo_id, memory_id)`; neither moved nor deleted"),
-        ("memory_model_failures", "keyed `(repo_id, memory_id, pass)`; neither moved nor deleted"),
-    ];
-
     /// A connection carrying the full shipped schema — in-memory, because the enumeration reads
     /// `sqlite_master` and needs no durability.
     fn latest_schema() -> Connection {
@@ -1682,10 +1672,7 @@ mod repo_id_scope_coverage {
             ("DIRECT_SCOPED_ADOPTION_TABLES", DIRECT_SCOPED_ADOPTION_TABLES.to_vec()),
             ("LATE_MERGE_DERIVED_PERIPHERY_TABLES", LATE_MERGE_DERIVED_PERIPHERY_TABLES.to_vec()),
             ("LATE_MERGE_HANDLED_ELSEWHERE", table_names(LATE_MERGE_HANDLED_ELSEWHERE)),
-            (
-                "LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED",
-                table_names(LATE_MERGE_MEMORY_VERIFICATION_UNRESOLVED),
-            ),
+            ("ADOPTION_ABANDONED_TABLES", table_names(ADOPTION_ABANDONED_TABLES)),
             ("TABLE_SYNC_UNRESOLVED", table_names(TABLE_SYNC_UNRESOLVED)),
         ]
     }
