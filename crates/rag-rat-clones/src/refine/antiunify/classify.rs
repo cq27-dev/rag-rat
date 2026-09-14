@@ -1,7 +1,8 @@
 use super::super::RefineMember;
 use super::super::score::Confidence;
+use super::spans;
 use super::types::{ClassAlignment, MetavarKind};
-use super::values::aligned_values;
+use super::values::{self, aligned_values};
 use super::widen::is_string_node_kind;
 use crate::normalize::NodeSpan;
 
@@ -126,7 +127,7 @@ fn matched_callee_monikers_agree(
     alignment: &ClassAlignment,
     col: usize,
 ) -> bool {
-    let mut seen: Option<&str> = None;
+    let mut monikers: Vec<&str> = Vec::new();
     for (m_idx, member) in members.iter().enumerate() {
         if !alignment.aligned[m_idx] {
             continue;
@@ -136,13 +137,9 @@ fn matched_callee_monikers_agree(
         let Some(moniker) = member.callee_monikers.get(&(span.start_byte, span.end_byte)) else {
             return false;
         };
-        match seen {
-            None => seen = Some(moniker),
-            Some(prev) if prev == moniker => {},
-            Some(_) => return false,
-        }
+        monikers.push(moniker);
     }
-    seen.is_some()
+    !monikers.is_empty() && values::all_equal(monikers.into_iter())
 }
 
 /// `true` when the anchor's spine leaf at column `col` is a callee / method-name identifier in
@@ -185,21 +182,14 @@ fn matched_source_values_differ(
     alignment: &ClassAlignment,
     col: usize,
 ) -> bool {
-    let mut seen: Option<&str> = None;
-    for (m_idx, member) in members.iter().enumerate() {
-        if !alignment.aligned[m_idx] {
-            continue;
-        }
-        let Some(j) = alignment.col_map[m_idx][col] else { continue };
-        let span = &member.node_spans[j];
-        let Some(value) = member.text.get(span.start_byte..span.end_byte) else { continue };
-        match seen {
-            None => seen = Some(value),
-            Some(prev) if prev == value => {},
-            Some(_) => return true,
-        }
-    }
-    false
+    let matched_values =
+        members.iter().enumerate().filter(|&(m_idx, _)| alignment.aligned[m_idx]).filter_map(
+            |(m_idx, member)| {
+                let span = &member.node_spans[alignment.col_map[m_idx][col]?];
+                member.text.get(span.start_byte..span.end_byte)
+            },
+        );
+    !values::all_equal(matched_values)
 }
 
 /// Classification outcome for one run: its extraction role, an optional type hint, the confidence
@@ -540,18 +530,7 @@ fn every_member_single_leaf(
         if !alignment.aligned[m_idx] {
             return true;
         }
-        let cm = &alignment.col_map[m_idx];
-        let inserts = &alignment.member_inserts[m_idx];
-        // Gather the member's token indices for the run, same as recover_values.
-        let mut idxs: Vec<usize> = Vec::new();
-        for &slot in &cm[lo..=hi] {
-            if let Some(j) = slot {
-                idxs.push(j);
-            }
-        }
-        for (_key, ins) in inserts.range(lo..=hi) {
-            idxs.extend(ins.iter().copied());
-        }
+        let idxs = spans::member_run_tokens(alignment, m_idx, lo, hi);
         idxs.len() == 1 && member.node_spans[idxs[0]].is_leaf
     })
 }
@@ -576,21 +555,12 @@ fn uniform_literal_bucket(
         if !alignment.aligned[m_idx] {
             continue;
         }
-        let cm = &alignment.col_map[m_idx];
-        let inserts = &alignment.member_inserts[m_idx];
-        // The member's single token index for this single-column run.
-        let j = if let Some(j) = cm[lo] {
-            j
-        } else {
-            // Anchor column lo is a gap for this member — its substituting leaf is keyed AT column
-            // lo.
-            let mut found = None;
-            for (_k, ins) in inserts.range(lo..=lo) {
-                if ins.len() == 1 {
-                    found = Some(ins[0]);
-                }
-            }
-            found?
+        // The member's single token for this single-column run: its matched token, else (column
+        // `lo` is a gap for this member) the one substituting leaf keyed AT column `lo`.
+        let run = spans::member_run_tokens(alignment, m_idx, lo, lo);
+        let j = match (alignment.col_map[m_idx][lo], run.as_slice()) {
+            (Some(j), _) | (None, &[j]) => j,
+            (None, _) => return None,
         };
         let tok = member.seq.get(j)?;
         if !tok.starts_with("LIT_") {
@@ -611,30 +581,19 @@ fn uniform_literal_bucket(
 /// to be conservative about. Any member realising the run as a multi-token subtree, a non-leaf,
 /// or a leaf WITHOUT a moniker returns `false` (finding 2's same-call-syntax scope + the
 /// no-evidence veto); a member that gapped the run contributes no opinion, mirroring
-/// [`run_callees_differ`]'s empty-value skip. Token indices are gathered the same way as
-/// [`every_member_single_leaf`] (col_map slots + inserts keyed in the run).
+/// [`run_callees_differ`]'s empty-value skip.
 fn run_callee_monikers_agree(
     members: &[RefineMember],
     alignment: &ClassAlignment,
     lo: usize,
     hi: usize,
 ) -> bool {
-    let mut seen: Option<&str> = None;
+    let mut monikers: Vec<&str> = Vec::new();
     for (m_idx, member) in members.iter().enumerate() {
         if !alignment.aligned[m_idx] {
             continue;
         }
-        let cm = &alignment.col_map[m_idx];
-        let inserts = &alignment.member_inserts[m_idx];
-        let mut idxs: Vec<usize> = Vec::new();
-        for &slot in &cm[lo..=hi] {
-            if let Some(j) = slot {
-                idxs.push(j);
-            }
-        }
-        for (_key, ins) in inserts.range(lo..=hi) {
-            idxs.extend(ins.iter().copied());
-        }
+        let idxs = spans::member_run_tokens(alignment, m_idx, lo, hi);
         if idxs.is_empty() {
             // A gap / cost-skipped member has no callee to compare — no opinion.
             continue;
@@ -649,38 +608,22 @@ fn run_callee_monikers_agree(
         let Some(moniker) = member.callee_monikers.get(&(span.start_byte, span.end_byte)) else {
             return false;
         };
-        match seen {
-            None => seen = Some(moniker),
-            Some(prev) if prev == moniker => {},
-            Some(_) => return false,
-        }
+        monikers.push(moniker);
     }
-    seen.is_some()
+    !monikers.is_empty() && values::all_equal(monikers.into_iter())
 }
 
 /// `true` when the run's per-member values (the call/method subtree source) differ across members —
 /// i.e. the callee/argument structure is not identical. Conservative: any two distinct non-empty
 /// values trip the guard.
 fn run_callees_differ(per_member_values: &[String]) -> bool {
-    let mut seen: Option<&str> = None;
-    for v in per_member_values {
-        // Skip the gap sentinel: an empty value is "no contribution" (a true indel gap on an
-        // aligned member, or a cost-skipped member's "unknown"), NOT a distinct callee. Without
-        // this, a skipped member's `""` reads as a second distinct value and trips the guard
-        // spuriously — the same un-gated-member residual as Fix 1, here surfacing through the
-        // values rather than `alignment.aligned[m]` (this fn only sees
-        // `per_member_values`). Aligned gaps already short-circuit to Gapped in
-        // `classify_run` before this call, so skipping empties is a no-op on that path and
-        // only suppresses the skipped-member false positive. Matches the doc: "any two
-        // distinct NON-EMPTY values trip the guard."
-        if v.is_empty() {
-            continue;
-        }
-        match seen {
-            None => seen = Some(v.as_str()),
-            Some(s) if s == v.as_str() => {},
-            Some(_) => return true,
-        }
-    }
-    false
+    // Skip the gap sentinel: an empty value is "no contribution" (a true indel gap on an aligned
+    // member, or a cost-skipped member's "unknown"), NOT a distinct callee. Without this, a
+    // skipped member's `""` reads as a second distinct value and trips the guard spuriously — the
+    // same un-gated-member residual as Fix 1, here surfacing through the values rather than
+    // `alignment.aligned[m]` (this fn only sees `per_member_values`). Aligned gaps already
+    // short-circuit to Gapped in `classify_run` before this call, so skipping empties is a no-op
+    // on that path and only suppresses the skipped-member false positive. Matches the doc: "any
+    // two distinct NON-EMPTY values trip the guard."
+    !values::all_equal(per_member_values.iter().map(String::as_str).filter(|v| !v.is_empty()))
 }
