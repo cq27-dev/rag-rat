@@ -7,6 +7,211 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.3](https://github.com/cq27-dev/rag-rat/compare/v0.23.2...v0.23.3) - 2026-09-15
+
+### Added
+
+- *(sync)* persist and report unresolved table-row causes ([#1344](https://github.com/cq27-dev/rag-rat/pull/1344))
+- *(sync)* key memory summaries by memory so a regeneration syncs as one upsert ([#1320](https://github.com/cq27-dev/rag-rat/pull/1320))
+- *(oplog)* persist permanent account pins and block unsupported authority ([#1352](https://github.com/cq27-dev/rag-rat/pull/1352))
+- *(sync)* restate a writer's own deletes so compaction can reclaim the entries that first stated them
+- *(oplog)* add isolated control v2 grammar and replay planning ([#1351](https://github.com/cq27-dev/rag-rat/pull/1351))
+- *(oplog)* verify externally pinned legacy checkpoints for control v2 ([#1350](https://github.com/cq27-dev/rag-rat/pull/1350))
+
+### Fixed
+
+- *(oracle)* reject an unknown corpus tool or tier when the profiles load
+- *(sync)* pad discovery announcements to hide roster size ([#1349](https://github.com/cq27-dev/rag-rat/pull/1349))
+- *(core)* advance migration replay test pin to schema v129 ([#1347](https://github.com/cq27-dev/rag-rat/pull/1347))
+- *(sync)* retain outstanding suffix tips after floor adoption ([#1346](https://github.com/cq27-dev/rag-rat/pull/1346))
+- *(core)* reject malformed local distill source tokens during hydration
+- *(core)* raise rebind's durability guard after the backfill it runs
+- *(core)* omit full error details from watcher test diagnostics
+- *(core)* roll back failed overlay refresh commits
+- *(db)* discard derived verification rows during late repo merge ([#1335](https://github.com/cq27-dev/rag-rat/pull/1335))
+- *(papertrail)* read a drifted error-class token as an unknown failure
+- *(oracle)* gate indexed definition documents on index-vs-disk drift
+- *(query)* recognize graph seed extensions from the language registry
+- *(clones)* stop charging the template-lane cell budget for skipped members
+- *(oplog)* identify malformed stored ids by their actual field
+- *(sync)* refuse a writer nonce presented to the pairing flow as unknown
+- *(sync)* report enrollment transport failures as transport, not storage
+- *(sync)* report a stalled session peer as a timeout, not a protocol violation
+- *(sync)* refuse an over-cap account-lane frame before writing it
+
+### Other
+
+- *(cli)* share command parsing, locking and maintenance reports ([#1336](https://github.com/cq27-dev/rag-rat/pull/1336))
+- *(oplog)* share account authority operations and type identifiers ([#1338](https://github.com/cq27-dev/rag-rat/pull/1338))
+- *(core)* type clone delta report status tokens
+- *(sync)* make SyncAlpn the crate's ALPN type for dialers and dispatchers
+- *(mcp)* correct test references that name things that no longer exist
+- *(base)* finish moving base's fixtures onto ScratchDir and test_git
+- *(base)* keep the embedding registry to one row per model
+- *(base)* route every hex encoding through base::hash
+- *(base)* name the global and per-worktree listener lock families
+- *(base)* settle the config enums on strum tokens and one config parser
+- *(base)* back Language tokens with strum and rename as_str to as_db_str
+- *(oracle)* pass the drift-gate snapshots as one ShaSnapshots bundle
+- *(core)* share index pipeline contracts and finalization ([#1341](https://github.com/cq27-dev/rag-rat/pull/1341))
+- *(core)* clarify query and embedding API boundaries ([#1340](https://github.com/cq27-dev/rag-rat/pull/1340))
+- *(core)* share graph extraction rules and clarify healing phases ([#1339](https://github.com/cq27-dev/rag-rat/pull/1339))
+- *(core)* avoid dumping sync effects in assertion failures
+- *(core)* move the remaining inline test tails into #[path] sibling files
+- *(core)* read sync_driver's kv timestamps through typed meta accessors
+- *(core)* split grep-augment's compose into its three lanes
+- *(core)* carry the discovery advertisement's identity as one AdvertisementIdentity
+- *(core)* reattach drain_synced_memory's doc and drop prompts.rs's module-wide dead_code allow
+- *(core)* give the stream seal-policy and access-mode intents a token surface
+- *(core)* route every lexical search entry point through LexicalQuery
+- *(core)* share eval's recall predicates and pass its search knobs as SearchTuning
+- *(core)* remove the unused search::hybrid and search::semantic modules
+- *(core)* merge eval expectation lanes through one accessor pair
+- *(core)* build signed node content and edge specs from the rows that carry them
+- *(core)* split sync_driver's reconcile and resident start into named phases
+- *(core)* share distill source tokens in the thread identity module
+- *(core)* run distill extract and drain through one transaction helper
+- *(core)* colocate watcher tests with their modules
+- *(core)* split consolidation by import responsibility
+- *(core)* name watcher pass inputs and lifecycle stages
+- *(core)* document overlay transaction failure policies
+- *(core)* share connection scope keys and view columns
+- *(core)* report watcher overlay failures through tracing
+- *(core)* pair on-open repairs with their read-only gates
+- *(core)* bump overlay revisions in their matching change arms
+- *(core)* name consolidation child slices and metadata sides
+- *(core)* carry checkout keys through overlay scopes
+- *(core)* enforce poison tripwire coverage from the schema registry
+- *(core)* describe poison coverage against the current schema
+- *(core)* align lifecycle documentation with its functions
+- *(db)* move EdgeConfidence below the read layer and hang its ladders off it
+- *(query)* type the persisted memory kind, status, confidence, source and relocation reason
+- *(db)* tighten the digest lane and chunk-text decoder primitives
+- *(dream)* type finding status and expose a typed kind on worklist and review rows
+- *(llm)* cover endpoint redaction in the crate that owns it
+- *(base)* name the workspace dir, legacy database, and imported marker
+- *(oracle)* type the persisted run status as RunStatus
+- *(papertrail)* isolate the reference-driven sync lane in ref_sync
+- *(papertrail)* type the report's pause reason and sync-error status
+- *(mcp)* drive tool schema checks from a complete per-tool table
+- *(mcp)* turn the hook listener's task body into an ordinary function
+- *(mcp)* export only the catalog's contract from the tools module
+- *(mcp)* declare the resurface window once for both dedup lanes
+- *(mcp)* route the clone file lens through file_lens
+- *(mcp)* share the lens discovery record and serve options between serve paths
+- *(mcp)* escalate graph completeness risk on the typed report
+- *(mcp)* build the graph tools' traversal options in one place
+- *(mcp)* declare the symbol selector and handle encoding once
+- *(mcp)* stop advertising search knobs the plain full-text tools discard
+- *(base)* share the config test fixtures instead of copying them
+- *(base)* honour the crate's own clock, version, and import seams
+- *(base)* resolve [index] root through one helper in Config::load
+- *(base)* derive the retention sweep's owned log names from Role
+- *(db)* split migrations into ladder infrastructure and per-era step modules
+- *(db)* move the migration ladder's interleaved test modules into their own files
+- *(db)* render PurgeIdSet's live subquery and temp capture from one descriptor
+- *(db)* name the registration outcomes in a Registration enum
+- *(db)* extract the adoption re-point phase into repoint_scoped_rows
+- *(db)* route sqlite_master existence probes through one helper
+- *(db)* pin the late-merge periphery list to its A5 prefix and fix stale coverage prose
+- *(db)* retire the stale migration-registration doc and tests that cannot fail
+- *(db)* carry each migration's ledger-atomic and refold flags in the roster
+- *(db)* build SchemaStatus through one constructor
+- *(db)* correct stale module headers and unresolvable cross-crate doc links
+- *(papertrail)* split the mirror runner's test tail by concern
+- *(papertrail)* route ref grammars on one reported MatchedShape
+- *(papertrail)* fold the configless legacy-grammar fallback into parse_tracker_refs
+- *(papertrail)* declare the transport's GitHub quota quirks as ProviderQuirks
+- *(papertrail)* bind delete_item's item identity once
+- *(papertrail)* bind the remaining enum tokens in SQL instead of spelling literals
+- *(papertrail)* state the ref-kind claim rank once on RefKind
+- *(papertrail)* type the mirror cursor's processed item kind as ItemKind
+- *(papertrail)* derive the error-class tokens and bind the pause class in SQL
+- *(papertrail)* name the persisted-health, symbol-span and issue-target shapes
+- *(papertrail)* key evidence coalescing on RecordKey
+- *(papertrail)* share the previous-civil-day rule between mirror and GitLab
+- *(papertrail)* reattach the commit-closer doc block to its function
+- *(papertrail)* route the tag and token fingerprints through hex_lower
+- *(llm)* make lib.rs an index of the crate's surface
+- *(llm)* correct provisioning visibility and stale module paths
+- *(llm)* name the sweep's failure-breaker budget once
+- *(llm)* build the tuner's and the benchmark's probe workload in one place
+- *(llm)* put the cookbook's platform process handling behind named shims
+- *(llm)* derive the embedding provision deadline from provision_deadline
+- *(llm)* type CookbookInput's backend and capability
+- *(llm)* fold the embedder's BuildParams into ProvisionedEmbedderParams
+- *(llm)* build every Authorization header in the shared http transport
+- *(oracle)* split backend tests by subject and narrow the lsp dead-code allow
+- *(oracle)* drop the stale phase-1 module headers and index every module
+- *(oracle)* collect store.rs row iterators instead of hand-rolled loops
+- *(oracle)* split the live pass's per-definition verdict write out of resolve_one_file
+- *(oracle)* give check_library_usage's cost-ordered phases their own functions
+- *(oracle)* spell the edge_oracle.kind SQL lists from OracleResolutionKind
+- *(oracle)* declare each live backend's moniker source on its registry entry
+- *(oracle)* share the edge-join-candidate SELECT and row mapper
+- *(oracle)* pin the corpus profile hash
+- *(oracle)* record an oracle run from a named OracleRunRecord
+- *(oracle)* express every drift gate through one pinning predicate
+- *(query)* share persisted memory test fixtures
+- *(query)* move memory tests into sibling modules
+- *(query)* curate graph and impact exports and remove row collectors
+- *(query)* make scoped_weighted_fan_in delegate to its batched sibling
+- *(query)* one short_name helper, and distinct names for the two qualified-symbol rules
+- *(query)* keep ImpactCategory typed through ImpactSurface
+- *(query)* read import/export dependents through one shared query
+- *(query)* share the traversal hop SELECT and summary counts between directions
+- *(query)* split important_symbols into its load, graph, seed and hydrate phases
+- *(query)* compose forward_visibility_filter from its three clauses
+- *(query)* name graph_meta's call-edge set and count/list predicates
+- *(query)* read binding resolution shadows through one named fragment
+- *(query)* name the live-memory status predicate once
+- *(dream)* match divergence evidence on the resolver's own resolution labels
+- *(dream)* keep the finding builders and imports in reading order
+- *(dream)* move the verdict grounding guards into their own module
+- *(dream)* write memory_reality through one UPSERT for both outcomes
+- *(dream)* build the pack content-line set once per grounding check
+- *(dream)* share each model pass's scope and failure-stamp preamble
+- *(dream)* name the unassigned repo sentinel through LEGACY_REPO_ID
+- *(clones)* share the RefineMember fixtures and import test names directly
+- *(clones)* pass the anti-unify class as one ClassView
+- *(clones)* drop the redundant per-group cancel poll in the maximality pass
+- *(clones)* split coherence_split_cancellable into named stages
+- *(clones)* gather member-run tokens and fold agreement in one place each
+- *(clones)* share one annotation-type scan
+- *(clones)* drive both LCS lanes through the budgeted path
+- *(clones)* type SigParam::type_source as an enum
+- *(clones)* name the v1 confidence thresholds and derive band steps
+- *(clones)* list str_escaped_char in the shared string-body kinds
+- *(clones)* restore the opening sentence of the MemberStatement doc
+- *(clones)* drop the crate-visible ClassAlignment and OccSpan re-export
+- *(clones)* write the star align's skip-and-sample arm once
+- *(clones)* make CellBudget own its spent/exhausted state
+- *(sync)* pin v1 revocation credit and plan explicit account upgrades ([#1343](https://github.com/cq27-dev/rag-rat/pull/1343))
+- *(oplog)* move large test modules to sibling files
+- *(oplog)* retain typed pending reasons in ingest outcomes
+- *(oplog)* share the identity-keyed wire set rules
+- *(oplog)* carry row keys and clocks through merge bookkeeping
+- *(oplog)* name projection ordering and assembly phases
+- *(oplog)* name the persisted pre-context stream placeholder
+- *(oplog)* name the (lamport, entry hash) chain cursor
+- *(oplog)* add field-aware constructors for stored fixed-width ids
+- *(oplog)* type the /5 scope id as ScopeId
+- *(oplog)* derive the node-status and override-action wire tokens with strum
+- *(oplog)* write the signed and stream-identity preimages through VecEncoderExt
+- *(oplog)* retire the stale crate header, dead-code allows and mangled comments
+- *(sync)* move the large inline test tails into tests modules and share the in-memory stores
+- *(sync)* split endpoint.rs into a module directory by concern
+- *(sync)* type the sync_invites role column as a StoredInviteKind
+- *(sync)* share the redeem-under-writer-lock scaffold between both invite kinds
+- *(sync)* expose transport error sources and derive discovery errors
+- *(sync)* share one bounded dial between the two enrollment dialers
+- *(sync)* bound every lane's frame IO through one deadline helper
+- *(sync)* route every length-prefixed framing through one reader and writer
+- *(sync)* carry the table session's idle timeout in its limits and pass capabilities, not bools
+- *(sync)* generate the op-log stores' NodeAuth impls from one macro
+- *(sync)* name lanes without ALPN-like suffixes and map every module in the crate docs
+- *(sync)* pin framing bytes and refusal boundaries before consolidation
+
 ## [0.23.2](https://github.com/cq27-dev/rag-rat/compare/v0.23.1...v0.23.2) - 2026-09-13
 
 ### Added
