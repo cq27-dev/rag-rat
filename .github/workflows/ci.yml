@@ -106,6 +106,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: ${{ !startsWith(runner.name, 'hetzner-') }}
       - uses: taiki-e/install-action@nextest
+        # install-action stages downloads in $HOME/.install-action/tmp and deletes it when done. The
+        # persistent runners share one $HOME, so concurrent jobs truncate each other's archives
+        # ("gzip: unexpected end of file"). The job temp dir is per runner and wiped every job.
+        env:
+          HOME: ${{ runner.temp }}
       # Hash embedder only (no model downloads). Tests run in parallel; the `ci` profile emits a
       # JUnit report at target/nextest/ci/junit.xml — nextest's store dir is workspace-relative, so
       # this holds wherever the cargo target dir points.
@@ -159,6 +164,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: ${{ !startsWith(runner.name, 'hetzner-') }}
       - uses: taiki-e/install-action@cargo-llvm-cov
+        # Per-runner staging dir; the persistent runners share $HOME (see the test job).
+        env:
+          HOME: ${{ runner.temp }}
       # The instrumented build is ~18 GB and identical on every persistent runner; one shared dir
       # instead of one per runner keeps it warm for all of them and stores it once. Cargo's own lock
       # covers only the build, not llvm-cov's clean/test/report cycle, so the whole command runs
