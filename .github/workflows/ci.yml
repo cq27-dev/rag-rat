@@ -212,7 +212,7 @@ jobs:
         working-directory: editors/vscode
       # Packaging smoke: the published VSIX must build from a clean checkout with no runtime
       # dependencies (both Node and web bundles are pre-built by `vscode:prepublish`).
-      - run: npx --yes @vscode/vsce package --no-dependencies --out /tmp/rag-rat-lens.vsix
+      - run: npx --yes @vscode/vsce package --no-dependencies --out "$RUNNER_TEMP/rag-rat-lens.vsix"
         working-directory: editors/vscode
 
       - name: Trim this runner's build cache
