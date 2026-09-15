@@ -83,6 +83,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: ${{ !startsWith(runner.name, 'hetzner-') }}
       - uses: taiki-e/install-action@nextest
+        # Per-runner staging dir; the persistent runners share $HOME (see ci.yml's test job).
+        env:
+          HOME: ${{ runner.temp }}
       # rust-cache can restore a PARTIAL ort-sys download — a cache marker present but the native
       # onnxruntime lib missing — so `cargo clean` alone re-emits link metadata pointing at a lib
       # that isn't there ("could not find native static library `onnxruntime`"). Nuke the downloaded
