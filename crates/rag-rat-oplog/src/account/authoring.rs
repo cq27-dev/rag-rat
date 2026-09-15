@@ -196,6 +196,7 @@ fn author_account_op_in_tx(
     op: &AccountOp,
     now_ms: i64,
 ) -> anyhow::Result<AccountEntryHash> {
+    super::control_policy::require_supported_account_control(tx, account_id)?;
     let fingerprint = device.fingerprint();
     // Chain from the control-log tail. Post-genesis the tail is never empty (the genesis is seq 0);
     // an empty chain here means the caller skipped the mint, which is a programming error.

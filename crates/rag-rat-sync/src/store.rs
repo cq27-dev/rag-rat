@@ -32,6 +32,7 @@ fn sign_binding(
     local_node: &[u8; 32],
     now_ms: i64,
 ) -> anyhow::Result<Vec<u8>> {
+    rag_rat_oplog::require_supported_account_control(conn, account_id)?;
     match sign_local_node_binding(conn, account_id, local_node, now_ms)? {
         Ok(bytes) => Ok(bytes),
         // No local device to sign with — send an anonymous (empty) binding. Never authorizes under
@@ -51,6 +52,7 @@ fn authorize_binding(
     remote_node: &[u8; 32],
     now_ms: i64,
 ) -> anyhow::Result<PeerAuthorization> {
+    rag_rat_oplog::require_supported_account_control(conn, account_id)?;
     Ok(match verify_node_binding(conn, account_id, binding, remote_node, now_ms)? {
         Ok(role) => PeerAuthorization::Granted(capability_for_role(role)),
         Err(NodeAuthError::NotRosterDevice) if account_effective_count(conn, account_id)? == 0 =>
@@ -141,6 +143,8 @@ impl SyncStore for OplogSyncStore<'_> {
     }
 
     fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Deferred)?;
+        rag_rat_oplog::require_supported_account_control(&tx, self.account_id)?;
         // Key by the SIGNED-envelope hash, not `entry_hash`: two envelopes can share an entry_hash
         // but differ in signature (pre-verify keeps competing signatures for exactly this reason),
         // and diffing by entry_hash would let a peer holding the valid signature suppress it.
@@ -159,9 +163,10 @@ impl SyncStore for OplogSyncStore<'_> {
         // non-public stream is skipped entirely, by the same fully-public gate as the owner.
         let entries = match self.serve_scope {
             ServeScope::Full => {
-                let mut entries = account_entries_for_sync(self.conn, self.account_id)?;
-                for grantee in ever_granted_accounts(self.conn, self.account_id)? {
-                    entries.extend(account_entries_for_enrollment(self.conn, grantee)?);
+                let mut entries = account_entries_for_sync(&tx, self.account_id)?;
+                for grantee in ever_granted_accounts(&tx, self.account_id)? {
+                    rag_rat_oplog::require_supported_account_control(&tx, grantee)?;
+                    entries.extend(account_entries_for_enrollment(&tx, grantee)?);
                 }
                 entries
             },
@@ -172,13 +177,13 @@ impl SyncStore for OplogSyncStore<'_> {
                 // ONE deferred snapshot so a concurrent `StreamOwn` committed on another connection
                 // can never slip a private stream in between the check and the read (the resident
                 // host runs sessions on separate connections, so this is a real race).
-                let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Deferred)?;
                 anyhow::ensure!(
                     account_is_fully_public(&tx, self.account_id)?,
                     "refusing PublicOnly serve: account holds a non-public stream",
                 );
                 let mut entries = account_entries_for_enrollment(&tx, self.account_id)?;
                 for grantee in ever_granted_accounts(&tx, self.account_id)? {
+                    rag_rat_oplog::require_supported_account_control(&tx, grantee)?;
                     if account_is_fully_public(&tx, grantee)? {
                         entries.extend(account_entries_for_enrollment(&tx, grantee)?);
                     }
@@ -193,6 +198,7 @@ impl SyncStore for OplogSyncStore<'_> {
     }
 
     fn ingest(&mut self, signed_bytes: &[u8]) -> anyhow::Result<Ingested> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         // Refuse an entry for an account this session does not carry before it reaches
         // `account_ingest`. `account_ingest` would happily store a valid entry for any account (it
         // is not account-scoped), so a peer could otherwise inject and grow unrelated accounts
@@ -277,6 +283,8 @@ impl SyncStore for OplogContentSyncStore<'_> {
     }
 
     fn snapshot(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Deferred)?;
+        rag_rat_oplog::require_supported_account_control(&tx, self.account_id)?;
         // Key by the SIGNED-envelope hash, not `entry_hash`: two content envelopes can share an
         // entry_hash but differ in signature (content_pre_verify keeps competing signatures for
         // exactly this reason), and diffing by entry_hash would let a peer holding the valid
@@ -286,11 +294,10 @@ impl SyncStore for OplogContentSyncStore<'_> {
         // omits the unauthenticated parked `content_pre_verify` candidates) — a public server must
         // not relay forged candidates to anonymous readers.
         let entries = match self.serve_scope {
-            ServeScope::Full => content_entries_for_sync(self.conn, self.account_id)?,
+            ServeScope::Full => content_entries_for_sync(&tx, self.account_id)?,
             ServeScope::PublicOnly => {
                 // Same fail-closed guard as the account store, in one deferred snapshot so the
                 // check and the serve see identical state.
-                let tx = Transaction::new_unchecked(self.conn, TransactionBehavior::Deferred)?;
                 anyhow::ensure!(
                     account_is_fully_public(&tx, self.account_id)?,
                     "refusing PublicOnly serve: account holds a non-public stream",
@@ -305,6 +312,7 @@ impl SyncStore for OplogContentSyncStore<'_> {
     }
 
     fn ingest(&mut self, signed_bytes: &[u8]) -> anyhow::Result<Ingested> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         // Admit this account's OWN content, plus foreign content on a `public_read` stream, before
         // it reaches `content_ingest`. This is a session-scope PRE-FILTER, not a trust boundary:
         // the claimed author is attacker-settable, so `content_ingest` re-resolves the roster key
@@ -389,6 +397,7 @@ impl<'a, F: Fn() -> i64> OplogTableSyncStore<'a, F> {
 
     /// Whether this binary currently supports any table stream for this account.
     pub fn has_streams(&self) -> anyhow::Result<bool> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         Ok(!rag_rat_oplog::table_sync_supported_streams(self.conn, self.account_id)?.is_empty())
     }
 }
@@ -417,6 +426,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 
     fn prepare(&mut self) -> anyhow::Result<()> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         // Author local edits FIRST, then compact: a row whose physical state disagrees with its
         // merge state halts compaction's re-authoring until the producer has settled it, so
         // authoring first lets compaction reach its budget in the same pass. `prepare` runs only
@@ -435,6 +445,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 
     fn has_pending_coverage(&self, item: &ManifestItem) -> anyhow::Result<bool> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         rag_rat_oplog::table_sync_has_pending_coverage(
             self.conn,
             self.account_id,
@@ -443,6 +454,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 
     fn supported_streams(&self) -> anyhow::Result<Vec<ManifestItem>> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         Ok(rag_rat_oplog::table_sync_supported_streams(self.conn, self.account_id)?
             .into_iter()
             .map(to_manifest_item)
@@ -450,6 +462,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 
     fn validates(&self, item: &ManifestItem) -> anyhow::Result<bool> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         rag_rat_oplog::table_sync_validate_stream(
             self.conn,
             self.account_id,
@@ -463,6 +476,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         after_device: Option<[u8; 32]>,
         limit: usize,
     ) -> anyhow::Result<Vec<ChainHead>> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         Ok(rag_rat_oplog::table_sync_chain_page_after(
             self.conn,
             self.account_id,
@@ -481,6 +495,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
     }
 
     fn frontier(&self, item: &ManifestItem, device: [u8; 32]) -> anyhow::Result<FrontierState> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         Ok(
             match rag_rat_oplog::table_sync_chain_frontier(
                 self.conn,
@@ -506,6 +521,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         start: ChainStart,
         limit: usize,
     ) -> anyhow::Result<Vec<ChainEntry>> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         let start = match start {
             ChainStart::Beginning => rag_rat_oplog::TableSyncEntryStart::Beginning,
             ChainStart::After { lamport, entry_hash } =>
@@ -542,6 +558,7 @@ impl<F: Fn() -> i64> TableSyncStore for OplogTableSyncStore<'_, F> {
         offered: &ChainHead,
         signed_bytes: &[u8],
     ) -> anyhow::Result<Ingested> {
+        rag_rat_oplog::require_supported_account_control(self.conn, self.account_id)?;
         Ok(
             match rag_rat_oplog::table_sync_ingest(
                 self.conn,
@@ -579,6 +596,79 @@ mod tests {
         assert_eq!(capability_for_role(DeviceRole::ReadOnly), PeerCapability::ReadOnly);
         assert_eq!(capability_for_role(DeviceRole::Member), PeerCapability::ReadWrite);
         assert_eq!(capability_for_role(DeviceRole::Owner), PeerCapability::ReadWrite);
+    }
+
+    fn assert_unsupported<T>(result: anyhow::Result<T>) {
+        let error = match result {
+            Ok(_) => panic!("a pinned unsupported account must block the operation"),
+            Err(error) => error,
+        };
+        assert!(
+            error.downcast_ref::<rag_rat_oplog::UnsupportedAccountControlVersion>().is_some(),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn stores_recheck_a_pin_installed_after_their_handshake() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &rag_rat_db::hooks::MigrationHooks::noop()).unwrap();
+        let account = rag_rat_oplog::local_account(&conn, 7).unwrap();
+        let device = rag_rat_oplog::local_device(&conn, 7).unwrap();
+        let node = crate::endpoint::node_id_from_secret([2; 32]);
+        let mut account_store = OplogSyncStore::new(&conn, account, || 7);
+        let mut content_store = OplogContentSyncStore::new(&conn, account, || 7);
+        let mut table_store = OplogTableSyncStore::new(&conn, account, || 7);
+        let auth = account_store.local_auth(&node, 7).unwrap();
+        assert_eq!(auth.capability, PeerCapability::ReadWrite);
+        assert!(!account_store.snapshot().unwrap().is_empty());
+        assert!(content_store.snapshot().unwrap().is_empty());
+        assert!(!table_store.has_streams().unwrap());
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let bundle = rag_rat_oplog::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
+        let pin = rag_rat_oplog::TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: bundle.certificate_digest(),
+            required_control_version: 2,
+        };
+        let proof = rag_rat_oplog::verify_checkpoint(pin, &bundle).unwrap();
+        rag_rat_oplog::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap();
+        tx.commit().unwrap();
+
+        assert_unsupported(account_store.local_auth(&node, 7));
+        assert_unsupported(account_store.authorize(&auth.binding, &node, 7));
+        assert_unsupported(account_store.snapshot());
+        assert_unsupported(account_store.ingest(&[0]));
+        assert_unsupported(content_store.snapshot());
+        assert_unsupported(content_store.ingest(&[0]));
+        assert_unsupported(table_store.has_streams());
+        assert_unsupported(table_store.prepare());
+        assert_unsupported(table_store.supported_streams());
+        let item = ManifestItem {
+            repo_id: "repo".into(),
+            incarnation_ref: [3; 32],
+            scope_id: "anchors/1".into(),
+            stream_id: [4; 32],
+        };
+        assert_unsupported(table_store.validates(&item));
+        assert_unsupported(table_store.has_pending_coverage(&item));
+        assert_unsupported(table_store.chain_page(&item, None, 1));
+        assert_unsupported(table_store.frontier(&item, [5; 32]));
+        assert_unsupported(table_store.entries(&item, [5; 32], ChainStart::Beginning, 1));
+        assert_unsupported(table_store.ingest(
+            &item,
+            &ChainHead {
+                device_fingerprint: [5; 32],
+                lamport: 0,
+                entry_hash: [6; 32],
+                floor: None,
+            },
+            &[0],
+        ));
+        // The pin is account-scoped even when stores share one database.
+        let unrelated = OplogSyncStore::new(&conn, AccountId::from_bytes([9; 32]), || 7);
+        assert!(unrelated.snapshot().unwrap().is_empty());
     }
 
     #[test]

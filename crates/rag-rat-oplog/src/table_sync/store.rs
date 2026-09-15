@@ -1496,6 +1496,7 @@ pub(crate) fn assert_current_incarnation(
     repo_id: &str,
     incarnation_ref: [u8; 32],
 ) -> anyhow::Result<()> {
+    crate::account::require_supported_account_control(tx, account_id)?;
     match crate::account::repo_incarnation_state(tx, account_id, repo_id)? {
         crate::account::RepoIncarnationState::Current(current)
             if current == crate::AccountEntryHash::from_bytes(incarnation_ref) =>

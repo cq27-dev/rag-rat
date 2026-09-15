@@ -153,8 +153,20 @@ Incomplete proofs must be observable as pending evidence; an installed pin requi
 control semantics must block operational authority explicitly. Enrollment must bind the expected
 pin through ticket, request, redemption, cached replay, and receipt verification. Pin, validated
 history, policy-aware enrollment acceptance, and account adoption must commit atomically. Recovery
-must export/import the pin with its certificate and full evidence. These persistence, integration,
-and activation paths are not implemented by the certificate-verification prerequisite above.
+must export/import the pin with its certificate and full evidence. V130 implements immutable pin and complete certificate/evidence retention outside derived
+authority, with snapshot-local policy queries and recovery export that re-verifies the proof.
+`pin_checkpoint_in_tx` consumes an externally expected pin and a `VerifiedCheckpoint` in the
+caller's IMMEDIATE transaction. Identical installation is idempotent; conflicting pins refuse.
+Refold suppresses operational authority while retaining signed evidence and the permanent pin.
+Roster, content, table-sync, enrollment and authoring paths return a typed
+`UnsupportedAccountControlVersion` under an installed pin, including sessions authenticated
+before installation. Unpinned v1 accounts continue using v1 semantics.
+
+This is a fail-closed persistence prerequisite, not v2 activation. There is no CLI pin-install
+or upgrade command. Trusted ticket transfer, versioned enrollment and atomic recovery adoption
+still require the complete policy-aware evaluator. A backup must retain the pin tables and proof;
+restoring older unpinned history requires supplying the trusted pin before operational use.
+Ordinary peer traffic never installs or replaces a pin.
 
 ## Wire and persistence integration
 

@@ -81,6 +81,7 @@ pub(crate) fn produce_and_author(
     tx: &Transaction<'_>,
     ctx: &SyncCtx<'_>,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
+    crate::account::require_supported_account_control(tx, ctx.account_id)?;
     store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     // Never author into a store a NEWER projector folded: our narrower column set would record
     // anti-echo hashes and park decisions the newer binary has to distrust.
@@ -194,6 +195,7 @@ pub(crate) fn process_readoption_work_for_stream(
     ctx: &SyncCtx<'_>,
     stream: crate::stream::StreamId,
 ) -> anyhow::Result<Option<usize>> {
+    crate::account::require_supported_account_control(tx, ctx.account_id)?;
     let Some(work) = store::readoption_work_for_stream(tx, ctx.account_id, stream)? else {
         return Ok(Some(0));
     };
@@ -364,6 +366,7 @@ pub(crate) fn reauthor_chain_pins(
     cap: usize,
     past_stuck: bool,
 ) -> anyhow::Result<usize> {
+    crate::account::require_supported_account_control(tx, ctx.account_id)?;
     if pins.is_empty() {
         return Ok(0);
     }
@@ -624,6 +627,7 @@ pub(crate) fn ingest(
     pubkey: &DevicePublic,
     advertised_floor: Option<store::ChainCursor>,
 ) -> anyhow::Result<IngestReport> {
+    crate::account::require_supported_account_control(tx, ctx.account_id)?;
     store::assert_current_incarnation(tx, ctx.account_id, ctx.repo_id, ctx.incarnation_ref)?;
     let device = pubkey.fingerprint();
     let stream = scope_stream_id(ctx.repo_id, ctx.account_id, ctx.incarnation_ref, scope_id);

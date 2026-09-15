@@ -170,6 +170,8 @@ fn require_founder_enrollment_authority(
     conn: &Connection,
     account_id: AccountId,
 ) -> Result<(), InviteError> {
+    rag_rat_oplog::require_supported_account_control(conn, account_id)
+        .map_err(InviteError::from)?;
     if read_local_account(conn)
         .map_err(InviteError::from)?
         .filter(|local| *local == account_id)
@@ -613,10 +615,16 @@ fn screen_under_writer_lock<'c, R>(
     after_load: impl Fn(&StoredInvite) -> Result<(), InviteError>,
     screen: impl Fn(&Connection, StoredInvite, i64) -> Result<Screened<R>, InviteError>,
 ) -> Result<LockedRedemption<'c, R>, InviteError> {
-    let invite = load_invite(conn, nonce)?;
-    after_load(&invite)?;
-    let arrival_ms = now_ms();
-    match screen(conn, invite, arrival_ms)? {
+    let initial = {
+        let read_tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)
+            .map_err(|error| InviteError::Storage(error.into()))?;
+        let invite = load_invite(&read_tx, nonce)?;
+        after_load(&invite)?;
+        let arrival_ms = now_ms();
+        (screen(&read_tx, invite, arrival_ms)?, arrival_ms)
+    };
+    let (initial, arrival_ms) = initial;
+    match initial {
         Screened::Replay(receipt) => return Ok(LockedRedemption::Replay(receipt)),
         Screened::ReplayExpired => {
             prune_expired_invites(conn, arrival_ms)?;
@@ -689,6 +697,8 @@ fn screen_invite(
     invite: StoredInvite,
     at_ms: i64,
 ) -> Result<Screened<EnrollmentReceipt>, InviteError> {
+    rag_rat_oplog::require_supported_account_control(conn, stored_invite_account(&invite)?)
+        .map_err(InviteError::from)?;
     if receipt_replay_expired(&invite, at_ms) {
         return Ok(Screened::ReplayExpired);
     }
@@ -709,6 +719,8 @@ fn screen_writer_invite(
     invite: StoredInvite,
     at_ms: i64,
 ) -> Result<Screened<WriterGrantReceipt>, InviteError> {
+    rag_rat_oplog::require_supported_account_control(conn, stored_invite_account(&invite)?)
+        .map_err(InviteError::from)?;
     if receipt_replay_expired(&invite, at_ms) {
         return Ok(Screened::ReplayExpired);
     }
