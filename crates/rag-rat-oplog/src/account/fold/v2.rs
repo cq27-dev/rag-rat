@@ -846,7 +846,13 @@ mod tests {
     fn v1_credit(frozen: &FrozenLegacy, twin: &Candidate) -> u64 {
         let mut entries = frozen.entries().to_vec();
         entries.push(twin.entry.clone());
-        let history = fold_account(&entries);
+        let (history, trace) = fold_account_traced(&entries, true);
+        // v1 computes a credit only for the cuts that actually installed a register. A cut it
+        // refused is not a contributor and is credited nothing at all, so gating on that set is
+        // what makes this the credit v1 GIVES rather than what the rule would compute if asked.
+        if !trace.is_some_and(|trace| trace.contributors.contains(&twin.hash())) {
+            return 0;
+        }
         let Some(genesis) = history.genesis_hash() else {
             return 0;
         };
