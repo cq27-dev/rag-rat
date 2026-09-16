@@ -44,7 +44,12 @@ fn revocation(demote: bool) -> ops::ControlOp {
             reason: "revoked".into(),
         }
     };
-    ops::ControlOp { checkpoint: [1; 32], pre_cut_view: [2; 32], op, credit_frontier: Some(vec![]) }
+    ops::ControlOp {
+        checkpoint: [1; 32],
+        pre_cut_view: Some([2; 32]),
+        op,
+        credit_frontier: Some(vec![]),
+    }
 }
 
 fn manifest(
@@ -62,7 +67,7 @@ fn signed(
 ) -> SignedAccountEntry {
     let mut op = revocation(false);
     op.checkpoint = checkpoint.pin().checkpoint_digest;
-    op.pre_cut_view = pre_cut_view;
+    op.pre_cut_view = Some(pre_cut_view);
     if let AccountOp::DeviceRemove { reason, .. } = &mut op.op {
         *reason = format!("revoked {salt}");
     }
@@ -104,7 +109,7 @@ fn revocations_bind_both_view_and_frontier_without_changing_v1_bytes() {
         assert!(legacy::decode(tag, &bytes).is_err());
         assert!(ops::decode(tag, &old).is_err());
         assert_eq!(legacy::encode(&op.op).unwrap(), old);
-        op.pre_cut_view[0] ^= 1;
+        op.pre_cut_view = Some([9; 32]);
         assert_ne!(op.encode().unwrap(), bytes);
         assert_eq!(fold::SUPPORTED_OP_VERSION, 1);
     }
@@ -160,10 +165,14 @@ fn payload_fit_does_not_bypass_the_complete_signed_envelope_limit() {
 }
 
 #[test]
-fn frontier_presence_duplicates_and_storage_range_are_validated_before_signing() {
+fn view_and_frontier_slots_are_present_exactly_for_a_revocation() {
     let mut op = revocation(false);
     op.credit_frontier = None;
-    assert!(op.encode().is_err());
+    assert!(op.encode().is_err(), "a revocation carries a frontier");
+    op.credit_frontier = Some(vec![]);
+    op.pre_cut_view = None;
+    assert!(op.encode().is_err(), "a revocation nominates a view");
+    op.pre_cut_view = Some([2; 32]);
     let head = DeviceCut {
         device_fingerprint: DeviceFingerprint::from_bytes([3; 32]),
         seq: 0,
@@ -175,10 +184,14 @@ fn frontier_presence_duplicates_and_storage_range_are_validated_before_signing()
     assert!(op.encode().is_err());
     op.credit_frontier = Some(vec![head; ops::FRONTIER_MAX + 1]);
     assert!(op.encode().is_err());
+
+    // An ordinary operation carries neither, and needs no historical evidence to be read.
     op.op = AccountOp::OwnerPromote { device_fingerprint: DeviceFingerprint::from_bytes([3; 32]) };
     op.credit_frontier = Some(vec![]);
     assert!(op.encode().is_err());
     op.credit_frontier = None;
+    assert!(op.encode().is_err(), "an ordinary operation nominates no view");
+    op.pre_cut_view = None;
     let bytes = op.encode().unwrap();
     assert_eq!(ops::decode(legacy::entry_type_of(&op.op), &bytes).unwrap(), op);
 }
@@ -288,51 +301,24 @@ fn checkpoint_mismatch_and_duplicate_evidence_are_rejected() {
 }
 
 #[test]
-fn dependency_depth_is_bounded_even_when_views_share_previous_results() {
-    let (checkpoint, device) = checkpoint();
-    let mut latest = manifest(&checkpoint, vec![]);
-    let mut manifests = vec![latest.encode().unwrap()];
-    let mut evidence = Vec::new();
-    for level in 1..views::MAX_DEPTH {
-        let entry = signed(&checkpoint, &device, latest.digest().unwrap(), level as u8);
-        latest = manifest(&checkpoint, vec![entry.entry_hash]);
-        evidence.push(entry.signed_bytes);
-        manifests.push(latest.encode().unwrap());
-    }
-    assert_eq!(
-        plan_replay(&checkpoint, &device, latest.digest().unwrap(), &manifests, &evidence)
-            .unwrap()
-            .views()
-            .count(),
-        views::MAX_DEPTH
-    );
-    let entry = signed(&checkpoint, &device, latest.digest().unwrap(), 99);
-    latest = manifest(&checkpoint, vec![entry.entry_hash]);
-    evidence.push(entry.signed_bytes);
-    manifests.push(latest.encode().unwrap());
-    assert!(matches!(
-        plan_replay(&checkpoint, &device, latest.digest().unwrap(), &manifests, &evidence),
-        Err(views::PlanError::Invalid(_))
-    ));
+fn no_lifetime_limit_is_stricter_than_the_declared_evidence_budget() {
+    // Every view and every reference has to be supplied as bytes, so the storage budget already
+    // bounds the work. A tighter view or reference cap would only limit how long an account may
+    // keep revoking, which is not a bound on anything a receiver spends.
+    assert_eq!(views::MAX_VIEWS, views::MAX_ENTRIES);
+    assert_eq!(views::MAX_REFERENCES, views::MAX_BYTES / 32);
 }
 
 #[test]
-fn total_references_are_bounded_across_individually_small_manifests() {
+fn aggregate_manifests_are_bounded_by_the_declared_evidence_byte_budget() {
     let (checkpoint, device) = checkpoint();
-    let mut manifests = Vec::new();
-    for salt in 0..5 {
-        let entries = (0..views::MAX_ENTRIES)
-            .map(|n| {
-                let mut hash = [salt; 32];
-                hash[..8].copy_from_slice(&(n as u64).to_be_bytes());
-                hash.into()
-            })
-            .collect();
-        manifests.push(manifest(&checkpoint, entries).encode().unwrap());
-    }
+    let chunk = views::MAX_BYTES / 128;
+    let manifests = vec![vec![0u8; chunk]; 200];
+    assert!(manifests.iter().all(|bytes| bytes.len() < views::MAX_BYTES));
     let result = plan_replay(&checkpoint, &device, [0; 32], &manifests, &[]);
     assert!(
-        matches!(result, Err(views::PlanError::Invalid(error)) if error.to_string().contains("reference limit"))
+        matches!(result, Err(views::PlanError::Invalid(error)) if error.to_string().contains("byte limit")),
+        "individually small manifests still have to fit the aggregate budget",
     );
 }
 

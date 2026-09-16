@@ -16,7 +16,10 @@ pub(in crate::account) const FRONTIER_MAX: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::account) struct ControlOp {
     pub checkpoint: [u8; 32],
-    pub pre_cut_view: [u8; 32],
+    /// The digest of the detached manifest naming this revocation's pre-cut view. Only a
+    /// revocation nominates one; an ordinary operation needs no historical view at all, so the
+    /// slot is absent and an executor never demands evidence it cannot use.
+    pub pre_cut_view: Option<[u8; 32]>,
     pub op: AccountOp,
     /// Present even when empty for a revocation; absent for every other operation.
     pub credit_frontier: Option<Vec<DeviceCut>>,
@@ -27,6 +30,7 @@ impl ControlOp {
         anyhow::ensure!(!matches!(self.op, AccountOp::AccountGenesis { .. }), "v2 has no genesis");
         let revocation =
             matches!(self.op, AccountOp::DeviceRemove { .. } | AccountOp::OwnerDemote { .. });
+        anyhow::ensure!(revocation == self.pre_cut_view.is_some(), "pre-cut view presence");
         anyhow::ensure!(revocation == self.credit_frontier.is_some(), "credit frontier presence");
         let mut frontier = self.credit_frontier.clone();
         if let Some(frontier) = &mut frontier {
@@ -47,7 +51,14 @@ impl ControlOp {
         e.put_array(5);
         e.put_str(DOMAIN);
         e.put_bytes(&self.checkpoint);
-        e.put_bytes(&self.pre_cut_view);
+        match &self.pre_cut_view {
+            Some(view) => {
+                e.put_bytes(view);
+            },
+            None => {
+                e.put_null();
+            },
+        }
         e.put_bytes(&payload);
         if let Some(frontier) = frontier {
             e.put_array(frontier.len() as u64);
@@ -72,7 +83,12 @@ pub(in crate::account) fn decode(entry_type: u32, bytes: &[u8]) -> anyhow::Resul
     let mut d = Decoder::new(bytes);
     anyhow::ensure!(d.array()? == Some(5) && d.str()? == DOMAIN, "v2 control grammar");
     let checkpoint = id::fixed(d.bytes()?)?;
-    let pre_cut_view = id::fixed(d.bytes()?)?;
+    let pre_cut_view = if d.datatype()? == minicbor::data::Type::Null {
+        d.null()?;
+        None
+    } else {
+        Some(id::fixed(d.bytes()?)?)
+    };
     let DecodedAccountOp::Known(op) = legacy::decode(entry_type, d.bytes()?)? else {
         anyhow::bail!("unsupported v2 control operation");
     };
