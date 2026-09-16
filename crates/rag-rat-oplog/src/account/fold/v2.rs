@@ -9,6 +9,19 @@
 //! a narrower membership test, so it is a subset of the v1 credit over the same outcomes, and every
 //! v1 ceiling still caps it.
 //!
+//! **What is and is not evaluated.** A nominated entry counts only if it held authority: a live
+//! owner incarnation minted for its OWN signer, with no legacy register already cutting its chain.
+//! Authentication and the chain walk establish who wrote an entry and where it sits, never that it
+//! was allowed to, so neither substitutes for that check. This is deliberately STRICTER than the v1
+//! pass, where condemnation outranks a stale-authority rejection and an unauthorized entry on the
+//! revoked chain is therefore credited: such an entry was never in the effective count, so counting
+//! its removal counts something its own author never did. Under-crediting only parks a cut, it
+//! never admits one that is ahead. State preconditions (a duplicate
+//! enrolment, a tombstoned re-add) are NOT evaluated — the v1 fold rejects those `Ineffective` and
+//! never credits them, so an entry failing one can still be counted here. That over-count is
+//! confined to the revoked device's own chain, since a cut counts only what its own register keys
+//! scope, and it can never exceed the entries actually nominated on that chain.
+//!
 //! **What the checkpoint froze.** Legacy outcomes are read from the verified fold verbatim. A v2
 //! cut may condemn what the legacy epoch left standing, but it cannot revive a branch loser, awaken
 //! a legacy parked cut, or undo a legacy tombstone — and a legacy entry that was already out of the
@@ -163,17 +176,48 @@ fn credit_under(input: &CutExecution<'_>, scope: CreditScope<'_>) -> u64 {
         }
     }
 
-    // Legacy outcomes come from the checkpoint verbatim; the nominated v2 entries are exactly the
-    // ones the owner's signature places in this view.
+    // Legacy outcomes come from the checkpoint verbatim.
     let mut outcomes: HashMap<AccountEntryHash, Outcome> = HashMap::new();
-    for (idx, candidate) in candidates.iter().enumerate() {
-        let outcome = if idx < legacy_count {
-            input.frozen.history.outcome(&candidate.hash())
-        } else {
-            Some(Outcome::Effective { auth_epoch: 0 })
-        };
-        if let Some(outcome) = outcome {
+    for candidate in &candidates[..legacy_count] {
+        if let Some(outcome) = input.frozen.history.outcome(&candidate.hash()) {
             outcomes.insert(candidate.hash(), outcome);
+        }
+    }
+    // A nominated entry is effective only if it held authority in this epoch. Being signed by a
+    // certified key and sitting on a chain that reaches an accepted branch establishes WHO wrote it
+    // and WHERE, never that it was allowed to: without this an unauthorized op — one the v1 fold
+    // rejects outright, and so never counts — would enter as effective and be worth a credit as
+    // soon as the cut condemned it, which is exactly the admission bypass a nomination must not
+    // buy. Ascending depth, so a mint is always settled before anything citing it.
+    // Every v2 candidate starts unauthorized and has to earn its place. One whose cited incarnation
+    // does not even resolve is never visited below, so it simply stays out.
+    let mut unauthorized: HashSet<AccountEntryHash> =
+        candidates[legacy_count..].iter().map(Candidate::hash).collect();
+    let mut v2_mints: HashMap<OwnerId, DeviceFingerprint> = HashMap::new();
+    for &idx in strata.values().flatten() {
+        if idx < legacy_count {
+            continue;
+        }
+        let candidate = &candidates[idx];
+        let signer = candidate.header().device_fingerprint;
+        let authorized = candidate.header().authority_ref.is_some_and(|incarnation| {
+            input.frozen.owner_is_live(incarnation, signer)
+                || v2_mints.get(&incarnation) == Some(&signer)
+        });
+        // The legacy epoch's registers still bound these chains, and continuing one at version 2
+        // does not reopen it.
+        let cut_by_legacy = matches!(
+            register_verdict(candidate, &input.frozen.trace.registers, &view),
+            RegisterVerdict::Condemned(_)
+        );
+        if authorized && !cut_by_legacy {
+            unauthorized.remove(&candidate.hash());
+            outcomes.insert(candidate.hash(), Outcome::Effective { auth_epoch: 0 });
+            if candidate.is_mint() {
+                v2_mints.insert(candidate.hash().into(), candidate.subject_device());
+            }
+        } else {
+            outcomes.insert(candidate.hash(), Outcome::Rejected(RejectReason::StaleAuthority));
         }
     }
 
@@ -181,7 +225,11 @@ fn credit_under(input: &CutExecution<'_>, scope: CreditScope<'_>) -> u64 {
     // view never widens this one's scope; it only moves outcomes, which is precisely why the
     // guarantee is an upper bound on identities rather than a fixed number.
     for candidate in &candidates {
-        if candidate.hash() == input.cut.hash() {
+        // An entry that never held authority was never in the effective count, so condemning it
+        // takes nothing away. The v1 overlay would promote it to `Condemned` anyway — condemnation
+        // outranks a stale-authority rejection there — and hand this cut a credit for an entry its
+        // own author never counted. Holding it out keeps the credit at or below the v1 rule.
+        if candidate.hash() == input.cut.hash() || unauthorized.contains(&candidate.hash()) {
             continue;
         }
         if let RegisterVerdict::Condemned(reason) = register_verdict(candidate, &registers, &view) {
@@ -547,6 +595,73 @@ mod tests {
         // own registers actually condemn it.
         assert_eq!(applied.credit, baseline.credit);
         assert_eq!(applied.credit, 1);
+    }
+
+    /// Being certified and on an accepted branch is not authority. The subject's key is certified
+    /// by the accepted legacy epoch and its chain reaches an accepted entry, so it passes both the
+    /// signature and the ancestry gate — but it holds no live incarnation, and an entry it signs
+    /// citing the founder's incarnation is impersonation the fold rejects outright.
+    #[test]
+    fn a_nomination_does_not_buy_admission_for_an_unauthorized_entry() {
+        let fixture = demoted_owner();
+        let (cut, _) = v2_cut(&fixture, false);
+        let enrol = {
+            let other = Dev::new(31);
+            AccountOp::DeviceAdd {
+                device_fingerprint: other.fp,
+                ed25519_pubkey: other.ed,
+                x25519_pubkey: other.x,
+                role: DeviceRole::Member,
+                label: None,
+            }
+        };
+        let op = v2_ops::ControlOp {
+            checkpoint: fixture.checkpoint.pin().checkpoint_digest,
+            pre_cut_view: None,
+            op: enrol,
+        };
+        // Cites the FOUNDER's live incarnation, which no legacy register bounds, so the only thing
+        // that can keep this out of the count is the mint naming a different device than the
+        // signer.
+        let signed = envelope::sign_account_entry(
+            &fixture.subject.secret,
+            &AccountEntryHeader {
+                account_id: fixture.checkpoint.pin().account_id,
+                log_id: 0,
+                device_fingerprint: fixture.subject.fp,
+                seq: 2,
+                prev_hash: Some(fixture.condemned_victim),
+                parent_ref: Some(fixture.condemned_victim),
+                entry_type: ops::entry_type_of(&op.op),
+                op_version: v2_ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(fixture.incarnation),
+            },
+            &op.encode().unwrap(),
+        )
+        .unwrap();
+        let unauthorized = Candidate::new(
+            VerifiedAccountEntry {
+                header: signed.header,
+                payload: signed.payload,
+                entry_hash: signed.entry_hash,
+            },
+            op.op,
+        );
+
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let without = apply_cut(CutExecution { frozen, nominated: &[], cut: &cut });
+        let with = apply_cut(CutExecution {
+            frozen,
+            nominated: std::slice::from_ref(&unauthorized),
+            cut: &cut,
+        });
+        // It sits on the revoked device's chain and the cut's device register condemns everything
+        // there, so it would be worth a credit the moment it were treated as effective.
+        assert_eq!(with.credit, without.credit, "a nomination never substitutes for admission");
+        assert_eq!(with.credit, 1);
     }
 
     #[test]

@@ -9,6 +9,10 @@
 //! to the legacy branch leaves the operation unapplied in full: no register, no credit, and no
 //! partial effect that a later arrival would have to unwind.
 //!
+//! Malformed input is an `Err`, never a verdict. A peer that attaches one unverifiable object to an
+//! otherwise sound operation gets its bundle refused; it does not get the operation itself
+//! permanently condemned, which is what a `Rejected` means.
+//!
 //! Every bound is the planner's declared evidence budget ([`views::MAX_ENTRIES`],
 //! [`views::MAX_BYTES`]), counted over the deduplicated objects this call was handed. Verification
 //! is performed fresh here on every call; no cache stands in for it.
@@ -54,7 +58,8 @@ pub(in crate::account) enum ParkCause {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::account) enum RejectCause {
-    /// No key the accepted legacy epoch certifies authenticates the supplied evidence.
+    /// No key the accepted legacy epoch certifies names the author of some supplied entry. This is
+    /// about the absence of a certifying key, never about bytes that fail to verify under one.
     Unauthenticated,
     /// The operation cites no live owner incarnation minted for its own signer.
     Inadmissible,
@@ -77,8 +82,12 @@ pub(in crate::account) fn execute(
         Err(views::PlanError::Invalid(error)) => return Err(error),
     };
     let frozen = checkpoint.frozen_legacy();
-    let Some(authenticated) = authenticate(&plan, frozen) else {
-        return Ok(Verdict::Rejected(RejectCause::Unauthenticated));
+    let authenticated = match authenticate(&plan, frozen) {
+        Ok(authenticated) => authenticated,
+        // Bytes that do not verify are a bad bundle, not a bad operation.
+        Err(AuthFailure::Malformed(error)) => return Err(error),
+        Err(AuthFailure::UnknownSigner) =>
+            return Ok(Verdict::Rejected(RejectCause::Unauthenticated)),
     };
 
     // Ancestry before authority: an operation whose branch we cannot yet walk is behind, not wrong.
@@ -88,10 +97,11 @@ pub(in crate::account) fn execute(
     let walk = std::iter::once(&authenticated.consumer).chain(authenticated.entries.values());
     for entry in walk {
         let header = &entry.verified.header;
-        if let Err(cause) =
-            chain_reaches_accepted_legacy(header, &authenticated, frozen, &mut reached)
-        {
-            return Ok(Verdict::Parked(cause));
+        match chain_reaches_accepted_legacy(header, &authenticated.headers, frozen, &mut reached) {
+            Ok(()) => {},
+            Err(WalkError::Incomplete(cause)) => return Ok(Verdict::Parked(cause)),
+            Err(WalkError::OverBudget) =>
+                anyhow::bail!("control chain ancestry exceeds the declared evidence budget"),
         }
     }
 
@@ -114,6 +124,8 @@ pub(in crate::account) fn execute(
     }
 
     // Only the identities the operation's own manifest named; an ordinary operation names none.
+    // Each one's own authority is judged inside the execution, never assumed from having been
+    // named here.
     let nominated: Vec<Candidate> = plan
         .root()
         .into_iter()
@@ -146,6 +158,14 @@ struct Authenticated {
     headers: HashMap<AccountEntryHash, AccountEntryHeader>,
 }
 
+/// Why authentication could not complete. The two cases carry different consequences, so they are
+/// never collapsed: absent certification is a property of the account, unverifiable bytes are a
+/// property of the bundle.
+enum AuthFailure {
+    Malformed(anyhow::Error),
+    UnknownSigner,
+}
+
 /// Authenticate every supplied v2 entry under a key the ACCEPTED legacy epoch certifies, or one an
 /// already-authenticated v2 enrollment introduces. An entry may introduce a key, but only once it
 /// has itself authenticated: pooling unverified introductions would admit a mutually-introducing
@@ -153,7 +173,7 @@ struct Authenticated {
 fn authenticate(
     plan: &views::ReplayPlan,
     frozen: &fold::v2::FrozenLegacy,
-) -> Option<Authenticated> {
+) -> Result<Authenticated, AuthFailure> {
     let mut keys = frozen.device_pubkeys();
     let mut headers: HashMap<AccountEntryHash, AccountEntryHeader> =
         frozen.entries().iter().map(|entry| (entry.entry_hash, entry.header.clone())).collect();
@@ -169,10 +189,13 @@ fn authenticate(
                 remaining.push(signed);
                 continue;
             };
+            // A key exists for this author, so the bytes now have to verify under it.
             let verified = DevicePublic::from_bytes(&key)
                 .and_then(|key| envelope::verify_account_signed(&signed.signed_bytes, &key))
-                .ok()?;
-            let op = ops::decode(verified.header.entry_type, &verified.payload).ok()?.op;
+                .map_err(AuthFailure::Malformed)?;
+            let op = ops::decode(verified.header.entry_type, &verified.payload)
+                .map_err(AuthFailure::Malformed)?
+                .op;
             // A v2 enrollment certifies the added device's key exactly as its v1 counterpart does.
             if let AccountOp::DeviceAdd { device_fingerprint, ed25519_pubkey, .. } = &op {
                 keys.insert(*device_fingerprint, *ed25519_pubkey);
@@ -186,11 +209,11 @@ fn authenticate(
             }
         }
         if remaining.len() == before {
-            return None;
+            return Err(AuthFailure::UnknownSigner);
         }
         pending = remaining;
     }
-    Some(Authenticated { consumer: consumer?, entries, headers })
+    Ok(Authenticated { consumer: consumer.ok_or(AuthFailure::UnknownSigner)?, entries, headers })
 }
 
 /// Whether `entry` mints an owner incarnation for `device`. A v2 entry's hash becomes the
@@ -203,15 +226,28 @@ fn mints_owner_for(entry: &V2Entry, device: DeviceFingerprint) -> bool {
     }
 }
 
+/// Why an ancestry walk did not land.
+enum WalkError {
+    /// Evidence is missing — the operation parks and is reconsidered when it arrives.
+    Incomplete(ParkCause),
+    /// The chain is longer than the declared evidence budget can verify.
+    OverBudget,
+}
+
 /// Walk an entry's own device chain back to a branch the checkpoint ACCEPTED. A withheld link parks
 /// rather than rejects — it is recoverable — while a walk that lands on a legacy entry the
 /// checkpoint did not accept is a branch loser no v2 continuation revives.
+///
+/// Each step demands the exact predecessor sequence, so a repeat is already unreachable; the step
+/// budget is the same defensive posture the view scheduler takes against a cycle it likewise cannot
+/// construct, and it ties the work to the declared evidence budget instead of to a chain length a
+/// header can claim.
 fn chain_reaches_accepted_legacy(
     entry: &AccountEntryHeader,
-    authenticated: &Authenticated,
+    headers: &HashMap<AccountEntryHash, AccountEntryHeader>,
     frozen: &fold::v2::FrozenLegacy,
     reached: &mut HashSet<AccountEntryHash>,
-) -> Result<(), ParkCause> {
+) -> Result<(), WalkError> {
     // An origin slot continues nothing: a device first enrolled at version 2 starts here.
     let Some(mut hash) = entry.prev_hash else {
         return Ok(());
@@ -223,24 +259,103 @@ fn chain_reaches_accepted_legacy(
         if reached.contains(&hash) {
             break;
         }
+        if walked.len() >= views::MAX_ENTRIES {
+            return Err(WalkError::OverBudget);
+        }
         let missing = if walked.is_empty() { ParkCause::ChainHead } else { ParkCause::Ancestry };
-        let header = authenticated.headers.get(&hash).ok_or(missing)?;
+        let header = headers.get(&hash).ok_or(WalkError::Incomplete(missing))?;
         if header.device_fingerprint != entry.device_fingerprint
             || header.seq != expected_seq
             || header.log_id != fold::CONTROL_LOG
         {
-            return Err(ParkCause::Ancestry);
+            return Err(WalkError::Incomplete(ParkCause::Ancestry));
         }
         walked.push(hash);
         if header.op_version != ops::CONTROL_VERSION {
             if !frozen.accepted_at_checkpoint(&hash) {
-                return Err(ParkCause::Ancestry);
+                return Err(WalkError::Incomplete(ParkCause::Ancestry));
             }
             break;
         }
-        hash = header.prev_hash.ok_or(ParkCause::Ancestry)?;
+        hash = header.prev_hash.ok_or(WalkError::Incomplete(ParkCause::Ancestry))?;
         expected_seq = expected_seq.saturating_sub(1);
     }
     reached.extend(walked);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::checkpoint::{self, TrustedCheckpointPin};
+
+    /// Exercise the walk's declared budget with synthetic headers: the step bound must hold for a
+    /// complete chain longer than the evidence budget, not only for a broken one.
+    #[test]
+    fn ancestry_longer_than_the_evidence_budget_is_refused_not_walked() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 1).unwrap();
+        let device = crate::local_device(&conn, 1).unwrap();
+        let tx = conn.transaction().unwrap();
+        let bundle = checkpoint::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
+        let proof = checkpoint::verify_checkpoint(
+            TrustedCheckpointPin {
+                account_id: account,
+                checkpoint_digest: bundle.certificate_digest(),
+                required_control_version: 2,
+            },
+            &bundle,
+        )
+        .unwrap();
+
+        let subject = DeviceFingerprint::from_bytes([0xab; 32]);
+        let link = |seq: u64| {
+            let mut hash = [0u8; 32];
+            hash[..8].copy_from_slice(&seq.to_be_bytes());
+            AccountEntryHash::from_bytes(hash)
+        };
+        let overlong = views::MAX_ENTRIES as u64 + 4;
+        let mut headers = HashMap::new();
+        for seq in 0..=overlong {
+            headers.insert(link(seq), AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: subject,
+                seq,
+                prev_hash: (seq != 0).then(|| link(seq - 1)),
+                parent_ref: None,
+                entry_type: 2,
+                op_version: ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: None,
+            });
+        }
+        let head = headers[&link(overlong)].clone();
+        assert!(matches!(
+            chain_reaches_accepted_legacy(
+                &head,
+                &headers,
+                proof.frozen_legacy(),
+                &mut HashSet::new()
+            ),
+            Err(WalkError::OverBudget)
+        ));
+
+        // The identical walk lands once it is short enough to fit the budget.
+        let short = headers[&link(4)].clone();
+        assert!(matches!(
+            chain_reaches_accepted_legacy(
+                &short,
+                &headers,
+                proof.frozen_legacy(),
+                &mut HashSet::new()
+            ),
+            // Reaching seq 0 without meeting a legacy entry is a chain rooted outside the
+            // checkpoint, which parks rather than spinning.
+            Err(WalkError::Incomplete(ParkCause::Ancestry))
+        ));
+    }
 }

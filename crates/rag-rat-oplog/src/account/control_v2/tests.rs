@@ -496,6 +496,72 @@ fn incomplete_evidence_parks_without_applying_registers_or_credit() {
     );
 }
 
+#[test]
+fn unverifiable_evidence_is_a_bad_bundle_not_a_permanently_rejected_operation() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let first = chain.add(1);
+    let second = chain.add(2);
+    // The signature rides outside the hashed body, so flipping it leaves a structurally valid
+    // object with the same identity that simply does not verify.
+    let mut tampered = first.signed_bytes.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(
+        executor::execute(&checkpoint, &second.signed_bytes, &[], &[tampered]).is_err(),
+        "an attachment that does not verify refuses the bundle",
+    );
+    // The operation itself was never at fault: it executes once the attachment is the real thing.
+    assert!(matches!(
+        executor::execute(&checkpoint, &second.signed_bytes, &[], &bytes(&[first])).unwrap(),
+        executor::Verdict::Applied { .. }
+    ));
+}
+
+#[test]
+fn an_author_no_certified_key_names_is_rejected_rather_than_refused() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let operation = chain.add(1);
+    let stranger = Dev::new(200);
+    let enrolled = Dev::new(201);
+    let op = ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: enrolled.fp,
+            ed25519_pubkey: enrolled.ed,
+            x25519_pubkey: enrolled.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    };
+    // Perfectly well-formed and correctly self-signed — nothing in the account certifies its key.
+    let foreign = envelope::sign_account_entry(
+        &stranger.secret,
+        &AccountEntryHeader {
+            account_id: checkpoint.pin().account_id,
+            log_id: 0,
+            device_fingerprint: stranger.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: legacy::entry_type_of(&op.op),
+            op_version: ops::CONTROL_VERSION,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: None,
+        },
+        &op.encode().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        executor::execute(&checkpoint, &operation.signed_bytes, &[], &[foreign.signed_bytes])
+            .unwrap(),
+        executor::Verdict::Rejected(executor::RejectCause::Unauthenticated)
+    ));
+}
+
 fn plan_replay(
     checkpoint: &VerifiedCheckpoint,
     device: &LocalDevice,
