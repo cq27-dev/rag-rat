@@ -340,7 +340,7 @@ pub(crate) fn read_snapshot(conn: &Connection) -> rusqlite::Result<Option<Transa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::{control_v2, envelope, fold, ops, storage, test_support};
+    use crate::account::{annex, control_v2, envelope, fold, ops, storage, test_support};
 
     fn proof(conn: &Connection, account: AccountId) -> VerifiedCheckpoint {
         let device = crate::local_device(conn, 0).unwrap();
@@ -841,7 +841,9 @@ mod tests {
         assert_eq!(accepted_flag(&conn, enrolled), 0, "acceptance is retracted too");
     }
 
-    /// Author a v2 `DeviceRemove` of `subject` on `device`'s own chain.
+    /// Author a v2 `DeviceRemove` of `subject` on `device`'s own chain, naming `pre_cut_view` as
+    /// the detached manifest that bounds its credit.
+    #[allow(clippy::too_many_arguments)]
     fn device_remove_entry(
         account: AccountId,
         device: &crate::identity::LocalDevice,
@@ -849,6 +851,7 @@ mod tests {
         seq: u64,
         genesis: super::id::AccountEntryHash,
         checkpoint_digest: [u8; 32],
+        pre_cut_view: [u8; 32],
         subject: crate::op::DeviceFingerprint,
     ) -> envelope::SignedAccountEntry {
         let op = ops::AccountOp::DeviceRemove {
@@ -858,11 +861,10 @@ mod tests {
             content_cuts: vec![],
             reason: "revoked".into(),
         };
-        // A revocation MUST name a pre-cut view — `ControlOp::encode` refuses otherwise — and this
-        // digest is exactly the manifest no refold can supply.
+        // A revocation MUST name a pre-cut view — `ControlOp::encode` refuses otherwise.
         let payload = control_v2::ops::ControlOp {
             checkpoint: checkpoint_digest,
-            pre_cut_view: Some([9; 32]),
+            pre_cut_view: Some(pre_cut_view),
             op: op.clone(),
         }
         .encode()
@@ -888,44 +890,67 @@ mod tests {
         .unwrap()
     }
 
-    /// A v2 revocation cannot yet take effect through a refold, and the reason is structural rather
-    /// than a policy choice: `ControlOp::encode` requires every revocation to name a DETACHED
-    /// pre-cut manifest by digest, and `execute_held` supplies no manifests, so `plan_replay`
-    /// cannot resolve the view and the operation parks on `ParkCause::Manifest`. Nothing
-    /// persists a manifest or hands one to the executor.
+    /// A v2 revocation's evidence is a DETACHED manifest it names by digest, and the manifest is an
+    /// ordinary annex entry. Both halves of that are load-bearing, so both are asserted here: while
+    /// the manifest is not held the cut parks on `ParkCause::Manifest` and applies NOTHING, and
+    /// storing that one entry — with nothing else about the account changing — is what lets the
+    /// refold hand the executor its evidence and project the register.
     ///
-    /// So the removal is neither accepted nor projected, and the subject stays on the roster. This
-    /// is fail-closed — a revocation that cannot be verified applies nothing — but it also means
-    /// the register effects `v2::pinned_history` composes are unreachable from here until
-    /// detached manifests become durable. When that lands, this test fails and is the place to
-    /// say what the refold now does instead.
+    /// The manifest carries no owner incarnation, which is also deliberate: `held_view_manifests`
+    /// must not gate a manifest on its carrier's live authority the way `usable_snapshots` gates a
+    /// snapshot, and a gate copied from that sibling would refuse this one outright.
     #[test]
-    fn a_v2_revocation_parks_for_want_of_the_manifest_no_refold_can_supply() {
+    fn a_v2_revocation_parks_for_want_of_its_manifest_and_applies_once_it_is_stored() {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
         let (account, device, genesis, enrolled) = account_with_one_enrolment(&conn);
         let digest = install_pin(&conn, account).checkpoint_digest;
         let subject = test_support::Dev::new(7).fp;
-        let remove = device_remove_entry(account, &device, enrolled, 2, genesis, digest, subject);
+        // The checkpoint froze the whole roster, so no v2 candidate precedes this cut and the view
+        // it nominates names none. An empty view is still a view: the cut commits to its digest.
+        let view = control_v2::views::ViewManifest { checkpoint: digest, entries: Vec::new() };
+        let remove = device_remove_entry(
+            account,
+            &device,
+            enrolled,
+            2,
+            genesis,
+            digest,
+            view.digest().unwrap(),
+            subject,
+        );
         storage::account_ingest(&conn, &remove.signed_bytes, 3).unwrap();
 
-        let status: String = conn
-            .query_row(
+        let status = |conn: &Connection| -> String {
+            conn.query_row(
                 "SELECT status FROM account_entry_status WHERE entry_hash = ?1",
                 [remove.entry_hash.as_slice()],
                 |r| r.get(0),
             )
-            .unwrap();
-        assert_eq!(status, "retained_unfolded", "the executor applied nothing for it");
-        assert_eq!(accepted_flag(&conn, remove.entry_hash), 0, "and it is not accepted");
-        let open_roster: i64 = conn
-            .query_row(
+            .unwrap()
+        };
+        let open_roster = |conn: &Connection| -> i64 {
+            conn.query_row(
                 "SELECT count(*) FROM account_roster_history WHERE closed_at IS NULL",
                 [],
                 |r| r.get(0),
             )
-            .unwrap();
-        assert_eq!(open_roster, 2, "the subject is still an open roster member");
+            .unwrap()
+        };
+        assert_eq!(status(&conn), "retained_unfolded", "the executor applied nothing for it");
+        assert_eq!(accepted_flag(&conn, remove.entry_hash), 0, "and it is not accepted");
+        assert_eq!(open_roster(&conn), 2, "the subject is still an open roster member");
+
+        // Storing the manifest is the ONLY thing that changes.
+        {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            annex::author::author_view_manifest_in_tx(&tx, &device, account, &view, 4).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(status(&conn), "accepted", "the cut now verifies from held rows alone");
+        assert_eq!(accepted_flag(&conn, remove.entry_hash), 1);
+        assert_eq!(open_roster(&conn), 1, "and the revocation closed the subject's roster seat");
     }
 
     /// The same operation WITHOUT a pre-cut view cannot even be authored: the presence rule is a

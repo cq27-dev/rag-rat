@@ -323,9 +323,7 @@ fn a_device_lacking_the_covered_history_reports_unverifiable_not_a_judgement() {
     // Hold nothing at all: the heads themselves are absent.
     assert_eq!(
         annex::verify::verify_snapshot(&[], std::slice::from_ref(&target)),
-        annex::verify::SnapshotVerdict::Unverifiable(
-            annex::verify::Unverifiable::WatermarkNotHeld
-        ),
+        annex::verify::SnapshotVerdict::Unverifiable(annex::verify::Unverifiable::WatermarkNotHeld),
     );
 
     // Hold the heads but not a link beneath them: a claim this device cannot reconstruct.
@@ -338,9 +336,7 @@ fn a_device_lacking_the_covered_history_reports_unverifiable_not_a_judgement() {
     assert!(heads.len() < f.entries.len(), "the fixture must have interior entries");
     assert_eq!(
         annex::verify::verify_snapshot(&heads, &[target]),
-        annex::verify::SnapshotVerdict::Unverifiable(
-            annex::verify::Unverifiable::IncompleteChain
-        ),
+        annex::verify::SnapshotVerdict::Unverifiable(annex::verify::Unverifiable::IncompleteChain),
     );
 }
 
@@ -414,9 +410,7 @@ fn a_forged_chain_link_is_not_walkable_into_the_verification_input() {
     forged.covered[0].seq = forged.covered[0].seq.wrapping_add(7);
     assert_eq!(
         annex::verify::verify_snapshot(&f.entries, &[forged]),
-        annex::verify::SnapshotVerdict::Unverifiable(
-            annex::verify::Unverifiable::IncompleteChain
-        ),
+        annex::verify::SnapshotVerdict::Unverifiable(annex::verify::Unverifiable::IncompleteChain),
     );
 }
 

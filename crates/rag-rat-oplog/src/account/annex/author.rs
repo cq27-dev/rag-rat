@@ -34,9 +34,10 @@
 use anyhow::Context;
 use rusqlite::Transaction;
 
+use super::super::control_v2::views;
 use super::super::envelope::{self, AccountEntryHeader, VerifiedAccountEntry, sign_account_entry};
 use super::super::fold::{self, AccountClassification, EntryStatus};
-use super::super::id::AccountEntryHash;
+use super::super::id::{AccountEntryHash, OwnerId};
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
 use super::ops::{AnnexOp, SnapshotTarget};
@@ -153,10 +154,72 @@ pub fn author_snapshot_in_tx(
     let payload = super::ops::encode(&manifest)
         .map_err(|err| anyhow::anyhow!("encoding the snapshot manifest failed: {err}"))?;
 
+    let authored = author_annex_entry_in_tx(tx, AnnexEntry {
+        device,
+        account_id,
+        entry_type: super::ops::entry_type::SNAPSHOT,
+        payload,
+        // A snapshot binds the account root it claims coverage over and cites the incarnation its
+        // USABILITY is scoped to; `usable_snapshots` reads both back.
+        parent_ref: Some(genesis_hash),
+        authority_ref: Some(owner_id),
+        auth_len: storage::account_effective_count(tx, account_id)?,
+        now_ms,
+    })?;
+    Ok(match authored {
+        AnnexAuthored::Authored(entry_hash) => SnapshotAuthorOutcome::Authored(entry_hash),
+        // The second of the two ceilings, and the same meaning as the first: too many devices to
+        // name in one manifest. It is exact rather than a reserve because a manifest cannot be
+        // split — `folded_state_hash` commits to the prefix its covered vector defines — so an
+        // account in the gap between a conservative reserve and the real overhead must not be told
+        // it cannot snapshot when it can.
+        AnnexAuthored::TooLargeToSign => SnapshotAuthorOutcome::CoverageExceedsEnvelope { devices },
+    })
+}
+
+/// One entry on this device's own annex chain: the payload, its tag, and the two header slots an
+/// artifact class may or may not have anything to put in.
+pub(in crate::account) struct AnnexEntry<'a> {
+    pub(in crate::account) device: &'a LocalDevice,
+    pub(in crate::account) account_id: AccountId,
+    pub(in crate::account) entry_type: u32,
+    pub(in crate::account) payload: Vec<u8>,
+    /// The account root, for an artifact that binds one. Nothing on this log revalidates
+    /// `parent_ref`, so `None` states "this artifact names no root" rather than omitting one.
+    pub(in crate::account) parent_ref: Option<AccountEntryHash>,
+    /// The owner incarnation, for an artifact whose USABILITY is scoped to one staying open.
+    pub(in crate::account) authority_ref: Option<OwnerId>,
+    pub(in crate::account) auth_len: u64,
+    pub(in crate::account) now_ms: i64,
+}
+
+/// What authoring one annex entry did. `TooLargeToSign` is a fact about the payload's size, which
+/// each artifact class reports in its own vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::account) enum AnnexAuthored {
+    Authored(AccountEntryHash),
+    TooLargeToSign,
+}
+
+/// The authoring sequence every annex artifact shares: chain tail → header → envelope fit → sign →
+/// insert → refold → PROVE the entry stayed inert.
+///
+/// Neither of the last two steps is bookkeeping. The insert alone leaves `account_entries` without
+/// the matching status row, so a status-based reader would omit the entry until some unrelated
+/// ingest happened to repair the projection. And `retained_unfolded` is the assertion of inertness,
+/// not an absence of one: the annex log is authority-inert, so an entry must land WITHOUT being
+/// folded into authority. Anything else — `accepted` above all — would mean an annex entry reached
+/// the control fold, which is exactly the failure ANNEX_LOG exists to prevent (#809). Roll the
+/// caller back.
+pub(in crate::account) fn author_annex_entry_in_tx(
+    tx: &Transaction<'_>,
+    entry: AnnexEntry<'_>,
+) -> anyhow::Result<AnnexAuthored> {
+    let fingerprint = entry.device.fingerprint();
     // The annex chain is this device's own, independent of its control chain — that separation is
     // the whole reason the log exists (#809).
     let (seq, prev_hash) =
-        match authoring::account_chain_tail(tx, account_id, fingerprint, fold::ANNEX_LOG)? {
+        match authoring::account_chain_tail(tx, entry.account_id, fingerprint, fold::ANNEX_LOG)? {
             Some((tail_seq, tail_hash)) => (
                 tail_seq.checked_add(1).context("annex chain tail is at u64::MAX seq")?,
                 Some(tail_hash),
@@ -165,71 +228,106 @@ pub fn author_snapshot_in_tx(
         };
 
     let header = AccountEntryHeader {
-        account_id,
+        account_id: entry.account_id,
         log_id: fold::ANNEX_LOG,
         device_fingerprint: fingerprint,
         seq,
         prev_hash,
-        parent_ref: Some(genesis_hash),
-        entry_type: super::ops::entry_type::SNAPSHOT,
+        parent_ref: entry.parent_ref,
+        entry_type: entry.entry_type,
         op_version: fold::SUPPORTED_OP_VERSION,
-        // Plaintext is structural for this tag: the manifest's entire value is that a peer can
-        // check coverage without decrypting anything, and ingest refuses a sealed one.
+        // Plaintext is structural for this log's artifacts: their whole value is that a peer can
+        // read them without decrypting anything, and ingest refuses a sealed snapshot outright.
         crypto_suite: 0,
-        auth_len: storage::account_effective_count(tx, account_id)?,
+        auth_len: entry.auth_len,
         key_id: None,
-        authority_ref: Some(owner_id),
+        authority_ref: entry.authority_ref,
     };
-    // Check BEFORE signing, against the EXACT signed size for this header — not a reserve. A
-    // manifest cannot be split (`folded_state_hash` commits to the prefix its covered vector
-    // defines), so the check is an exact validity threshold, and an account in the gap between a
-    // conservative reserve and the real overhead must not be told it cannot snapshot when it can.
-    // Without the guard the failure is a raw envelope rejection from inside `sign_account_entry`,
-    // which reads as a bug in authoring rather than what it is: too many devices to name in one
-    // manifest.
-    if !envelope::entry_fits_envelope(&header, &payload) {
-        return Ok(SnapshotAuthorOutcome::CoverageExceedsEnvelope { devices });
+    // Check BEFORE signing, against the EXACT signed size for this header — not a reserve — so an
+    // over-size payload surfaces as a typed outcome instead of a raw envelope rejection from inside
+    // `sign_account_entry`, which reads as a bug in authoring rather than what it is.
+    if !envelope::entry_fits_envelope(&header, &entry.payload) {
+        return Ok(AnnexAuthored::TooLargeToSign);
     }
-    let signed = sign_account_entry(device.secret(), &header, &payload)?;
+    let signed = sign_account_entry(entry.device.secret(), &header, &entry.payload)?;
     let verified = VerifiedAccountEntry {
         header: signed.header,
         payload: signed.payload,
         entry_hash: signed.entry_hash,
     };
-    match storage::insert_candidate(tx, &verified, &signed.signed_bytes, now_ms)? {
+    match storage::insert_candidate(tx, &verified, &signed.signed_bytes, entry.now_ms)? {
         CandidateInsert::Inserted | CandidateInsert::AlreadyPresent => {},
         CandidateInsert::AtCapacity(scope) => anyhow::bail!(
-            "the account candidate store is at capacity ({scope:?}); cannot author a snapshot",
+            "the account candidate store is at capacity ({scope:?}); cannot author an annex entry",
         ),
     }
 
-    // Refold in THIS transaction, like every other local authoring path. The insert alone leaves
-    // `account_entries` without the matching status row, so a status-based reader would omit the
-    // entry until some unrelated ingest happened to repair the projection.
-    //
-    // `retained_unfolded` is the assertion of inertness, not an absence of one: the annex log is
-    // authority-inert, so a snapshot must land in the store WITHOUT being folded into authority.
-    // Anything else — `accepted` above all — would mean an annex entry reached the control fold,
-    // which is exactly the failure ANNEX_LOG exists to prevent (#809). Roll the caller back.
-    let statuses = storage::refold_in_tx(tx, account_id, now_ms)?;
+    let statuses = storage::refold_in_tx(tx, entry.account_id, entry.now_ms)?;
     match statuses.get(&verified.entry_hash).copied() {
         Some(EntryStatus::RetainedUnfolded) => {},
         other => {
             let other = other.map(EntryStatus::as_db_str);
             anyhow::bail!(
-                "authored snapshot folded to {other:?} instead of staying inert on the annex log; \
-                 rolling back",
+                "authored annex entry folded to {other:?} instead of staying inert on the annex \
+                 log; rolling back",
             )
         },
     }
-    Ok(SnapshotAuthorOutcome::Authored(verified.entry_hash))
+    Ok(AnnexAuthored::Authored(verified.entry_hash))
+}
+
+/// Store one control-v2 pre-cut view, so the cut that names its digest can be verified from held
+/// rows alone rather than from a bundle a peer happens to attach.
+///
+/// **Author it from the device that authors the cut.** A manifest signed by a device the account
+/// does not certify parks in `account_pre_verify`, which is capped per account and evicts
+/// oldest-first — evidence a cut depends on permanently would then be evictable, and the cut would
+/// return to `ParkCause::Manifest` long after it applied. Same-author is what makes the manifest
+/// exactly as durable as the cut: whenever the cut is storable, its evidence is too.
+///
+/// Unlike its snapshot sibling on this log, the entry names no root and no incarnation. That is
+/// deliberate rather than an omission: a manifest's integrity is the digest the cut signed, so
+/// nothing reads either field — and carrying one would invite a later reader to gate on it, which
+/// would make a revoked author's manifest vanish and re-park a cut that had already applied.
+#[allow(
+    dead_code,
+    reason = "no production path authors a v2 cut yet — pin install is test-only (#1311)"
+)]
+pub(in crate::account) fn author_view_manifest_in_tx(
+    tx: &Transaction<'_>,
+    device: &LocalDevice,
+    account_id: AccountId,
+    view: &views::ViewManifest,
+    now_ms: i64,
+) -> anyhow::Result<AccountEntryHash> {
+    // VERBATIM: a cut names its evidence by `sha256` of exactly these bytes.
+    let payload = view.encode()?;
+    match author_annex_entry_in_tx(tx, AnnexEntry {
+        device,
+        account_id,
+        entry_type: super::ops::entry_type::VIEW_MANIFEST,
+        payload,
+        parent_ref: None,
+        authority_ref: None,
+        auth_len: 0,
+        now_ms,
+    })? {
+        AnnexAuthored::Authored(entry_hash) => Ok(entry_hash),
+        // Unreachable while `views::MAX_VIEW_ENTRIES` stays under what one envelope carries, which
+        // is why that bound is declared in envelope terms rather than in the planner's.
+        AnnexAuthored::TooLargeToSign => anyhow::bail!(
+            "a view naming {} identities does not fit one signed annex entry; \
+             views::MAX_VIEW_ENTRIES sits above the envelope ceiling",
+            view.entries.len(),
+        ),
+    }
 }
 
 #[cfg(test)]
 mod coverage_ceiling_tests {
     use super::super::super::id::OwnerId;
     use super::super::super::limits;
-    use super::super::ops::{CoveredWatermark, AnnexOp, SnapshotTarget, encode};
+    use super::super::ops::{AnnexOp, CoveredWatermark, SnapshotTarget, encode};
     use super::*;
     use crate::op::DeviceFingerprint;
 
@@ -352,6 +450,41 @@ mod coverage_ceiling_tests {
             .is_err(),
             "the encoder rejects a covered vector past SNAPSHOT_COVERED_MAX, so the guard must \
              run first",
+        );
+    }
+
+    /// `MAX_VIEW_ENTRIES` is a promise that a view that large can actually be SIGNED, so measure
+    /// the signed envelope rather than the payload — the payload is the smaller of the two.
+    #[test]
+    fn a_view_at_the_declared_bound_fits_one_signed_annex_entry() {
+        let view = |entries: usize| views::ViewManifest {
+            checkpoint: [0xaa; 32],
+            entries: (0..entries)
+                .map(|i| {
+                    let mut hash = [0u8; 32];
+                    hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                    AccountEntryHash::from_bytes(hash)
+                })
+                .collect(),
+        };
+        let header = AccountEntryHeader {
+            entry_type: super::super::ops::entry_type::VIEW_MANIFEST,
+            ..header()
+        };
+        let payload = view(views::MAX_VIEW_ENTRIES).encode().expect("the declared bound encodes");
+        assert!(
+            envelope::entry_fits_envelope(&header, &payload),
+            "a view at the declared bound must actually sign",
+        );
+        assert!(view(views::MAX_VIEW_ENTRIES + 1).encode().is_err(), "one past it is refused");
+
+        // And the bound is HONEST rather than arbitrarily cautious: the envelope really does run
+        // out just above it, so lowering the constant would silently shrink what a cut may name.
+        let spare =
+            limits::ACCOUNT_ENVELOPE_MAX_BYTES - envelope::signed_entry_len(&header, &payload);
+        assert!(
+            spare < 34 * 64,
+            "the declared bound should sit just under the real ceiling; {spare} bytes spare",
         );
     }
 

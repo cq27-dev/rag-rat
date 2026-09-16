@@ -305,9 +305,12 @@ fn authenticate(
 /// evidence, and the pass shares its signature checks through a single [`AuthMemo`]. Without that,
 /// a pool of N operations costs N full verifications of the pool, on every refold.
 ///
-/// A detached pre-cut manifest is not durable, so a revocation that names one parks on
-/// [`ParkCause::Manifest`] until it is supplied. An ordinary operation names no view and needs no
-/// historical evidence, so it executes from held rows alone.
+/// A revocation's evidence is a DETACHED manifest, and `manifests` is what the store holds of them
+/// — the annex payloads for this account, verbatim. Every operation in the pass is offered the same
+/// set, because a manifest is content-addressed: which of them a given cut can use is decided by
+/// the digest it signed, never by who carried the bytes. A manifest that has not arrived yet parks
+/// its cut on [`ParkCause::Manifest`] until it does, and an ordinary operation names no view at
+/// all.
 ///
 /// Rows that are not v2 candidates for THIS checkpoint are excluded from the pool rather than
 /// refused inside it: such a row would refuse every bundle it appeared in, not just its own. A
@@ -316,6 +319,7 @@ fn authenticate(
 pub(in crate::account) fn execute_held(
     checkpoint: &VerifiedCheckpoint,
     held: &[Vec<u8>],
+    manifests: &[Vec<u8>],
 ) -> BTreeMap<AccountEntryHash, Verdict> {
     let pin = checkpoint.pin();
     let mut verdicts = BTreeMap::new();
@@ -340,7 +344,7 @@ pub(in crate::account) fn execute_held(
         let consumer = hashes[last];
         let verdict = {
             let (evidence, operation) = pool.split_at(last);
-            execute_shared(checkpoint, &operation[0], &[], evidence, &mut memo)
+            execute_shared(checkpoint, &operation[0], manifests, evidence, &mut memo)
         };
         hashes.swap(index, last);
         pool.swap(index, last);
