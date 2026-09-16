@@ -69,8 +69,24 @@ cleanup_checkout() {
     if [ "${KEEP_CHECKOUT:-0}" != "1" ]; then
         rm -rf "$CHECKOUT" "$DB" "$DB"-wal "$DB"-shm
     fi
+    rm -rf "${PYTHON_SHIM:-}"
 }
 trap cleanup_checkout EXIT
+
+# A python corpus's prepare step spells `python`, which Debian and Ubuntu leave absent unless
+# `python-is-python3` is installed — so it works in CI, whose setup action provides a bare `python`,
+# and fails on a stock dev box with `python: command not found`.
+#
+# The environment is adjusted rather than the command, and that is the whole point: the prepare
+# string is hashed into `corpus_profile_hash`, which is what lets a run be declared comparable with
+# the recorded ones. Rewriting it to `python3` would silently make every future run incomparable
+# with every prior one, to fix a portability nit.
+if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    PYTHON_SHIM="$(mktemp -d)"
+    ln -s "$(command -v python3)" "$PYTHON_SHIM/python"
+    export PATH="$PYTHON_SHIM:$PATH"
+    echo "oracle-run: no bare 'python' on PATH; shimmed to $(command -v python3)" >&2
+fi
 
 echo "oracle-run: corpus=$CORPUS tool=$TOOL repo=$REPO rev=$REV (budget ${TIMEOUT_MINUTES}m)" >&2
 
