@@ -630,6 +630,157 @@ fn a_member_cannot_promote_itself_into_the_authority_it_then_cites() {
     );
 }
 
+/// The mirror of the member's self-promotion: here the FOUNDER mints the incarnation, so the very
+/// same operation is authorized the moment that one entry arrives. Withholding it must therefore
+/// park — a receiver holding one bundle cannot tell an incarnation that never existed from one
+/// whose mint it was not given, and a refusal that asking can clear is not a property of the
+/// operation.
+#[test]
+fn a_cut_citing_a_mint_that_was_not_supplied_parks_until_that_mint_arrives() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let member = Dev::new(78);
+    let enrolment = chain.author(ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: member.fp,
+            ed25519_pubkey: member.ed,
+            x25519_pubkey: member.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    });
+    let mint = chain.author(ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::OwnerPromote { device_fingerprint: member.fp },
+    });
+    let enrolled = Dev::new(79);
+    let op = ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: enrolled.fp,
+            ed25519_pubkey: enrolled.ed,
+            x25519_pubkey: enrolled.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    };
+    // The member acts under the incarnation the founder minted for it, on its own origin slot.
+    let operation = envelope::sign_account_entry(
+        &member.secret,
+        &AccountEntryHeader {
+            account_id: checkpoint.pin().account_id,
+            log_id: 0,
+            device_fingerprint: member.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: legacy::entry_type_of(&op.op),
+            op_version: ops::CONTROL_VERSION,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: Some(mint.entry_hash.into()),
+        },
+        &op.encode().unwrap(),
+    )
+    .unwrap();
+
+    // The enrolment alone certifies the member's KEY, so nothing but its authority is outstanding.
+    let evidence = bytes(&[enrolment, mint]);
+    let verdict =
+        executor::execute(&checkpoint, &operation.signed_bytes, &[], &evidence[..1]).unwrap();
+    assert!(
+        matches!(verdict, executor::Verdict::Parked(executor::ParkCause::Mint)),
+        "a citation whose mint was not supplied cannot be refused for good, got {verdict:?}",
+    );
+    // Supplying that one entry authorizes the identical operation, which is exactly why the
+    // refusal above could never have claimed permanence.
+    let verdict = executor::execute(&checkpoint, &operation.signed_bytes, &[], &evidence).unwrap();
+    assert!(
+        matches!(verdict, executor::Verdict::Applied { .. }),
+        "the same operation applies once its mint arrives, got {verdict:?}",
+    );
+}
+
+/// The depth-2 case, and the reason the classifier walks the citation chain instead of asking about
+/// the entry an operation directly cites. The mint this operation names IS supplied; the mint THAT
+/// one cites is not. Judging one link answers `Inadmissible` here — refusing for good an operation
+/// that the single withheld entry authorizes.
+#[test]
+fn a_citation_chain_parks_on_a_withheld_link_two_mints_up() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let first = Dev::new(81);
+    let second = Dev::new(82);
+    let enrol = |dev: &Dev| ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: dev.fp,
+            ed25519_pubkey: dev.ed,
+            x25519_pubkey: dev.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    };
+    let enrolments = [chain.author(enrol(&first)), chain.author(enrol(&second))];
+    // The withheld link. It sits at the TIP of the founder's chain, so nothing else supplied needs
+    // it to walk its own ancestry and the operation reaches the authority rule.
+    let promote_first = chain.author(ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::OwnerPromote { device_fingerprint: first.fp },
+    });
+    let sign = |dev: &Dev, authority: AccountEntryHash, op: ops::ControlOp| {
+        envelope::sign_account_entry(
+            &dev.secret,
+            &AccountEntryHeader {
+                account_id: checkpoint.pin().account_id,
+                log_id: 0,
+                device_fingerprint: dev.fp,
+                seq: 0,
+                prev_hash: None,
+                parent_ref: None,
+                entry_type: legacy::entry_type_of(&op.op),
+                op_version: ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(authority.into()),
+            },
+            &op.encode().unwrap(),
+        )
+        .unwrap()
+    };
+    // `first` promotes `second` under the incarnation the withheld entry opened, and `second` acts
+    // under that one — two mints from anything the checkpoint itself holds.
+    let promote_second = sign(&first, promote_first.entry_hash, ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::OwnerPromote { device_fingerprint: second.fp },
+    });
+    let operation = sign(&second, promote_second.entry_hash, enrol(&Dev::new(83)));
+
+    let mut evidence = bytes(&enrolments);
+    evidence.push(promote_second.signed_bytes);
+    let verdict = executor::execute(&checkpoint, &operation.signed_bytes, &[], &evidence).unwrap();
+    assert!(
+        matches!(verdict, executor::Verdict::Parked(executor::ParkCause::Mint)),
+        "the mint it cites is held; the mint THAT one cites is not, got {verdict:?}",
+    );
+    // The whole chain resolves once that one entry arrives, so no link of it was ever refusable.
+    evidence.push(promote_first.signed_bytes);
+    let verdict = executor::execute(&checkpoint, &operation.signed_bytes, &[], &evidence).unwrap();
+    assert!(
+        matches!(verdict, executor::Verdict::Applied { .. }),
+        "the same operation applies once the withheld link arrives, got {verdict:?}",
+    );
+}
+
 fn plan_replay(
     checkpoint: &VerifiedCheckpoint,
     device: &LocalDevice,
