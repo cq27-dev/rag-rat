@@ -198,6 +198,10 @@ pub(in crate::account) enum V2Verdict {
     WrongDevice,
     /// The frozen legacy registers already cut this chain.
     Condemned,
+    /// The citation chain dies at an object this call was never handed. Alone among these verdicts
+    /// it is not a property of the operation: the same operation with that mint attached may be
+    /// authorized, so a consumer must route it to a park and never to a permanent refusal.
+    MintNotSupplied,
 }
 
 /// THE control v2 authority rule, resolved once per bundle.
@@ -217,6 +221,8 @@ impl V2Authority {
     pub(in crate::account) fn resolve(frozen: &FrozenLegacy, bundle: &[Candidate]) -> Self {
         let mut verdicts = HashMap::new();
         let Some(genesis) = frozen.history.genesis_hash() else {
+            // No genesis in the frozen epoch: no citation resolves against it and no arrival
+            // changes a checkpoint, so every entry falls to the permanent default below.
             return Self { verdicts, mints: HashMap::new() };
         };
         let legacy = frozen.foldable();
@@ -237,7 +243,8 @@ impl V2Authority {
             }
         }
         // Ascending depth, so a mint is settled before anything citing it. An entry whose cited
-        // incarnation does not resolve is never reached here and keeps the default refusal.
+        // incarnation does not resolve is never reached here; the pass after this one classifies
+        // why, because the reason decides whether its refusal can ever be cleared.
         let mut mints: HashMap<OwnerId, DeviceFingerprint> = HashMap::new();
         for &idx in strata.values().flatten() {
             if idx < legacy_count {
@@ -272,10 +279,28 @@ impl V2Authority {
             };
             verdicts.insert(candidate.hash(), verdict);
         }
+        // The entries the walk never reached are refused too, but not alike. A citation chain that
+        // dies at an object NOTHING SUPPLIED is refused for want of evidence — the same bundle plus
+        // that mint authorizes the same operation — while one that dies at an object we hold, or
+        // that cites nothing at all, is refused on its own merits. The frozen epoch never changes,
+        // so only the first can ever be cleared, and only the first may park.
+        for candidate in bundle {
+            if verdicts.contains_key(&candidate.hash()) {
+                continue;
+            }
+            let withheld = incarnations
+                .author_incarnation_id(candidate)
+                .is_some_and(|cited| cites_unsupplied_mint(&incarnations, &headers, cited));
+            let verdict =
+                if withheld { V2Verdict::MintNotSupplied } else { V2Verdict::Inadmissible };
+            verdicts.insert(candidate.hash(), verdict);
+        }
         Self { verdicts, mints }
     }
 
-    /// Absent means refused: an entry this resolution never reached holds no authority.
+    /// Every entry of the resolved bundle carries a verdict, including the ones the stratum walk
+    /// never reached. Absence therefore means the caller is asking about an entry this resolution
+    /// was never given: it holds no authority, and it never parks on that account.
     pub(in crate::account) fn verdict(&self, hash: &AccountEntryHash) -> V2Verdict {
         self.verdicts.get(hash).copied().unwrap_or(V2Verdict::Inadmissible)
     }
@@ -286,15 +311,50 @@ impl V2Authority {
     }
 }
 
+/// Whether the citations from `cited` run out at an object this call was never handed. That is the
+/// ONE way a citation fails to resolve recoverably: the mint may simply have been withheld, and
+/// attaching it authorizes the very same operation. A citation landing on an object we DO hold is
+/// answered for good — a held entry that is not a mint never becomes one, and a mint citing nothing
+/// never gains a citation. This walks the chain [`Incarnations::incarnation_depth`] walks, because
+/// that walk is what decides whether an entry is reached at all.
+fn cites_unsupplied_mint(
+    incarnations: &Incarnations<'_>,
+    headers: &HashMap<AccountEntryHash, &AccountEntryHeader>,
+    cited: OwnerId,
+) -> bool {
+    let mut seen = HashSet::new();
+    let mut node = cited;
+    loop {
+        // A cycle resolves nothing, and nothing that arrives later breaks it.
+        if !seen.insert(node) {
+            return false;
+        }
+        let Some(mint) = incarnations.candidate(&node) else {
+            let hash: AccountEntryHash = node.into();
+            return !headers.contains_key(&hash);
+        };
+        match mint.header().authority_ref {
+            None => return false,
+            Some(parent) => node = parent,
+        }
+    }
+}
+
 /// Execute one authorized operation. A non-cut installs nothing and earns nothing.
 pub(in crate::account) fn apply_cut(input: CutExecution<'_>) -> CutOutcome {
     // The one resolution decides THIS operation too. Keeping the check here, and not only in the
     // caller, is the whole point of resolving once: an authority answer a second caller has to
-    // remember to re-apply is an authority answer that eventually goes unapplied.
+    // remember to re-apply is an authority answer that eventually goes unapplied. Spelled out
+    // variant by variant for the same reason: a verdict added later must be routed deliberately,
+    // not swept into a permanent refusal by a wildcard.
     match input.authority.verdict(&input.cut.hash()) {
         V2Verdict::Authorized => {},
         V2Verdict::WrongDevice => return CutOutcome::Rejected(RejectReason::WrongDevice),
-        _ => return CutOutcome::Rejected(RejectReason::StaleAuthority),
+        // Refused for want of an entry, not on its merits: the cited mint would authorize this very
+        // operation, so the refusal cannot claim permanence.
+        V2Verdict::MintNotSupplied => return CutOutcome::Parked(ParkReason::UnknownOwnerRef),
+        V2Verdict::Inadmissible | V2Verdict::Condemned =>
+            return CutOutcome::Rejected(RejectReason::StaleAuthority),
     }
     let proposed = cut_op_registers(input.cut);
     if proposed.is_empty() {
@@ -1172,6 +1232,50 @@ mod tests {
         // there, so it would be worth a credit the moment it were treated as effective.
         assert_eq!(with.credit, without.credit, "a nomination never substitutes for admission");
         assert_eq!(with.credit, 1);
+    }
+
+    /// The two ways a citation fails to resolve, told apart on ONE entry: the same operation citing
+    /// the same hash, differing only in whether that object was supplied. An entry we hold that is
+    /// not a mint never becomes one, so that refusal is final; an object nothing supplied may
+    /// simply be withheld, which a single bundle cannot distinguish from never having existed.
+    #[test]
+    fn an_unresolvable_citation_parks_only_when_the_object_it_names_is_not_held() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (_, nominated) = v2_cut(&fixture, true);
+        let non_mint = nominated[0].clone();
+        let other = Dev::new(51);
+        let citing = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            non_mint.hash().into(),
+            founder_tip(&fixture).seq + 2,
+            non_mint.hash(),
+            &AccountOp::DeviceAdd {
+                device_fingerprint: other.fp,
+                ed25519_pubkey: other.ed,
+                x25519_pubkey: other.x,
+                role: DeviceRole::Member,
+                label: None,
+            },
+            v2_ops::CONTROL_VERSION,
+        );
+
+        // The cited entry is here, and it is a `DeviceAdd` of a Member: no evidence makes it a
+        // mint, so nothing about this operation is outstanding.
+        let held = V2Authority::resolve(frozen, &[non_mint, citing.clone()]);
+        assert_eq!(held.verdict(&citing.hash()), V2Verdict::Inadmissible);
+        assert!(matches!(
+            apply_cut(CutExecution { frozen, authority: &held, nominated: &[], cut: &citing }),
+            CutOutcome::Rejected(RejectReason::StaleAuthority)
+        ));
+
+        let withheld = V2Authority::resolve(frozen, std::slice::from_ref(&citing));
+        assert_eq!(withheld.verdict(&citing.hash()), V2Verdict::MintNotSupplied);
+        assert!(matches!(
+            apply_cut(CutExecution { frozen, authority: &withheld, nominated: &[], cut: &citing }),
+            CutOutcome::Parked(ParkReason::UnknownOwnerRef)
+        ));
     }
 
     #[test]

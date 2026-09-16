@@ -5,9 +5,10 @@
 //! certifies, and an unbroken chain back to a branch the checkpoint accepted. Nothing is counted on
 //! a peer's word — there is no entry count without the signed entry behind it.
 //!
-//! Incomplete evidence PARKS. A withheld manifest, a withheld chain head, or a gap in the walk back
-//! to the legacy branch leaves the operation unapplied in full: no register, no credit, and no
-//! partial effect that a later arrival would have to unwind.
+//! Incomplete evidence PARKS. A withheld manifest, a withheld chain head, a withheld mint of the
+//! incarnation the operation cites, or a gap in the walk back to the legacy branch leaves the
+//! operation unapplied in full: no register, no credit, and no partial effect that a later arrival
+//! would have to unwind.
 //!
 //! Malformed input is an `Err`, never a verdict. A peer that attaches one unverifiable object to an
 //! otherwise sound operation gets its bundle refused; it does not get the operation itself
@@ -67,12 +68,18 @@ pub(in crate::account) enum ParkCause {
     Signer,
     /// A watermark the cut names belongs to an incarnation the frozen epoch does not hold.
     CutTarget,
+    /// The mint of the incarnation the operation cites was not supplied. A receiver holding one
+    /// bundle cannot tell an incarnation that never existed from one whose mint was withheld, and
+    /// attaching that single entry authorizes the same operation — so this is recoverable.
+    Mint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::account) enum RejectCause {
     /// The operation cites no live owner incarnation minted for its own signer, judged by the one
-    /// authority resolution the credit pass also reads.
+    /// authority resolution the credit pass also reads. Only a citation that RESOLVED lands here: a
+    /// citation naming an object nothing supplied is [`ParkCause::Mint`], because no verdict over
+    /// one bundle can call that permanent.
     Inadmissible,
     /// The frozen legacy registers already condemn the operation's own chain slot.
     Condemned,
@@ -130,11 +137,16 @@ pub(in crate::account) fn execute(
         .map(V2Entry::candidate)
         .chain(std::iter::once(cut.clone()))
         .collect();
+    // Routed variant by variant: a wildcard here is how a refusal that cannot support permanence
+    // ends up claiming it anyway.
     let authority = fold::v2::V2Authority::resolve(frozen, &bundle);
     match authority.verdict(&cut.hash()) {
         fold::v2::V2Verdict::Authorized => {},
         fold::v2::V2Verdict::Condemned => return Ok(Verdict::Rejected(RejectCause::Condemned)),
-        _ => return Ok(Verdict::Rejected(RejectCause::Inadmissible)),
+        // The mint it cites is not in this bundle. That is withheld evidence like any other.
+        fold::v2::V2Verdict::MintNotSupplied => return Ok(Verdict::Parked(ParkCause::Mint)),
+        fold::v2::V2Verdict::Inadmissible | fold::v2::V2Verdict::WrongDevice =>
+            return Ok(Verdict::Rejected(RejectCause::Inadmissible)),
     }
 
     // Only the identities the operation's own manifest named; an ordinary operation names none.
