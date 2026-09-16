@@ -275,6 +275,11 @@ fn replay_pending_entry(
     let account_id = store::stream_account_id(tx, pending.stream_id)?;
     // A pinned account's entries wait for a binary that can execute the pin — a projector bump,
     // not the next open. Asked before the incarnation read, which refuses under the pin.
+    //
+    // The reason token is now WIDER than its name: an account whose pin this binary CAN execute
+    // reparks under it too, because the incarnation read below still refuses for either pin state.
+    // `PendingReason` is persisted, so renaming the token is a compatibility change and not worth
+    // making until the support gate itself distinguishes the two.
     if crate::account::control_policy::account_is_pinned(tx, account_id)? {
         return repark(tx, pending, PendingReason::UnsupportedAccountControl);
     }

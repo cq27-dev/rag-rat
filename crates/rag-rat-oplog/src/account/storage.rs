@@ -1592,12 +1592,11 @@ pub(super) fn refold_after_pin_install_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
 ) -> anyhow::Result<()> {
-    let now_ms = tx.query_row(
-        "SELECT coalesce(max(received_at_ms), 0) FROM account_entries WHERE account_id = ?1",
-        [account_id.to_bytes().as_slice()],
-        |row| row.get(0),
-    )?;
-    refold_in_tx(tx, account_id, now_ms)?;
+    // The WALL clock, not the last entry's arrival. Installing a pin is something happening now,
+    // and anything downstream that compares a stored expiry against this clock (invite reservations
+    // are `expires_at_ms > now_ms`) reads a long-expired row as outstanding when the "now" it is
+    // handed is really the age of the newest entry.
+    refold_in_tx(tx, account_id, rag_rat_base::time::now_ms())?;
     Ok(())
 }
 
@@ -1740,21 +1739,29 @@ fn fold_account_state_in_tx(
             super::content::promote_pre_verify_for_account(tx, account_id, now_ms)?,
         PreVerifyPromotion::Skip => Default::default(),
     };
+    let unpinned = matches!(policy, super::control_policy::AccountControlPolicy::LegacyV1);
     // Content is retracted under EVERY pin, including one this binary folds: see
     // [`retract_pinned_content_in_tx`]. A pinned account therefore reports no affected streams, so
     // the ordinary finalize never walks the gated stream-authority chain.
-    let affected_streams =
-        if matches!(policy, super::control_policy::AccountControlPolicy::LegacyV1) {
-            super::content::affected_streams_for_account(tx, account_id, &previously_owned)?
-        } else {
-            retract_pinned_content_in_tx(tx, account_id)?;
-            Vec::new()
-        };
+    let affected_streams = if unpinned {
+        super::content::affected_streams_for_account(tx, account_id, &previously_owned)?
+    } else {
+        retract_pinned_content_in_tx(tx, account_id)?;
+        Vec::new()
+    };
     // Every fold path — trusted, untrusted, and the DeviceAdd promotion sweep — can grow the
     // live key-target set (a locally minted key, a remotely synced `StreamOwn`/wrap, or a parked
     // wrap a promoted DeviceAdd just certified). Top outstanding invite reservations up to the
     // new mandatory redemption cost inside the same transaction (#945).
-    top_up_account_candidate_reservations_in_tx(tx, account_id, now_ms)?;
+    //
+    // Skipped under EVERY pin. There is nothing to reserve capacity for on an account no
+    // enrollment can redeem against, and the top-up resolves the account's streams through the
+    // GATED `owned_streams_for_account` — so running it here would fail the whole fold, including
+    // the pin install itself, and blame a version mismatch that is not the cause. Reaching for the
+    // ungated `owned_stream_bytes` instead would work mechanically and weaken the gate.
+    if unpinned {
+        top_up_account_candidate_reservations_in_tx(tx, account_id, now_ms)?;
+    }
     Ok(AccountStateFold { statuses, affected_streams, rejected_content_promotions })
 }
 

@@ -249,7 +249,9 @@ thread_local! {
     /// evidence set, so a hit under the same key can only be the proof this call would rebuild.
     ///
     /// Thread-local, not process-global: process-global test state passes nextest and then fails
-    /// the single-process coverage run.
+    /// the single-process coverage run. It never evicts, which is bounded by the number of pinned
+    /// accounts a thread touches — a pin is permanent and operator-installed, so that set does not
+    /// grow with traffic.
     static VERIFIED_CHECKPOINTS: RefCell<CheckpointCache> = RefCell::new(CheckpointCache::new());
 }
 
@@ -664,6 +666,77 @@ mod tests {
             0,
             "a post-pin v1 sibling never competes for a slot the checkpoint decided",
         );
+    }
+
+    /// A v2 continuation may EXTEND a device's accepted chain but never CONTEST a slot the
+    /// checkpoint already decided.
+    ///
+    /// Such an entry really is authorized: its `prev_hash` is checkpoint-accepted so the ancestry
+    /// walk lands, and the founder signing it cites its own live incarnation, so the executor
+    /// applies it. The min-hash tiebreak is symmetric, so without the frozen-slot guard an applied
+    /// v2 entry with the smaller hash displaces the checkpoint's own winner and collapses the
+    /// accepted chain above it — selecting a different historical branch, which is the frozen
+    /// branch-loser revival the pin exists to prevent. Being authorized is not permission to
+    /// rewrite what the pin froze.
+    #[test]
+    fn an_applied_v2_entry_cannot_contest_a_slot_the_checkpoint_already_decided() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, device, genesis, accepted) = account_with_one_enrolment(&conn);
+        let digest = install_pin(&conn, account).checkpoint_digest;
+
+        // Same slot as the accepted enrolment, and the smaller hash — the side that wins the
+        // min-hash tiebreak the moment both are effective.
+        let contender = (20u8..=200)
+            .map(|seed| device_add_entry(account, &device, genesis, digest, 2, seed))
+            .find(|entry| entry.entry_hash < accepted)
+            .expect("a smaller-hash v2 contender exists");
+        storage::account_ingest(&conn, &contender.signed_bytes, 2).unwrap();
+
+        assert_eq!(accepted_flag(&conn, accepted), 1, "the checkpoint's winner keeps its slot");
+        assert_eq!(
+            accepted_flag(&conn, contender.entry_hash),
+            0,
+            "an APPLIED v2 entry still never displaces a slot the checkpoint decided",
+        );
+    }
+
+    /// Installing a pin must not fail merely because an enrollment invite is outstanding.
+    ///
+    /// The fold's reservation top-up resolves the account's streams through the GATED
+    /// `owned_streams_for_account`, which refuses under either pin state — and it short-circuits
+    /// when nothing is outstanding, so a fixture without a reservation never reached it. There is
+    /// nothing to reserve capacity for on an account no enrollment can redeem against, so the whole
+    /// top-up is skipped under a pin; running it would fail the fold, and the pin install with it,
+    /// blaming a version mismatch that is not the cause.
+    #[test]
+    fn a_pin_installs_with_an_enrollment_reservation_outstanding() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, _device, _genesis, enrolled) = account_with_one_enrolment(&conn);
+        {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            crate::upsert_account_candidate_reservation_in_tx(
+                &tx,
+                account,
+                [9; 32],
+                4,
+                4096,
+                2,
+                rag_rat_base::time::now_ms() + 3_600_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        install_pin(&conn, account);
+        assert_eq!(
+            accepted_flag(&conn, enrolled),
+            1,
+            "the pin installed and folded with the reservation still outstanding",
+        );
+        storage::refold_account(&conn, account).unwrap();
+        assert_eq!(accepted_flag(&conn, enrolled), 1, "and every later fold is equally unaffected");
     }
 
     /// Two v2 continuations at ONE chain slot resolve to exactly one accepted entry, and to the
