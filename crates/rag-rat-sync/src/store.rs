@@ -8,11 +8,11 @@
 use rag_rat_oplog::{
     AccessMode, AccountId, ContentIngestOutcome, DeviceRole, IngestOutcome, NodeAuthError,
     account_effective_count, account_entries_for_enrollment, account_entries_for_sync,
-    account_entry_ref, account_ingest, account_is_fully_public, account_signed_entry_exists,
-    account_signed_hash, content_entries_for_public_sync, content_entries_for_sync,
-    content_entry_ref, content_ingest, content_signed_entry_exists, content_signed_hash,
-    ever_granted_accounts, owner_ever_granted, sign_local_node_binding, stream_access_mode,
-    stream_owner_account, verify_node_binding,
+    account_entry_ref, account_ingest, account_is_fully_public, account_is_pinned,
+    account_signed_entry_exists, account_signed_hash, content_entries_for_public_sync,
+    content_entries_for_sync, content_entry_ref, content_ingest, content_signed_entry_exists,
+    content_signed_hash, ever_granted_accounts, owner_ever_granted, sign_local_node_binding,
+    stream_access_mode, stream_control_pinned, stream_owner_account, verify_node_binding,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
@@ -165,7 +165,12 @@ impl SyncStore for OplogSyncStore<'_> {
             ServeScope::Full => {
                 let mut entries = account_entries_for_sync(&tx, self.account_id)?;
                 for grantee in ever_granted_accounts(&tx, self.account_id)? {
-                    rag_rat_oplog::require_supported_account_control(&tx, grantee)?;
+                    // A pinned grantee's log is not relayed: this store retracted everything it
+                    // contributed. The owner's own grant row keeps naming it, so skipping (not
+                    // aborting) is what keeps the owner servable.
+                    if account_is_pinned(&tx, grantee)? {
+                        continue;
+                    }
                     entries.extend(account_entries_for_enrollment(&tx, grantee)?);
                 }
                 entries
@@ -183,7 +188,9 @@ impl SyncStore for OplogSyncStore<'_> {
                 );
                 let mut entries = account_entries_for_enrollment(&tx, self.account_id)?;
                 for grantee in ever_granted_accounts(&tx, self.account_id)? {
-                    rag_rat_oplog::require_supported_account_control(&tx, grantee)?;
+                    if account_is_pinned(&tx, grantee)? {
+                        continue;
+                    }
                     if account_is_fully_public(&tx, grantee)? {
                         entries.extend(account_entries_for_enrollment(&tx, grantee)?);
                     }
@@ -214,6 +221,13 @@ impl SyncStore for OplogSyncStore<'_> {
         if entry_account != self.account_id
             && !owner_ever_granted(self.conn, self.account_id, entry_account)?
         {
+            return Ok(Ingested::NoChange);
+        }
+        // A relayed account this store has pinned is an entry-level no-op, never a session
+        // failure: the peer has no pin and will re-offer it every round, and the session's own
+        // account (checked above, and the only one that aborts) must keep converging past it.
+        // The evidence is not wanted either — a fold of a pinned account only retracts.
+        if entry_account != self.account_id && account_is_pinned(self.conn, entry_account)? {
             return Ok(Ingested::NoChange);
         }
         // Skip an entry already held — matched by the EXACT signed envelope under the entry's OWN
@@ -325,6 +339,12 @@ impl SyncStore for OplogContentSyncStore<'_> {
         let Ok((stream, entry_account, _entry_hash)) = content_entry_ref(signed_bytes) else {
             return Ok(Ingested::NoChange);
         };
+        // A stream routed to a pinned account takes nothing, whoever authored it — including this
+        // session's own account, whose other devices (without the pin) re-offer its contributions
+        // every round. The session account's OWN pin still aborts, at the check above.
+        if stream_control_pinned(self.conn, stream)? {
+            return Ok(Ingested::NoChange);
+        }
         if entry_account != self.account_id {
             // Resolve the access mode from the STREAM's owner, never from the attacker-settable
             // claimed author — that also correctly admits grant-gated contributor content
@@ -339,8 +359,10 @@ impl SyncStore for OplogContentSyncStore<'_> {
             // This also covers content an owner relays from its contributors (#1280): the account
             // fold lets a `StreamGrant` take effect only on an owned `PublicRead` stream, so every
             // contribution sits on a public stream.
-            let public =
-                stream_owner_account(self.conn, stream).ok().flatten().is_some_and(|owner| {
+            // A pinned foreign author resolves the same way: not public here, dropped as
+            // NoChange — the peer has no pin and re-offers every round.
+            let public = !account_is_pinned(self.conn, entry_account)?
+                && stream_owner_account(self.conn, stream).ok().flatten().is_some_and(|owner| {
                     stream_access_mode(self.conn, owner, stream).ok()
                         == Some(AccessMode::PublicRead)
                 });
@@ -361,7 +383,22 @@ impl SyncStore for OplogContentSyncStore<'_> {
         // budgets. A structural refusal (Rejected) or a capacity block is NOT a session error — a
         // peer may legitimately offer what this binary declines (e.g. content over the remote-flood
         // cap) — so map both to NoChange rather than aborting the whole session.
-        match content_ingest(self.conn, signed_bytes, (self.now_fn)())? {
+        // `content_ingest` checks the author's and the stream owner's policy under its own write
+        // lock; a pin that landed between the pre-filter above and that check is, for a FOREIGN
+        // entry, the same entry-level no-op — only the session's own account aborts. (A pin on
+        // the session account as the STREAM OWNER surfaces here too, for one foreign entry: it
+        // is swallowed, nothing was written, and the next call aborts at the check above.)
+        let outcome = match content_ingest(self.conn, signed_bytes, (self.now_fn)()) {
+            Ok(outcome) => outcome,
+            Err(error)
+                if entry_account != self.account_id
+                    && error
+                        .downcast_ref::<rag_rat_oplog::UnsupportedAccountControlVersion>()
+                        .is_some() =>
+                return Ok(Ingested::NoChange),
+            Err(error) => return Err(error),
+        };
+        match outcome {
             // Newly durable: stored as a candidate, or durably parked pending its roster key. The
             // `Eviction` suffix reports collateral pre-verify eviction of OTHER parked rows, not a
             // failure of THIS entry.

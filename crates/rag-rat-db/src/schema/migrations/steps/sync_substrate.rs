@@ -333,10 +333,12 @@ pub fn apply_content_projected_tables(conn: &Connection) -> rusqlite::Result<()>
 /// now records structural classification and enqueues the stream here instead; the settle seam
 /// (`settle_pending_content_refolds`) folds each dirty stream ONCE.
 /// INVARIANT: a `stream_id` is present while a refold + reproject is still owed. The row is
-/// discharged ONLY by `refold_and_project_stream_in_tx` — reached either from the settle seam or
-/// from a TRUSTED/local account fold (`finalize_affected_streams`) — and only after both steps
-/// succeed. The untrusted remote account-ingest path never clears it here; it only ADDS debt
-/// (`ACCOUNT_CHANGE`) for settle to drain.
+/// discharged by `refold_and_project_stream_in_tx` — reached either from the settle seam or
+/// from a TRUSTED/local account fold (`finalize_affected_streams`) — only after both steps
+/// succeed, and by the control-pin cleanup (`refold_and_project_for_cleanup_in_tx`) only for a
+/// stream routed to the pinned account, which nothing else will ever settle. The untrusted remote
+/// account-ingest path never clears it here; it only ADDS debt (`ACCOUNT_CHANGE`) for settle to
+/// drain, as does the pin cleanup for a live stream it refolded or could not re-project.
 /// Purely additive; `CREATE ... IF NOT EXISTS`, so a torn replay reconverges without a wrapping
 /// transaction; nothing pre-existing to backfill.
 pub fn apply_content_streams_pending_refold(conn: &Connection) -> rusqlite::Result<()> {

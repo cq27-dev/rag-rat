@@ -1266,6 +1266,28 @@ pub fn stream_owner_account(
 ) -> anyhow::Result<Option<AccountId>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
     super::control_policy::require_supported_stream_control(conn, stream_id)?;
+    stream_owner_account_unchecked(conn, stream_id)
+}
+
+/// [`stream_owner_account`] for the paths that RETRACT rather than act: a stream routed to a
+/// pinned account reads as owned by nobody, which is the declassify-to-structural verdict the
+/// refold and the projector already give a stream whose owner is contested. The signed candidates
+/// stay stored for a binary that can execute the pin; only their acceptance and projection go.
+pub(in crate::account) fn stream_owner_account_for_cleanup(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> anyhow::Result<Option<AccountId>> {
+    let _snapshot = super::control_policy::read_snapshot(conn)?;
+    if super::control_policy::stream_control_pinned(conn, stream_id)? {
+        return Ok(None);
+    }
+    stream_owner_account_unchecked(conn, stream_id)
+}
+
+fn stream_owner_account_unchecked(
+    conn: &Connection,
+    stream_id: StreamId,
+) -> anyhow::Result<Option<AccountId>> {
     let owner: Option<Vec<u8>> = conn
         .query_row(
             "SELECT account_id FROM account_stream_ownership WHERE stream_id = ?1",
@@ -1734,14 +1756,33 @@ pub(super) fn clear_unsupported_authority_in_tx(
     tx: &Transaction<'_>,
     account_id: AccountId,
 ) -> anyhow::Result<()> {
-    tx.execute(
-        "UPDATE content_entries SET accepted=0 WHERE author_account_id=?1 OR stream_id IN (SELECT \
-         stream_id FROM account_control_pin_streams WHERE account_id=?1)",
+    // Capture routes before removing ownership. Refold/reprojection is a declassification path:
+    // it must run even though operational authority for this account is unsupported.
+    let mut affected = content::affected_streams_for_account(tx, account_id, &[])?;
+    let pinned_streams = {
+        let mut stmt =
+            tx.prepare("SELECT stream_id FROM account_control_pin_streams WHERE account_id=?1")?;
+        stmt.query_map([account_id.to_bytes().as_slice()], |r| r.get::<_, Vec<u8>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for bytes in pinned_streams {
+        affected.push(StreamId::from_bytes(id::fixed(&bytes)?));
+    }
+    affected.sort_unstable();
+    affected.dedup();
+    // What the retraction below still has to retract. Every fold of a pinned account comes
+    // through here — install, and each later local ingest for the account — and a re-projection
+    // is O(all content on the affected streams) plus a Lens-visible epoch bump; once nothing is
+    // accepted there is nothing left to retract, so only a fold that flipped something re-projects.
+    let mut flipped = tx.execute(
+        "UPDATE content_entries SET accepted=0 WHERE accepted=1 AND (author_account_id=?1 OR \
+         stream_id IN (SELECT stream_id FROM account_control_pin_streams WHERE account_id=?1))",
         [account_id.to_bytes().as_slice()],
     )?;
-    tx.execute("UPDATE account_entries SET accepted=0 WHERE account_id=?1", [account_id
-        .to_bytes()
-        .as_slice()])?;
+    flipped += tx
+        .execute("UPDATE account_entries SET accepted=0 WHERE accepted=1 AND account_id=?1", [
+            account_id.to_bytes().as_slice(),
+        ])?;
     tx.execute(
         "UPDATE account_entry_status SET status='retained_unfolded', detail='unsupported_version' \
          WHERE entry_hash IN (SELECT entry_hash FROM account_entries WHERE account_id=?1)",
@@ -1767,6 +1808,11 @@ pub(super) fn clear_unsupported_authority_in_tx(
         ])?;
     }
 
+    if flipped > 0 {
+        for stream in affected {
+            content::refold_and_project_for_cleanup_in_tx(tx, stream)?;
+        }
+    }
     Ok(())
 }
 

@@ -2596,6 +2596,16 @@ fn relay_note(id: &str) -> rag_rat_oplog::MemoryOp {
 /// stream)`.
 fn owner_with_an_accepted_contribution()
 -> (Connection, AccountId, Connection, AccountId, rag_rat_oplog::StreamId) {
+    let fixture = owner_with_a_contribution(true);
+    assert_eq!(accepted_notes(&fixture.0, fixture.4), vec!["guest-note", "owner-note"]);
+    fixture
+}
+
+/// [`owner_with_an_accepted_contribution`], with the owner's own note optional: without it the
+/// stream holds nothing but the contribution.
+fn owner_with_a_contribution(
+    with_owner_note: bool,
+) -> (Connection, AccountId, Connection, AccountId, rag_rat_oplog::StreamId) {
     use rag_rat_oplog::{
         AccessMode, ContentRefoldBudget, SealPolicy, author_content_batch,
         author_stream_grant_in_tx, ensure_owned_stream_v2_with_mode_in_tx,
@@ -2613,8 +2623,16 @@ fn owner_with_an_accepted_contribution()
         tx.commit().unwrap();
         stream
     };
-    author_content_batch(&owner, stream, &[relay_note("owner-note")], SealPolicy::Plaintext, NOW)
+    if with_owner_note {
+        author_content_batch(
+            &owner,
+            stream,
+            &[relay_note("owner-note")],
+            SealPolicy::Plaintext,
+            NOW,
+        )
         .unwrap();
+    }
     let contributor = fresh_db();
     let contributor_account = local_account(&contributor, NOW).unwrap();
     {
@@ -2633,7 +2651,6 @@ fn owner_with_an_accepted_contribution()
     contribute(&contributor, owner_account, stream, "guest-note");
     copy_account(&contributor, &owner, contributor_account);
     settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW).unwrap();
-    assert_eq!(accepted_notes(&owner, stream), vec!["guest-note", "owner-note"]);
     (owner, owner_account, contributor, contributor_account, stream)
 }
 
@@ -2895,4 +2912,337 @@ async fn an_anonymous_pull_of_an_owner_converges_on_its_contributions() {
             "the second pull is quiet: {report:?}",
         );
     }
+}
+
+// ── a permanent control pin retracts what the pinned account projected (#1311) ─────────────────
+
+/// Pin `account` in `dst` from a checkpoint a device of that account prepares in `src`: the
+/// permanent "this store cannot execute this account's control" mark.
+fn pin_account_from(dst: &Connection, src: &Connection, account: AccountId) {
+    use rusqlite::{Transaction, TransactionBehavior};
+    let device = rag_rat_oplog::local_device(src, NOW).unwrap();
+    let tx = Transaction::new_unchecked(src, TransactionBehavior::Immediate).unwrap();
+    let bundle = rag_rat_oplog::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
+    tx.commit().unwrap();
+    let pin = rag_rat_oplog::TrustedCheckpointPin {
+        account_id: account,
+        checkpoint_digest: bundle.certificate_digest(),
+        required_control_version: 2,
+    };
+    let proof = rag_rat_oplog::verify_checkpoint(pin, &bundle).unwrap();
+    let tx = Transaction::new_unchecked(dst, TransactionBehavior::Immediate).unwrap();
+    assert_eq!(
+        rag_rat_oplog::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap(),
+        rag_rat_oplog::PinInstallOutcome::Installed
+    );
+    tx.commit().unwrap();
+}
+
+/// `(retained, accepted)` content entries `author` holds on `stream`.
+fn author_entries(
+    conn: &Connection,
+    stream: rag_rat_oplog::StreamId,
+    author: AccountId,
+) -> (i64, i64) {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(accepted), 0) FROM content_entries
+         WHERE stream_id = ?1 AND author_account_id = ?2",
+        rusqlite::params![stream.to_bytes().as_slice(), author.to_bytes().as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// Pinning an owner retracts everything on its streams in the pin's own transaction: the
+/// projection empties, the signed evidence stays, and the projection passes that run later (the
+/// open-time rebuild, a queued settle) complete on the pinned stream and keep it empty.
+#[test]
+fn pinning_an_owner_retracts_its_projection_and_later_passes_stay_quiet() {
+    use rag_rat_oplog::{ContentRefoldBudget, settle_pending_content_refolds};
+    let (owner, owner_account, _contributor, contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+    assert!(!rag_rat_oplog::list_projected_content_nodes(&owner, stream).unwrap().is_empty());
+
+    pin_account_from(&owner, &owner, owner_account);
+    assert!(
+        rag_rat_oplog::list_projected_content_nodes(&owner, stream).unwrap().is_empty(),
+        "the pin empties the projection in its own transaction",
+    );
+    assert_eq!(author_entries(&owner, stream, owner_account), (1, 0), "retained, declassified");
+    assert_eq!(
+        author_entries(&owner, stream, contributor_account),
+        (1, 0),
+        "the contribution on the pinned owner's stream goes with it",
+    );
+
+    // Force the two passes that materialise projections to run over the store: an older projector
+    // stamp owes a rebuild (which finds nothing left on the retracted stream), and a queued row
+    // owes a settle of this very stream.
+    owner
+        .execute(
+            "UPDATE oplog_meta SET value = CAST(value AS INTEGER) - 1
+             WHERE key = 'content_projector_version'",
+            [],
+        )
+        .unwrap();
+    assert!(rag_rat_oplog::rebuild_all_content_projections_if_stale(&owner).unwrap());
+    owner
+        .execute("INSERT INTO content_streams_pending_refold(stream_id) VALUES (?1)", [stream
+            .to_bytes()
+            .as_slice()])
+        .unwrap();
+    settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    assert!(!rag_rat_oplog::content_stream_has_pending_refold(&owner, stream).unwrap());
+    assert!(rag_rat_oplog::list_projected_content_nodes(&owner, stream).unwrap().is_empty());
+}
+
+/// Pinning a CONTRIBUTOR declassifies only what it authored: the owner's notes stay accepted, the
+/// contributor's are retained but no longer project, the owner keeps authoring over the retracted
+/// entry without parking a refold behind it, keeps serving (the contributor's log is skipped, not
+/// a session failure), and cannot grant the pinned account again.
+#[test]
+fn pinning_a_contributor_declassifies_its_notes_and_the_owner_keeps_authoring() {
+    use rag_rat_oplog::{
+        ContentRefoldBudget, SealPolicy, author_content_batch, author_stream_grant_in_tx,
+        settle_pending_content_refolds,
+    };
+    use rag_rat_sync::{ServeScope, SyncStore};
+    use rusqlite::{Transaction, TransactionBehavior};
+    let (owner, owner_account, contributor, contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+
+    pin_account_from(&owner, &contributor, contributor_account);
+    assert_eq!(accepted_notes(&owner, stream), vec!["owner-note"]);
+    assert_eq!(author_entries(&owner, stream, contributor_account), (1, 0));
+    assert_eq!(author_entries(&owner, stream, owner_account), (1, 1));
+
+    let own_log: Vec<Vec<u8>> = account_entries_for_sync(&owner, owner_account)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.signed_bytes)
+        .collect();
+    for scope in [ServeScope::Full, ServeScope::PublicOnly] {
+        let mut serve = OplogSyncStore::new(&owner, owner_account, || NOW);
+        serve.set_serve_scope(scope);
+        let mut served: Vec<Vec<u8>> =
+            serve.snapshot().unwrap().into_iter().map(|(_, bytes)| bytes).collect();
+        served.sort();
+        let mut expected = own_log.clone();
+        expected.sort();
+        assert_eq!(served, expected, "the owner serves its own log and skips the pinned grantee");
+    }
+    // The content it relays goes with the log that authorised it.
+    let relayed_authors: Vec<AccountId> =
+        rag_rat_oplog::content_entries_for_sync(&owner, owner_account)
+            .unwrap()
+            .iter()
+            .map(|e| rag_rat_oplog::content_entry_ref(&e.signed_bytes).unwrap().1)
+            .collect();
+    assert_eq!(relayed_authors, vec![owner_account], "the pinned contribution is not relayed");
+
+    let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+    let error = author_stream_grant_in_tx(
+        &tx,
+        stream,
+        contributor_account,
+        rag_rat_oplog::GrantRole::Writer,
+        NOW + 1,
+    )
+    .unwrap_err();
+    assert!(
+        error.downcast_ref::<rag_rat_oplog::UnsupportedAccountControlVersion>().is_some(),
+        "no path grants a pinned account: {error:#}"
+    );
+    let authored: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1",
+            [owner_account.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(authored, own_log.len() as i64, "refused before any grant entry is authored");
+    drop(tx);
+
+    author_content_batch(
+        &owner,
+        stream,
+        &[relay_note("later-note")],
+        SealPolicy::Plaintext,
+        NOW + 1,
+    )
+    .unwrap();
+    settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW + 1).unwrap();
+    assert!(!rag_rat_oplog::content_stream_has_pending_refold(&owner, stream).unwrap());
+    assert_eq!(accepted_notes(&owner, stream), vec!["later-note", "owner-note"]);
+}
+
+/// The mirror of the grantee case: pinning the OWNER in a contributor's store withholds the
+/// contributor's entries on that stream from both content serve scopes (its own stream still
+/// serves) instead of aborting them, and its own contribution re-offered by a device without the
+/// pin is dropped rather than aborting the session.
+#[test]
+fn a_contributor_keeps_serving_after_its_owner_is_pinned() {
+    use rag_rat_oplog::{
+        AccessMode, SealPolicy, author_content_batch, content_entries_for_sync, content_entry_ref,
+        ensure_owned_stream_v2_with_mode_in_tx,
+    };
+    use rag_rat_sync::{Ingested, OplogContentSyncStore, ServeScope, SyncStore};
+    use rusqlite::{Transaction, TransactionBehavior};
+    let (owner, owner_account, contributor, contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+    let own_stream = {
+        let tx = Transaction::new_unchecked(&contributor, TransactionBehavior::Immediate).unwrap();
+        let own =
+            ensure_owned_stream_v2_with_mode_in_tx(&tx, "repo-own", AccessMode::PublicRead, NOW)
+                .unwrap();
+        tx.commit().unwrap();
+        own
+    };
+    author_content_batch(
+        &contributor,
+        own_stream,
+        &[relay_note("mine")],
+        SealPolicy::Plaintext,
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(author_entries(&contributor, stream, contributor_account), (1, 1));
+    // The contribution as the owner relays it: what a device of this account without the pin
+    // would offer back.
+    let contribution = content_entries_for_sync(&owner, owner_account)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.signed_bytes)
+        .find(|bytes| content_entry_ref(bytes).unwrap().1 == contributor_account)
+        .unwrap();
+
+    pin_account_from(&contributor, &owner, owner_account);
+    assert_eq!(author_entries(&contributor, stream, contributor_account), (1, 0));
+    for scope in [ServeScope::Full, ServeScope::PublicOnly] {
+        let mut serve = OplogContentSyncStore::new(&contributor, contributor_account, || NOW);
+        serve.set_serve_scope(scope);
+        let served: Vec<rag_rat_oplog::StreamId> = serve
+            .snapshot()
+            .unwrap()
+            .iter()
+            .map(|(_, bytes)| content_entry_ref(bytes).unwrap().0)
+            .collect();
+        assert_eq!(served, vec![own_stream], "only the pinned stream is withheld");
+        let mut accounts = OplogSyncStore::new(&contributor, contributor_account, || NOW);
+        accounts.set_serve_scope(scope);
+        assert!(!accounts.snapshot().unwrap().is_empty(), "its own log still serves");
+    }
+
+    // A device that never held the contribution: the envelope is new here, and the stream it
+    // sits on is pinned.
+    contributor
+        .execute(
+            "DELETE FROM content_entries WHERE stream_id = ?1 AND author_account_id = ?2",
+            rusqlite::params![
+                stream.to_bytes().as_slice(),
+                contributor_account.to_bytes().as_slice()
+            ],
+        )
+        .unwrap();
+    let mut ingest = OplogContentSyncStore::new(&contributor, contributor_account, || NOW);
+    assert_eq!(ingest.ingest(&contribution).unwrap(), Ingested::NoChange);
+    assert_eq!(author_entries(&contributor, stream, contributor_account), (0, 0));
+}
+
+/// A live owner's stream holding nothing but a pinned contributor's entries keeps those entries as
+/// its clock basis (the stored clock survives the retraction), and the owner goes on authoring.
+#[test]
+fn a_stream_left_with_only_pinned_entries_keeps_its_clock_basis() {
+    use rag_rat_oplog::{
+        ContentRefoldBudget, SealPolicy, author_content_batch, settle_pending_content_refolds,
+    };
+    use rusqlite::OptionalExtension;
+    let (owner, owner_account, contributor, contributor_account, stream) =
+        owner_with_a_contribution(false);
+    // A second contribution, so the basis sits above lamport 0 (a zero clock stores nothing).
+    contribute(&contributor, owner_account, stream, "guest-2");
+    copy_account(&contributor, &owner, contributor_account);
+    settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    assert_eq!(accepted_notes(&owner, stream), vec!["guest-2", "guest-note"]);
+    let top: i64 = owner
+        .query_row(
+            "SELECT MAX(lamport) FROM content_entries WHERE stream_id = ?1",
+            [stream.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(top >= 1, "lamport {top}");
+
+    pin_account_from(&owner, &contributor, contributor_account);
+    assert!(accepted_notes(&owner, stream).is_empty());
+    let clock: Option<i64> = owner
+        .query_row(
+            "SELECT clock FROM content_stream_clocks WHERE stream_id = ?1",
+            [stream.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(clock, Some(top), "the retracted contribution still props the stream clock");
+
+    author_content_batch(
+        &owner,
+        stream,
+        &[relay_note("later-note")],
+        SealPolicy::Plaintext,
+        NOW + 1,
+    )
+    .unwrap();
+    settle_pending_content_refolds(&owner, &ContentRefoldBudget::unbounded(), NOW + 1).unwrap();
+    assert_eq!(accepted_notes(&owner, stream), vec!["later-note"]);
+}
+
+/// A relayed account this store has pinned is an entry-level no-op for both session stores: the
+/// peer has no pin and re-offers it every round, so the session must converge past it, and the
+/// owner's own entries on the same page still land.
+#[test]
+fn a_session_drops_a_pinned_foreign_authors_entries_and_keeps_the_rest() {
+    use rag_rat_oplog::{
+        ContentRefoldBudget, content_entries_for_sync, content_entry_ref,
+        settle_pending_content_refolds,
+    };
+    use rag_rat_sync::{Ingested, OplogContentSyncStore, SyncStore};
+    let (owner, owner_account, contributor, contributor_account, stream) =
+        owner_with_an_accepted_contribution();
+    let receiver = fresh_db();
+    // The pin lands before any of the contributor's history reaches this store.
+    pin_account_from(&receiver, &contributor, contributor_account);
+
+    let mut accounts = OplogSyncStore::new(&receiver, owner_account, || NOW);
+    for entry in account_entries_for_sync(&owner, owner_account).unwrap() {
+        assert_eq!(accounts.ingest(&entry.signed_bytes).unwrap(), Ingested::Stored);
+    }
+    for entry in account_entries_for_sync(&contributor, contributor_account).unwrap() {
+        assert_eq!(
+            accounts.ingest(&entry.signed_bytes).unwrap(),
+            Ingested::NoChange,
+            "a pinned relayed account is dropped, not a session failure",
+        );
+    }
+    assert!(account_entries_for_sync(&receiver, contributor_account).unwrap().is_empty());
+
+    // The owner serves the contribution beside its own note (it relays what folded accepted on
+    // its stream); only the note it authored lands here.
+    let mut contents = OplogContentSyncStore::new(&receiver, owner_account, || NOW);
+    for entry in content_entries_for_sync(&owner, owner_account).unwrap() {
+        let (_, author, _) = content_entry_ref(&entry.signed_bytes).unwrap();
+        let own = author == owner_account;
+        let expected = if own { Ingested::Stored } else { Ingested::NoChange };
+        assert_eq!(
+            contents.ingest(&entry.signed_bytes).unwrap(),
+            expected,
+            "only the owner's own note lands (owner-authored: {own})"
+        );
+    }
+    for entry in content_entries_for_sync(&contributor, contributor_account).unwrap() {
+        assert_eq!(contents.ingest(&entry.signed_bytes).unwrap(), Ingested::NoChange);
+    }
+    settle_pending_content_refolds(&receiver, &ContentRefoldBudget::unbounded(), NOW).unwrap();
+    assert_eq!(accepted_notes(&receiver, stream), vec!["owner-note"]);
+    assert_eq!(author_entries(&receiver, stream, contributor_account), (0, 0));
 }

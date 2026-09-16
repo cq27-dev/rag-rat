@@ -114,8 +114,8 @@ pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
 pub(in crate::account) use content::{seal_and_sign_content_entry, sign_sealed_content_entry};
 pub use control_policy::{
     AccountControlPolicy, PinInstallOutcome, UnsupportedAccountControlVersion,
-    account_control_policy, export_account_checkpoint, pin_checkpoint_in_tx,
-    require_supported_account_control,
+    account_control_policy, account_is_pinned, export_account_checkpoint, pin_checkpoint_in_tx,
+    require_supported_account_control, stream_control_pinned,
 };
 pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, EntryStatus,

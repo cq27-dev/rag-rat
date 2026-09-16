@@ -67,6 +67,7 @@ pub use storage::{
 pub(super) use storage::{
     accepted_chain_tails, accepted_entry_at, affected_streams_for_account,
     finalize_affected_streams, promote_pre_verify_for_account, queue_account_changed_streams,
+    refold_and_project_for_cleanup_in_tx,
 };
 #[cfg(test)]
 pub(super) use storage::{pre_verify_content_sweeps, reset_pre_verify_content_sweeps};

@@ -134,6 +134,54 @@ fn only_a_configured_contribution_grant_makes_a_stream_less_account_servable() {
     );
 }
 
+/// The admission probe runs before authentication on every inbound dial, so a pinned contribution
+/// owner must read as "not servable", never as the typed refusal — including an owner whose stream
+/// was never published here (no routing-table row for the pin to key on). And the outbound pull
+/// stops dialling it: its session store would refuse after the handshake, every cadence.
+#[test]
+fn a_pinned_contribution_owner_makes_the_probe_answer_false_not_error() {
+    use rusqlite::{Transaction, TransactionBehavior};
+    let owner = schema_conn();
+    let owner_account = rag_rat_oplog::local_account(&owner, 1_000).unwrap();
+    let contributor = schema_conn();
+    let account = rag_rat_oplog::local_account(&contributor, 1_000).unwrap();
+    contributor
+        .execute(
+            "INSERT INTO repos(repo_id, display_name, registered_at_ms) VALUES ('repo-a','a',0)",
+            [],
+        )
+        .unwrap();
+    rag_rat_db::meta::set_repo_meta(
+        &contributor,
+        "repo-a",
+        "memory_contribution_owner",
+        &rag_rat_base::hash::hex_lower(&owner_account.to_bytes()),
+    )
+    .unwrap();
+    assert!(!account_is_public_kb(&contributor, account).unwrap(), "owner not synced: private");
+    assert_eq!(foreign_pull_targets(&contributor, account).unwrap(), vec![owner_account]);
+
+    let device = rag_rat_oplog::local_device(&owner, 1_000).unwrap();
+    let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+    let bundle = rag_rat_oplog::prepare_checkpoint_in_tx(&tx, owner_account, &device).unwrap();
+    tx.commit().unwrap();
+    let pin = rag_rat_oplog::TrustedCheckpointPin {
+        account_id: owner_account,
+        checkpoint_digest: bundle.certificate_digest(),
+        required_control_version: 2,
+    };
+    let proof = rag_rat_oplog::verify_checkpoint(pin, &bundle).unwrap();
+    let tx = Transaction::new_unchecked(&contributor, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap();
+    tx.commit().unwrap();
+
+    assert!(!account_is_public_kb(&contributor, account).unwrap(), "pinned owner: still private");
+    assert!(
+        foreign_pull_targets(&contributor, account).unwrap().is_empty(),
+        "a pinned owner is no longer dialled"
+    );
+}
+
 #[test]
 fn nudge_is_durable_when_no_resident_host_is_live() {
     let conn = Connection::open_in_memory().unwrap();

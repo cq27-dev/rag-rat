@@ -64,6 +64,31 @@ pub fn account_control_policy(
     }
 }
 
+/// Whether `account` sits under a permanent control pin this binary cannot execute. The one
+/// predicate every cleanup path asks; operational paths use [`require_supported_account_control`]
+/// and fail closed instead.
+pub fn account_is_pinned(conn: &Connection, account: AccountId) -> anyhow::Result<bool> {
+    Ok(matches!(
+        account_control_policy(conn, account)?,
+        AccountControlPolicy::UnsupportedVersion(_)
+    ))
+}
+
+/// Whether `stream` is routed to a pinned account, by ownership or by the pin's routing table.
+/// The routing table is derived from the authenticated checkpoint proof, so this is the tightest
+/// "the pin retracted this stream" answer a cleanup consumer can ask.
+pub fn stream_control_pinned(
+    conn: &Connection,
+    stream: crate::stream::StreamId,
+) -> anyhow::Result<bool> {
+    match require_supported_stream_control(conn, stream) {
+        Ok(()) => Ok(false),
+        Err(error) if error.downcast_ref::<UnsupportedAccountControlVersion>().is_some() =>
+            Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 /// Call inside the SAME snapshot as the authorized read or the SAME write transaction as mutation.
 pub fn require_supported_account_control(
     conn: &Connection,
@@ -292,6 +317,104 @@ mod tests {
         let error = require_supported_account_control(&reopened, account).unwrap_err();
         assert!(error.downcast_ref::<UnsupportedAccountControlVersion>().is_some());
         require_supported_account_control(&reopened, AccountId::from_bytes([9; 32])).unwrap();
+    }
+
+    /// A local account owning `repo` with one projected note on its stream.
+    fn account_with_a_projected_note(
+        conn: &Connection,
+        repo: &str,
+    ) -> (AccountId, crate::stream::StreamId) {
+        use crate::op::{MemoryOp, NodeContent, NodeId};
+        let account = crate::local_account(conn, 0).unwrap();
+        let tx =
+            Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        let stream = crate::ensure_owned_stream_v2_in_tx(&tx, repo, 1).unwrap();
+        tx.commit().unwrap();
+        let note = MemoryOp::NodeCreate {
+            node_id: NodeId::from("n1"),
+            content: NodeContent {
+                kind: "Invariant".into(),
+                title: "n1".into(),
+                body: "body".into(),
+                confidence: "high".into(),
+                source: "agent".into(),
+                tags: Vec::new(),
+                payload: None,
+            },
+        };
+        crate::author_content_batch(conn, stream, &[note], crate::SealPolicy::Plaintext, 1)
+            .unwrap();
+        assert_eq!(
+            crate::content_projection::list_projected_content_nodes(conn, stream).unwrap().len(),
+            1
+        );
+        (account, stream)
+    }
+
+    /// The pin re-projects the streams it retracts in its own transaction. A later fold of the
+    /// pinned account finds nothing left to flip and leaves the (empty) projection alone.
+    #[test]
+    fn pin_empties_the_projection_once_and_a_later_fold_leaves_it_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, stream) = account_with_a_projected_note(&conn, "pin-projection-test");
+        let proof = proof(&conn, account);
+        let tx =
+            Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        pin_checkpoint_in_tx(&tx, proof.pin(), &proof).unwrap();
+        assert!(
+            crate::content_projection::list_projected_content_nodes(&tx, stream)
+                .unwrap()
+                .is_empty(),
+            "retracted inside the install transaction"
+        );
+        tx.commit().unwrap();
+        let epoch = crate::content_projection::content_projection_epoch(&conn, stream).unwrap();
+        super::super::storage::refold_account(&conn, account).unwrap();
+        assert_eq!(
+            crate::content_projection::content_projection_epoch(&conn, stream).unwrap(),
+            epoch,
+            "nothing re-projects a stream the pin already emptied"
+        );
+    }
+
+    /// A projection owned by a NEWER binary must not be rewritten by this one — but the pin is
+    /// the fail-closed mechanism and lands anyway: acceptance is retracted, the projection is left
+    /// as it is, and a pending mark hands the rewrite to the binary that owns it.
+    #[test]
+    fn pin_install_lands_under_a_newer_projector_and_hands_it_the_reprojection() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, stream) = account_with_a_projected_note(&conn, "pin-stamp-test");
+        let proof = proof(&conn, account);
+        conn.execute(
+            "INSERT OR REPLACE INTO oplog_meta(key, value) VALUES ('content_projector_version', \
+             ?1)",
+            [(crate::content_projection::CONTENT_PROJECTOR_VERSION + 1).to_string()],
+        )
+        .unwrap();
+
+        let tx =
+            Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        assert_eq!(
+            pin_checkpoint_in_tx(&tx, proof.pin(), &proof).unwrap(),
+            PinInstallOutcome::Installed
+        );
+        tx.commit().unwrap();
+        assert!(account_is_pinned(&conn, account).unwrap());
+        let accepted: i64 = conn
+            .query_row("SELECT count(*) FROM content_entries WHERE accepted = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(accepted, 0, "acceptance is retracted regardless");
+        assert_eq!(
+            crate::content_projection::list_projected_content_nodes(&conn, stream).unwrap().len(),
+            1,
+            "the newer binary's projection is not rewritten by this one"
+        );
+        assert!(
+            crate::account::content_stream_has_pending_refold(&conn, stream).unwrap(),
+            "and it is owed the rewrite"
+        );
     }
 
     #[test]

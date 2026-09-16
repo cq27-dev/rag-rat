@@ -95,6 +95,11 @@ const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 /// So the legacy shape can only be created by a refold that predates this vocabulary, and that
 /// refold cannot run again once the vocabulary is stamped. Binding the vocabulary per mark (a
 /// migration) would buy nothing over dominating the one path that writes stale classifications.
+///
+/// `UnsupportedAccountControl` joined without a bump: no stored mark predates it. A pinned
+/// account's entries were never re-parked by an older binary — its pass refused the incarnation
+/// read and rolled back — and a mark from BEFORE the pin sits in the deferral family, which
+/// re-derives at the next open anyway.
 const TABLE_SYNC_DEFERRAL_VOCABULARY: i64 = 2;
 
 const TABLE_SYNC_DEFERRAL_VOCABULARY_KEY: &str = "table_sync_deferral_vocabulary";
@@ -268,6 +273,11 @@ fn replay_pending_entry(
         return repark(tx, pending, PendingReason::NoStreamContext);
     };
     let account_id = store::stream_account_id(tx, pending.stream_id)?;
+    // A pinned account's entries wait for a binary that can execute the pin — a projector bump,
+    // not the next open. Asked before the incarnation read, which refuses under the pin.
+    if crate::account::control_policy::account_is_pinned(tx, account_id)? {
+        return repark(tx, pending, PendingReason::UnsupportedAccountControl);
+    }
     match crate::account::repo_incarnation_state(tx, account_id, &context.repo_id)? {
         crate::account::RepoIncarnationState::Current(current)
             if current == crate::AccountEntryHash::from_bytes(context.incarnation_ref) => {},

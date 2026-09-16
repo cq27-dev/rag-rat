@@ -95,6 +95,13 @@ pub(crate) enum PendingReason {
     /// can establish, disambiguate, or restore this reference, so replay must retain debt and
     /// retry.
     DeferredIncarnationAuthority,
+    /// Retained evidence under a permanent account policy this binary cannot execute. Retry on a
+    /// later projector version, not every open; unrelated accounts can continue replaying.
+    ///
+    /// OBLIGATION: nothing else re-evaluates this mark. A binary that ships execution of the
+    /// pinned control version MUST bump `TABLE_SYNC_PROJECTOR_VERSION` (or the deferral
+    /// vocabulary), or these entries never replay.
+    UnsupportedAccountControl,
     /// A live row whose content differs from what was last published: an edit no peer has seen,
     /// which replaying this entry would silently overwrite.
     DeferredUnsentEdit,
@@ -163,7 +170,8 @@ impl PendingReason {
             | Self::UnknownOpKind
             | Self::UndecodablePayload
             | Self::TableNotInScope
-            | Self::NoStreamContext => false,
+            | Self::NoStreamContext
+            | Self::UnsupportedAccountControl => false,
         }
     }
 

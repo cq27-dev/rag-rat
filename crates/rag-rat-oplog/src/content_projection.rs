@@ -202,6 +202,14 @@ fn reproject_stream_projection(tx: &Transaction<'_>, stream_id: StreamId) -> any
     Ok(())
 }
 
+/// Whether a NEWER binary owns this store's `/3` projection (the stamp is ahead of this binary's
+/// [`CONTENT_PROJECTOR_VERSION`]). A writer that must land regardless (the control pin) asks this
+/// and leaves the projection to that binary instead of tripping the assert below.
+pub(crate) fn content_projector_is_newer(conn: &Connection) -> anyhow::Result<bool> {
+    Ok(stored_content_projector_version(conn)?
+        .is_some_and(|stored| stored > CONTENT_PROJECTOR_VERSION))
+}
+
 /// Error if a NEWER `/3` projector already folded this store's content projection — an older binary
 /// must not reproject (it would drop ops the newer binary knows) or stamp the version down. Mirrors
 /// the `/1` guard in [`crate::store`], at the `/3` projection layer (a projector bump need
@@ -484,6 +492,12 @@ fn load_accepted_entries(
     stream_id: StreamId,
 ) -> anyhow::Result<(Vec<Entry>, EntryAuthors)> {
     let mut authors = EntryAuthors::new();
+    // A stream routed to a pinned account projects EMPTY: the projection is rewritten and its
+    // epoch advanced, so materialising consumers retract the image. (A stream with no owner at
+    // all still projects, keyless — that is the pre-ownership state, not a retraction.)
+    if crate::account::control_policy::stream_control_pinned(tx, stream_id)? {
+        return Ok((Vec::new(), authors));
+    }
     // Key wraps live in the immutable stream OWNER's secrets log. A granted writer's account is
     // only the content author and may have no copy of those wraps.
     let owner_account = stream_owner_account(tx, stream_id)?;
