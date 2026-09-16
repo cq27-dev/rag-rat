@@ -10,7 +10,7 @@ use super::envelope::{self, SignedAccountEntry, VerifiedAccountEntry};
 use super::fold::{self, AccountClassification, AuthorityQuery};
 use super::id::{self, AccountEntryHash, AccountId, OwnerId};
 use super::ops::DeviceCut;
-use super::{candidate, snapshot, storage};
+use super::{annex, candidate, storage};
 use crate::cbor::{self, VecEncoderExt};
 use crate::device::{DevicePublic, DeviceSecret};
 use crate::identity::LocalDevice;
@@ -314,7 +314,7 @@ fn verify_projection(
         "checkpoint genesis mismatch"
     );
     anyhow::ensure!(
-        snapshot::projection::folded_state_hash(&projection.history) == certificate.projection_hash,
+        annex::projection::folded_state_hash(&projection.history) == certificate.projection_hash,
         "checkpoint legacy projection mismatch"
     );
     let signer = DevicePublic::from_bytes(&certificate.signer_key)?.fingerprint();
@@ -404,7 +404,7 @@ fn prepare_checkpoint(
             .genesis_hash()
             .ok_or_else(|| anyhow::anyhow!("checkpoint has no genesis"))?,
         evidence_digest: evidence_digest(entries.iter().map(|entry| entry.entry_hash)),
-        projection_hash: snapshot::projection::folded_state_hash(&projection.history),
+        projection_hash: annex::projection::folded_state_hash(&projection.history),
         signer_key: signer.public().to_bytes(),
         incarnation,
     };

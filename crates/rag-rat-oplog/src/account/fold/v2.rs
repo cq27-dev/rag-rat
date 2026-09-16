@@ -1529,7 +1529,7 @@ mod tests {
     }
 
     fn projection_hash(history: &AccountAuthHistory) -> [u8; 32] {
-        crate::account::snapshot::projection::folded_state_hash(history)
+        crate::account::annex::projection::folded_state_hash(history)
     }
 
     /// Composing NO v2 operation must reproduce the frozen fold exactly, byte for byte in the

@@ -18,7 +18,7 @@ use super::fold::{self, AuthorityChain, EntryStatus};
 use super::id::{self, AccountEntryHash, GrantId, OwnerId, RosterRef, SignedHash};
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
-use super::{AccountId, content, secrets, snapshot};
+use super::{AccountId, annex, content, secrets};
 use crate::cbor;
 use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
@@ -670,7 +670,7 @@ fn owner_chain_authority_in_snapshot(
 
 /// Verify every snapshot this device holds for `account_id` against the account history it holds.
 ///
-/// The read/query surface for [`snapshot::verify`], and deliberately READ-ONLY: it returns verdicts
+/// The read/query surface for [`annex::verify`], and deliberately READ-ONLY: it returns verdicts
 /// and changes nothing. A `Mismatch` here does not delete, condemn, or unaccept the entry — a
 /// snapshot whose claim is false stays stored and is simply never trusted. Nothing may feed a
 /// verdict back into acceptance, because verifying consults the local candidate inventory and an
@@ -682,7 +682,7 @@ fn owner_chain_authority_in_snapshot(
 pub(in crate::account) fn verify_stored_snapshots(
     conn: &Connection,
     account_id: AccountId,
-) -> anyhow::Result<Vec<(AccountEntryHash, snapshot::verify::SnapshotVerdict)>> {
+) -> anyhow::Result<Vec<(AccountEntryHash, annex::verify::SnapshotVerdict)>> {
     let rows = load_candidates(conn, account_id)?;
     let held: Vec<envelope::VerifiedAccountEntry> =
         rows.iter().map(|row| row.verified.clone()).collect();
@@ -695,16 +695,16 @@ pub(in crate::account) fn verify_stored_snapshots(
         {
             continue;
         }
-        let Ok(snapshot::ops::DecodedSnapshotOp::Known(snapshot::ops::SnapshotOp::Snapshot {
+        let Ok(annex::ops::DecodedAnnexOp::Known(annex::ops::AnnexOp::Snapshot {
             targets,
             ..
-        })) = snapshot::ops::decode(header.entry_type, &row.verified.payload)
+        })) = annex::ops::decode(header.entry_type, &row.verified.payload)
         else {
             // An unknown tag or a future state format is retained and uninterpretable here — not a
             // verdict, and not an error.
             continue;
         };
-        verdicts.push((row.entry_hash, snapshot::verify::verify_snapshot(&held, &targets)));
+        verdicts.push((row.entry_hash, annex::verify::verify_snapshot(&held, &targets)));
     }
     verdicts.sort_unstable_by_key(|(hash, _)| *hash);
     Ok(verdicts)
@@ -715,7 +715,7 @@ pub(in crate::account) fn verify_stored_snapshots(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::account) struct UsableSnapshot {
     pub(in crate::account) entry_hash: AccountEntryHash,
-    pub(in crate::account) targets: Vec<snapshot::ops::SnapshotTarget>,
+    pub(in crate::account) targets: Vec<annex::ops::SnapshotTarget>,
 }
 
 /// Every stored snapshot that verified AND whose author's cited incarnation is still open.
@@ -746,10 +746,10 @@ pub(in crate::account) fn usable_snapshots(
         {
             continue;
         }
-        let Ok(snapshot::ops::DecodedSnapshotOp::Known(snapshot::ops::SnapshotOp::Snapshot {
+        let Ok(annex::ops::DecodedAnnexOp::Known(annex::ops::AnnexOp::Snapshot {
             targets,
             ..
-        })) = snapshot::ops::decode(header.entry_type, &row.verified.payload)
+        })) = annex::ops::decode(header.entry_type, &row.verified.payload)
         else {
             continue;
         };
@@ -762,8 +762,8 @@ pub(in crate::account) fn usable_snapshots(
         ) {
             continue;
         }
-        if snapshot::verify::verify_snapshot(&held, &targets)
-            != snapshot::verify::SnapshotVerdict::Verified
+        if annex::verify::verify_snapshot(&held, &targets)
+            != annex::verify::SnapshotVerdict::Verified
         {
             continue;
         }
@@ -771,7 +771,7 @@ pub(in crate::account) fn usable_snapshots(
         // carrying unverified targets would let an author pad a manifest with fabricated secrets or
         // content coverage and outrank an honest snapshot on claims nobody validated.
         let verified_targets: Vec<_> =
-            targets.into_iter().filter(snapshot::verify::is_supported_target).collect();
+            targets.into_iter().filter(annex::verify::is_supported_target).collect();
         usable.push(UsableSnapshot { entry_hash: row.entry_hash, targets: verified_targets });
     }
     usable.sort_unstable_by_key(|snapshot| snapshot.entry_hash);
@@ -785,11 +785,11 @@ pub(in crate::account) fn selected_snapshot(
     account_id: AccountId,
 ) -> anyhow::Result<Option<UsableSnapshot>> {
     let usable = usable_snapshots(conn, account_id)?;
-    let candidates: Vec<snapshot::select::Candidate<'_>> = usable
+    let candidates: Vec<annex::select::Candidate<'_>> = usable
         .iter()
-        .map(|s| snapshot::select::Candidate { entry_hash: s.entry_hash, targets: &s.targets })
+        .map(|s| annex::select::Candidate { entry_hash: s.entry_hash, targets: &s.targets })
         .collect();
-    let Some(chosen) = snapshot::select::select(&candidates) else {
+    let Some(chosen) = annex::select::select(&candidates) else {
         return Ok(None);
     };
     Ok(usable.into_iter().find(|s| s.entry_hash == chosen))
@@ -2398,7 +2398,7 @@ impl AccountEntriesView {
     /// its own view of that device's chain.
     pub(in crate::account) fn accepted_control_heads(
         &self,
-    ) -> Vec<snapshot::ops::CoveredWatermark> {
+    ) -> Vec<annex::ops::CoveredWatermark> {
         let mut heads: HashMap<DeviceFingerprint, (u64, AccountEntryHash)> = HashMap::new();
         for entry in &self.held {
             if entry.header.log_id != fold::CONTROL_LOG
@@ -2413,9 +2413,9 @@ impl AccountEntriesView {
                 *slot = (entry.header.seq, entry.entry_hash);
             }
         }
-        let mut covered: Vec<snapshot::ops::CoveredWatermark> = heads
+        let mut covered: Vec<annex::ops::CoveredWatermark> = heads
             .into_iter()
-            .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+            .map(|(device_fingerprint, (seq, entry_hash))| annex::ops::CoveredWatermark {
                 device_fingerprint,
                 seq,
                 entry_hash,
@@ -3500,7 +3500,7 @@ fn is_current_annex_plaintext(header: &AccountEntryHeader) -> bool {
 /// than leaving a grow-only hole here that no verifier could ever evaluate.
 fn is_sealed_snapshot(header: &AccountEntryHeader) -> bool {
     header.log_id == fold::ANNEX_LOG
-        && header.entry_type == snapshot::ops::entry_type::SNAPSHOT
+        && header.entry_type == annex::ops::entry_type::SNAPSHOT
         && header.crypto_suite != 0
 }
 
@@ -3527,7 +3527,7 @@ pub(super) fn validate_storable_header_payload(
         // can never chain; an unknown tag is retained opaque. This is STRUCTURAL only — whether the
         // manifest's coverage claim is true is a read-time question, and asking it here would make
         // storage depend on what this device happens to hold.
-        snapshot::ops::validate_storable_snapshot_payload(header.entry_type, payload)
+        annex::ops::validate_storable_annex_payload(header.entry_type, payload)
             .map_err(|err| format!("annex op payload decode failed: {err}"))?;
     }
     Ok(())

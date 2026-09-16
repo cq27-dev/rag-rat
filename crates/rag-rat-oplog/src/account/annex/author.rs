@@ -39,7 +39,7 @@ use super::super::fold::{self, AccountClassification, EntryStatus};
 use super::super::id::AccountEntryHash;
 use super::super::storage::{self, CandidateInsert};
 use super::super::{AccountId, authoring, limits};
-use super::ops::{SnapshotOp, SnapshotTarget};
+use super::ops::{AnnexOp, SnapshotTarget};
 use super::{projection, verify};
 use crate::identity::LocalDevice;
 
@@ -139,7 +139,7 @@ pub fn author_snapshot_in_tx(
     if devices > limits::SNAPSHOT_COVERED_MAX {
         return Ok(SnapshotAuthorOutcome::CoverageExceedsEnvelope { devices });
     }
-    let manifest = SnapshotOp::Snapshot {
+    let manifest = AnnexOp::Snapshot {
         state_format_version: super::ops::SNAPSHOT_STATE_FORMAT_V1,
         moderation_epoch: 0,
         targets: vec![SnapshotTarget {
@@ -229,7 +229,7 @@ pub fn author_snapshot_in_tx(
 mod coverage_ceiling_tests {
     use super::super::super::id::OwnerId;
     use super::super::super::limits;
-    use super::super::ops::{CoveredWatermark, SnapshotOp, SnapshotTarget, encode};
+    use super::super::ops::{CoveredWatermark, AnnexOp, SnapshotTarget, encode};
     use super::*;
     use crate::op::DeviceFingerprint;
 
@@ -253,7 +253,7 @@ mod coverage_ceiling_tests {
     }
 
     fn payload(devices: usize) -> Vec<u8> {
-        let op = SnapshotOp::Snapshot {
+        let op = AnnexOp::Snapshot {
             state_format_version: super::super::ops::SNAPSHOT_STATE_FORMAT_V1,
             moderation_epoch: 0,
             targets: vec![SnapshotTarget {
@@ -328,7 +328,7 @@ mod coverage_ceiling_tests {
         // count in this band never reaches `encode`. Pin the encoder actually rejects it, proving
         // the guard is load-bearing rather than defensive.
         assert!(
-            encode(&SnapshotOp::Snapshot {
+            encode(&AnnexOp::Snapshot {
                 state_format_version: super::super::ops::SNAPSHOT_STATE_FORMAT_V1,
                 moderation_epoch: 0,
                 targets: vec![SnapshotTarget {

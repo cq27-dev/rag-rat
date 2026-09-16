@@ -2661,8 +2661,8 @@ fn an_annex_entry_is_stored_inert_and_never_touches_control_acceptance() {
     let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
     account_ingest(&conn, &genesis_bytes, NOW).unwrap();
 
-    let manifest = snapshot::ops::encode(&snapshot::ops::SnapshotOp::Snapshot {
-        state_format_version: snapshot::ops::SNAPSHOT_STATE_FORMAT_V1,
+    let manifest = annex::ops::encode(&annex::ops::AnnexOp::Snapshot {
+        state_format_version: annex::ops::SNAPSHOT_STATE_FORMAT_V1,
         moderation_epoch: 0,
         targets: Vec::new(),
     })
@@ -2674,7 +2674,7 @@ fn an_annex_entry_is_stored_inert_and_never_touches_control_acceptance() {
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 0,
         auth_len: 1,
@@ -2729,7 +2729,7 @@ fn a_garbage_annex_manifest_is_refused_at_ingest() {
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 0,
         auth_len: 1,
@@ -2927,7 +2927,7 @@ fn a_sealed_snapshot_is_refused_rather_than_retained() {
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 1,
         key_id: Some([0x77; 32]),
@@ -2983,7 +2983,7 @@ fn author_snapshot_over(
     account_id: AccountId,
     founder: &Dev,
     genesis_hash: AccountEntryHash,
-    mangle: impl FnOnce(&mut snapshot::ops::SnapshotTarget),
+    mangle: impl FnOnce(&mut annex::ops::SnapshotTarget),
 ) -> [u8; 32] {
     // The honest claim: every device's control-chain head, and the hash of folding exactly
     // that.
@@ -3004,16 +3004,16 @@ fn author_snapshot_over(
     }
     let control_only: Vec<_> =
         held.iter().filter(|e| e.header.log_id == fold::CONTROL_LOG).cloned().collect();
-    let mut target = snapshot::ops::SnapshotTarget {
+    let mut target = annex::ops::SnapshotTarget {
         log_id: fold::CONTROL_LOG,
         stream_id: None,
         subject_account_id: None,
-        folded_state_hash: snapshot::projection::folded_state_hash(&fold::fold_account(
+        folded_state_hash: annex::projection::folded_state_hash(&fold::fold_account(
             &control_only,
         )),
         covered: heads
             .into_iter()
-            .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+            .map(|(device_fingerprint, (seq, entry_hash))| annex::ops::CoveredWatermark {
                 device_fingerprint,
                 seq,
                 entry_hash: AccountEntryHash::from_bytes(entry_hash),
@@ -3022,8 +3022,8 @@ fn author_snapshot_over(
     };
     mangle(&mut target);
 
-    let payload = snapshot::ops::encode(&snapshot::ops::SnapshotOp::Snapshot {
-        state_format_version: snapshot::ops::SNAPSHOT_STATE_FORMAT_V1,
+    let payload = annex::ops::encode(&annex::ops::AnnexOp::Snapshot {
+        state_format_version: annex::ops::SNAPSHOT_STATE_FORMAT_V1,
         moderation_epoch: 0,
         targets: vec![target],
     })
@@ -3035,7 +3035,7 @@ fn author_snapshot_over(
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 0,
         auth_len: 1,
@@ -3073,7 +3073,7 @@ fn a_stored_snapshot_verifies_end_to_end_and_a_forged_one_does_not() {
     );
     assert_eq!(
         verify_stored_snapshots(&conn, account_id).unwrap(),
-        vec![(honest.into(), snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(honest.into(), annex::verify::SnapshotVerdict::Verified)],
         "an honest claim over stored history verifies through the real read path",
     );
 
@@ -3093,7 +3093,7 @@ fn a_stored_snapshot_verifies_end_to_end_and_a_forged_one_does_not() {
     );
     assert_eq!(verify_stored_snapshots(&conn, account_id).unwrap(), vec![(
         forged.into(),
-        snapshot::verify::SnapshotVerdict::Mismatch
+        annex::verify::SnapshotVerdict::Mismatch
     )],);
     assert_eq!(
         status(&conn, &forged).as_deref(),
@@ -3121,10 +3121,10 @@ fn an_authored_snapshot_verifies_and_is_selected_through_production_code() {
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account.account_id, NOW + 2).unwrap();
+        annex::author::author_snapshot_in_tx(&tx, &device, account.account_id, NOW + 2).unwrap();
     tx.commit().unwrap();
 
-    let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+    let annex::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
         panic!("the local founder is an open owner with history");
     };
 
@@ -3132,7 +3132,7 @@ fn an_authored_snapshot_verifies_and_is_selected_through_production_code() {
     // watermark vector — the whole point of sharing the prefix walk.
     assert_eq!(
         verify_stored_snapshots(&conn, account.account_id).unwrap(),
-        vec![(hash, snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(hash, annex::verify::SnapshotVerdict::Verified)],
         "an authored snapshot must verify against the history it was authored over",
     );
     assert_eq!(
@@ -3199,10 +3199,10 @@ fn a_member_device_has_no_authority_to_cite_and_authors_nothing() {
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 2).unwrap();
+        annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 2).unwrap();
     tx.commit().unwrap();
 
-    assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::NotAnOpenOwner);
+    assert_eq!(outcome, annex::author::SnapshotAuthorOutcome::NotAnOpenOwner);
     assert!(
         usable_snapshots(&conn, account_id).unwrap().is_empty(),
         "reporting the state must not have minted anything",
@@ -3283,10 +3283,10 @@ fn a_contested_account_is_never_snapshotted_even_by_an_open_owner() {
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 6).unwrap();
+        annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 6).unwrap();
     tx.commit().unwrap();
 
-    assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::AccountNotLive);
+    assert_eq!(outcome, annex::author::SnapshotAuthorOutcome::AccountNotLive);
     assert!(
         usable_snapshots(&conn, account_id).unwrap().is_empty(),
         "declining must not have minted anything",
@@ -3366,9 +3366,9 @@ fn a_snapshot_parents_the_canonical_genesis_not_a_lower_hashed_impostor() {
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 3).unwrap();
+        annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 3).unwrap();
     tx.commit().unwrap();
-    let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+    let annex::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
         panic!("the account still folds Live despite the impostor");
     };
 
@@ -3447,14 +3447,14 @@ fn a_snapshot_binds_the_total_tombstone_set_so_a_deep_removal_still_bars_re_enro
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 20).unwrap();
+        annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 20).unwrap();
     tx.commit().unwrap();
-    let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+    let annex::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
         panic!("the local founder is an open owner of a live account");
     };
     assert_eq!(
         verify_stored_snapshots(&conn, account_id).unwrap(),
-        vec![(hash, snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(hash, annex::verify::SnapshotVerdict::Verified)],
         "the snapshot must verify, or it binds nothing at all",
     );
 
@@ -3466,7 +3466,7 @@ fn a_snapshot_binds_the_total_tombstone_set_so_a_deep_removal_still_bars_re_enro
     let usable = usable_snapshots(&conn, account_id).unwrap();
     let covered = &usable[0].targets[0].covered;
     let by_hash = held.held().iter().map(|entry| (entry.entry_hash, entry)).collect();
-    let prefix = snapshot::verify::on_branch_prefix(covered, &by_hash)
+    let prefix = annex::verify::on_branch_prefix(covered, &by_hash)
         .expect("the covered prefix is walkable");
     let bound = fold::fold_account(&prefix);
     assert!(
@@ -3572,9 +3572,9 @@ fn a_coverage_claim_names_the_accepted_fork_not_the_losing_one() {
     let effective_before = account_effective_count(&conn, account_id).unwrap();
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 4).unwrap();
+        annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 4).unwrap();
     tx.commit().unwrap();
-    assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::HeldEvidenceOffBranch);
+    assert_eq!(outcome, annex::author::SnapshotAuthorOutcome::HeldEvidenceOffBranch);
     assert!(
         verify_stored_snapshots(&conn, account_id).unwrap().is_empty(),
         "declining must not have stored a snapshot to verify",
@@ -3626,7 +3626,7 @@ fn padding_a_manifest_with_unverifiable_coverage_does_not_win_selection() {
         &founder,
         AccountEntryHash::from_bytes(genesis_hash),
         |target| {
-            target.covered.push(snapshot::ops::CoveredWatermark {
+            target.covered.push(annex::ops::CoveredWatermark {
                 device_fingerprint: member.fp,
                 seq: 0,
                 entry_hash: AccountEntryHash::from_bytes([0xcd; 32]),
@@ -3640,7 +3640,7 @@ fn padding_a_manifest_with_unverifiable_coverage_does_not_win_selection() {
     // verify — the first line of defence. What matters for selection is that a snapshot cannot
     // gain rank from coverage that was never checked.
     assert!(
-        usable.iter().all(|s| s.targets.iter().all(snapshot::verify::is_supported_target)),
+        usable.iter().all(|s| s.targets.iter().all(annex::verify::is_supported_target)),
         "only verified targets may reach the selector",
     );
     assert_eq!(
@@ -3708,7 +3708,7 @@ fn closing_an_incarnation_makes_every_snapshot_it_authored_unusable() {
 
     assert_eq!(
         verify_stored_snapshots(&conn, account_id).unwrap(),
-        vec![(snapshot_hash.into(), snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(snapshot_hash.into(), annex::verify::SnapshotVerdict::Verified)],
         "the claim is still true — revocation is about authority, not correctness",
     );
     assert!(

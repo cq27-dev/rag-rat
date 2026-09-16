@@ -43,7 +43,7 @@ mod registers;
 // C4.2b: the account secrets log (`log_id = 1`) — the `StreamKeyWrap` op + owner-gated acceptance
 // evaluator, consuming the control fold's authority projection (#607).
 mod secrets;
-mod snapshot;
+mod annex;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -149,7 +149,7 @@ pub use secrets::{
 // cadence before then would write entries nothing reads into a capacity-bounded candidate
 // store that cannot yet prune them, since the tombstone horizon is still outstanding on #609.
 #[allow(unused_imports, reason = "C6 authoring seam is frozen before transport wiring lands")]
-pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
+pub use annex::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use storage::{
     CapacityScope, IngestOutcome, PromotionOutcome, StreamGrantListing, SyncAccountEntry,
     account_effective_count, account_entries_for_enrollment, account_entries_for_sync,
