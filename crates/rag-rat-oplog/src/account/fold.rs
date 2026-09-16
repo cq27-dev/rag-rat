@@ -1073,10 +1073,13 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
 }
 
 /// Captured only for an explicitly verified checkpoint, never allocated on ordinary v1 replay.
+/// It carries the FINAL coherent pass's state, so a cut held out as authored ahead appears here
+/// exactly as the fold left it: with no register installed and as no one's contributor.
 pub(super) struct LegacyTrace {
+    /// The revocation registers the fold installed — the only fold state v2 execution reads.
     registers: HashMap<RegisterKey, Cut>,
+    /// The candidates that installed one. v1 computes a revocation credit for these alone.
     contributors: HashSet<AccountEntryHash>,
-    readiness_exclusions: HashMap<AccountEntryHash, Outcome>,
 }
 
 pub(super) fn fold_account_traced(
@@ -1091,7 +1094,7 @@ pub(super) fn fold_account_traced(
     // exclusions only grow.
     let mut readiness_exclusions = HashMap::new();
     loop {
-        let (history, discovered, mut trace) =
+        let (history, discovered, trace) =
             fold_account_pass(entries, &readiness_exclusions, capture);
         let mut changed = false;
         for (hash, outcome) in discovered {
@@ -1103,9 +1106,6 @@ pub(super) fn fold_account_traced(
             }
         }
         if !changed {
-            if let Some(trace) = &mut trace {
-                trace.readiness_exclusions = readiness_exclusions;
-            }
             return (history, trace);
         }
     }
@@ -1412,11 +1412,7 @@ fn fold_account_pass(
             genesis_hash: Some(genesis_owner_id),
         },
         discovered,
-        capture.then(|| LegacyTrace {
-            registers,
-            contributors: register_contributors,
-            readiness_exclusions: HashMap::new(),
-        }),
+        capture.then(|| LegacyTrace { registers, contributors: register_contributors }),
     )
 }
 

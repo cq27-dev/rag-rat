@@ -68,11 +68,12 @@
 use super::*;
 
 /// Authenticated evidence and the FINAL coherent legacy fold, captured once during checkpoint
-/// verification. Normal v1 folds neither retain this trace nor clone their result.
+/// verification. Only the fold state execution actually reads is retained: of the trace, that is
+/// the registers alone. Normal v1 folds allocate no trace at all.
 pub(in crate::account) struct FrozenLegacy {
     entries: Vec<VerifiedAccountEntry>,
     history: AccountAuthHistory,
-    trace: LegacyTrace,
+    registers: HashMap<RegisterKey, Cut>,
     accepted: HashSet<AccountEntryHash>,
 }
 
@@ -83,11 +84,17 @@ impl FrozenLegacy {
         trace: LegacyTrace,
         accepted: HashSet<AccountEntryHash>,
     ) -> Self {
-        Self { entries, history, trace, accepted }
+        Self { entries, history, registers: trace.registers, accepted }
     }
 
     pub(in crate::account) fn entries(&self) -> &[VerifiedAccountEntry] {
         &self.entries
+    }
+
+    pub(in crate::account) fn accepted_entries(
+        &self,
+    ) -> impl Iterator<Item = AccountEntryHash> + '_ {
+        self.accepted.iter().copied()
     }
 
     /// Whether the checkpoint accepted this legacy entry. This is the eligibility ceiling for
@@ -265,7 +272,7 @@ impl V2Authority {
                     .is_some_and(|mint| mint.subject_device() != signer);
                 if impersonates { V2Verdict::WrongDevice } else { V2Verdict::Inadmissible }
             } else if matches!(
-                register_verdict(candidate, &frozen.trace.registers, &view),
+                register_verdict(candidate, &frozen.registers, &view),
                 RegisterVerdict::Condemned(_)
             ) {
                 // A chain the legacy epoch cut is not reopened by continuing it at version 2.
@@ -542,7 +549,7 @@ mod tests {
     use crate::identity::LocalDevice;
 
     #[test]
-    fn frozen_trace_comes_from_final_branch_closure_not_raw_fold_counts() {
+    fn frozen_legacy_comes_from_final_branch_closure_not_raw_fold_counts() {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
         let account = crate::local_account(&conn, 1).unwrap();
@@ -595,26 +602,32 @@ mod tests {
         assert_eq!(frozen.history.effective_count(), 2);
         assert_eq!(frozen.accepted.len(), 2);
         assert_eq!(proof.forked_legacy_entries().count(), 1);
-        assert!(frozen.trace.contributors.is_empty());
     }
 
+    /// The frozen registers are the only fold state v2 execution reads, and they come from the
+    /// FINAL coherent pass. At `auth_len` 1 an ineffective legacy removal still installs one;
+    /// at 999 the same removal is held out as authored ahead of the fold and installs none.
+    /// What separates the two folds is therefore a verdict on a v2 continuation of the cut
+    /// chain — the same entry either way — and not a captured value only this test would ever
+    /// read.
     #[test]
-    fn frozen_trace_preserves_ineffective_contributors_and_final_readiness_exclusions() {
-        for auth_len in [1, 999] {
+    fn a_frozen_register_condemns_a_v2_continuation_of_the_cut_chain() {
+        for (auth_len, expected) in [(1, V2Verdict::Condemned), (999, V2Verdict::Authorized)] {
             let mut conn = rusqlite::Connection::open_in_memory().unwrap();
             rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
             let account = crate::local_account(&conn, 1).unwrap();
             let device = crate::local_device(&conn, 1).unwrap();
             let genesis =
                 storage::account_entries_for_enrollment(&conn, account).unwrap()[0].entry_hash;
+            let subject = Dev::new(7);
             let op = AccountOp::DeviceRemove {
-                device_fingerprint: Dev::new(7).fp,
+                device_fingerprint: subject.fp,
                 control_cut: Cut::Empty,
                 secrets_cut: Cut::Empty,
                 content_cuts: vec![],
                 reason: "never enrolled".into(),
             };
-            let signed = envelope::sign_account_entry(
+            let removal = envelope::sign_account_entry(
                 device.secret(),
                 &AccountEntryHeader {
                     account_id: account,
@@ -633,7 +646,7 @@ mod tests {
                 &ops::encode(&op).unwrap(),
             )
             .unwrap();
-            storage::account_ingest(&conn, &signed.signed_bytes, 1).unwrap();
+            storage::account_ingest(&conn, &removal.signed_bytes, 1).unwrap();
             let tx = conn.transaction().unwrap();
             let bundle = checkpoint::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
             let proof = checkpoint::verify_checkpoint(
@@ -646,13 +659,69 @@ mod tests {
             )
             .unwrap();
             let frozen = proof.frozen_legacy();
-            assert!(!frozen.accepted.contains(&signed.entry_hash));
-            assert_eq!(frozen.trace.contributors.contains(&signed.entry_hash), auth_len == 1);
-            assert_eq!(!frozen.trace.registers.is_empty(), auth_len == 1);
-            assert_eq!(
-                frozen.trace.readiness_exclusions.contains_key(&signed.entry_hash),
-                auth_len == 999
+            // Removing a device that was never enrolled is ineffective, so neither fold accepts the
+            // removal itself: the register it left behind is the whole difference.
+            assert!(!frozen.accepted.contains(&removal.entry_hash));
+
+            // v2 mints the subject a live incarnation. State preconditions are not evaluated here,
+            // so this promote is authorized whether or not the subject is on the roster — which
+            // leaves the frozen register as the only thing that can keep its chain out.
+            let promote = author_on_founder_chain(
+                &proof,
+                &device,
+                genesis.into(),
+                2,
+                removal.entry_hash,
+                &AccountOp::OwnerPromote { device_fingerprint: subject.fp },
+                v2_ops::CONTROL_VERSION,
             );
+            let other = Dev::new(8);
+            let enrol = v2_ops::ControlOp {
+                checkpoint: proof.pin().checkpoint_digest,
+                pre_cut_view: None,
+                op: AccountOp::DeviceAdd {
+                    device_fingerprint: other.fp,
+                    ed25519_pubkey: other.ed,
+                    x25519_pubkey: other.x,
+                    role: DeviceRole::Member,
+                    label: None,
+                },
+            };
+            let signed = envelope::sign_account_entry(
+                &subject.secret,
+                &AccountEntryHeader {
+                    account_id: account,
+                    log_id: 0,
+                    device_fingerprint: subject.fp,
+                    seq: 0,
+                    prev_hash: None,
+                    parent_ref: None,
+                    entry_type: ops::entry_type_of(&enrol.op),
+                    op_version: v2_ops::CONTROL_VERSION,
+                    crypto_suite: 0,
+                    auth_len: 1,
+                    key_id: None,
+                    authority_ref: Some(promote.hash().into()),
+                },
+                &enrol.encode().unwrap(),
+            )
+            .unwrap();
+            let continuation = Candidate::new(
+                VerifiedAccountEntry {
+                    header: signed.header,
+                    payload: signed.payload,
+                    entry_hash: signed.entry_hash,
+                },
+                enrol.op,
+            );
+
+            let authority = V2Authority::resolve(frozen, &[promote.clone(), continuation.clone()]);
+            assert_eq!(
+                authority.verdict(&promote.hash()),
+                V2Verdict::Authorized,
+                "the mint itself is on a chain no register scopes",
+            );
+            assert_eq!(authority.verdict(&continuation.hash()), expected);
         }
     }
 
