@@ -203,7 +203,6 @@ pub(super) enum AccountClassification {
 
 /// The derived authority history of one account: per-entry outcomes, the account classification,
 /// and (only when `contested`) the deterministic recovery successor.
-#[derive(Clone)]
 pub(super) struct AccountAuthHistory {
     outcomes: HashMap<AccountEntryHash, Outcome>,
     classification: AccountClassification,
