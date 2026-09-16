@@ -4,9 +4,10 @@ use super::super::checkpoint::{self, TrustedCheckpointPin, VerifiedCheckpoint};
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader, SignedAccountEntry};
 use super::super::fold;
-use super::super::id::AccountEntryHash;
-use super::super::ops::{self as legacy, AccountOp, DeviceCut};
-use super::{ops, views};
+use super::super::id::{AccountEntryHash, OwnerId};
+use super::super::ops::{self as legacy, AccountOp, DeviceRole};
+use super::super::test_support::Dev;
+use super::{executor, ops, views};
 use crate::identity::LocalDevice;
 use crate::op::DeviceFingerprint;
 
@@ -44,7 +45,7 @@ fn revocation(demote: bool) -> ops::ControlOp {
             reason: "revoked".into(),
         }
     };
-    ops::ControlOp { checkpoint: [1; 32], pre_cut_view: [2; 32], op, credit_frontier: Some(vec![]) }
+    ops::ControlOp { checkpoint: [1; 32], pre_cut_view: Some([2; 32]), op }
 }
 
 fn manifest(
@@ -62,7 +63,7 @@ fn signed(
 ) -> SignedAccountEntry {
     let mut op = revocation(false);
     op.checkpoint = checkpoint.pin().checkpoint_digest;
-    op.pre_cut_view = pre_cut_view;
+    op.pre_cut_view = Some(pre_cut_view);
     if let AccountOp::DeviceRemove { reason, .. } = &mut op.op {
         *reason = format!("revoked {salt}");
     }
@@ -88,15 +89,101 @@ fn signed(
     .unwrap()
 }
 
+/// Authors v2 operations on the checkpoint signer's own chain, threading `(seq, prev_hash)`. The
+/// cited incarnation stays the one the legacy epoch minted — only the chain moves — so a long run
+/// of operations exercises chain length rather than a run of fresh authority.
+struct Chain<'a> {
+    checkpoint: &'a VerifiedCheckpoint,
+    device: &'a LocalDevice,
+    seq: u64,
+    prev: AccountEntryHash,
+    incarnation: OwnerId,
+}
+
+impl<'a> Chain<'a> {
+    fn new(checkpoint: &'a VerifiedCheckpoint, device: &'a LocalDevice) -> Self {
+        let tip = checkpoint
+            .continuation_heads()
+            .iter()
+            .find(|head| head.device_fingerprint == device.fingerprint())
+            .expect("the checkpoint signer has an accepted control head");
+        // The fixture account holds only its genesis, so the founder's head IS the mint its
+        // incarnation is named by.
+        Chain {
+            checkpoint,
+            device,
+            seq: tip.seq + 1,
+            prev: tip.hash,
+            incarnation: tip.hash.into(),
+        }
+    }
+
+    fn author(&mut self, op: ops::ControlOp) -> SignedAccountEntry {
+        let signed = envelope::sign_account_entry(
+            self.device.secret(),
+            &AccountEntryHeader {
+                account_id: self.checkpoint.pin().account_id,
+                log_id: 0,
+                device_fingerprint: self.device.fingerprint(),
+                seq: self.seq,
+                prev_hash: Some(self.prev),
+                parent_ref: Some(self.prev),
+                entry_type: legacy::entry_type_of(&op.op),
+                op_version: ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(self.incarnation),
+            },
+            &op.encode().unwrap(),
+        )
+        .unwrap();
+        self.seq += 1;
+        self.prev = signed.entry_hash;
+        signed
+    }
+
+    /// An ordinary operation: it nominates no view and needs no historical evidence at all.
+    fn add(&mut self, seed: u8) -> SignedAccountEntry {
+        let enrolled = Dev::new(seed);
+        self.author(ops::ControlOp {
+            checkpoint: self.checkpoint.pin().checkpoint_digest,
+            pre_cut_view: None,
+            op: AccountOp::DeviceAdd {
+                device_fingerprint: enrolled.fp,
+                ed25519_pubkey: enrolled.ed,
+                x25519_pubkey: enrolled.x,
+                role: DeviceRole::Member,
+                label: None,
+            },
+        })
+    }
+
+    fn remove(&mut self, pre_cut_view: [u8; 32], index: u32) -> SignedAccountEntry {
+        let mut target = [0u8; 32];
+        target[..4].copy_from_slice(&index.to_le_bytes());
+        self.author(ops::ControlOp {
+            checkpoint: self.checkpoint.pin().checkpoint_digest,
+            pre_cut_view: Some(pre_cut_view),
+            op: AccountOp::DeviceRemove {
+                device_fingerprint: DeviceFingerprint::from_bytes(target),
+                control_cut: Cut::Empty,
+                secrets_cut: Cut::Empty,
+                content_cuts: vec![],
+                reason: format!("revoked {index}"),
+            },
+        })
+    }
+}
+
+fn bytes(entries: &[SignedAccountEntry]) -> Vec<Vec<u8>> {
+    entries.iter().map(|entry| entry.signed_bytes.clone()).collect()
+}
+
 #[test]
-fn revocations_bind_both_view_and_frontier_without_changing_v1_bytes() {
+fn revocations_bind_their_pre_cut_view_without_changing_v1_bytes() {
     for demote in [false, true] {
         let mut op = revocation(demote);
-        op.credit_frontier = Some(vec![DeviceCut {
-            device_fingerprint: DeviceFingerprint::from_bytes([7; 32]),
-            seq: 4,
-            hash: [8; 32].into(),
-        }]);
         let tag = legacy::entry_type_of(&op.op);
         let old = legacy::encode(&op.op).unwrap();
         let bytes = op.encode().unwrap();
@@ -104,7 +191,7 @@ fn revocations_bind_both_view_and_frontier_without_changing_v1_bytes() {
         assert!(legacy::decode(tag, &bytes).is_err());
         assert!(ops::decode(tag, &old).is_err());
         assert_eq!(legacy::encode(&op.op).unwrap(), old);
-        op.pre_cut_view[0] ^= 1;
+        op.pre_cut_view = Some([9; 32]);
         assert_ne!(op.encode().unwrap(), bytes);
         assert_eq!(fold::SUPPORTED_OP_VERSION, 1);
     }
@@ -160,25 +247,19 @@ fn payload_fit_does_not_bypass_the_complete_signed_envelope_limit() {
 }
 
 #[test]
-fn frontier_presence_duplicates_and_storage_range_are_validated_before_signing() {
+fn the_pre_cut_view_is_the_only_slot_and_is_present_exactly_for_a_revocation() {
     let mut op = revocation(false);
-    op.credit_frontier = None;
-    assert!(op.encode().is_err());
-    let head = DeviceCut {
-        device_fingerprint: DeviceFingerprint::from_bytes([3; 32]),
-        seq: 0,
-        hash: [4; 32].into(),
-    };
-    op.credit_frontier = Some(vec![head.clone(), head.clone()]);
-    assert!(op.encode().is_err());
-    op.credit_frontier = Some(vec![DeviceCut { seq: u64::MAX, ..head.clone() }]);
-    assert!(op.encode().is_err());
-    op.credit_frontier = Some(vec![head; ops::FRONTIER_MAX + 1]);
-    assert!(op.encode().is_err());
+    op.pre_cut_view = None;
+    assert!(op.encode().is_err(), "a revocation nominates a view");
+    op.pre_cut_view = Some([2; 32]);
+    let revoking = op.encode().unwrap();
+    assert_eq!(ops::decode(legacy::entry_type_of(&op.op), &revoking).unwrap(), op);
+
+    // An ordinary operation nominates none, and needs no historical evidence to be read. The
+    // payload carries no other slot: credit evidence is the detached manifest alone.
     op.op = AccountOp::OwnerPromote { device_fingerprint: DeviceFingerprint::from_bytes([3; 32]) };
-    op.credit_frontier = Some(vec![]);
-    assert!(op.encode().is_err());
-    op.credit_frontier = None;
+    assert!(op.encode().is_err(), "an ordinary operation nominates no view");
+    op.pre_cut_view = None;
     let bytes = op.encode().unwrap();
     assert_eq!(ops::decode(legacy::entry_type_of(&op.op), &bytes).unwrap(), op);
 }
@@ -288,51 +369,264 @@ fn checkpoint_mismatch_and_duplicate_evidence_are_rejected() {
 }
 
 #[test]
-fn dependency_depth_is_bounded_even_when_views_share_previous_results() {
+fn aggregate_manifests_are_bounded_by_the_declared_evidence_byte_budget() {
     let (checkpoint, device) = checkpoint();
-    let mut latest = manifest(&checkpoint, vec![]);
-    let mut manifests = vec![latest.encode().unwrap()];
-    let mut evidence = Vec::new();
-    for level in 1..views::MAX_DEPTH {
-        let entry = signed(&checkpoint, &device, latest.digest().unwrap(), level as u8);
-        latest = manifest(&checkpoint, vec![entry.entry_hash]);
-        evidence.push(entry.signed_bytes);
-        manifests.push(latest.encode().unwrap());
-    }
-    assert_eq!(
-        plan_replay(&checkpoint, &device, latest.digest().unwrap(), &manifests, &evidence)
-            .unwrap()
-            .views()
-            .count(),
-        views::MAX_DEPTH
+    let chunk = views::MAX_BYTES / 128;
+    let manifests = vec![vec![0u8; chunk]; 200];
+    assert!(manifests.iter().all(|bytes| bytes.len() < views::MAX_BYTES));
+    let result = plan_replay(&checkpoint, &device, [0; 32], &manifests, &[]);
+    assert!(
+        matches!(result, Err(views::PlanError::Invalid(error)) if error.to_string().contains("byte limit")),
+        "individually small manifests still have to fit the aggregate budget",
     );
-    let entry = signed(&checkpoint, &device, latest.digest().unwrap(), 99);
-    latest = manifest(&checkpoint, vec![entry.entry_hash]);
-    evidence.push(entry.signed_bytes);
-    manifests.push(latest.encode().unwrap());
+}
+
+#[test]
+fn ordinary_operations_execute_at_any_chain_length_with_no_historical_view() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let operations: Vec<SignedAccountEntry> = (0..40u8).map(|seed| chain.add(seed)).collect();
+    assert!(operations.len() > 32, "the run must exceed any plausible depth cap");
+    for (index, operation) in operations.iter().enumerate() {
+        // No manifest at all: an ordinary operation nominates nothing, so there is no view to
+        // supply and nothing for a depth cap to measure.
+        let held = bytes(&operations[..index]);
+        let verdict = executor::execute(&checkpoint, &operation.signed_bytes, &[], &held).unwrap();
+        let executor::Verdict::Applied { registers, credit } = verdict else {
+            panic!("operation {index} did not execute");
+        };
+        assert!(registers.is_empty(), "an enrollment installs no register");
+        assert_eq!(credit, 0, "only a revocation earns credit");
+    }
+}
+
+#[test]
+fn independent_revocation_manifests_commit_cumulative_prior_candidates() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let mut manifests = Vec::new();
+    let mut cuts: Vec<SignedAccountEntry> = Vec::new();
+    // Each cut commits to every candidate before it: 96 distinct views, not one long chain of
+    // single-entry views, and each one independent of the others' contents.
+    for index in 0..96u32 {
+        let view = manifest(&checkpoint, cuts.iter().map(|cut| cut.entry_hash).collect());
+        manifests.push(view.encode().unwrap());
+        cuts.push(chain.remove(view.digest().unwrap(), index));
+    }
+    let (last, earlier) = cuts.split_last().unwrap();
+    let evidence = bytes(earlier);
+    let plan = views::plan_replay(&checkpoint, &last.signed_bytes, &manifests, &evidence).unwrap();
+    assert_eq!(plan.views().count(), 96, "each distinct view is scheduled exactly once");
+    assert_eq!(plan.root().unwrap().entries.len(), 95);
+    let verdict =
+        executor::execute(&checkpoint, &last.signed_bytes, &manifests, &evidence).unwrap();
+    let executor::Verdict::Applied { registers, .. } = verdict else {
+        panic!("the deepest cut did not execute");
+    };
+    assert_eq!(registers.len(), 2, "a device remove cuts control and secrets");
+}
+
+#[test]
+fn incomplete_evidence_parks_without_applying_registers_or_credit() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let empty = manifest(&checkpoint, vec![]);
+    let cut0 = chain.remove(empty.digest().unwrap(), 0);
+    let view1 = manifest(&checkpoint, vec![cut0.entry_hash]);
+    let cut1 = chain.remove(view1.digest().unwrap(), 1);
+    // Deliberately nominates only `cut0`, so `cut1` may be withheld without the manifest noticing.
+    let view2 = manifest(&checkpoint, vec![cut0.entry_hash]);
+    let cut2 = chain.remove(view2.digest().unwrap(), 2);
+    let view3 = manifest(&checkpoint, vec![cut0.entry_hash, cut2.entry_hash]);
+    let cut3 = chain.remove(view3.digest().unwrap(), 3);
+    let (m0, m1) = (empty.encode().unwrap(), view1.encode().unwrap());
+    let (m2, m3) = (view2.encode().unwrap(), view3.encode().unwrap());
+
+    let cases = [
+        // A cited view is withheld.
+        (
+            &cut1,
+            vec![m1.clone()],
+            bytes(std::slice::from_ref(&cut0)),
+            executor::ParkCause::Manifest,
+        ),
+        // A nominated identity's signed bytes are withheld.
+        (&cut1, vec![m0.clone(), m1], Vec::new(), executor::ParkCause::Evidence),
+        // The slot the operation continues from is withheld.
+        (
+            &cut2,
+            vec![m0.clone(), m2.clone()],
+            bytes(std::slice::from_ref(&cut0)),
+            executor::ParkCause::ChainHead,
+        ),
+        // A link further back along the walk to the legacy branch is withheld.
+        (
+            &cut3,
+            vec![m0.clone(), m2.clone(), m3.clone()],
+            bytes(&[cut0.clone(), cut2.clone()]),
+            executor::ParkCause::Ancestry,
+        ),
+    ];
+    for (operation, manifests, evidence, expected) in cases {
+        let verdict =
+            executor::execute(&checkpoint, &operation.signed_bytes, &manifests, &evidence).unwrap();
+        // A park carries no register and no credit: the variant itself withholds both, so there is
+        // no partial application for a later arrival to unwind.
+        assert!(
+            matches!(verdict, executor::Verdict::Parked(cause) if cause == expected),
+            "expected {expected:?}",
+        );
+    }
+
+    // The same operation applies once nothing is missing, so the parks above withheld real effect.
+    let complete = bytes(&[cut0, cut1, cut2]);
+    let verdict =
+        executor::execute(&checkpoint, &cut3.signed_bytes, &[m0, m2, m3], &complete).unwrap();
+    assert!(
+        matches!(verdict, executor::Verdict::Applied { registers, .. } if registers.len() == 2)
+    );
+}
+
+#[test]
+fn unverifiable_evidence_is_a_bad_bundle_not_a_permanently_rejected_operation() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let first = chain.add(1);
+    let second = chain.add(2);
+    // The signature rides outside the hashed body, so flipping it leaves a structurally valid
+    // object with the same identity that simply does not verify.
+    let mut tampered = first.signed_bytes.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(
+        executor::execute(&checkpoint, &second.signed_bytes, &[], &[tampered]).is_err(),
+        "an attachment that does not verify refuses the bundle",
+    );
+    // The operation itself was never at fault: it executes once the attachment is the real thing.
     assert!(matches!(
-        plan_replay(&checkpoint, &device, latest.digest().unwrap(), &manifests, &evidence),
-        Err(views::PlanError::Invalid(_))
+        executor::execute(&checkpoint, &second.signed_bytes, &[], &bytes(&[first])).unwrap(),
+        executor::Verdict::Applied { .. }
     ));
 }
 
 #[test]
-fn total_references_are_bounded_across_individually_small_manifests() {
+fn an_author_no_supplied_key_names_parks_because_its_enrolment_may_be_withheld() {
     let (checkpoint, device) = checkpoint();
-    let mut manifests = Vec::new();
-    for salt in 0..5 {
-        let entries = (0..views::MAX_ENTRIES)
-            .map(|n| {
-                let mut hash = [salt; 32];
-                hash[..8].copy_from_slice(&(n as u64).to_be_bytes());
-                hash.into()
-            })
-            .collect();
-        manifests.push(manifest(&checkpoint, entries).encode().unwrap());
-    }
-    let result = plan_replay(&checkpoint, &device, [0; 32], &manifests, &[]);
+    let mut chain = Chain::new(&checkpoint, &device);
+    let operation = chain.add(1);
+    let stranger = Dev::new(200);
+    let enrolled = Dev::new(201);
+    let op = ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: enrolled.fp,
+            ed25519_pubkey: enrolled.ed,
+            x25519_pubkey: enrolled.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    };
+    // Perfectly well-formed and correctly self-signed. Nothing supplied certifies its key — but a
+    // v2 enrolment can introduce any key, so the receiver cannot tell "never enrolled" from
+    // "enrolment withheld", and must not condemn a sound operation over an attachment either way.
+    let foreign = envelope::sign_account_entry(
+        &stranger.secret,
+        &AccountEntryHeader {
+            account_id: checkpoint.pin().account_id,
+            log_id: 0,
+            device_fingerprint: stranger.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: legacy::entry_type_of(&op.op),
+            op_version: ops::CONTROL_VERSION,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: None,
+        },
+        &op.encode().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        executor::execute(&checkpoint, &operation.signed_bytes, &[], &[foreign.signed_bytes])
+            .unwrap(),
+        executor::Verdict::Parked(executor::ParkCause::Signer)
+    ));
+    // Without the attachment the very same operation applies, so the park withheld nothing of its
+    // own and one uncertified object cannot condemn it.
+    assert!(matches!(
+        executor::execute(&checkpoint, &operation.signed_bytes, &[], &[]).unwrap(),
+        executor::Verdict::Applied { .. }
+    ));
+}
+
+#[test]
+fn a_member_cannot_promote_itself_into_the_authority_it_then_cites() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let member = Dev::new(77);
+    // The founder enrols the member, so the accepted epoch certifies its KEY. That is all it
+    // certifies: the roster says nothing about authority to act.
+    let enrolment = chain.author(ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: member.fp,
+            ed25519_pubkey: member.ed,
+            x25519_pubkey: member.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    });
+    let sign = |seq: u64, prev: Option<AccountEntryHash>, op: ops::ControlOp| {
+        envelope::sign_account_entry(
+            &member.secret,
+            &AccountEntryHeader {
+                account_id: checkpoint.pin().account_id,
+                log_id: 0,
+                device_fingerprint: member.fp,
+                seq,
+                prev_hash: prev,
+                parent_ref: prev,
+                entry_type: legacy::entry_type_of(&op.op),
+                op_version: ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: (seq != 0).then(|| prev.unwrap().into()),
+            },
+            &op.encode().unwrap(),
+        )
+        .unwrap()
+    };
+    // A self-serving mint, then a cut of the founder's chain citing it.
+    let mint = sign(0, None, ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::OwnerPromote { device_fingerprint: member.fp },
+    });
+    let view = manifest(&checkpoint, vec![]);
+    let cut = sign(1, Some(mint.entry_hash), ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: Some(view.digest().unwrap()),
+        op: AccountOp::DeviceRemove {
+            device_fingerprint: device.fingerprint(),
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "seized".into(),
+        },
+    });
+    // Everything else about this bundle is in order: both entries authenticate under keys the
+    // account certifies, both chain to a root this bundle supplies, and the view the cut names is
+    // present. Only the authority rule stands between a Member and the founder's chain.
+    let manifests = [view.encode().unwrap()];
+    let evidence = bytes(&[enrolment, mint]);
+    let verdict = executor::execute(&checkpoint, &cut.signed_bytes, &manifests, &evidence).unwrap();
     assert!(
-        matches!(result, Err(views::PlanError::Invalid(error)) if error.to_string().contains("reference limit"))
+        matches!(verdict, executor::Verdict::Rejected(executor::RejectCause::Inadmissible)),
+        "a member's self-minted authority must be refused, got {verdict:?}",
     );
 }
 

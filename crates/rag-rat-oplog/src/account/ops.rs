@@ -1007,10 +1007,11 @@ mod tests {
         assert_eq!(hex(&encode(&sample(entry_type::ACCOUNT_REROOT)).unwrap()), "825820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd6b636f6d70726f6d69736564");
     }
 
-    /// V1 readers reject an added revocation field, even when it is canonical CBOR.
-    /// A signed credit frontier therefore needs a new control-log envelope version (#1311).
+    /// A v1 reader rejects a revocation carrying a sixth field, even when the addition is itself
+    /// canonical CBOR. Extending a revocation is a new control-log envelope version; there is no
+    /// added field a v1 reader can be made to tolerate.
     #[test]
-    fn v1_revocations_reject_an_added_credit_frontier() {
+    fn v1_revocations_reject_an_added_sixth_field() {
         for tag in [entry_type::DEVICE_REMOVE, entry_type::OWNER_DEMOTE] {
             let mut payload = encode(&sample(tag)).unwrap();
             assert_eq!(payload[0], 0x85, "v1 revocations are five-field arrays");

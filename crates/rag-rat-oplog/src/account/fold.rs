@@ -13,6 +13,10 @@
 //! is genuine owner-key compromise ⇒ the account folds `contested` and halts authority mutation
 //! (§12).
 
+// Pure v2 execution is isolated until the account activation path is integrated.
+#[allow(dead_code, reason = "control v2 execution is not enabled in production (#1311)")]
+pub(super) mod v2;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::ControlFlow;
 
@@ -199,6 +203,7 @@ pub(super) enum AccountClassification {
 
 /// The derived authority history of one account: per-entry outcomes, the account classification,
 /// and (only when `contested`) the deterministic recovery successor.
+#[derive(Clone)]
 pub(super) struct AccountAuthHistory {
     outcomes: HashMap<AccountEntryHash, Outcome>,
     classification: AccountClassification,
@@ -613,13 +618,20 @@ fn require_subject<T, S: PartialEq>(actual: S, expected: S) -> Result<(), Author
 
 /// A structurally-valid, signature-valid candidate the fold considers: the verified entry + its
 /// decoded KNOWN op. (Unknown ops classify `RetainedUnfolded` and are never folded.)
-struct Candidate {
+#[derive(Clone)]
+pub(in crate::account) struct Candidate {
     entry: VerifiedAccountEntry,
     op: AccountOp,
 }
 
 impl Candidate {
-    fn hash(&self) -> AccountEntryHash {
+    /// Pair a verified entry with the KNOWN op it carries. Control v2 entries wrap the same v1
+    /// operation grammar, so its executor builds candidates the fold's own rules can read.
+    pub(in crate::account) fn new(entry: VerifiedAccountEntry, op: AccountOp) -> Self {
+        Self { entry, op }
+    }
+
+    pub(in crate::account) fn hash(&self) -> AccountEntryHash {
         self.entry.entry_hash
     }
 
@@ -1057,6 +1069,20 @@ fn join_register(
 /// MUST share `account_id` (the caller groups by account). Order-independent: the result is
 /// identical under every permutation of `entries`.
 pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHistory {
+    fold_account_traced(entries, false).0
+}
+
+/// Captured only for an explicitly verified checkpoint, never allocated on ordinary v1 replay.
+pub(super) struct LegacyTrace {
+    registers: HashMap<RegisterKey, Cut>,
+    contributors: HashSet<AccountEntryHash>,
+    readiness_exclusions: HashMap<AccountEntryHash, Outcome>,
+}
+
+pub(super) fn fold_account_traced(
+    entries: &[VerifiedAccountEntry],
+    capture: bool,
+) -> (AccountAuthHistory, Option<LegacyTrace>) {
     // Readiness is monotone: once an entry proves it was authored ahead of the locally folded
     // authority history (or depends on authority that did not survive the fold), it cannot
     // contribute a register or phase-E mutation in this fold. Re-run the frozen stratified pass
@@ -1065,7 +1091,8 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
     // exclusions only grow.
     let mut readiness_exclusions = HashMap::new();
     loop {
-        let (history, discovered) = fold_account_pass(entries, &readiness_exclusions);
+        let (history, discovered, mut trace) =
+            fold_account_pass(entries, &readiness_exclusions, capture);
         let mut changed = false;
         for (hash, outcome) in discovered {
             if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -1076,7 +1103,10 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
             }
         }
         if !changed {
-            return history;
+            if let Some(trace) = &mut trace {
+                trace.readiness_exclusions = readiness_exclusions;
+            }
+            return (history, trace);
         }
     }
 }
@@ -1084,7 +1114,8 @@ pub(super) fn fold_account(entries: &[VerifiedAccountEntry]) -> AccountAuthHisto
 fn fold_account_pass(
     entries: &[VerifiedAccountEntry],
     readiness_exclusions: &HashMap<AccountEntryHash, Outcome>,
-) -> (AccountAuthHistory, HashMap<AccountEntryHash, Outcome>) {
+    capture: bool,
+) -> (AccountAuthHistory, HashMap<AccountEntryHash, Outcome>, Option<LegacyTrace>) {
     let mut outcomes: HashMap<AccountEntryHash, Outcome> = HashMap::new();
 
     // Decode once, then classify. `candidates` are the ops the fold actually folds; `all_headers`
@@ -1164,6 +1195,7 @@ fn fold_account_pass(
                 genesis_hash: None,
             },
             HashMap::new(),
+            None,
         );
     };
     let genesis_owner_id = genesis.hash();
@@ -1301,7 +1333,17 @@ fn fold_account_pass(
     let credits: HashMap<AccountEntryHash, u64> = candidates
         .iter()
         .filter(|c| register_contributors.contains(&c.hash()))
-        .map(|c| (c.hash(), revocation_credit(&candidates, &strata, &incarnations, &outcomes, c)))
+        .map(|c| {
+            let credit = revocation_credit(
+                &candidates,
+                &strata,
+                &incarnations,
+                &outcomes,
+                c,
+                CreditScope::EveryScopedEntry,
+            );
+            (c.hash(), credit)
+        })
         .collect();
     let mut discovered = close_final_authority_dependencies(&candidates, &credits, &mut outcomes);
     if matches!(classification, AccountClassification::Contested { .. }) {
@@ -1370,6 +1412,11 @@ fn fold_account_pass(
             genesis_hash: Some(genesis_owner_id),
         },
         discovered,
+        capture.then(|| LegacyTrace {
+            registers,
+            contributors: register_contributors,
+            readiness_exclusions: HashMap::new(),
+        }),
     )
 }
 
@@ -1865,12 +1912,32 @@ fn normalize_auth_epochs(outcomes: &mut HashMap<AccountEntryHash, Outcome>) -> u
 /// Dependents rejected on a state precondition (`Ineffective`) are not counted: under-crediting
 /// only parks the cut, it never admits an ahead one. A `CutExtend` has no creator keys and gets
 /// none.
+/// Which condemned entries a cut may count toward its own freshness credit. A v1 cut counts every
+/// entry its own register keys scope, because the log carries no statement of which ones its author
+/// had folded. A v2 cut counts only the identities its signed pre-cut manifest nominated, so its
+/// credit is by construction a SUBSET of the v1 credit over the same outcomes and register scope —
+/// the same loops decide it, under a strictly narrower membership test.
+enum CreditScope<'a> {
+    EveryScopedEntry,
+    Nominated(&'a HashSet<AccountEntryHash>),
+}
+
+impl CreditScope<'_> {
+    fn admits(&self, hash: &AccountEntryHash) -> bool {
+        match self {
+            CreditScope::EveryScopedEntry => true,
+            CreditScope::Nominated(eligible) => eligible.contains(hash),
+        }
+    }
+}
+
 fn revocation_credit(
     candidates: &[Candidate],
     strata: &BTreeMap<usize, Vec<usize>>,
     incarnations: &Incarnations<'_>,
     outcomes: &HashMap<AccountEntryHash, Outcome>,
     cut: &Candidate,
+    scope: CreditScope<'_>,
 ) -> u64 {
     let keys: Vec<RegisterKey> = cut_op_registers(cut).into_iter().map(|(key, ..)| key).collect();
     let mut closed_mints: HashSet<AccountEntryHash> = HashSet::new();
@@ -1881,6 +1948,7 @@ fn revocation_credit(
         // Never the cut itself: a self-removal condemns its own entry, which its author never
         // folded, and counting it would let an ahead self-cut pay for its own freshness.
         if c.hash() != cut.hash()
+            && scope.admits(&c.hash())
             && matches!(outcomes.get(&c.hash()), Some(Outcome::Condemned(_)))
             && keys.iter().any(|key| key.scopes(c.header()))
         {
@@ -1895,6 +1963,7 @@ fn revocation_credit(
         let c = &candidates[i];
         // Nor the cut itself when it condemned its own authorizing mint and went stale.
         if c.hash() != cut.hash()
+            && scope.admits(&c.hash())
             && outcomes.get(&c.hash()) == Some(&Outcome::Rejected(RejectReason::StaleAuthority))
             && incarnations
                 .author_incarnation_id(c)

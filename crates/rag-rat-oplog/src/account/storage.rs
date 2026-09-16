@@ -2001,8 +2001,31 @@ pub(super) fn project_verified_checkpoint_evidence(
     derive_account_projection(&rows)
 }
 
+pub(super) fn project_checkpoint_with_trace(
+    entries: &[VerifiedAccountEntry],
+) -> (AccountProjection, Option<fold::LegacyTrace>) {
+    let rows = entries
+        .iter()
+        .map(|entry| CandidateRow {
+            entry_hash: entry.entry_hash,
+            log_id: entry.header.log_id,
+            device_fingerprint: entry.header.device_fingerprint,
+            seq: entry.header.seq,
+            verified: entry.clone(),
+        })
+        .collect::<Vec<_>>();
+    derive_account_projection_traced(&rows, true)
+}
+
 /// Derive an author-chain-coherent, authority-closed projection without touching storage.
 fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
+    derive_account_projection_traced(rows, false).0
+}
+
+fn derive_account_projection_traced(
+    rows: &[CandidateRow],
+    capture: bool,
+) -> (AccountProjection, Option<fold::LegacyTrace>) {
     let mut forked = HashSet::new();
     loop {
         let entries: Vec<VerifiedAccountEntry> = rows
@@ -2010,7 +2033,7 @@ fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
             .filter(|row| !forked.contains(&row.entry_hash))
             .map(|row| row.verified.clone())
             .collect();
-        let history = fold::fold_account(&entries);
+        let (history, trace) = fold::fold_account_traced(&entries, capture);
         let effective: HashSet<AccountEntryHash> = rows
             .iter()
             .filter(|row| {
@@ -2028,7 +2051,7 @@ fn derive_account_projection(rows: &[CandidateRow]) -> AccountProjection {
         let newly_forked: Vec<AccountEntryHash> =
             effective.difference(&accepted).copied().collect();
         if newly_forked.is_empty() {
-            return AccountProjection { history, accepted, forked };
+            return (AccountProjection { history, accepted, forked }, trace);
         }
         // Monotone elimination is both the termination argument and the security boundary: once
         // an effective candidate loses its author branch or its cited authority branch, neither it
