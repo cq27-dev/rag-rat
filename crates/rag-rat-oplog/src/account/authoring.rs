@@ -504,6 +504,10 @@ pub fn author_stream_grant_in_tx(
     role: ops::GrantRole,
     now_ms: i64,
 ) -> anyhow::Result<GrantId> {
+    // A grantee whose control this binary cannot execute gets no grant, whichever path asks for
+    // one (a direct grant or a redeemed writer invite): the grant would admit content this
+    // store could only retract.
+    super::control_policy::require_supported_account_control(tx, grantee_account_id)?;
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
         "cannot author a stream grant before the store's local account is minted (call \
          local_account first)",

@@ -721,6 +721,8 @@ fn screen_writer_invite(
 ) -> Result<Screened<WriterGrantReceipt>, InviteError> {
     rag_rat_oplog::require_supported_account_control(conn, stored_invite_account(&invite)?)
         .map_err(InviteError::from)?;
+    rag_rat_oplog::require_supported_account_control(conn, request.contributor_account)
+        .map_err(InviteError::from)?;
     if receipt_replay_expired(&invite, at_ms) {
         return Ok(Screened::ReplayExpired);
     }

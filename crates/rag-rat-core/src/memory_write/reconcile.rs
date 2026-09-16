@@ -656,7 +656,12 @@ struct PrivateStreamRefusal(String);
 /// already cannot reach this account for that stream — and blocking on it would be a permanent
 /// refusal with no recourse.
 fn private_stream_strands_contributions(conn: &Connection) -> anyhow::Result<Option<String>> {
-    if let Some((contributing_repo, owner)) = contribution_targets(conn)?.first() {
+    // A configured target whose owner is pinned here is not at stake either: nothing can be
+    // served to or pulled from it (the same rule the evidence half below applies).
+    for (contributing_repo, owner) in contribution_targets(conn)? {
+        if rag_rat_oplog::account_is_pinned(conn, owner)? {
+            continue;
+        }
         return Ok(Some(format!(
             "contributes repo `{contributing_repo}`'s memories to account {}",
             rag_rat_base::hash::hex_lower(&owner.to_bytes()),

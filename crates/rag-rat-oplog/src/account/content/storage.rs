@@ -108,6 +108,8 @@ pub fn content_ingest(
     signed_bytes: &[u8],
     now_ms: i64,
 ) -> anyhow::Result<ContentIngestOutcome> {
+    // Structural rejections happen BEFORE SQLite's process-wide writer lock: a peer spraying
+    // malformed or over-ceiling frames must not serialize every other writer.
     let signed = match envelope::decode_content_signed(signed_bytes) {
         Ok(signed) => signed,
         Err(error) => return Ok(ContentIngestOutcome::Rejected(error.to_string())),
@@ -125,17 +127,31 @@ pub fn content_ingest(
         )));
     }
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
-    crate::account::require_supported_account_control(&tx, signed.header.author_account_id)?;
-    super::super::control_policy::require_supported_stream_control(&tx, signed.header.stream_id)?;
-    if let Some(status) = stored_status_for_exact_envelope(&tx, &signed, signed_bytes)? {
+    let outcome = content_ingest_in_tx(&tx, &signed, signed_bytes, now_ms)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// The body of [`content_ingest`] inside its IMMEDIATE transaction: author and stream-owner
+/// policy are checked here, under the same lock as the write. The wrapper always commits, so
+/// every return before the first write (`park_pre_verify` / `insert_candidate`) must stay
+/// read-only — a refusal commits nothing.
+fn content_ingest_in_tx(
+    tx: &Transaction<'_>,
+    signed: &SignedContentEntry,
+    signed_bytes: &[u8],
+    now_ms: i64,
+) -> anyhow::Result<ContentIngestOutcome> {
+    crate::account::require_supported_account_control(tx, signed.header.author_account_id)?;
+    super::super::control_policy::require_supported_stream_control(tx, signed.header.stream_id)?;
+    if let Some(status) = stored_status_for_exact_envelope(tx, signed, signed_bytes)? {
         return Ok(ContentIngestOutcome::Ingested { status });
     }
 
-    let public = match resolve_roster_key(&tx, &signed) {
+    let public = match resolve_roster_key(tx, signed) {
         Ok(Some(public)) => public,
         Ok(None) => {
-            let outcome = park_pre_verify(&tx, &signed, signed_bytes, now_ms)?;
-            tx.commit()?;
+            let outcome = park_pre_verify(tx, signed, signed_bytes, now_ms)?;
             return Ok(outcome);
         },
         Err(error) => return Ok(ContentIngestOutcome::Rejected(error.to_string())),
@@ -165,7 +181,7 @@ pub fn content_ingest(
     // would park anyway.
     if verified.header.lamport > crate::entry::MAX_LAMPORT_ADVANCE {
         let stream_max =
-            super::author::stream_max_content_lamport(&tx, verified.header.stream_id)?.unwrap_or(0);
+            super::author::stream_max_content_lamport(tx, verified.header.stream_id)?.unwrap_or(0);
         if verified.header.lamport > stream_max.saturating_add(crate::entry::MAX_LAMPORT_ADVANCE) {
             return Ok(ContentIngestOutcome::Rejected(format!(
                 "entry lamport {} jumps more than {} past the accepted stream clock {stream_max}",
@@ -174,7 +190,7 @@ pub fn content_ingest(
             )));
         }
     }
-    match stored_candidate_bytes(&tx, &verified.entry_hash)? {
+    match stored_candidate_bytes(tx, &verified.entry_hash)? {
         Some(stored) if stored != signed_bytes => {
             return Ok(ContentIngestOutcome::Rejected(
                 "entry hash collides with a different stored envelope".into(),
@@ -182,25 +198,24 @@ pub fn content_ingest(
         },
         Some(_) => {},
         None =>
-            if let Some(scope) = candidate_capacity(&tx, &verified, signed_bytes.len())? {
+            if let Some(scope) = candidate_capacity(tx, &verified, signed_bytes.len())? {
                 return Ok(ContentIngestOutcome::CapacityReached { scope });
             },
     }
-    insert_candidate(&tx, &verified, signed_bytes, now_ms)?;
-    reclassify_chain(&tx, &verified)?;
+    insert_candidate(tx, &verified, signed_bytes, now_ms)?;
+    reclassify_chain(tx, &verified)?;
     // Structural classification is done; the authority + branch-selection fold (the pass that sets
     // `accepted`) is deferred off this per-entry path (#652) by marking the stream as owing a
     // refold. `settle_pending_content_refolds` folds it once. So the returned status is the
     // STRUCTURAL verdict, not the acceptance verdict.
     mark_stream_pending_refold(
-        &tx,
+        tx,
         verified.header.stream_id,
         PENDING_REFOLD_CONTENT_CANDIDATE,
         now_ms,
     )?;
-    let status = status_for(&tx, &verified.entry_hash)?
+    let status = status_for(tx, &verified.entry_hash)?
         .unwrap_or_else(|| ContentStatus::RetainedUnfolded.as_db_str().to_string());
-    tx.commit()?;
     Ok(ContentIngestOutcome::Ingested { status })
 }
 
@@ -391,6 +406,15 @@ pub(in crate::account) fn promote_pre_verify_for_account(
             // the drop-before-storage contract; a legitimately re-offered envelope re-parks and
             // gets re-judged with a fresher clock.
             if signed.header.lamport >= crate::entry::MAX_ENTRY_LAMPORT {
+                PRE_VERIFY.delete(tx, &signed_hash)?;
+                progressed = true;
+                continue;
+            }
+            // A stream routed to a pinned account takes no candidate; the parked row is dropped
+            // like any other refusal (a peer re-offering it is dropped too) rather than raising
+            // out of the account fold that promotes it. A point query, so it sits before the
+            // roster resolve, the signature check and the clock walk.
+            if super::super::control_policy::stream_control_pinned(tx, signed.header.stream_id)? {
                 PRE_VERIFY.delete(tx, &signed_hash)?;
                 progressed = true;
                 continue;
@@ -731,6 +755,47 @@ pub(super) fn refold_and_project_stream_in_tx(
     Ok(())
 }
 
+/// The pin's variant of [`refold_and_project_stream_in_tx`]: retract unsupported authority without
+/// growing enrollment reservations. Pin installation only removes authority; it has no authoring
+/// timestamp.
+///
+/// A pinned stream's pending mark is discharged here: nothing else will ever settle it. A stream
+/// that is NOT pinned (a pinned contributor's entries on a live owner's stream) is marked pending
+/// instead — the refold can accept an entry that was parked behind the retracted ones, and the
+/// reservation top-up that acceptance owes (#945) is the timestamped settle's job.
+///
+/// When a NEWER binary owns this store's `/3` projection, the stream is refolded but not
+/// re-projected: the pin still lands (it is the fail-closed mechanism and must not be blocked by
+/// projection state), `accepted` is already retracted, and the pending mark hands the projection
+/// rewrite to the binary that owns it.
+///
+/// Marks are enqueued at time 0 — no clock reaches here — which sorts them to the head of the
+/// settle order; a retraction's debt is the oldest there is.
+pub(in crate::account) fn refold_and_project_for_cleanup_in_tx(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+) -> anyhow::Result<()> {
+    refold_content_stream(tx, stream_id)?;
+    let queue_exists = pending_refold_table_exists(tx)?;
+    if content_projected_tables_exist(tx)? {
+        if content_projection::content_projector_is_newer(tx)? {
+            if queue_exists {
+                mark_stream_pending_refold(tx, stream_id, PENDING_REFOLD_ACCOUNT_CHANGE, 0)?;
+            }
+            return Ok(());
+        }
+        content_projection::reproject_accepted_content_stream(tx, stream_id)?;
+    }
+    if queue_exists {
+        if super::super::control_policy::stream_control_pinned(tx, stream_id)? {
+            clear_pending_content_refold(tx, stream_id)?;
+        } else {
+            mark_stream_pending_refold(tx, stream_id, PENDING_REFOLD_ACCOUNT_CHANGE, 0)?;
+        }
+    }
+    Ok(())
+}
+
 pub(in crate::account) fn finalize_affected_streams(
     tx: &Transaction<'_>,
     streams: &[StreamId],
@@ -783,13 +848,15 @@ pub(super) fn refold_content_stream(
     // This is a DECLASSIFY, not a skip — if ownership was dropped by a later fold (owner
     // contested / branch reselection), previously accepted content must lose `accepted` here,
     // or it would stay live with no current authority basis.
-    let Some(owner_account_id) = account_storage::stream_owner_account(tx, stream_id)? else {
+    let Some(owner_account_id) = account_storage::stream_owner_account_for_cleanup(tx, stream_id)?
+    else {
         declassify_stream_to_structural(tx, stream_id)?;
         store_stream_clock(tx, stream_id, 0)?;
         return Ok(());
     };
 
-    let resolved = resolve_stream_authority(tx, stream_id, owner_account_id)?;
+    let StreamAuthority { resolved, pinned } =
+        resolve_stream_authority(tx, stream_id, owner_account_id)?;
 
     // Clear every `accepted` on the stream up front — so the `content_accepted_slot` partial-unique
     // index never transiently sees two accepted rows at one `(stream, author, device, seq)` (I10a),
@@ -800,7 +867,8 @@ pub(super) fn refold_content_stream(
         .as_slice()])?;
     let handled: HashSet<AccountEntryHash> = resolved.iter().map(|r| r.entry_hash).collect();
     declassify_rows_absent_from(tx, stream_id, &handled)?;
-    if resolved.is_empty() {
+    // A stream holding only pinned authors' entries still has a clock basis to keep.
+    if resolved.is_empty() && pinned.is_empty() {
         store_stream_clock(tx, stream_id, 0)?;
         return Ok(());
     }
@@ -854,6 +922,7 @@ pub(super) fn refold_content_stream(
         .iter()
         .filter(|r| matches!(raw.get(&r.entry_hash), Some(ContentAcceptance::Condemned(_))))
         .map(|r| (r.entry_hash, &r.header))
+        .chain(pinned.iter().map(|(hash, header)| (*hash, header)))
         .collect();
     let (accepted, lamport_parked, clock) =
         lamport_advance_clamped(&resolved, accepted, &condemned);
@@ -2069,6 +2138,10 @@ pub fn purge_legacy_lamport_violators(conn: &Connection) -> rusqlite::Result<()>
 /// configuration that produced it. The servability probe (`account_is_public_kb`) reads this per
 /// inbound connection BEFORE authentication, so it rides the V117 author-leading partial index;
 /// the ownership exclusion is an indexed subquery.
+///
+/// A stream routed to a control pin never comes back from here — structurally, by the routing
+/// table, not only because the pin retracted acceptance there — so the callers' policy-checked
+/// owner reads never raise on one.
 pub fn authored_foreign_streams(
     conn: &Connection,
     account: AccountId,
@@ -2079,6 +2152,7 @@ pub fn authored_foreign_streams(
            AND stream_id NOT IN (
                SELECT stream_id FROM account_stream_ownership WHERE account_id = ?1
            )
+           AND stream_id NOT IN (SELECT stream_id FROM account_control_pin_streams)
          ORDER BY stream_id",
     )?;
     let rows = stmt
@@ -2190,12 +2264,20 @@ fn verdict_for(
     })
 }
 
+/// One stream's candidates with their authority facts resolved against the current fold.
+struct StreamAuthority {
+    /// The entries the evaluator judges.
+    resolved: Vec<ResolvedEntry>,
+    /// Entries whose author is pinned: never evaluated, but part of the stream's clock basis.
+    pinned: Vec<(AccountEntryHash, ContentEntryHeader)>,
+}
+
 /// Read every candidate on the stream and resolve its authority facts against the current fold.
 fn resolve_stream_authority(
     tx: &Transaction<'_>,
     stream_id: StreamId,
     owner_account_id: AccountId,
-) -> anyhow::Result<Vec<ResolvedEntry>> {
+) -> anyhow::Result<StreamAuthority> {
     let headers = load_stream_headers(tx, stream_id)?;
     let view: HashMap<AccountEntryHash, ContentEntryHeader> =
         headers.iter().map(|(hash, header)| (*hash, header.clone())).collect();
@@ -2213,7 +2295,16 @@ fn resolve_stream_authority(
     // longer be trusted — the content parks until the owner recovers.
     let owner_contested = account_storage::account_is_contested(tx, owner_account_id)?;
     let mut resolved = Vec::with_capacity(headers.len());
+    let mut pinned = Vec::new();
     for (entry_hash, header) in headers {
+        if caches.author_pinned(tx, header.author_account_id)? {
+            // A pinned author's entries are not evaluated — `declassify_rows_absent_from` retracts
+            // their acceptance, and the signed candidates stay for a binary that can execute the
+            // pin — but their headers still join the clock basis, exactly as condemned rows do:
+            // an honest dependent that minted against them while they were accepted must not park.
+            pinned.push((entry_hash, header));
+            continue;
+        }
         let ownership = AuthorityQuery::Effective(CitedOwnership {
             owner_account_id,
             stream_id: header.stream_id,
@@ -2311,7 +2402,7 @@ fn resolve_stream_authority(
             subject_hold,
         });
     }
-    Ok(resolved)
+    Ok(StreamAuthority { resolved, pinned })
 }
 
 /// Per-refold memoization of the authority facts, keyed by exactly what each query depends on, so a
@@ -2324,9 +2415,23 @@ struct AuthorityCaches {
     grant: HashMap<(GrantId, AccountId, DeviceFingerprint), AuthorityQuery<CitedGrantAuthority>>,
     held_control_log: HashMap<AccountId, u64>,
     contested: HashMap<AccountId, bool>,
+    pinned: HashMap<AccountId, bool>,
 }
 
 impl AuthorityCaches {
+    fn author_pinned(
+        &mut self,
+        tx: &Transaction<'_>,
+        account_id: AccountId,
+    ) -> anyhow::Result<bool> {
+        if let Some(pinned) = self.pinned.get(&account_id) {
+            return Ok(*pinned);
+        }
+        let pinned = super::super::control_policy::account_is_pinned(tx, account_id)?;
+        self.pinned.insert(account_id, pinned);
+        Ok(pinned)
+    }
+
     fn freshness(
         &mut self,
         tx: &Transaction<'_>,
@@ -2757,10 +2862,26 @@ pub fn content_entries_for_sync(
         });
     }
 
-    for entry in &out {
-        super::super::control_policy::require_supported_stream_control(conn, entry.stream_id)?;
+    // Entries on a stream routed to a pinned account are withheld, not a session failure: this
+    // store retracted their acceptance and projection, so not relaying them is the consistent
+    // answer, and the serving account (checked above) keeps converging past them.
+    let mut pinned_streams: HashMap<StreamId, bool> = HashMap::new();
+    let mut served = Vec::with_capacity(out.len());
+    for entry in out {
+        let pinned = match pinned_streams.get(&entry.stream_id) {
+            Some(pinned) => *pinned,
+            None => {
+                let pinned =
+                    super::super::control_policy::stream_control_pinned(conn, entry.stream_id)?;
+                pinned_streams.insert(entry.stream_id, pinned);
+                pinned
+            },
+        };
+        if !pinned {
+            served.push(entry);
+        }
     }
-    Ok(out)
+    Ok(served)
 }
 
 /// The public-serve variant of [`content_entries_for_sync`] (#407): AUTHENTICATED `content_entries`
@@ -2790,7 +2911,10 @@ pub fn content_entries_for_public_sync(
         if let Some(known) = public.get(&stream) {
             return Ok(*known);
         }
-        let verdict = match crate::account::storage::stream_owner_account(conn, stream)? {
+        // The cleanup read: a stream routed to a pinned account resolves ownerless and is
+        // withheld like any other, never a session failure.
+        let verdict = match crate::account::storage::stream_owner_account_for_cleanup(conn, stream)?
+        {
             Some(owner) =>
                 crate::account::storage::stream_access_mode(conn, owner, stream)?
                     == crate::stream::AccessMode::PublicRead,
@@ -2881,6 +3005,11 @@ fn relayed_content_entries(
                SELECT 1 FROM account_roster_history r
                WHERE r.account_id = e.author_account_id
                  AND r.device_fingerprint = e.device_fingerprint
+           )
+           -- A pinned author's contributions are retracted here and not relayed (its roster rows
+           -- are gone too, but the rule is stated, not inherited).
+           AND NOT EXISTS (
+               SELECT 1 FROM account_control_pins p WHERE p.account_id = e.author_account_id
            )
          ORDER BY e.stream_id, e.seq, e.entry_hash",
     )?;

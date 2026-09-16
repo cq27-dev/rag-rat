@@ -44,9 +44,15 @@ pub(crate) fn owner_stream_access_mode(
         conn,
         repo_id,
         rag_rat_oplog::AccessMode::PublicRead,
-    )? && rag_rat_oplog::stream_owner_account(conn, public_id)?.is_some()
-    {
-        return Ok(rag_rat_oplog::AccessMode::PublicRead);
+    )? {
+        // A pinned owner keeps routing to its public stream: the ownership fact is retracted, but
+        // the pin's routing table still names the stream. The answer is the same — public — and
+        // every authoring path refuses on its own.
+        if rag_rat_oplog::stream_control_pinned(conn, public_id)?
+            || rag_rat_oplog::stream_owner_account(conn, public_id)?.is_some()
+        {
+            return Ok(rag_rat_oplog::AccessMode::PublicRead);
+        }
     }
     Ok(rag_rat_oplog::AccessMode::Private)
 }

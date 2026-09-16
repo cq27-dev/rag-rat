@@ -166,6 +166,15 @@ fn verified_owner_stream(
         owner,
         rag_rat_oplog::AccessMode::PublicRead,
     )?;
+    // This route identifies the old materialization for cleanup, never grants authority. A pin
+    // removes the ownership projection, but must not strand the old synced image in this repo.
+    // Keyed on the pin's routing table, not on the owner alone: a pinned owner that never owned
+    // this stream here (a mistyped id) still drains nothing. (A pinned LOCAL account takes the
+    // local derivation instead, whose projection the pin emptied, and drains its synced rows the
+    // same way.)
+    if rag_rat_oplog::stream_control_pinned(conn, stream)? {
+        return Ok(Some(stream));
+    }
     if rag_rat_oplog::stream_owner_account(conn, stream)? != Some(owner) {
         return Ok(None);
     }

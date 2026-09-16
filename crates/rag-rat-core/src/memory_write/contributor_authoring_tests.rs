@@ -940,6 +940,76 @@ fn a_subscriber_gets_a_contributors_memory_through_the_owner_alone() {
     assert_eq!(synced_memory_titles(&subscriber), vec!["guest-note", "owner-note"]);
 }
 
+/// A subscriber's mirror is a materialised image of the owner's projection, so when the owner is
+/// pinned here that image must go the way the projection went: the next drain retracts the synced
+/// rows (their authority basis is gone) and leaves the subscriber's own memories alone.
+#[test]
+fn a_subscriber_retracts_the_owners_memories_once_the_owner_is_pinned() {
+    let (owner, subscriber, owner_account) = subscription_pair();
+    crate::drain_synced_memory(&subscriber).unwrap();
+    assert_eq!(synced_memory_titles(&subscriber), vec!["owner-note"]);
+
+    let device = rag_rat_oplog::local_device(&owner, NOW).unwrap();
+    let tx = owner.unchecked_transaction().unwrap();
+    let bundle = rag_rat_oplog::prepare_checkpoint_in_tx(&tx, owner_account, &device).unwrap();
+    tx.commit().unwrap();
+    let pin = rag_rat_oplog::TrustedCheckpointPin {
+        account_id: owner_account,
+        checkpoint_digest: bundle.certificate_digest(),
+        required_control_version: 2,
+    };
+    let proof = rag_rat_oplog::verify_checkpoint(pin, &bundle).unwrap();
+    let tx = subscriber.unchecked_transaction().unwrap();
+    rag_rat_oplog::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap();
+    tx.commit().unwrap();
+
+    crate::drain_synced_memory(&subscriber).unwrap();
+    assert!(synced_memory_titles(&subscriber).is_empty(), "the mirrored image is retracted");
+    assert_eq!(memory_titles(&subscriber), vec!["subscriber-note"]);
+}
+
+/// A pinned LOCAL owner still resolves its published repo to its public stream when the intent row
+/// is gone (the one-way ratchet reads the pin's routing as "still public"), so the drain's local
+/// derivation finds the projection the pin emptied instead of erroring.
+#[test]
+fn a_pinned_local_owner_still_ratchets_to_its_public_stream_and_drains() {
+    let owner = scoped_conn();
+    let owner_account = local_account(&owner, NOW).unwrap();
+    assert!(enable_public_authoring(&owner, NOW).unwrap());
+    create_memory(&owner, concept("owner-note")).unwrap();
+    owner
+        .execute("DELETE FROM repo_meta WHERE repo_id = ?1 AND key = ?2", params![
+            REPO,
+            super::ownership::STREAM_ACCESS_MODE_META_KEY
+        ])
+        .unwrap();
+    assert_eq!(
+        super::ownership::owner_stream_access_mode(&owner, REPO).unwrap(),
+        AccessMode::PublicRead,
+        "the ratchet answers from ownership before the pin",
+    );
+
+    let device = rag_rat_oplog::local_device(&owner, NOW).unwrap();
+    let tx = owner.unchecked_transaction().unwrap();
+    let bundle = rag_rat_oplog::prepare_checkpoint_in_tx(&tx, owner_account, &device).unwrap();
+    let pin = rag_rat_oplog::TrustedCheckpointPin {
+        account_id: owner_account,
+        checkpoint_digest: bundle.certificate_digest(),
+        required_control_version: 2,
+    };
+    let proof = rag_rat_oplog::verify_checkpoint(pin, &bundle).unwrap();
+    rag_rat_oplog::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(
+        super::ownership::owner_stream_access_mode(&owner, REPO).unwrap(),
+        AccessMode::PublicRead,
+        "and from the pin's routing after it",
+    );
+    crate::drain_synced_memory(&owner).unwrap();
+    assert_eq!(memory_titles(&owner), vec!["owner-note"], "a local row survives the drain");
+}
+
 /// The read-only half of cross-account mirroring (#1156): the two guards `sync contribute` carries
 /// (an effective Writer grant, a fully-public local account) exist only because a contributor
 /// AUTHORS onto the owner's stream. A subscriber writes nothing there and is never pulled from, so

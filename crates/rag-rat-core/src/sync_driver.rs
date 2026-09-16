@@ -431,6 +431,15 @@ pub(crate) fn contribution_stream_is_servable(
     stream: rag_rat_oplog::StreamId,
     account: rag_rat_oplog::AccountId,
 ) -> anyhow::Result<bool> {
+    // A stream routed to a pinned account, or one derived for a pinned owner that never published
+    // it here, is not servable — this store retracted or never held it — and the answer is a plain
+    // `false`, never the typed refusal the access-mode read would raise on the owner: this
+    // predicate runs at every inbound admission.
+    if rag_rat_oplog::stream_control_pinned(conn, stream)?
+        || rag_rat_oplog::account_is_pinned(conn, owner)?
+    {
+        return Ok(false);
+    }
     if rag_rat_oplog::stream_access_mode(conn, owner, stream)?
         != rag_rat_oplog::AccessMode::PublicRead
     {
@@ -1013,7 +1022,15 @@ fn foreign_pull_targets(
     targets.sort_unstable_by_key(|target| target.to_bytes());
     targets.dedup();
     targets.retain(|target| *target != local);
-    Ok(targets)
+    // A pinned target can store nothing here: its session store refuses after the dial and the
+    // auth round trip, every cadence. Not a target.
+    let mut reachable = Vec::with_capacity(targets.len());
+    for target in targets {
+        if !rag_rat_oplog::account_is_pinned(conn, target)? {
+            reachable.push(target);
+        }
+    }
+    Ok(reachable)
 }
 
 /// The routes to try for ONE foreign account, each a node paired with the relay that reaches it.

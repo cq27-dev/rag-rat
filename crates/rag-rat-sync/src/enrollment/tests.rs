@@ -2073,3 +2073,44 @@ fn an_unknown_stored_role_preserves_each_flows_refusal_order() {
         Err(InviteError::Expired)
     ));
 }
+
+#[test]
+fn writer_redemption_refuses_a_pinned_contributor_before_fresh_or_replay() {
+    for replay in [false, true] {
+        let (conn, account, _stream, ticket) = writer_fixture();
+        let contributor_db = db();
+        let contributor = rag_rat_oplog::local_account(&contributor_db, NOW).unwrap();
+        let device = rag_rat_oplog::local_device(&contributor_db, NOW).unwrap();
+        let tx =
+            Transaction::new_unchecked(&contributor_db, TransactionBehavior::Immediate).unwrap();
+        let bundle = rag_rat_oplog::prepare_checkpoint_in_tx(&tx, contributor, &device).unwrap();
+        tx.commit().unwrap();
+        let pin = rag_rat_oplog::TrustedCheckpointPin {
+            account_id: contributor,
+            checkpoint_digest: bundle.certificate_digest(),
+            required_control_version: 2,
+        };
+        let proof = rag_rat_oplog::verify_checkpoint(pin, &bundle).unwrap();
+        let request = WriterGrantRequest {
+            nonce: ticket.nonce,
+            expected_account: account,
+            contributor_account: contributor,
+        };
+        if replay {
+            redeem_writer_invite(&conn, &request, [9; 32], &|| NOW + 1).unwrap();
+        }
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        rag_rat_oplog::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap();
+        tx.commit().unwrap();
+        let before: i64 =
+            conn.query_row("SELECT count(*) FROM account_entries", [], |r| r.get(0)).unwrap();
+        let error = redeem_writer_invite(&conn, &request, [9; 32], &|| NOW + 2).unwrap_err();
+        assert!(
+            matches!(error, InviteError::Storage(ref source) if source.downcast_ref::<rag_rat_oplog::UnsupportedAccountControlVersion>().is_some()),
+            "{error:#}"
+        );
+        let after: i64 =
+            conn.query_row("SELECT count(*) FROM account_entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(before, after);
+    }
+}

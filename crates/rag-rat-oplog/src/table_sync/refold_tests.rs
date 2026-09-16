@@ -2062,6 +2062,7 @@ fn pending_reason_tokens_are_pinned() {
             (PendingReason::TableNotInScope, "table_not_in_scope", false),
             (PendingReason::NoStreamContext, "no_stream_context", false),
             (PendingReason::DeferredIncarnationAuthority, "deferred_incarnation_authority", true,),
+            (PendingReason::UnsupportedAccountControl, "unsupported_account_control", false),
             (PendingReason::DeferredUnsentEdit, "deferred_unsent_edit", true),
             (PendingReason::DeferredUnsentDelete, "deferred_unsent_delete", true),
             (PendingReason::DeferredUnreadableRow, "deferred_unreadable_row", true),
@@ -2670,3 +2671,43 @@ fn a_subset_constraint_failure_parks_the_restate_instead_of_quarantining_it() {
 
 #[path = "diagnostics_tests.rs"]
 mod diagnostics_tests;
+
+/// A pinned account's retained entries wait for a binary that can execute the pin. That is a
+/// projector bump, not the next open: the mark is not a deferral, so once stamped at the current
+/// version nothing retries it, and an older stamp re-evaluates it like any other mark.
+#[test]
+fn a_pinned_accounts_entries_park_once_and_wait_for_a_projector_bump() {
+    let mut a = Device::new();
+    let mut b = Device::new();
+    let entries = author_wide_row(&mut a);
+    b.enroll(a.pubkey().fingerprint());
+    assert_eq!(b.ingest(OLD_REGISTRY, "repo", &entries, &a.pubkey()), vec![
+        IngestOutcome::Retained(PendingReason::NewerSpecVersion)
+    ]);
+
+    b.conn
+        .execute(
+            "INSERT INTO account_control_pins(account_id, checkpoint_digest, required_version, \
+             certificate) VALUES (?1, ?2, 2, ?3)",
+            params![ACCOUNT.as_slice(), [7u8; 32].as_slice(), [0u8; 8].as_slice()],
+        )
+        .unwrap();
+    assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+    assert_eq!(
+        b.pending_mark().unwrap(),
+        (
+            PendingReason::UnsupportedAccountControl.as_db_str().to_string(),
+            TABLE_SYNC_PROJECTOR_VERSION
+        )
+    );
+    assert_eq!(b.row(), None, "nothing of a pinned account projects");
+    assert!(
+        !refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap(),
+        "not a deferral: the next open owes nothing for it",
+    );
+
+    b.age_pending_marks();
+    assert!(refold_stale_projections_against(&b.conn, NEW_REGISTRY).unwrap());
+    assert_eq!(b.pending_count(), 1, "a projector bump re-evaluates it, and it parks again");
+    assert_eq!(b.row(), None);
+}
