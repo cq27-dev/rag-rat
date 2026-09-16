@@ -48,6 +48,7 @@ pub(super) struct AccountProjection {
     pub(super) forked: HashSet<AccountEntryHash>,
 }
 
+#[derive(Default)]
 struct AccountStateFold {
     statuses: HashMap<AccountEntryHash, EntryStatus>,
     affected_streams: Vec<StreamId>,
@@ -1584,6 +1585,22 @@ fn decode_stored_boundary(
     }
 }
 
+/// Re-derive everything a freshly installed pin changes, in the install transaction. Routed through
+/// the ordinary refold so the install and every later fold take the SAME dispatch: a pin this
+/// binary executes rebuilds its projection from the checkpoint, one it cannot execute retracts it.
+pub(super) fn refold_after_pin_install_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+) -> anyhow::Result<()> {
+    let now_ms = tx.query_row(
+        "SELECT coalesce(max(received_at_ms), 0) FROM account_entries WHERE account_id = ?1",
+        [account_id.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?;
+    refold_in_tx(tx, account_id, now_ms)?;
+    Ok(())
+}
+
 /// The refold body (caller owns the txn). Returns each entry_hash → its projected status.
 /// `pub(super)` so [`super::bootstrap`] can fold its freshly-inserted local-account genesis inside
 /// the same mint transaction, rather than nesting the self-transacting [`refold_account`].
@@ -1651,19 +1668,25 @@ fn fold_account_state_in_tx(
     now_ms: i64,
     promotion: PreVerifyPromotion,
 ) -> anyhow::Result<AccountStateFold> {
-    if matches!(
-        super::control_policy::account_control_policy(tx, account_id)?,
-        super::control_policy::AccountControlPolicy::UnsupportedVersion(_)
-    ) {
+    let policy = super::control_policy::account_control_policy(tx, account_id)?;
+    // A pin this binary cannot execute retracts instead of folding: acceptance and every derived
+    // projection go, and the signed candidates stay for a binary that can execute it.
+    if matches!(policy, super::control_policy::AccountControlPolicy::UnsupportedVersion(_)) {
         clear_unsupported_authority_in_tx(tx, account_id)?;
-        return Ok(AccountStateFold {
-            statuses: HashMap::new(),
-            affected_streams: Vec::new(),
-            rejected_content_promotions: Default::default(),
-        });
+        return Ok(AccountStateFold::default());
     }
     let rows = load_candidates(tx, account_id)?;
-    let projection = derive_account_projection(&rows);
+    let projection = match policy {
+        super::control_policy::AccountControlPolicy::ControlV2(_) => {
+            let checkpoint = super::control_policy::verified_checkpoint(tx, account_id)?;
+            let control_log = load_control_log_bytes(tx, account_id)?;
+            derive_pinned_projection(&rows, &checkpoint, &control_log)
+        },
+        // An unpinned account folds v1, whatever versions its rows carry.
+        super::control_policy::AccountControlPolicy::LegacyV1
+        | super::control_policy::AccountControlPolicy::UnsupportedVersion(_) =>
+            derive_account_projection(&rows),
+    };
 
     // Streams this account owns BEFORE the projection rewrite: a fold that drops a `StreamOwn` fact
     // must still refold that stream so its content is declassified, but the ownership row is gone
@@ -1717,8 +1740,16 @@ fn fold_account_state_in_tx(
             super::content::promote_pre_verify_for_account(tx, account_id, now_ms)?,
         PreVerifyPromotion::Skip => Default::default(),
     };
+    // Content is retracted under EVERY pin, including one this binary folds: see
+    // [`retract_pinned_content_in_tx`]. A pinned account therefore reports no affected streams, so
+    // the ordinary finalize never walks the gated stream-authority chain.
     let affected_streams =
-        super::content::affected_streams_for_account(tx, account_id, &previously_owned)?;
+        if matches!(policy, super::control_policy::AccountControlPolicy::LegacyV1) {
+            super::content::affected_streams_for_account(tx, account_id, &previously_owned)?
+        } else {
+            retract_pinned_content_in_tx(tx, account_id)?;
+            Vec::new()
+        };
     // Every fold path — trusted, untrusted, and the DeviceAdd promotion sweep — can grow the
     // live key-target set (a locally minted key, a remotely synced `StreamOwn`/wrap, or a parked
     // wrap a promoted DeviceAdd just certified). Top outstanding invite reservations up to the
@@ -1750,14 +1781,13 @@ fn owned_stream_bytes(conn: &Connection, account_id: AccountId) -> anyhow::Resul
     rows.iter().map(|bytes| id::fixed(bytes)).collect()
 }
 
-/// Replace every query-ready authority fact for this account. The caller's IMMEDIATE refold txn
-/// also owns accepted/status, so readers can never observe authority from a different fold round.
-pub(super) fn clear_unsupported_authority_in_tx(
+/// Every stream a pinned account's retraction touches: the streams its content currently reaches,
+/// plus the streams the pin's routing table still names once the ownership rows are suppressed.
+/// Read BEFORE any retraction, because both inputs are things a retraction removes.
+fn pinned_affected_streams(
     tx: &Transaction<'_>,
     account_id: AccountId,
-) -> anyhow::Result<()> {
-    // Capture routes before removing ownership. Refold/reprojection is a declassification path:
-    // it must run even though operational authority for this account is unsupported.
+) -> anyhow::Result<Vec<StreamId>> {
     let mut affected = content::affected_streams_for_account(tx, account_id, &[])?;
     let pinned_streams = {
         let mut stmt =
@@ -1770,6 +1800,43 @@ pub(super) fn clear_unsupported_authority_in_tx(
     }
     affected.sort_unstable();
     affected.dedup();
+    Ok(affected)
+}
+
+/// Retract the content acceptance of a pinned account's streams and re-project them through the
+/// CLEANUP path.
+///
+/// Content is retracted under EVERY pin, including one this binary executes and folds. The content
+/// acceptance path resolves stream authority through gated reads — [`account_is_contested`] and the
+/// ownership/access-mode lookups — and those refuse for any pin, so there is no evaluation to
+/// project. A pinned fold therefore retracts here and reports NO affected streams, rather than
+/// handing the ordinary finalize a stream whose gated chain would fail the fold.
+fn retract_pinned_content_in_tx(tx: &Transaction<'_>, account_id: AccountId) -> anyhow::Result<()> {
+    let affected = pinned_affected_streams(tx, account_id)?;
+    let flipped = tx.execute(
+        "UPDATE content_entries SET accepted=0 WHERE accepted=1 AND (author_account_id=?1 OR \
+         stream_id IN (SELECT stream_id FROM account_control_pin_streams WHERE account_id=?1))",
+        [account_id.to_bytes().as_slice()],
+    )?;
+    // Once nothing is accepted there is nothing left to retract, so only a fold that flipped
+    // something pays for a re-projection.
+    if flipped > 0 {
+        for stream in affected {
+            content::refold_and_project_for_cleanup_in_tx(tx, stream)?;
+        }
+    }
+    Ok(())
+}
+
+/// Replace every query-ready authority fact for this account. The caller's IMMEDIATE refold txn
+/// also owns accepted/status, so readers can never observe authority from a different fold round.
+pub(super) fn clear_unsupported_authority_in_tx(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+) -> anyhow::Result<()> {
+    // Capture routes before removing ownership. Refold/reprojection is a declassification path:
+    // it must run even though operational authority for this account is unsupported.
+    let affected = pinned_affected_streams(tx, account_id)?;
     // What the retraction below still has to retract. Every fold of a pinned account comes
     // through here — install, and each later local ingest for the account — and a re-projection
     // is O(all content on the affected streams) plus a Lens-visible epoch bump; once nothing is
@@ -1797,6 +1864,9 @@ pub(super) fn clear_unsupported_authority_in_tx(
         "account_stream_grants",
         "account_stream_grant_cuts",
         "account_auth_state",
+        // The eighth is the SECRETS-log (log 1) projection that `refold_secrets_log` rebuilds, not
+        // one of the seven `rewrite_authority_projection` owns — the pin short-circuits both
+        // passes, so both projections have to go.
         "account_repo_incarnation_current",
     ] {
         let account_column = match table {
@@ -2102,6 +2172,93 @@ fn derive_account_projection_traced(
         // Monotone elimination is both the termination argument and the security boundary: once
         // an effective candidate loses its author branch or its cited authority branch, neither it
         // nor any effect it produced may participate in a later fold round.
+        forked.extend(newly_forked);
+    }
+}
+
+/// The stored signed bytes of every control-log row for this account, in a deterministic order.
+/// Deliberately the WHOLE log: the executor decides which rows are v2 candidates for the pin, so a
+/// row it refuses is left out of the pool rather than refusing the pool.
+fn load_control_log_bytes(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut stmt = conn.prepare(
+        "SELECT signed_bytes FROM account_entries
+          WHERE account_id = ?1 AND log_id = ?2 ORDER BY entry_hash",
+    )?;
+    Ok(stmt
+        .query_map(params![account_id.to_bytes().as_slice(), fold::CONTROL_LOG], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<Vec<u8>>>>()?)
+}
+
+/// The projection of an account under a control pin THIS binary executes.
+///
+/// The checkpoint fixes the legacy epoch, so neither the accepted legacy set nor the folded history
+/// is re-derived here: the certificate commits to exactly that history, so re-folding the same
+/// evidence could only reproduce it or disagree with the pin. Two rules do the rest.
+///
+/// **A control-log v1 entry participates IFF the checkpoint's evidence carries it**
+/// ([`fold::v2::FrozenLegacy::entries`] is exactly that set). Account ingest is not pin-gated, so
+/// v1 rows keep arriving after the pin. Letting one into the effective set hands it to a selection
+/// walk that re-derives acceptance from seq 0 over the LIVE candidates: a post-pin sibling with a
+/// smaller entry hash wins the min-hash tiebreak, demotes the checkpoint's own winner to forked and
+/// collapses that device's accepted chain — while the executor keeps admitting v2 continuations on
+/// the strength of `accepted_at_checkpoint`. That revives a frozen branch loser out of ordinary v1
+/// traffic, which is the one thing the pin exists to prevent. With the rule, selection reproduces
+/// the checkpoint's accepted set exactly, and `select_coherent_branches` needs no change.
+///
+/// **A v2 entry enters the effective set only when the executor APPLIED it**, and never at a slot
+/// the checkpoint already decided. Selection promotes nothing: the ordinary coherence walk picks
+/// one sibling per `(log_id, device, seq)` by entry hash, and monotone elimination drops the loser
+/// — so v2 equivocation resolves through the very machinery v1 equivocation does.
+fn derive_pinned_projection(
+    rows: &[CandidateRow],
+    checkpoint: &super::checkpoint::VerifiedCheckpoint,
+    control_log: &[Vec<u8>],
+) -> AccountProjection {
+    let frozen = checkpoint.frozen_legacy();
+    let accepted_at_checkpoint: HashSet<AccountEntryHash> = frozen.accepted_entries().collect();
+    // The slots the checkpoint already decided. A v2 entry may EXTEND a device's accepted chain but
+    // never contest a slot at or below its tip: the min-hash tiebreak is symmetric, so without this
+    // an authorized v2 sibling with a smaller entry hash would displace a checkpoint-accepted entry
+    // — selecting a different historical branch, which the pin forbids however the entry was
+    // authorized.
+    let frozen_slots: HashSet<(u8, DeviceFingerprint, u64)> = frozen
+        .entries()
+        .iter()
+        .filter(|entry| accepted_at_checkpoint.contains(&entry.entry_hash))
+        .map(|entry| (entry.header.log_id, entry.header.device_fingerprint, entry.header.seq))
+        .collect();
+    let applied: HashSet<AccountEntryHash> =
+        super::control_v2::executor::execute_held(checkpoint, control_log)
+            .into_iter()
+            .filter(|(_, verdict)| {
+                matches!(verdict, super::control_v2::executor::Verdict::Applied { .. })
+            })
+            .map(|(hash, _)| hash)
+            .collect();
+
+    let mut forked: HashSet<AccountEntryHash> = HashSet::new();
+    loop {
+        let mut effective: HashSet<AccountEntryHash> =
+            accepted_at_checkpoint.difference(&forked).copied().collect();
+        effective.extend(
+            rows.iter()
+                .filter(|row| {
+                    applied.contains(&row.entry_hash)
+                        && !forked.contains(&row.entry_hash)
+                        && !frozen_slots.contains(&(row.log_id, row.device_fingerprint, row.seq))
+                })
+                .map(|row| row.entry_hash),
+        );
+        let selected = select_coherent_branches(rows, &effective);
+        let accepted = close_selection_over_authority(rows, selected);
+        let newly_forked: Vec<AccountEntryHash> =
+            effective.difference(&accepted).copied().collect();
+        if newly_forked.is_empty() {
+            return AccountProjection { history: frozen.history().clone(), accepted, forked };
+        }
         forked.extend(newly_forked);
     }
 }

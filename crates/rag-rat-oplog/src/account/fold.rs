@@ -203,6 +203,10 @@ pub(super) enum AccountClassification {
 
 /// The derived authority history of one account: per-entry outcomes, the account classification,
 /// and (only when `contested`) the deterministic recovery successor.
+///
+/// `Clone` so a checkpoint's frozen history can be projected by a pinned refold without re-folding
+/// the evidence it was derived from.
+#[derive(Clone)]
 pub(super) struct AccountAuthHistory {
     outcomes: HashMap<AccountEntryHash, Outcome>,
     classification: AccountClassification,

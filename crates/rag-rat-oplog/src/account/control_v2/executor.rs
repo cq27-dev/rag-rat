@@ -15,8 +15,14 @@
 //! permanently condemned, which is what a `Rejected` means.
 //!
 //! Every bound is the planner's declared evidence budget ([`views::MAX_ENTRIES`],
-//! [`views::MAX_BYTES`]), counted over the deduplicated objects this call was handed. Verification
-//! is performed fresh here on every call; no cache stands in for it.
+//! [`views::MAX_BYTES`]), counted over the deduplicated objects this call was handed. Every bound,
+//! every commitment and every authority verdict is derived fresh on each call.
+//!
+//! The ONE thing a caller may share across calls is the signature check itself, through an
+//! [`AuthMemo`] ([`execute_held`] does this for a refold's whole pool). A memo entry is keyed on
+//! the exact `(entry_hash, signing key)` pair it was verified under, so a bundle that introduces a
+//! DIFFERENT key for the same author still has to verify on its own terms — the memo can only skip
+//! repeating an Ed25519 check whose two inputs are byte-identical, never substitute for one.
 //!
 //! **Equivocation on the consumer's own chain slot is OUT OF SCOPE here.** Two v2 entries at the
 //! same `seq` off the same accepted `prev_hash` both execute, because this layer decides ONE
@@ -25,8 +31,9 @@
 //! held candidate set, and it must happen before an operation reaches here. Saying nothing was what
 //! made a reader expect the check at this layer.
 //!
-//! This engine is not wired to production. The v1 fold dispatches nothing here, no CLI activates
-//! it, and executing an operation flips no readiness or pin state.
+//! A refold of an account under a control pin this binary executes dispatches here, through
+//! [`execute_held`]. Nothing else does: no CLI activates it, an UNPINNED account never reaches it
+//! whatever versions its rows carry, and executing an operation flips no readiness or pin state.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -87,6 +94,14 @@ pub(in crate::account) enum RejectCause {
     Precondition(RejectReason),
 }
 
+/// Signature checks already performed, shared across the operations of one execution pass.
+///
+/// Keyed on `(entry_hash, signing key)`: the entry hash commits to the header and payload, so a hit
+/// means this exact object already verified under this exact key. Ed25519 verification is what an
+/// execution pass actually spends, and re-running it per operation is what makes N operations over
+/// one pool cost N times the pool.
+pub(in crate::account) type AuthMemo = HashMap<(AccountEntryHash, [u8; 32]), V2Entry>;
+
 /// Execute `operation` against `checkpoint`. `Err` is malformed or over-budget input; an honest
 /// peer that is merely behind gets a [`Verdict::Parked`].
 pub(in crate::account) fn execute(
@@ -95,6 +110,17 @@ pub(in crate::account) fn execute(
     manifests: &[Vec<u8>],
     evidence: &[Vec<u8>],
 ) -> anyhow::Result<Verdict> {
+    execute_shared(checkpoint, operation, manifests, evidence, &mut AuthMemo::default())
+}
+
+/// [`execute`], reusing `memo`'s signature checks. Every other decision is still derived fresh.
+fn execute_shared(
+    checkpoint: &VerifiedCheckpoint,
+    operation: &[u8],
+    manifests: &[Vec<u8>],
+    evidence: &[Vec<u8>],
+    memo: &mut AuthMemo,
+) -> anyhow::Result<Verdict> {
     let plan = match views::plan_replay(checkpoint, operation, manifests, evidence) {
         Ok(plan) => plan,
         Err(views::PlanError::MissingView(_)) => return Ok(Verdict::Parked(ParkCause::Manifest)),
@@ -102,7 +128,7 @@ pub(in crate::account) fn execute(
         Err(views::PlanError::Invalid(error)) => return Err(error),
     };
     let frozen = checkpoint.frozen_legacy();
-    let authenticated = match authenticate(&plan, frozen) {
+    let authenticated = match authenticate(&plan, frozen, memo) {
         Ok(authenticated) => authenticated,
         // Bytes that do not verify are a bad bundle, not a bad operation.
         Err(AuthFailure::Malformed(error)) => return Err(error),
@@ -175,7 +201,8 @@ pub(in crate::account) fn execute(
 }
 
 /// One authenticated v2 entry: the verified envelope and the inner v1 operation it carries.
-struct V2Entry {
+#[derive(Clone)]
+pub(in crate::account) struct V2Entry {
     verified: VerifiedAccountEntry,
     op: AccountOp,
 }
@@ -212,6 +239,7 @@ enum AuthFailure {
 fn authenticate(
     plan: &views::ReplayPlan,
     frozen: &fold::v2::FrozenLegacy,
+    memo: &mut AuthMemo,
 ) -> Result<Authenticated, AuthFailure> {
     let mut keys = frozen.device_pubkeys();
     let mut headers: HashMap<AccountEntryHash, AccountEntryHeader> =
@@ -229,21 +257,30 @@ fn authenticate(
     }
     while let Some(signed) = ready.pop() {
         let key = keys[&signed.header.device_fingerprint];
-        // A key exists for this author, so the bytes now have to verify under it.
-        let verified = DevicePublic::from_bytes(&key)
-            .and_then(|key| envelope::verify_account_signed(&signed.signed_bytes, &key))
-            .map_err(AuthFailure::Malformed)?;
-        let op = ops::decode(verified.header.entry_type, &verified.payload)
-            .map_err(AuthFailure::Malformed)?
-            .op;
+        // A key exists for this author, so the bytes now have to verify under it — unless this
+        // exact object already verified under this exact key earlier in the pass. The memo is keyed
+        // on both, so a different key for the same author is a different check and still runs.
+        let entry = match memo.get(&(signed.entry_hash, key)) {
+            Some(entry) => entry.clone(),
+            None => {
+                let verified = DevicePublic::from_bytes(&key)
+                    .and_then(|key| envelope::verify_account_signed(&signed.signed_bytes, &key))
+                    .map_err(AuthFailure::Malformed)?;
+                let op = ops::decode(verified.header.entry_type, &verified.payload)
+                    .map_err(AuthFailure::Malformed)?
+                    .op;
+                let entry = V2Entry { verified, op };
+                memo.insert((signed.entry_hash, key), entry.clone());
+                entry
+            },
+        };
         // A v2 enrolment certifies the added device's key exactly as its v1 counterpart does. It
         // does NOT confer authority — `V2Authority` judges that separately.
-        if let AccountOp::DeviceAdd { device_fingerprint, ed25519_pubkey, .. } = &op {
+        if let AccountOp::DeviceAdd { device_fingerprint, ed25519_pubkey, .. } = &entry.op {
             keys.insert(*device_fingerprint, *ed25519_pubkey);
             ready.extend(waiting.remove(device_fingerprint).unwrap_or_default());
         }
-        headers.insert(verified.entry_hash, verified.header.clone());
-        let entry = V2Entry { verified, op };
+        headers.insert(entry.verified.entry_hash, entry.verified.header.clone());
         if signed.entry_hash == plan.consumer().entry_hash {
             consumer = Some(entry);
         } else {
@@ -254,6 +291,58 @@ fn authenticate(
         return Err(AuthFailure::UnknownSigner);
     }
     Ok(Authenticated { consumer: consumer.ok_or(AuthFailure::UnknownSigner)?, entries, headers })
+}
+
+/// Execute every held v2 control operation for one account against `checkpoint`.
+///
+/// One pool, one authentication: each operation is judged against every OTHER held v2 entry as its
+/// evidence, and the pass shares its signature checks through a single [`AuthMemo`]. Without that,
+/// a pool of N operations costs N full verifications of the pool, on every refold.
+///
+/// A detached pre-cut manifest is not durable, so a revocation that names one parks on
+/// [`ParkCause::Manifest`] until it is supplied. An ordinary operation names no view and needs no
+/// historical evidence, so it executes from held rows alone.
+///
+/// Rows that are not v2 candidates for THIS checkpoint are excluded from the pool rather than
+/// refused inside it: such a row would refuse every bundle it appeared in, not just its own. A
+/// bundle that still fails to verify yields no verdict for that ONE operation and never for the
+/// rest — a peer cannot silence an account's other operations by attaching one bad object.
+pub(in crate::account) fn execute_held(
+    checkpoint: &VerifiedCheckpoint,
+    held: &[Vec<u8>],
+) -> BTreeMap<AccountEntryHash, Verdict> {
+    let pin = checkpoint.pin();
+    let mut verdicts = BTreeMap::new();
+    let mut hashes = Vec::new();
+    let mut pool = Vec::new();
+    for row in held {
+        if let Ok((entry, _)) = views::decode_candidate(&pin, row) {
+            hashes.push(entry.entry_hash);
+            pool.push(row.clone());
+        }
+    }
+    let Some(last) = pool.len().checked_sub(1) else {
+        return verdicts;
+    };
+    let mut memo = AuthMemo::default();
+    for index in 0..pool.len() {
+        // Rotate the consumer to the end so the remaining prefix is exactly its evidence without
+        // copying the pool once per operation — `plan_replay` refuses a bundle carrying its own
+        // consumer, so the consumer has to come out of the evidence one way or another.
+        hashes.swap(index, last);
+        pool.swap(index, last);
+        let consumer = hashes[last];
+        let verdict = {
+            let (evidence, operation) = pool.split_at(last);
+            execute_shared(checkpoint, &operation[0], &[], evidence, &mut memo)
+        };
+        hashes.swap(index, last);
+        pool.swap(index, last);
+        if let Ok(verdict) = verdict {
+            verdicts.insert(consumer, verdict);
+        }
+    }
+    verdicts
 }
 
 /// Why an ancestry walk did not land.
