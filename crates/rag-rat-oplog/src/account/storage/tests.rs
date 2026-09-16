@@ -2760,6 +2760,23 @@ fn view_manifest_entry(
     sign_account_entry(&signer.secret, &header, &view.encode().unwrap()).unwrap()
 }
 
+/// The branch an ingest took, as a stable token an assertion message can name.
+///
+/// Assertions about an ingest name the branch instead of interpolating the `IngestOutcome`: the
+/// outcome is a value `account_ingest` returned, and formatting a returned value into a panic
+/// message is the shape a cleartext-logging scan reads as writing it to a log. A closed match to
+/// string literals carries nothing out of the outcome, so there is no value to leak — and a new
+/// variant breaks this arm rather than going unnamed in a failure.
+fn ingest_branch(outcome: &IngestOutcome) -> &'static str {
+    match outcome {
+        IngestOutcome::Rejected(_) => "rejected",
+        IngestOutcome::PreVerify => "pre_verify",
+        IngestOutcome::PreVerifyWithEviction { .. } => "pre_verify_with_eviction",
+        IngestOutcome::CapacityReached { .. } => "capacity_reached",
+        IngestOutcome::Ingested { .. } => "ingested",
+    }
+}
+
 #[test]
 fn a_view_manifest_reaches_capacity_an_ordinary_candidate_cannot() {
     // A cut names its evidence as a DETACHED manifest that competes for the same grow-only budget
@@ -2809,10 +2826,7 @@ fn a_view_manifest_reaches_capacity_an_ordinary_candidate_cannot() {
     let (ordinary, reserved) =
         ordinary_and_manifest((ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 1) as u64, 0);
     assert_eq!(ordinary, IngestOutcome::CapacityReached { scope: CapacityScope::CandidateAccount });
-    assert!(
-        matches!(reserved, IngestOutcome::Ingested { .. }),
-        "a view manifest reaches the reserved slots, got {reserved:?}",
-    );
+    assert_eq!(ingest_branch(&reserved), "ingested", "a view manifest reaches the reserved slots",);
 
     // The byte floor is a separate counter and needs its own case: entry slots are free here, and
     // only the ordinary byte budget is spoken for.
@@ -2821,10 +2835,7 @@ fn a_view_manifest_reaches_capacity_an_ordinary_candidate_cannot() {
     assert_eq!(ordinary, IngestOutcome::CapacityReached {
         scope: CapacityScope::CandidateAccountBytes
     });
-    assert!(
-        matches!(reserved, IngestOutcome::Ingested { .. }),
-        "a view manifest reaches the reserved bytes, got {reserved:?}",
-    );
+    assert_eq!(ingest_branch(&reserved), "ingested", "a view manifest reaches the reserved bytes",);
 }
 
 #[test]
