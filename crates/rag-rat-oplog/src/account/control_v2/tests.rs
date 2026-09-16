@@ -392,7 +392,7 @@ fn ordinary_operations_execute_at_any_chain_length_with_no_historical_view() {
         // supply and nothing for a depth cap to measure.
         let held = bytes(&operations[..index]);
         let verdict = executor::execute(&checkpoint, &operation.signed_bytes, &[], &held).unwrap();
-        let executor::Verdict::Applied { registers, credit } = verdict else {
+        let executor::Verdict::Applied { registers, credit, .. } = verdict else {
             panic!("operation {index} did not execute");
         };
         assert!(registers.is_empty(), "an enrollment installs no register");

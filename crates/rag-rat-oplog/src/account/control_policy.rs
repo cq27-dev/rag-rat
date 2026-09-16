@@ -841,6 +841,112 @@ mod tests {
         assert_eq!(accepted_flag(&conn, enrolled), 0, "acceptance is retracted too");
     }
 
+    /// Author a v2 `DeviceRemove` of `subject` on `device`'s own chain.
+    fn device_remove_entry(
+        account: AccountId,
+        device: &crate::identity::LocalDevice,
+        prev: super::id::AccountEntryHash,
+        seq: u64,
+        genesis: super::id::AccountEntryHash,
+        checkpoint_digest: [u8; 32],
+        subject: crate::op::DeviceFingerprint,
+    ) -> envelope::SignedAccountEntry {
+        let op = ops::AccountOp::DeviceRemove {
+            device_fingerprint: subject,
+            control_cut: crate::account::cut::Cut::Empty,
+            secrets_cut: crate::account::cut::Cut::Empty,
+            content_cuts: vec![],
+            reason: "revoked".into(),
+        };
+        // A revocation MUST name a pre-cut view — `ControlOp::encode` refuses otherwise — and this
+        // digest is exactly the manifest no refold can supply.
+        let payload = control_v2::ops::ControlOp {
+            checkpoint: checkpoint_digest,
+            pre_cut_view: Some([9; 32]),
+            op: op.clone(),
+        }
+        .encode()
+        .unwrap();
+        envelope::sign_account_entry(
+            device.secret(),
+            &envelope::AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: device.fingerprint(),
+                seq,
+                prev_hash: Some(prev),
+                parent_ref: Some(prev),
+                entry_type: ops::entry_type_of(&op),
+                op_version: control_v2::ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(genesis.into()),
+            },
+            &payload,
+        )
+        .unwrap()
+    }
+
+    /// A v2 revocation cannot yet take effect through a refold, and the reason is structural rather
+    /// than a policy choice: `ControlOp::encode` requires every revocation to name a DETACHED
+    /// pre-cut manifest by digest, and `execute_held` supplies no manifests, so `plan_replay`
+    /// cannot resolve the view and the operation parks on `ParkCause::Manifest`. Nothing
+    /// persists a manifest or hands one to the executor.
+    ///
+    /// So the removal is neither accepted nor projected, and the subject stays on the roster. This
+    /// is fail-closed — a revocation that cannot be verified applies nothing — but it also means
+    /// the register effects `v2::pinned_history` composes are unreachable from here until
+    /// detached manifests become durable. When that lands, this test fails and is the place to
+    /// say what the refold now does instead.
+    #[test]
+    fn a_v2_revocation_parks_for_want_of_the_manifest_no_refold_can_supply() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, device, genesis, enrolled) = account_with_one_enrolment(&conn);
+        let digest = install_pin(&conn, account).checkpoint_digest;
+        let subject = test_support::Dev::new(7).fp;
+        let remove = device_remove_entry(account, &device, enrolled, 2, genesis, digest, subject);
+        storage::account_ingest(&conn, &remove.signed_bytes, 3).unwrap();
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM account_entry_status WHERE entry_hash = ?1",
+                [remove.entry_hash.as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "retained_unfolded", "the executor applied nothing for it");
+        assert_eq!(accepted_flag(&conn, remove.entry_hash), 0, "and it is not accepted");
+        let open_roster: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM account_roster_history WHERE closed_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open_roster, 2, "the subject is still an open roster member");
+    }
+
+    /// The same operation WITHOUT a pre-cut view cannot even be authored: the presence rule is a
+    /// property of the signed payload, so there is no way to sidestep the manifest by omitting it.
+    #[test]
+    fn a_revocation_cannot_be_authored_without_naming_a_pre_cut_view() {
+        let op = ops::AccountOp::DeviceRemove {
+            device_fingerprint: test_support::Dev::new(7).fp,
+            control_cut: crate::account::cut::Cut::Empty,
+            secrets_cut: crate::account::cut::Cut::Empty,
+            content_cuts: vec![],
+            reason: "revoked".into(),
+        };
+        let encoded =
+            control_v2::ops::ControlOp { checkpoint: [1; 32], pre_cut_view: None, op }.encode();
+        assert!(
+            encoded.is_err_and(|error| error.to_string().contains("pre-cut view presence")),
+            "a revocation must name the manifest that bounds its credit",
+        );
+    }
+
     /// The forward-compat half of the version dispatch, unreachable through a stored row while the
     /// V130 CHECK admits only version 2.
     #[test]

@@ -2201,9 +2201,12 @@ fn load_control_log_bytes(
 
 /// The projection of an account under a control pin THIS binary executes.
 ///
-/// The checkpoint fixes the legacy epoch, so neither the accepted legacy set nor the folded history
-/// is re-derived here: the certificate commits to exactly that history, so re-folding the same
-/// evidence could only reproduce it or disagree with the pin. Two rules do the rest.
+/// The checkpoint fixes the legacy epoch, so the legacy fold is never RE-DERIVED here: the
+/// certificate commits to exactly that history, so re-folding the same evidence could only
+/// reproduce it or disagree with the pin. What the frozen history does not carry is the effect of
+/// the account's own v2 operations, which [`fold::v2::pinned_history`] composes on top of it — so a
+/// device a v2 cut revoked leaves the roster projection and its entries stop being accepted. Two
+/// rules do the rest.
 ///
 /// **A control-log v1 entry participates IFF the checkpoint's evidence carries it**
 /// ([`fold::v2::FrozenLegacy::entries`] is exactly that set). Account ingest is not pin-gated, so
@@ -2237,34 +2240,47 @@ fn derive_pinned_projection(
         .filter(|entry| accepted_at_checkpoint.contains(&entry.entry_hash))
         .map(|entry| (entry.header.log_id, entry.header.device_fingerprint, entry.header.seq))
         .collect();
-    let applied: HashSet<AccountEntryHash> =
-        super::control_v2::executor::execute_held(checkpoint, control_log)
-            .into_iter()
-            .filter(|(_, verdict)| {
-                matches!(verdict, super::control_v2::executor::Verdict::Applied { .. })
-            })
-            .map(|(hash, _)| hash)
-            .collect();
+    let verdicts = super::control_v2::executor::execute_held(checkpoint, control_log);
+    // An entry at a slot the checkpoint already decided contributes NOTHING — not its acceptance
+    // and not its registers. Being authorized is not permission to rewrite what the pin froze.
+    let contests_frozen_slot: HashSet<AccountEntryHash> = rows
+        .iter()
+        .filter(|row| frozen_slots.contains(&(row.log_id, row.device_fingerprint, row.seq)))
+        .map(|row| row.entry_hash)
+        .collect();
 
     let mut forked: HashSet<AccountEntryHash> = HashSet::new();
     loop {
-        let mut effective: HashSet<AccountEntryHash> =
-            accepted_at_checkpoint.difference(&forked).copied().collect();
-        effective.extend(
-            rows.iter()
-                .filter(|row| {
-                    applied.contains(&row.entry_hash)
-                        && !forked.contains(&row.entry_hash)
-                        && !frozen_slots.contains(&(row.log_id, row.device_fingerprint, row.seq))
-                })
-                .map(|row| row.entry_hash),
-        );
+        // A forked entry lost its slot, so its registers must revoke nothing either — which is why
+        // the history is composed inside the loop rather than once above it.
+        let applied: Vec<fold::v2::AppliedOperation<'_>> = verdicts
+            .iter()
+            .filter(|(hash, _)| !forked.contains(hash) && !contests_frozen_slot.contains(hash))
+            .filter_map(|(_, verdict)| match verdict {
+                super::control_v2::executor::Verdict::Applied { entry, registers, .. } =>
+                    Some(fold::v2::AppliedOperation { entry, registers }),
+                _ => None,
+            })
+            .collect();
+        let history = fold::v2::pinned_history(frozen, &applied);
+        // The checkpoint's accepted set plus the applied entries, MINUS whatever the composed
+        // history explicitly condemns. An entry the composition does not model at all — every
+        // applied operation that installs no register — keeps its acceptance; acceptance is a
+        // question about branch selection, and only a v2 REGISTER takes it away.
+        let still_effective =
+            |hash: &AccountEntryHash| history.outcome(hash).is_none_or(|o| o.is_effective());
+        let mut effective: HashSet<AccountEntryHash> = accepted_at_checkpoint
+            .iter()
+            .filter(|hash| !forked.contains(*hash) && still_effective(hash))
+            .copied()
+            .collect();
+        effective.extend(applied.iter().map(|op| op.entry.hash()).filter(still_effective));
         let selected = select_coherent_branches(rows, &effective);
         let accepted = close_selection_over_authority(rows, selected);
         let newly_forked: Vec<AccountEntryHash> =
             effective.difference(&accepted).copied().collect();
         if newly_forked.is_empty() {
-            return AccountProjection { history: frozen.history().clone(), accepted, forked };
+            return AccountProjection { history, accepted, forked };
         }
         forked.extend(newly_forked);
     }

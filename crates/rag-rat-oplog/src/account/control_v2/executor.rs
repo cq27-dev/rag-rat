@@ -51,8 +51,11 @@ use crate::op::DeviceFingerprint;
 /// What executing one v2 operation against the checkpoint decided.
 #[derive(Debug)]
 pub(in crate::account) enum Verdict {
-    /// Authorized: the registers it installs and the credit its signed nomination earns.
-    Applied { registers: Vec<(RegisterKey, Cut)>, credit: u64 },
+    /// Authorized: the entry itself, the registers it installs, and the credit its signed
+    /// nomination earns. The entry rides along so a consumer projecting these registers reads the
+    /// very operation `apply_cut` derived them from, rather than decoding the row a second time.
+    /// Boxed so an ordinary `Parked`/`Rejected` verdict stays a small value.
+    Applied { entry: Box<Candidate>, registers: Vec<(RegisterKey, Cut)>, credit: u64 },
     /// Evidence is incomplete. NOTHING is applied — no register, no credit — and the operation is
     /// reconsidered when the missing objects arrive.
     Parked(ParkCause),
@@ -191,8 +194,11 @@ fn execute_shared(
             nominated: &nominated,
             cut: &cut,
         }) {
-            fold::v2::CutOutcome::Applied(applied) =>
-                Verdict::Applied { registers: applied.registers, credit: applied.credit },
+            fold::v2::CutOutcome::Applied(applied) => Verdict::Applied {
+                entry: Box::new(cut.clone()),
+                registers: applied.registers,
+                credit: applied.credit,
+            },
             fold::v2::CutOutcome::Rejected(reason) =>
                 Verdict::Rejected(RejectCause::Precondition(reason)),
             fold::v2::CutOutcome::Parked(_) => Verdict::Parked(ParkCause::CutTarget),
