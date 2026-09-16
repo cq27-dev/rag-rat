@@ -52,9 +52,7 @@ impl CheckpointBundle {
 pub struct VerifiedCheckpoint {
     pin: TrustedCheckpointPin,
     bundle: CheckpointBundle,
-    accepted: HashSet<AccountEntryHash>,
     forked: HashSet<AccountEntryHash>,
-    nonaccepted: HashSet<AccountEntryHash>,
     continuation_heads: Vec<DeviceCut>,
     frozen: fold::v2::FrozenLegacy,
 }
@@ -71,7 +69,7 @@ impl VerifiedCheckpoint {
         &self.bundle
     }
     pub fn accepted_legacy_entries(&self) -> impl Iterator<Item = AccountEntryHash> + '_ {
-        self.accepted.iter().copied()
+        self.frozen.accepted_entries()
     }
     /// Branch/authority-closure losers, distinct from other nonaccepted legacy entries.
     pub fn forked_legacy_entries(&self) -> impl Iterator<Item = AccountEntryHash> + '_ {
@@ -80,7 +78,14 @@ impl VerifiedCheckpoint {
     /// All nonaccepted control candidates, including parked/rejected entries. This is diagnostic
     /// membership, not permission to drop their evidence or their legacy register contributions.
     pub fn nonaccepted_legacy_entries(&self) -> impl Iterator<Item = AccountEntryHash> + '_ {
-        self.nonaccepted.iter().copied()
+        self.frozen
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.header.log_id == fold::CONTROL_LOG
+                    && !self.frozen.accepted_at_checkpoint(&entry.entry_hash)
+            })
+            .map(|entry| entry.entry_hash)
     }
     pub fn continuation_heads(&self) -> &[DeviceCut] {
         &self.continuation_heads
@@ -346,26 +351,16 @@ fn verify_projection(
                 anyhow::anyhow!("invalid checkpoint continuation branches: {error:?}")
             })?;
     anyhow::ensure!(branch == projection.accepted, "checkpoint accepted branches are incomplete");
-    let nonaccepted = entries
-        .iter()
-        .filter(|entry| {
-            entry.header.log_id == fold::CONTROL_LOG
-                && !projection.accepted.contains(&entry.entry_hash)
-        })
-        .map(|entry| entry.entry_hash)
-        .collect();
     let frozen = fold::v2::FrozenLegacy::new(
         entries,
         projection.history,
         trace.ok_or_else(|| anyhow::anyhow!("checkpoint has no final legacy trace"))?,
-        projection.accepted.clone(),
+        projection.accepted,
     );
     Ok(VerifiedCheckpoint {
         pin: expected,
         bundle: bundle.clone(),
-        accepted: projection.accepted,
         forked: projection.forked,
-        nonaccepted,
         continuation_heads,
         frozen,
     })
@@ -726,7 +721,7 @@ mod tests {
         let bundle = prepare_checkpoint(account, &evidence, &founder.secret).unwrap();
         let proof = verify_checkpoint(pin(account, &bundle), &bundle).unwrap();
         forks.sort_unstable();
-        assert!(proof.accepted.contains(&forks[0]));
+        assert!(proof.accepted_legacy_entries().any(|hash| hash == forks[0]));
         assert!(proof.forked.contains(&forks[1]));
         evidence.reverse();
         let reordered = prepare_checkpoint(account, &evidence, &founder.secret).unwrap();
