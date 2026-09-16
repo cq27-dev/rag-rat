@@ -5,22 +5,44 @@
 //! it may ever count — the entries it named, plus the legacy entries the checkpoint accepted. It is
 //! not a frozen number and not a claim of causation: the numeric credit may still fall as other
 //! authorized cuts change those identities' outcomes, and nothing here establishes that this cut
-//! was historically effective. Credit is derived by the v1 [`super::revocation_credit`] loops under
-//! a narrower membership test, so it is a subset of the v1 credit over the same outcomes, and every
-//! v1 ceiling still caps it.
+//! was historically effective.
 //!
-//! **What is and is not evaluated.** A nominated entry counts only if it held authority: a live
-//! owner incarnation minted for its OWN signer, with no legacy register already cutting its chain.
-//! Authentication and the chain walk establish who wrote an entry and where it sits, never that it
-//! was allowed to, so neither substitutes for that check. This is deliberately STRICTER than the v1
-//! pass, where condemnation outranks a stale-authority rejection and an unauthorized entry on the
-//! revoked chain is therefore credited: such an entry was never in the effective count, so counting
-//! its removal counts something its own author never did. Under-crediting only parks a cut, it
-//! never admits one that is ahead. State preconditions (a duplicate
-//! enrolment, a tombstoned re-add) are NOT evaluated — the v1 fold rejects those `Ineffective` and
-//! never credits them, so an entry failing one can still be counted here. That over-count is
-//! confined to the revoked device's own chain, since a cut counts only what its own register keys
-//! scope, and it can never exceed the entries actually nominated on that chain.
+//! **Credit is the v1 rule over a CONSTRUCTED outcome map.** The counting is
+//! [`super::revocation_credit`] itself under a narrower membership test, so against one fixed
+//! outcome map it can only ever count fewer entries than v1 would. The map is where the two part
+//! company: a legacy entry's outcome is the checkpoint's own, but a nominated v2 entry's is
+//! constructed here rather than folded. So this is NOT a ceiling underneath a real v1 fold, and a
+//! reader must not treat it as one — the residual below says exactly where it can exceed one.
+//!
+//! **What is and is not evaluated.** A nominated entry is effective only if it held authority: a
+//! live owner incarnation minted for its OWN signer, with no legacy register already cutting its
+//! chain. Authentication and the chain walk establish who wrote an entry and where it sits, never
+//! that it was allowed to, so neither substitutes for that check. A cited mint naming a different
+//! device is `WrongDevice`, distinct from `StaleAuthority`, because the two are credited
+//! differently: the second loop of the credit rule counts stale dependents of a condemned mint and
+//! must not count an impersonator.
+//!
+//! That check makes this pass STRICTER than v1. It is a deliberate tightening, NOT the repair of a
+//! violated bound — no bound was ever broken here, and a reader should not go looking for one. v1
+//! does credit such an entry: its condemnation overlay overwrites the effect pass's
+//! `Rejected(StaleAuthority)`, so an unauthorized op on the revoked chain still ends `Condemned`
+//! and still counts. It is held out here because it was never in the effective count, so crediting
+//! its removal would count something its own author never counted. Under-crediting only parks a
+//! cut, it never admits one that is ahead.
+//!
+//! **The residual, in the other direction.** State preconditions are NOT evaluated. A nominated
+//! entry the v1 fold would reject `Ineffective` — re-enrolling a device already on the roster,
+//! promoting one that is not enrolled, granting on a stream that is not publicly owned — is counted
+//! here once the cut condemns it, and a real v1 fold would not count it. Evaluating them needs the
+//! running effect-pass state, which the frozen facts do not carry, and a second copy of that rule
+//! table would be free to drift from the one in [`super::classify_effect`].
+//!
+//! The excess is bounded by the nominated entries the cut's OWN register keys scope, plus the
+//! transitive stale dependents of any mint among them — the same closure v1 credits, and the reason
+//! the second loop needs the `WrongDevice` split above. Nothing a peer merely asserts widens it:
+//! every counted entry is a signed object this call authenticated.
+//! `a_nominated_entry_v1_would_reject_ineffective_is_still_counted` demonstrates the worst case
+//! rather than leaving it to argument.
 //!
 //! **What the checkpoint froze.** Legacy outcomes are read from the verified fold verbatim. A v2
 //! cut may condemn what the legacy epoch left standing, but it cannot revive a branch loser, awaken
@@ -200,7 +222,8 @@ fn credit_under(input: &CutExecution<'_>, scope: CreditScope<'_>) -> u64 {
         }
         let candidate = &candidates[idx];
         let signer = candidate.header().device_fingerprint;
-        let authorized = candidate.header().authority_ref.is_some_and(|incarnation| {
+        let cited = candidate.header().authority_ref;
+        let authorized = cited.is_some_and(|incarnation| {
             input.frozen.owner_is_live(incarnation, signer)
                 || v2_mints.get(&incarnation) == Some(&signer)
         });
@@ -216,9 +239,18 @@ fn credit_under(input: &CutExecution<'_>, scope: CreditScope<'_>) -> u64 {
             if candidate.is_mint() {
                 v2_mints.insert(candidate.hash().into(), candidate.subject_device());
             }
-        } else {
-            outcomes.insert(candidate.hash(), Outcome::Rejected(RejectReason::StaleAuthority));
+            continue;
         }
+        // Separate impersonation from a mint that simply is not live any more, exactly as
+        // `authority_status` does. Only the latter is a stale dependent the credit rule's second
+        // loop may count when the cut condemns the mint it cites; an entry citing a mint for
+        // ANOTHER device is `WrongDevice` and is never credited.
+        let impersonates = cited
+            .and_then(|incarnation| incarnations.candidate(&incarnation))
+            .is_some_and(|mint| mint.subject_device() != signer);
+        let reason =
+            if impersonates { RejectReason::WrongDevice } else { RejectReason::StaleAuthority };
+        outcomes.insert(candidate.hash(), Outcome::Rejected(reason));
     }
 
     // Only the cut's OWN registers decide what it took away — the v1 rule. Another cut in the same
@@ -595,6 +627,94 @@ mod tests {
         // own registers actually condemn it.
         assert_eq!(applied.credit, baseline.credit);
         assert_eq!(applied.credit, 1);
+    }
+
+    /// Author one v2 operation on the founder's own chain, citing its live incarnation.
+    fn sign_v2(
+        fixture: &DemotedOwner,
+        seq: u64,
+        prev: AccountEntryHash,
+        op: v2_ops::ControlOp,
+    ) -> Candidate {
+        let signed = envelope::sign_account_entry(
+            fixture.founder.secret(),
+            &AccountEntryHeader {
+                account_id: fixture.checkpoint.pin().account_id,
+                log_id: 0,
+                device_fingerprint: fixture.founder.fingerprint(),
+                seq,
+                prev_hash: Some(prev),
+                parent_ref: Some(prev),
+                entry_type: ops::entry_type_of(&op.op),
+                op_version: v2_ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(fixture.incarnation),
+            },
+            &op.encode().unwrap(),
+        )
+        .unwrap();
+        Candidate::new(
+            VerifiedAccountEntry {
+                header: signed.header,
+                payload: signed.payload,
+                entry_hash: signed.entry_hash,
+            },
+            op.op,
+        )
+    }
+
+    /// THE residual, demonstrated rather than argued. State preconditions are not evaluated, so an
+    /// entry the v1 fold would reject `Ineffective` still earns a credit once the cut condemns it.
+    /// The excess is exactly one per nominated entry the cut's own registers scope.
+    #[test]
+    fn a_nominated_entry_v1_would_reject_ineffective_is_still_counted() {
+        let fixture = demoted_owner();
+        let tip = fixture
+            .checkpoint
+            .continuation_heads()
+            .iter()
+            .find(|head| head.device_fingerprint == fixture.founder.fingerprint())
+            .unwrap()
+            .clone();
+        // Re-enrolling a device already on the roster: `classify_effect` rejects this
+        // `DuplicateAdd`, so a real v1 fold would never credit it.
+        let duplicate = sign_v2(&fixture, tip.seq + 1, tip.hash, v2_ops::ControlOp {
+            checkpoint: fixture.checkpoint.pin().checkpoint_digest,
+            pre_cut_view: None,
+            op: AccountOp::DeviceAdd {
+                device_fingerprint: fixture.subject.fp,
+                ed25519_pubkey: fixture.subject.ed,
+                x25519_pubkey: fixture.subject.x,
+                role: DeviceRole::Member,
+                label: None,
+            },
+        });
+        let cut = sign_v2(&fixture, tip.seq + 2, duplicate.hash(), v2_ops::ControlOp {
+            checkpoint: fixture.checkpoint.pin().checkpoint_digest,
+            pre_cut_view: Some([9; 32]),
+            op: AccountOp::DeviceRemove {
+                device_fingerprint: fixture.founder.fingerprint(),
+                control_cut: Cut::Empty,
+                secrets_cut: Cut::Empty,
+                content_cuts: vec![],
+                reason: "revoked".into(),
+            },
+        });
+
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let without = apply_cut(CutExecution { frozen, nominated: &[], cut: &cut });
+        let with = apply_cut(CutExecution {
+            frozen,
+            nominated: std::slice::from_ref(&duplicate),
+            cut: &cut,
+        });
+        assert_eq!(
+            with.credit,
+            without.credit + 1,
+            "an ineffective nomination the cut scopes is worth exactly one over-count",
+        );
     }
 
     /// Being certified and on an accepted branch is not authority. The subject's key is certified
