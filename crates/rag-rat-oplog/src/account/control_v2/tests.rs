@@ -4,9 +4,10 @@ use super::super::checkpoint::{self, TrustedCheckpointPin, VerifiedCheckpoint};
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader, SignedAccountEntry};
 use super::super::fold;
-use super::super::id::AccountEntryHash;
-use super::super::ops::{self as legacy, AccountOp, DeviceCut};
-use super::{ops, views};
+use super::super::id::{AccountEntryHash, OwnerId};
+use super::super::ops::{self as legacy, AccountOp, DeviceCut, DeviceRole};
+use super::super::test_support::Dev;
+use super::{executor, ops, views};
 use crate::identity::LocalDevice;
 use crate::op::DeviceFingerprint;
 
@@ -91,6 +92,99 @@ fn signed(
         &op.encode().unwrap(),
     )
     .unwrap()
+}
+
+/// Authors v2 operations on the checkpoint signer's own chain, threading `(seq, prev_hash)`. The
+/// cited incarnation stays the one the legacy epoch minted — only the chain moves — so a long run
+/// of operations exercises chain length rather than a run of fresh authority.
+struct Chain<'a> {
+    checkpoint: &'a VerifiedCheckpoint,
+    device: &'a LocalDevice,
+    seq: u64,
+    prev: AccountEntryHash,
+    incarnation: OwnerId,
+}
+
+impl<'a> Chain<'a> {
+    fn new(checkpoint: &'a VerifiedCheckpoint, device: &'a LocalDevice) -> Self {
+        let tip = checkpoint
+            .continuation_heads()
+            .iter()
+            .find(|head| head.device_fingerprint == device.fingerprint())
+            .expect("the checkpoint signer has an accepted control head");
+        // The fixture account holds only its genesis, so the founder's head IS the mint its
+        // incarnation is named by.
+        Chain {
+            checkpoint,
+            device,
+            seq: tip.seq + 1,
+            prev: tip.hash,
+            incarnation: tip.hash.into(),
+        }
+    }
+
+    fn author(&mut self, op: ops::ControlOp) -> SignedAccountEntry {
+        let signed = envelope::sign_account_entry(
+            self.device.secret(),
+            &AccountEntryHeader {
+                account_id: self.checkpoint.pin().account_id,
+                log_id: 0,
+                device_fingerprint: self.device.fingerprint(),
+                seq: self.seq,
+                prev_hash: Some(self.prev),
+                parent_ref: Some(self.prev),
+                entry_type: legacy::entry_type_of(&op.op),
+                op_version: ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(self.incarnation),
+            },
+            &op.encode().unwrap(),
+        )
+        .unwrap();
+        self.seq += 1;
+        self.prev = signed.entry_hash;
+        signed
+    }
+
+    /// An ordinary operation: it nominates no view and needs no historical evidence at all.
+    fn add(&mut self, seed: u8) -> SignedAccountEntry {
+        let enrolled = Dev::new(seed);
+        self.author(ops::ControlOp {
+            checkpoint: self.checkpoint.pin().checkpoint_digest,
+            pre_cut_view: None,
+            op: AccountOp::DeviceAdd {
+                device_fingerprint: enrolled.fp,
+                ed25519_pubkey: enrolled.ed,
+                x25519_pubkey: enrolled.x,
+                role: DeviceRole::Member,
+                label: None,
+            },
+            credit_frontier: None,
+        })
+    }
+
+    fn remove(&mut self, pre_cut_view: [u8; 32], index: u32) -> SignedAccountEntry {
+        let mut target = [0u8; 32];
+        target[..4].copy_from_slice(&index.to_le_bytes());
+        self.author(ops::ControlOp {
+            checkpoint: self.checkpoint.pin().checkpoint_digest,
+            pre_cut_view: Some(pre_cut_view),
+            op: AccountOp::DeviceRemove {
+                device_fingerprint: DeviceFingerprint::from_bytes(target),
+                control_cut: Cut::Empty,
+                secrets_cut: Cut::Empty,
+                content_cuts: vec![],
+                reason: format!("revoked {index}"),
+            },
+            credit_frontier: Some(vec![]),
+        })
+    }
+}
+
+fn bytes(entries: &[SignedAccountEntry]) -> Vec<Vec<u8>> {
+    entries.iter().map(|entry| entry.signed_bytes.clone()).collect()
 }
 
 #[test]
@@ -319,6 +413,112 @@ fn aggregate_manifests_are_bounded_by_the_declared_evidence_byte_budget() {
     assert!(
         matches!(result, Err(views::PlanError::Invalid(error)) if error.to_string().contains("byte limit")),
         "individually small manifests still have to fit the aggregate budget",
+    );
+}
+
+#[test]
+fn ordinary_operations_execute_at_any_chain_length_with_no_historical_view() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let operations: Vec<SignedAccountEntry> = (0..40u8).map(|seed| chain.add(seed)).collect();
+    assert!(operations.len() > 32, "the run must exceed any plausible depth cap");
+    for (index, operation) in operations.iter().enumerate() {
+        // No manifest at all: an ordinary operation nominates nothing, so there is no view to
+        // supply and nothing for a depth cap to measure.
+        let held = bytes(&operations[..index]);
+        let verdict = executor::execute(&checkpoint, &operation.signed_bytes, &[], &held).unwrap();
+        let executor::Verdict::Applied { registers, credit } = verdict else {
+            panic!("operation {index} did not execute");
+        };
+        assert!(registers.is_empty(), "an enrollment installs no register");
+        assert_eq!(credit, 0, "only a revocation earns credit");
+    }
+}
+
+#[test]
+fn independent_revocation_manifests_commit_cumulative_prior_candidates() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let mut manifests = Vec::new();
+    let mut cuts: Vec<SignedAccountEntry> = Vec::new();
+    // Each cut commits to every candidate before it: 96 distinct views, not one long chain of
+    // single-entry views, and each one independent of the others' contents.
+    for index in 0..96u32 {
+        let view = manifest(&checkpoint, cuts.iter().map(|cut| cut.entry_hash).collect());
+        manifests.push(view.encode().unwrap());
+        cuts.push(chain.remove(view.digest().unwrap(), index));
+    }
+    let (last, earlier) = cuts.split_last().unwrap();
+    let evidence = bytes(earlier);
+    let plan = views::plan_replay(&checkpoint, &last.signed_bytes, &manifests, &evidence).unwrap();
+    assert_eq!(plan.views().count(), 96, "each distinct view is scheduled exactly once");
+    assert_eq!(plan.root().unwrap().entries.len(), 95);
+    let verdict =
+        executor::execute(&checkpoint, &last.signed_bytes, &manifests, &evidence).unwrap();
+    let executor::Verdict::Applied { registers, .. } = verdict else {
+        panic!("the deepest cut did not execute");
+    };
+    assert_eq!(registers.len(), 2, "a device remove cuts control and secrets");
+}
+
+#[test]
+fn incomplete_evidence_parks_without_applying_registers_or_credit() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let empty = manifest(&checkpoint, vec![]);
+    let cut0 = chain.remove(empty.digest().unwrap(), 0);
+    let view1 = manifest(&checkpoint, vec![cut0.entry_hash]);
+    let cut1 = chain.remove(view1.digest().unwrap(), 1);
+    // Deliberately nominates only `cut0`, so `cut1` may be withheld without the manifest noticing.
+    let view2 = manifest(&checkpoint, vec![cut0.entry_hash]);
+    let cut2 = chain.remove(view2.digest().unwrap(), 2);
+    let view3 = manifest(&checkpoint, vec![cut0.entry_hash, cut2.entry_hash]);
+    let cut3 = chain.remove(view3.digest().unwrap(), 3);
+    let (m0, m1) = (empty.encode().unwrap(), view1.encode().unwrap());
+    let (m2, m3) = (view2.encode().unwrap(), view3.encode().unwrap());
+
+    let cases = [
+        // A cited view is withheld.
+        (
+            &cut1,
+            vec![m1.clone()],
+            bytes(std::slice::from_ref(&cut0)),
+            executor::ParkCause::Manifest,
+        ),
+        // A nominated identity's signed bytes are withheld.
+        (&cut1, vec![m0.clone(), m1], Vec::new(), executor::ParkCause::Evidence),
+        // The slot the operation continues from is withheld.
+        (
+            &cut2,
+            vec![m0.clone(), m2.clone()],
+            bytes(std::slice::from_ref(&cut0)),
+            executor::ParkCause::ChainHead,
+        ),
+        // A link further back along the walk to the legacy branch is withheld.
+        (
+            &cut3,
+            vec![m0.clone(), m2.clone(), m3.clone()],
+            bytes(&[cut0.clone(), cut2.clone()]),
+            executor::ParkCause::Ancestry,
+        ),
+    ];
+    for (operation, manifests, evidence, expected) in cases {
+        let verdict =
+            executor::execute(&checkpoint, &operation.signed_bytes, &manifests, &evidence).unwrap();
+        // A park carries no register and no credit: the variant itself withholds both, so there is
+        // no partial application for a later arrival to unwind.
+        assert!(
+            matches!(verdict, executor::Verdict::Parked(cause) if cause == expected),
+            "expected {expected:?}",
+        );
+    }
+
+    // The same operation applies once nothing is missing, so the parks above withheld real effect.
+    let complete = bytes(&[cut0, cut1, cut2]);
+    let verdict =
+        executor::execute(&checkpoint, &cut3.signed_bytes, &[m0, m2, m3], &complete).unwrap();
+    assert!(
+        matches!(verdict, executor::Verdict::Applied { registers, .. } if registers.len() == 2)
     );
 }
 

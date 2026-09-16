@@ -1,10 +1,12 @@
 //! Control-specific v2 prerequisites, deliberately disconnected from production ingestion.
 //!
-//! A resolved view is an exact replay INPUT, not an authority verdict. Activation still needs
-//! frozen legacy branch exclusions, register admission and readiness, then a policy-aware fold
-//! deriving accepted-authority counts and cut-local credit from these views. Never feed the
-//! combined candidate set into the v1 fold or treat a resolved frontier as effective credit.
+//! A resolved view is an exact replay INPUT, not an authority verdict. [`executor`] turns one into
+//! a verdict: it authenticates every nominated entry, walks it back to a branch the checkpoint
+//! accepted, applies the frozen legacy policy, and derives the operation's registers plus the
+//! bounded credit its nomination earns. Nothing here dispatches from the v1 fold, and executing an
+//! operation flips no readiness or pin state.
 
+pub(super) mod executor;
 pub(super) mod ops;
 pub(super) mod views;
 
