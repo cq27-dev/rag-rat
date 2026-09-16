@@ -37,6 +37,15 @@
 //! installs nothing here either, which is what keeps a sole owner from removing itself and leaving
 //! the account with no authority at all.
 //!
+//! Those two lookups resolve differently on purpose. The `OwnerDemote` binding also resolves an
+//! incarnation an authorized v2 mint in the bundle opened, since it is a LOOKUP and widening it
+//! only lets a correct operation through — resolving the frozen epoch alone would park a demote of
+//! a v2-promoted owner forever, on evidence already supplied. The last-owner guard counts only the
+//! FROZEN open owners, because it is a COUNT: widening it on the strength of entries whose effects
+//! this operation does not install would weaken the one invariant stopping an ownerless account.
+//! The cost is that a cut relying on a v2-promoted co-owner to escape the guard is refused until
+//! the checkpoint advances past that promotion.
+//!
 //! **The residual, in the other direction.** State preconditions are NOT evaluated. A nominated
 //! entry the v1 fold would reject `Ineffective` — re-enrolling a device already on the roster,
 //! promoting one that is not enrolled, granting on a stream that is not publicly owned — is counted
@@ -200,13 +209,15 @@ pub(in crate::account) enum V2Verdict {
 /// and only the transitive check refuses both.
 pub(in crate::account) struct V2Authority {
     verdicts: HashMap<AccountEntryHash, V2Verdict>,
+    /// The incarnations AUTHORIZED v2 mints opened, and the device each was minted for.
+    mints: HashMap<OwnerId, DeviceFingerprint>,
 }
 
 impl V2Authority {
     pub(in crate::account) fn resolve(frozen: &FrozenLegacy, bundle: &[Candidate]) -> Self {
         let mut verdicts = HashMap::new();
         let Some(genesis) = frozen.history.genesis_hash() else {
-            return Self { verdicts };
+            return Self { verdicts, mints: HashMap::new() };
         };
         let legacy = frozen.foldable();
         let legacy_count = legacy.len();
@@ -261,17 +272,30 @@ impl V2Authority {
             };
             verdicts.insert(candidate.hash(), verdict);
         }
-        Self { verdicts }
+        Self { verdicts, mints }
     }
 
     /// Absent means refused: an entry this resolution never reached holds no authority.
     pub(in crate::account) fn verdict(&self, hash: &AccountEntryHash) -> V2Verdict {
         self.verdicts.get(hash).copied().unwrap_or(V2Verdict::Inadmissible)
     }
+
+    /// The device an AUTHORIZED v2 mint in this bundle opened `incarnation` for.
+    fn mint_subject(&self, incarnation: OwnerId) -> Option<DeviceFingerprint> {
+        self.mints.get(&incarnation).copied()
+    }
 }
 
 /// Execute one authorized operation. A non-cut installs nothing and earns nothing.
 pub(in crate::account) fn apply_cut(input: CutExecution<'_>) -> CutOutcome {
+    // The one resolution decides THIS operation too. Keeping the check here, and not only in the
+    // caller, is the whole point of resolving once: an authority answer a second caller has to
+    // remember to re-apply is an authority answer that eventually goes unapplied.
+    match input.authority.verdict(&input.cut.hash()) {
+        V2Verdict::Authorized => {},
+        V2Verdict::WrongDevice => return CutOutcome::Rejected(RejectReason::WrongDevice),
+        _ => return CutOutcome::Rejected(RejectReason::StaleAuthority),
+    }
     let proposed = cut_op_registers(input.cut);
     if proposed.is_empty() {
         return CutOutcome::Applied(AppliedCut { registers: Vec::new(), credit: 0 });
@@ -302,7 +326,14 @@ fn register_precondition(
         return Some(CutOutcome::Rejected(RejectReason::LastOwner));
     }
     if let AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } = &input.cut.op {
-        match input.frozen.incarnation_subject(*owner_id) {
+        // An incarnation an authorized v2 mint opened is as real as a frozen one. Resolving only
+        // the frozen epoch would park a correct demote of a v2-promoted owner forever, because the
+        // evidence that would clear the park is already supplied.
+        let subject = input
+            .frozen
+            .incarnation_subject(*owner_id)
+            .or_else(|| input.authority.mint_subject(*owner_id));
+        match subject {
             None => return Some(CutOutcome::Parked(ParkReason::UnknownOwnerRef)),
             Some(subject) if subject != *device_fingerprint =>
                 return Some(CutOutcome::Rejected(RejectReason::WrongDevice)),
@@ -1000,6 +1031,78 @@ mod tests {
         // own registers actually condemn it.
         assert_eq!(with.credit, baseline.credit);
         assert_eq!(with.credit, 1);
+    }
+
+    /// The transitive half of the authority rule, and the only guard on it. This mint cites the
+    /// founder's LIVE incarnation, so `author_depth` resolves and the mint is genuinely VISITED —
+    /// unlike a mint citing nothing, which `verdict`'s absent-entry default refuses whether or not
+    /// the rule exists. `WrongDevice` is a verdict that default cannot produce, so this fails the
+    /// moment a mint is allowed to certify before it is itself authorized.
+    #[test]
+    fn a_visited_mint_certifies_nothing_until_it_is_itself_authorized() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let member = Dev::new(12);
+        let sign =
+            |seq: u64, prev: Option<AccountEntryHash>, incarnation: OwnerId, op: AccountOp| {
+                let revocation = matches!(op, AccountOp::DeviceRemove { .. });
+                let payload = v2_ops::ControlOp {
+                    checkpoint: fixture.checkpoint.pin().checkpoint_digest,
+                    pre_cut_view: revocation.then_some([9; 32]),
+                    op: op.clone(),
+                }
+                .encode()
+                .unwrap();
+                let signed = envelope::sign_account_entry(
+                    &member.secret,
+                    &AccountEntryHeader {
+                        account_id: fixture.checkpoint.pin().account_id,
+                        log_id: 0,
+                        device_fingerprint: member.fp,
+                        seq,
+                        prev_hash: prev,
+                        parent_ref: prev,
+                        entry_type: ops::entry_type_of(&op),
+                        op_version: v2_ops::CONTROL_VERSION,
+                        crypto_suite: 0,
+                        auth_len: 1,
+                        key_id: None,
+                        authority_ref: Some(incarnation),
+                    },
+                    &payload,
+                )
+                .unwrap();
+                Candidate::new(
+                    VerifiedAccountEntry {
+                        header: signed.header,
+                        payload: signed.payload,
+                        entry_hash: signed.entry_hash,
+                    },
+                    op,
+                )
+            };
+        let mint = sign(0, None, fixture.incarnation, AccountOp::OwnerPromote {
+            device_fingerprint: member.fp,
+        });
+        let cut = sign(1, Some(mint.hash()), mint.hash().into(), AccountOp::DeviceRemove {
+            device_fingerprint: fixture.founder.fingerprint(),
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "seized".into(),
+        });
+
+        let authority = V2Authority::resolve(frozen, &[mint.clone(), cut.clone()]);
+        // Refused on its own merits rather than by the absent-entry default: the incarnation it
+        // cites was minted for the founder, not for this signer.
+        assert_eq!(authority.verdict(&mint.hash()), V2Verdict::WrongDevice);
+        // And a mint that was itself refused certifies nothing that cites it.
+        assert_eq!(authority.verdict(&cut.hash()), V2Verdict::Inadmissible);
+        // `apply_cut` enforces that same answer itself rather than trusting its caller to.
+        assert!(matches!(
+            apply_cut(CutExecution { frozen, authority: &authority, nominated: &[], cut: &cut }),
+            CutOutcome::Rejected(_)
+        ));
     }
 
     /// Being certified and on an accepted branch is not authority. The subject's key is certified
