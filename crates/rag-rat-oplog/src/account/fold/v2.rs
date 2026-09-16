@@ -30,6 +30,13 @@
 //! its removal would count something its own author never counted. Under-crediting only parks a
 //! cut, it never admits one that is ahead.
 //!
+//! **Register-pass preconditions ARE enforced.** Before a cut installs anything it passes the same
+//! I2 last-owner guard, `OwnerDemote` owner_id ↔ subject binding and §11.3 watermark binding that
+//! v1's register pass applies, by calling v1's own predicates rather than restating them. Those are
+//! not state preconditions and are NOT part of the residual below: a cut v1 refuses to admit
+//! installs nothing here either, which is what keeps a sole owner from removing itself and leaving
+//! the account with no authority at all.
+//!
 //! **The residual, in the other direction.** State preconditions are NOT evaluated. A nominated
 //! entry the v1 fold would reject `Ineffective` — re-enrolling a device already on the roster,
 //! promoting one that is not enrolled, granting on a stream that is not publicly owned — is counted
@@ -91,31 +98,30 @@ impl FrozenLegacy {
     }
 
     /// Whether `incarnation` is an owner incarnation the frozen epoch still holds open for
-    /// `device`. Re-signing an op at version 2 grants no authority the legacy fold withheld.
-    pub(in crate::account) fn owner_is_live(
-        &self,
-        incarnation: OwnerId,
-        device: DeviceFingerprint,
-    ) -> bool {
+    /// `device`. Private on purpose: every caller goes through [`V2Authority`], so admission and
+    /// credit cannot end up asking different questions.
+    fn owner_is_live(&self, incarnation: OwnerId, device: DeviceFingerprint) -> bool {
         matches!(
             self.history.owner_incarnation_effective(incarnation, device),
             AuthorityQuery::Effective(_)
         )
     }
 
-    /// Whether the FINAL legacy registers already condemn `candidate`. A chain the legacy epoch cut
-    /// is not reopened by continuing it at version 2.
-    pub(in crate::account) fn condemns(&self, candidate: &Candidate) -> bool {
-        let headers = self.headers();
-        let view = CandidateView { headers: &headers };
-        matches!(
-            register_verdict(candidate, &self.trace.registers, &view),
-            RegisterVerdict::Condemned(_)
-        )
+    /// The devices holding an OPEN owner incarnation, shaped for the I2 last-owner guard.
+    fn open_owners(&self) -> HashMap<DeviceFingerprint, OwnerId> {
+        self.history
+            .owner_incarnation_facts()
+            .filter(|(_, fact)| fact.closed_at.is_none())
+            .map(|(id, fact)| (fact.authority.device_fingerprint, *id))
+            .collect()
     }
 
-    fn headers(&self) -> HashMap<AccountEntryHash, &AccountEntryHeader> {
-        self.entries.iter().map(|entry| (entry.entry_hash, &entry.header)).collect()
+    /// The device an incarnation was minted for, if the frozen epoch holds it at all.
+    fn incarnation_subject(&self, incarnation: OwnerId) -> Option<DeviceFingerprint> {
+        self.history
+            .owner_incarnation_facts()
+            .find(|(id, _)| **id == incarnation)
+            .map(|(_, fact)| fact.authority.device_fingerprint)
     }
 
     /// The legacy entries the control fold actually folds — the immutable baseline a v2 cut
@@ -139,10 +145,25 @@ impl FrozenLegacy {
 /// One authenticated v2 operation resolved against the frozen epoch and the view it signed.
 pub(in crate::account) struct CutExecution<'a> {
     pub(in crate::account) frozen: &'a FrozenLegacy,
-    /// The v2 entries the operation's signed manifest nominates, already authenticated against a
-    /// key the accepted legacy epoch certifies. An entry absent from here is never counted.
+    /// Authority for every authenticated entry in the bundle, resolved ONCE by
+    /// [`V2Authority::resolve`] so admission and credit read the same answer.
+    pub(in crate::account) authority: &'a V2Authority,
+    /// The v2 entries the operation's signed manifest nominates. Being named here is not
+    /// authority: each one's verdict still comes from `authority`.
     pub(in crate::account) nominated: &'a [Candidate],
     pub(in crate::account) cut: &'a Candidate,
+}
+
+impl CutExecution<'_> {
+    fn headers(&self) -> HashMap<AccountEntryHash, &AccountEntryHeader> {
+        self.frozen
+            .entries
+            .iter()
+            .map(|entry| (entry.entry_hash, &entry.header))
+            .chain(self.nominated.iter().map(|c| (c.hash(), c.header())))
+            .chain(std::iter::once((self.cut.hash(), self.cut.header())))
+            .collect()
+    }
 }
 
 /// What an authorized operation installs, and the bounded credit its nomination earns.
@@ -151,17 +172,151 @@ pub(in crate::account) struct AppliedCut {
     pub(in crate::account) credit: u64,
 }
 
+/// What executing one operation decided. A cut failing a register precondition installs nothing.
+pub(in crate::account) enum CutOutcome {
+    Applied(AppliedCut),
+    Rejected(RejectReason),
+    Parked(ParkReason),
+}
+
+/// The authority verdict for one control v2 entry against the frozen epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::account) enum V2Verdict {
+    Authorized,
+    /// The cited incarnation is not a live owner minted for this signer.
+    Inadmissible,
+    /// The cited mint names a different device — impersonation.
+    WrongDevice,
+    /// The frozen legacy registers already cut this chain.
+    Condemned,
+}
+
+/// THE control v2 authority rule, resolved once per bundle.
+///
+/// A mint a signer cites must ITSELF have been authorized, transitively, back to an incarnation the
+/// frozen epoch holds open. Asking that question in two places is exactly how an operation gets
+/// admitted on a mint the credit pass would have refused, so there is deliberately one resolution
+/// and no second way to ask: a Member device can sign a self-serving `OwnerPromote` and cite it,
+/// and only the transitive check refuses both.
+pub(in crate::account) struct V2Authority {
+    verdicts: HashMap<AccountEntryHash, V2Verdict>,
+}
+
+impl V2Authority {
+    pub(in crate::account) fn resolve(frozen: &FrozenLegacy, bundle: &[Candidate]) -> Self {
+        let mut verdicts = HashMap::new();
+        let Some(genesis) = frozen.history.genesis_hash() else {
+            return Self { verdicts };
+        };
+        let legacy = frozen.foldable();
+        let legacy_count = legacy.len();
+        let mut candidates = legacy;
+        candidates.extend(bundle.iter().cloned());
+        let mut headers: HashMap<AccountEntryHash, &AccountEntryHeader> =
+            frozen.entries.iter().map(|entry| (entry.entry_hash, &entry.header)).collect();
+        for candidate in &candidates[legacy_count..] {
+            headers.insert(candidate.hash(), candidate.header());
+        }
+        let view = CandidateView { headers: &headers };
+        let mut incarnations = Incarnations::build(&candidates, genesis.into());
+        let mut strata: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (idx, candidate) in candidates.iter().enumerate() {
+            if let Some(depth) = incarnations.author_depth(candidate) {
+                strata.entry(depth).or_default().push(idx);
+            }
+        }
+        // Ascending depth, so a mint is settled before anything citing it. An entry whose cited
+        // incarnation does not resolve is never reached here and keeps the default refusal.
+        let mut mints: HashMap<OwnerId, DeviceFingerprint> = HashMap::new();
+        for &idx in strata.values().flatten() {
+            if idx < legacy_count {
+                continue;
+            }
+            let candidate = &candidates[idx];
+            let signer = candidate.header().device_fingerprint;
+            let cited = candidate.header().authority_ref;
+            let live = cited.is_some_and(|incarnation| {
+                frozen.owner_is_live(incarnation, signer)
+                    || mints.get(&incarnation) == Some(&signer)
+            });
+            let verdict = if !live {
+                // Separate impersonation from a mint that is merely no longer live: only the
+                // latter leaves a stale dependent the credit rule's second loop may count.
+                let impersonates = cited
+                    .and_then(|incarnation| incarnations.candidate(&incarnation))
+                    .is_some_and(|mint| mint.subject_device() != signer);
+                if impersonates { V2Verdict::WrongDevice } else { V2Verdict::Inadmissible }
+            } else if matches!(
+                register_verdict(candidate, &frozen.trace.registers, &view),
+                RegisterVerdict::Condemned(_)
+            ) {
+                // A chain the legacy epoch cut is not reopened by continuing it at version 2.
+                V2Verdict::Condemned
+            } else {
+                // Only an AUTHORIZED mint may certify anything citing it.
+                if candidate.is_mint() {
+                    mints.insert(candidate.hash().into(), candidate.subject_device());
+                }
+                V2Verdict::Authorized
+            };
+            verdicts.insert(candidate.hash(), verdict);
+        }
+        Self { verdicts }
+    }
+
+    /// Absent means refused: an entry this resolution never reached holds no authority.
+    pub(in crate::account) fn verdict(&self, hash: &AccountEntryHash) -> V2Verdict {
+        self.verdicts.get(hash).copied().unwrap_or(V2Verdict::Inadmissible)
+    }
+}
+
 /// Execute one authorized operation. A non-cut installs nothing and earns nothing.
-pub(in crate::account) fn apply_cut(input: CutExecution<'_>) -> AppliedCut {
-    let registers: Vec<(RegisterKey, Cut)> =
-        cut_op_registers(input.cut).into_iter().map(|(key, cut, _)| (key, cut)).collect();
+pub(in crate::account) fn apply_cut(input: CutExecution<'_>) -> CutOutcome {
+    let proposed = cut_op_registers(input.cut);
+    if proposed.is_empty() {
+        return CutOutcome::Applied(AppliedCut { registers: Vec::new(), credit: 0 });
+    }
+    if let Some(refused) = register_precondition(&input, &proposed) {
+        return refused;
+    }
+    let registers = proposed.into_iter().map(|(key, cut, _)| (key, cut)).collect();
     // The nominated identities, plus the legacy entries the checkpoint accepted — legacy evidence
     // is implicit in every view, but bounded by what was actually standing when it froze.
     let mut eligible: HashSet<AccountEntryHash> =
         input.nominated.iter().map(Candidate::hash).collect();
     eligible.extend(input.frozen.accepted.iter().copied());
     let credit = credit_under(&input, CreditScope::Nominated(&eligible));
-    AppliedCut { registers, credit }
+    CutOutcome::Applied(AppliedCut { registers, credit })
+}
+
+/// The register-pass checks a cut must pass before it installs anything: the I2 last-owner guard,
+/// the `OwnerDemote` owner_id ↔ subject binding, and §11.3 watermark binding. These call v1's own
+/// predicates rather than restating them — a cut v1 refuses to admit must install nothing here too,
+/// or an account can be left with no owner at all.
+fn register_precondition(
+    input: &CutExecution<'_>,
+    proposed: &[(RegisterKey, Cut, CutCoordinate)],
+) -> Option<CutOutcome> {
+    let owners = input.frozen.open_owners();
+    if owners.len() == 1 && closes_open_incarnation(&input.cut.op, &owners).is_some() {
+        return Some(CutOutcome::Rejected(RejectReason::LastOwner));
+    }
+    if let AccountOp::OwnerDemote { device_fingerprint, owner_id, .. } = &input.cut.op {
+        match input.frozen.incarnation_subject(*owner_id) {
+            None => return Some(CutOutcome::Parked(ParkReason::UnknownOwnerRef)),
+            Some(subject) if subject != *device_fingerprint =>
+                return Some(CutOutcome::Rejected(RejectReason::WrongDevice)),
+            Some(_) => {},
+        }
+    }
+    let headers = input.headers();
+    let view = CandidateView { headers: &headers };
+    // A watermark naming a DIFFERENT coordinate rejects the whole op; one not yet held still
+    // installs, exactly as v1 treats it.
+    let misbound = proposed.iter().any(|(_, cut, coord)| {
+        candidate::validate_cut_target(cut, coord, &view) == candidate::CutBinding::Mismatch
+    });
+    misbound.then_some(CutOutcome::Rejected(RejectReason::CutTargetMismatch))
 }
 
 /// The credit `input.cut` earns under `scope`, over one shared baseline. Production only ever asks
@@ -205,51 +360,24 @@ fn credit_under(input: &CutExecution<'_>, scope: CreditScope<'_>) -> u64 {
             outcomes.insert(candidate.hash(), outcome);
         }
     }
-    // A nominated entry is effective only if it held authority in this epoch. Being signed by a
-    // certified key and sitting on a chain that reaches an accepted branch establishes WHO wrote it
-    // and WHERE, never that it was allowed to: without this an unauthorized op — one the v1 fold
-    // rejects outright, and so never counts — would enter as effective and be worth a credit as
-    // soon as the cut condemned it, which is exactly the admission bypass a nomination must not
-    // buy. Ascending depth, so a mint is always settled before anything citing it.
-    // Every v2 candidate starts unauthorized and has to earn its place. One whose cited incarnation
-    // does not even resolve is never visited below, so it simply stays out.
-    let mut unauthorized: HashSet<AccountEntryHash> =
-        candidates[legacy_count..].iter().map(Candidate::hash).collect();
-    let mut v2_mints: HashMap<OwnerId, DeviceFingerprint> = HashMap::new();
-    for &idx in strata.values().flatten() {
-        if idx < legacy_count {
-            continue;
-        }
-        let candidate = &candidates[idx];
-        let signer = candidate.header().device_fingerprint;
-        let cited = candidate.header().authority_ref;
-        let authorized = cited.is_some_and(|incarnation| {
-            input.frozen.owner_is_live(incarnation, signer)
-                || v2_mints.get(&incarnation) == Some(&signer)
-        });
-        // The legacy epoch's registers still bound these chains, and continuing one at version 2
-        // does not reopen it.
-        let cut_by_legacy = matches!(
-            register_verdict(candidate, &input.frozen.trace.registers, &view),
-            RegisterVerdict::Condemned(_)
-        );
-        if authorized && !cut_by_legacy {
-            unauthorized.remove(&candidate.hash());
+    // A nominated entry is effective only if the ONE authority resolution admitted it. Being signed
+    // by a certified key and sitting on a chain that reaches an accepted branch establishes WHO
+    // wrote it and WHERE, never that it was allowed to.
+    let mut unauthorized: HashSet<AccountEntryHash> = HashSet::new();
+    for candidate in &candidates[legacy_count..] {
+        let verdict = input.authority.verdict(&candidate.hash());
+        if verdict == V2Verdict::Authorized {
             outcomes.insert(candidate.hash(), Outcome::Effective { auth_epoch: 0 });
-            if candidate.is_mint() {
-                v2_mints.insert(candidate.hash().into(), candidate.subject_device());
-            }
             continue;
         }
-        // Separate impersonation from a mint that simply is not live any more, exactly as
-        // `authority_status` does. Only the latter is a stale dependent the credit rule's second
-        // loop may count when the cut condemns the mint it cites; an entry citing a mint for
-        // ANOTHER device is `WrongDevice` and is never credited.
-        let impersonates = cited
-            .and_then(|incarnation| incarnations.candidate(&incarnation))
-            .is_some_and(|mint| mint.subject_device() != signer);
-        let reason =
-            if impersonates { RejectReason::WrongDevice } else { RejectReason::StaleAuthority };
+        unauthorized.insert(candidate.hash());
+        // Only a mint that is merely no longer live leaves a stale dependent the credit rule's
+        // second loop may count; an impersonator never does.
+        let reason = if verdict == V2Verdict::WrongDevice {
+            RejectReason::WrongDevice
+        } else {
+            RejectReason::StaleAuthority
+        };
         outcomes.insert(candidate.hash(), Outcome::Rejected(reason));
     }
 
@@ -257,11 +385,19 @@ fn credit_under(input: &CutExecution<'_>, scope: CreditScope<'_>) -> u64 {
     // view never widens this one's scope; it only moves outcomes, which is precisely why the
     // guarantee is an upper bound on identities rather than a fixed number.
     for candidate in &candidates {
+        // The genesis is the account's ROOT axiom and is never condemnable. v1 exempts it in
+        // `rederive_condemnation` for the same reason, and without the exemption a self-removal on
+        // the founder's chain credits the account's own root — over-crediting, the unsafe
+        // direction, by an entry that is neither nominated nor a stale dependent.
+        //
         // An entry that never held authority was never in the effective count, so condemning it
         // takes nothing away. The v1 overlay would promote it to `Condemned` anyway — condemnation
         // outranks a stale-authority rejection there — and hand this cut a credit for an entry its
         // own author never counted. Holding it out keeps the credit at or below the v1 rule.
-        if candidate.hash() == input.cut.hash() || unauthorized.contains(&candidate.hash()) {
+        if candidate.hash() == genesis
+            || candidate.hash() == input.cut.hash()
+            || unauthorized.contains(&candidate.hash())
+        {
             continue;
         }
         if let RegisterVerdict::Condemned(reason) = register_verdict(candidate, &registers, &view) {
@@ -487,7 +623,7 @@ mod tests {
         let accepted_victim = author(&subject.secret, 0, genesis, subject_incarnation, &member(12));
         let condemned_victim =
             author(&subject.secret, 1, accepted_victim, subject_incarnation, &member(13));
-        author(founder.secret(), 2, subject_incarnation.into(), genesis.into(), &{
+        let demote = author(founder.secret(), 2, subject_incarnation.into(), genesis.into(), &{
             AccountOp::OwnerDemote {
                 device_fingerprint: subject.fp,
                 owner_id: subject_incarnation,
@@ -495,6 +631,16 @@ mod tests {
                 secrets_cut: Cut::Empty,
                 reason: "demoted".into(),
             }
+        });
+        // A second open owner, so a later cut of the founder is not the I2 last-owner case. It sits
+        // on the founder's chain, which the cut fixtures below do not scope.
+        let second = Dev::new(41);
+        author(founder.secret(), 3, demote, genesis.into(), &AccountOp::DeviceAdd {
+            device_fingerprint: second.fp,
+            ed25519_pubkey: second.ed,
+            x25519_pubkey: second.x,
+            role: DeviceRole::Owner,
+            label: None,
         });
 
         let tx = conn.transaction().unwrap();
@@ -582,77 +728,75 @@ mod tests {
         (cut, if nominate_unrelated { vec![extra] } else { Vec::new() })
     }
 
-    #[test]
-    fn nominated_credit_is_a_subset_of_the_v1_credit_for_the_same_register_scope() {
-        let fixture = demoted_owner();
-        let (cut, nominated) = v2_cut(&fixture, false);
-        let input = CutExecution {
-            frozen: fixture.checkpoint.frozen_legacy(),
-            nominated: &nominated,
-            cut: &cut,
-        };
-        let unrestricted = credit_under(&input, CreditScope::EveryScopedEntry);
-        let applied = apply_cut(input);
-        // The v1 rule counts both of the subject's entries; the frozen accepted set admits only the
-        // one the checkpoint was still counting.
-        assert_eq!(unrestricted, 2, "v1 counts every entry the cut's own registers scope");
-        assert_eq!(applied.credit, 1, "a legacy branch already out of the count earns nothing");
-        assert!(applied.credit <= unrestricted, "nomination can only narrow the v1 credit");
-        assert_eq!(applied.registers.len(), 2, "a device remove cuts control and secrets");
-        assert!(
-            fixture.checkpoint.frozen_legacy().accepted_at_checkpoint(&fixture.accepted_victim)
-        );
-        assert!(
-            !fixture.checkpoint.frozen_legacy().accepted_at_checkpoint(&fixture.condemned_victim)
-        );
+    /// Execute `cut` exactly as the executor does: ONE authority resolution over the bundle, then
+    /// `apply_cut` reading that same resolution. A test must not be able to hand `apply_cut` an
+    /// authority the executor would never have derived.
+    fn execute(frozen: &FrozenLegacy, nominated: &[Candidate], cut: &Candidate) -> CutOutcome {
+        let bundle: Vec<Candidate> =
+            nominated.iter().cloned().chain(std::iter::once(cut.clone())).collect();
+        let authority = V2Authority::resolve(frozen, &bundle);
+        apply_cut(CutExecution { frozen, authority: &authority, nominated, cut })
     }
 
-    #[test]
-    fn nominating_entries_the_cut_never_took_does_not_inflate_its_credit() {
-        let fixture = demoted_owner();
-        let (cut, nominated) = v2_cut(&fixture, true);
-        assert_eq!(nominated.len(), 1, "an entry on a chain this cut does not scope");
-        let bare = v2_cut(&fixture, false);
-        let baseline = apply_cut(CutExecution {
-            frozen: fixture.checkpoint.frozen_legacy(),
-            nominated: &bare.1,
-            cut: &bare.0,
-        });
-        let applied = apply_cut(CutExecution {
-            frozen: fixture.checkpoint.frozen_legacy(),
-            nominated: &nominated,
-            cut: &cut,
-        });
-        // Nomination is weaker than proof of loss: naming an entry earns nothing unless the cut's
-        // own registers actually condemn it.
-        assert_eq!(applied.credit, baseline.credit);
-        assert_eq!(applied.credit, 1);
+    fn applied(frozen: &FrozenLegacy, nominated: &[Candidate], cut: &Candidate) -> AppliedCut {
+        match execute(frozen, nominated, cut) {
+            CutOutcome::Applied(applied) => applied,
+            CutOutcome::Rejected(reason) => panic!("unexpectedly rejected: {reason:?}"),
+            CutOutcome::Parked(reason) => panic!("unexpectedly parked: {reason:?}"),
+        }
     }
 
-    /// Author one v2 operation on the founder's own chain, citing its live incarnation.
-    fn sign_v2(
-        fixture: &DemotedOwner,
+    fn founder_tip(fixture: &DemotedOwner) -> DeviceCut {
+        fixture
+            .checkpoint
+            .continuation_heads()
+            .iter()
+            .find(|head| head.device_fingerprint == fixture.founder.fingerprint())
+            .unwrap()
+            .clone()
+    }
+
+    /// Author `op` on the founder's chain at `version`. v2 wraps the operation in the control v2
+    /// payload; v1 encodes it directly, which is what a real fold can judge.
+    fn author_on_founder_chain(
+        checkpoint: &VerifiedCheckpoint,
+        founder: &LocalDevice,
+        incarnation: OwnerId,
         seq: u64,
         prev: AccountEntryHash,
-        op: v2_ops::ControlOp,
+        op: &AccountOp,
+        version: u32,
     ) -> Candidate {
+        let revocation =
+            matches!(op, AccountOp::DeviceRemove { .. } | AccountOp::OwnerDemote { .. });
+        let payload = if version == v2_ops::CONTROL_VERSION {
+            v2_ops::ControlOp {
+                checkpoint: checkpoint.pin().checkpoint_digest,
+                pre_cut_view: revocation.then_some([9; 32]),
+                op: op.clone(),
+            }
+            .encode()
+            .unwrap()
+        } else {
+            ops::encode(op).unwrap()
+        };
         let signed = envelope::sign_account_entry(
-            fixture.founder.secret(),
+            founder.secret(),
             &AccountEntryHeader {
-                account_id: fixture.checkpoint.pin().account_id,
+                account_id: checkpoint.pin().account_id,
                 log_id: 0,
-                device_fingerprint: fixture.founder.fingerprint(),
+                device_fingerprint: founder.fingerprint(),
                 seq,
                 prev_hash: Some(prev),
                 parent_ref: Some(prev),
-                entry_type: ops::entry_type_of(&op.op),
-                op_version: v2_ops::CONTROL_VERSION,
+                entry_type: ops::entry_type_of(op),
+                op_version: version,
                 crypto_suite: 0,
                 auth_len: 1,
                 key_id: None,
-                authority_ref: Some(fixture.incarnation),
+                authority_ref: Some(incarnation),
             },
-            &op.encode().unwrap(),
+            &payload,
         )
         .unwrap();
         Candidate::new(
@@ -661,8 +805,136 @@ mod tests {
                 payload: signed.payload,
                 entry_hash: signed.entry_hash,
             },
-            op.op,
+            op.clone(),
         )
+    }
+
+    /// What a REAL v1 fold credits this cut: the same counting loops, but over the outcome map
+    /// `fold_account` derives rather than the one execution constructs. This is the oracle — where
+    /// the documented bound and the code diverge, it shows up here as a number.
+    fn v1_credit(frozen: &FrozenLegacy, twin: &Candidate) -> u64 {
+        let mut entries = frozen.entries().to_vec();
+        entries.push(twin.entry.clone());
+        let history = fold_account(&entries);
+        let Some(genesis) = history.genesis_hash() else {
+            return 0;
+        };
+        let candidates: Vec<Candidate> = entries
+            .iter()
+            .filter(|entry| {
+                entry.header.log_id == CONTROL_LOG
+                    && entry.header.op_version == SUPPORTED_OP_VERSION
+                    && entry.header.crypto_suite == 0
+            })
+            .filter_map(|entry| match ops::decode(entry.header.entry_type, &entry.payload) {
+                Ok(DecodedAccountOp::Known(op)) => Some(Candidate::new(entry.clone(), op)),
+                _ => None,
+            })
+            .collect();
+        let mut incarnations = Incarnations::build(&candidates, genesis.into());
+        let mut strata: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for (idx, candidate) in candidates.iter().enumerate() {
+            if let Some(depth) = incarnations.author_depth(candidate) {
+                strata.entry(depth).or_default().push(idx);
+            }
+        }
+        let outcomes: HashMap<AccountEntryHash, Outcome> = candidates
+            .iter()
+            .filter_map(|c| history.outcome(&c.hash()).map(|outcome| (c.hash(), outcome)))
+            .collect();
+        revocation_credit(
+            &candidates,
+            &strata,
+            &incarnations,
+            &outcomes,
+            twin,
+            CreditScope::EveryScopedEntry,
+        )
+    }
+
+    #[test]
+    fn executed_credit_never_exceeds_a_real_v1_fold_of_the_same_operation() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, nominated) = v2_cut(&fixture, false);
+        let executed = applied(frozen, &nominated, &cut);
+
+        let tip = founder_tip(&fixture);
+        let twin = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &cut.op,
+            SUPPORTED_OP_VERSION,
+        );
+        let oracle = v1_credit(frozen, &twin);
+
+        assert_eq!(oracle, 2, "v1 counts both of the subject's entries");
+        assert_eq!(executed.credit, 1, "a legacy branch already out of the count earns nothing");
+        assert!(executed.credit <= oracle, "execution must not out-credit a real v1 fold");
+        assert_eq!(executed.registers.len(), 2, "a device remove cuts control and secrets");
+        assert!(frozen.accepted_at_checkpoint(&fixture.accepted_victim));
+        assert!(!frozen.accepted_at_checkpoint(&fixture.condemned_victim));
+    }
+
+    /// The I2 last-owner guard and the genesis root axiom together. A sole owner removing itself
+    /// installs nothing: v1 rejects it `LastOwner`, never makes it a register contributor, and so
+    /// credits it nothing — including nothing for the account's own genesis, which its empty cut
+    /// would otherwise condemn.
+    #[test]
+    fn a_sole_owners_self_removal_installs_nothing_as_in_v1() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 1).unwrap();
+        let founder = crate::local_device(&conn, 1).unwrap();
+        let genesis =
+            storage::account_entries_for_enrollment(&conn, account).unwrap()[0].entry_hash;
+        let tx = conn.transaction().unwrap();
+        let bundle = checkpoint::prepare_checkpoint_in_tx(&tx, account, &founder).unwrap();
+        let proof = checkpoint::verify_checkpoint(
+            TrustedCheckpointPin {
+                account_id: account,
+                checkpoint_digest: bundle.certificate_digest(),
+                required_control_version: 2,
+            },
+            &bundle,
+        )
+        .unwrap();
+        drop(tx);
+
+        let op = AccountOp::DeviceRemove {
+            device_fingerprint: founder.fingerprint(),
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "self".into(),
+        };
+        let frozen = proof.frozen_legacy();
+        let cut = author_on_founder_chain(
+            &proof,
+            &founder,
+            genesis.into(),
+            1,
+            genesis,
+            &op,
+            v2_ops::CONTROL_VERSION,
+        );
+        assert!(matches!(
+            execute(frozen, &[], &cut),
+            CutOutcome::Rejected(RejectReason::LastOwner)
+        ));
+        let twin = author_on_founder_chain(
+            &proof,
+            &founder,
+            genesis.into(),
+            1,
+            genesis,
+            &op,
+            SUPPORTED_OP_VERSION,
+        );
+        assert_eq!(v1_credit(frozen, &twin), 0, "v1 credits a refused cut nothing");
     }
 
     /// THE residual, demonstrated rather than argued. State preconditions are not evaluated, so an
@@ -671,50 +943,63 @@ mod tests {
     #[test]
     fn a_nominated_entry_v1_would_reject_ineffective_is_still_counted() {
         let fixture = demoted_owner();
-        let tip = fixture
-            .checkpoint
-            .continuation_heads()
-            .iter()
-            .find(|head| head.device_fingerprint == fixture.founder.fingerprint())
-            .unwrap()
-            .clone();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let tip = founder_tip(&fixture);
         // Re-enrolling a device already on the roster: `classify_effect` rejects this
         // `DuplicateAdd`, so a real v1 fold would never credit it.
-        let duplicate = sign_v2(&fixture, tip.seq + 1, tip.hash, v2_ops::ControlOp {
-            checkpoint: fixture.checkpoint.pin().checkpoint_digest,
-            pre_cut_view: None,
-            op: AccountOp::DeviceAdd {
+        let duplicate = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &AccountOp::DeviceAdd {
                 device_fingerprint: fixture.subject.fp,
                 ed25519_pubkey: fixture.subject.ed,
                 x25519_pubkey: fixture.subject.x,
                 role: DeviceRole::Member,
                 label: None,
             },
-        });
-        let cut = sign_v2(&fixture, tip.seq + 2, duplicate.hash(), v2_ops::ControlOp {
-            checkpoint: fixture.checkpoint.pin().checkpoint_digest,
-            pre_cut_view: Some([9; 32]),
-            op: AccountOp::DeviceRemove {
+            v2_ops::CONTROL_VERSION,
+        );
+        let cut = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 2,
+            duplicate.hash(),
+            &AccountOp::DeviceRemove {
                 device_fingerprint: fixture.founder.fingerprint(),
                 control_cut: Cut::Empty,
                 secrets_cut: Cut::Empty,
                 content_cuts: vec![],
                 reason: "revoked".into(),
             },
-        });
+            v2_ops::CONTROL_VERSION,
+        );
 
-        let frozen = fixture.checkpoint.frozen_legacy();
-        let without = apply_cut(CutExecution { frozen, nominated: &[], cut: &cut });
-        let with = apply_cut(CutExecution {
-            frozen,
-            nominated: std::slice::from_ref(&duplicate),
-            cut: &cut,
-        });
+        let without = applied(frozen, &[], &cut);
+        let with = applied(frozen, std::slice::from_ref(&duplicate), &cut);
         assert_eq!(
             with.credit,
             without.credit + 1,
             "an ineffective nomination the cut scopes is worth exactly one over-count",
         );
+    }
+
+    #[test]
+    fn nominating_entries_the_cut_never_took_does_not_inflate_its_credit() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, nominated) = v2_cut(&fixture, true);
+        assert_eq!(nominated.len(), 1, "an entry on a chain this cut does not scope");
+        let bare = v2_cut(&fixture, false);
+        let baseline = applied(frozen, &bare.1, &bare.0);
+        let with = applied(frozen, &nominated, &cut);
+        // Nomination is weaker than proof of loss: naming an entry earns nothing unless the cut's
+        // own registers actually condemn it.
+        assert_eq!(with.credit, baseline.credit);
+        assert_eq!(with.credit, 1);
     }
 
     /// Being certified and on an accepted branch is not authority. The subject's key is certified
@@ -772,12 +1057,8 @@ mod tests {
         );
 
         let frozen = fixture.checkpoint.frozen_legacy();
-        let without = apply_cut(CutExecution { frozen, nominated: &[], cut: &cut });
-        let with = apply_cut(CutExecution {
-            frozen,
-            nominated: std::slice::from_ref(&unauthorized),
-            cut: &cut,
-        });
+        let without = applied(frozen, &[], &cut);
+        let with = applied(frozen, std::slice::from_ref(&unauthorized), &cut);
         // It sits on the revoked device's chain and the cut's device register condemns everything
         // there, so it would be worth a credit the moment it were treated as effective.
         assert_eq!(with.credit, without.credit, "a nomination never substitutes for admission");
@@ -788,12 +1069,8 @@ mod tests {
     fn an_operation_that_installs_no_register_earns_no_credit() {
         let fixture = demoted_owner();
         let (_, nominated) = v2_cut(&fixture, true);
-        let applied = apply_cut(CutExecution {
-            frozen: fixture.checkpoint.frozen_legacy(),
-            nominated: &[],
-            cut: &nominated[0],
-        });
-        assert!(applied.registers.is_empty());
-        assert_eq!(applied.credit, 0);
+        let outcome = applied(fixture.checkpoint.frozen_legacy(), &[], &nominated[0]);
+        assert!(outcome.registers.is_empty());
+        assert_eq!(outcome.credit, 0);
     }
 }

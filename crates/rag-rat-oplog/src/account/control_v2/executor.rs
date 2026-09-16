@@ -17,6 +17,13 @@
 //! [`views::MAX_BYTES`]), counted over the deduplicated objects this call was handed. Verification
 //! is performed fresh here on every call; no cache stands in for it.
 //!
+//! **Equivocation on the consumer's own chain slot is OUT OF SCOPE here.** Two v2 entries at the
+//! same `seq` off the same accepted `prev_hash` both execute, because this layer decides ONE
+//! operation against a checkpoint and has no accepted-branch selection to appeal to. Choosing
+//! between equivocating siblings is `select_coherent_branches`' job in the storage layer, on the
+//! held candidate set, and it must happen before an operation reaches here. Saying nothing was what
+//! made a reader expect the check at this layer.
+//!
 //! This engine is not wired to production. The v1 fold dispatches nothing here, no CLI activates
 //! it, and executing an operation flips no readiness or pin state.
 
@@ -25,15 +32,16 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::super::checkpoint::VerifiedCheckpoint;
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader, SignedAccountEntry, VerifiedAccountEntry};
-use super::super::fold::{self, Candidate};
+use super::super::fold::{self, Candidate, RejectReason};
 use super::super::id::AccountEntryHash;
-use super::super::ops::{AccountOp, DeviceRole};
+use super::super::ops::AccountOp;
 use super::super::registers::RegisterKey;
 use super::{ops, views};
 use crate::device::DevicePublic;
 use crate::op::DeviceFingerprint;
 
 /// What executing one v2 operation against the checkpoint decided.
+#[derive(Debug)]
 pub(in crate::account) enum Verdict {
     /// Authorized: the registers it installs and the credit its signed nomination earns.
     Applied { registers: Vec<(RegisterKey, Cut)>, credit: u64 },
@@ -54,17 +62,22 @@ pub(in crate::account) enum ParkCause {
     ChainHead,
     /// A link between an entry and the accepted legacy branch is not held.
     Ancestry,
+    /// No key the bundle carries names some entry's author. A v2 enrolment can introduce any key,
+    /// so this is recoverable: the enrolment may simply have been withheld.
+    Signer,
+    /// A watermark the cut names belongs to an incarnation the frozen epoch does not hold.
+    CutTarget,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::account) enum RejectCause {
-    /// No key the accepted legacy epoch certifies names the author of some supplied entry. This is
-    /// about the absence of a certifying key, never about bytes that fail to verify under one.
-    Unauthenticated,
-    /// The operation cites no live owner incarnation minted for its own signer.
+    /// The operation cites no live owner incarnation minted for its own signer, judged by the one
+    /// authority resolution the credit pass also reads.
     Inadmissible,
     /// The frozen legacy registers already condemn the operation's own chain slot.
     Condemned,
+    /// The cut fails a register-pass precondition and installs nothing.
+    Precondition(RejectReason),
 }
 
 /// Execute `operation` against `checkpoint`. `Err` is malformed or over-budget input; an honest
@@ -86,8 +99,10 @@ pub(in crate::account) fn execute(
         Ok(authenticated) => authenticated,
         // Bytes that do not verify are a bad bundle, not a bad operation.
         Err(AuthFailure::Malformed(error)) => return Err(error),
-        Err(AuthFailure::UnknownSigner) =>
-            return Ok(Verdict::Rejected(RejectCause::Unauthenticated)),
+        // A v2 enrolment can introduce any key, so "no key names this author" is never provably
+        // permanent — the enrolment that introduces it may simply be withheld. Parking also keeps
+        // one uncertified attachment from condemning an otherwise sound operation.
+        Err(AuthFailure::UnknownSigner) => return Ok(Verdict::Parked(ParkCause::Signer)),
     };
 
     // Ancestry before authority: an operation whose branch we cannot yet walk is behind, not wrong.
@@ -105,27 +120,25 @@ pub(in crate::account) fn execute(
         }
     }
 
-    let consumer = &authenticated.consumer;
-    let header = &consumer.verified.header;
-    let Some(incarnation) = header.authority_ref else {
-        return Ok(Verdict::Rejected(RejectCause::Inadmissible));
-    };
-    let live = frozen.owner_is_live(incarnation, header.device_fingerprint)
-        || authenticated
-            .entries
-            .get(&incarnation.into())
-            .is_some_and(|mint| mints_owner_for(mint, header.device_fingerprint));
-    if !live {
-        return Ok(Verdict::Rejected(RejectCause::Inadmissible));
-    }
-    let cut = consumer.candidate();
-    if frozen.condemns(&cut) {
-        return Ok(Verdict::Rejected(RejectCause::Condemned));
+    let cut = authenticated.consumer.candidate();
+    // ONE authority resolution over the whole bundle, and admission reads exactly what credit
+    // reads. Asking separately is how an operation gets admitted on a mint the credit pass would
+    // have refused — a Member can sign its own `OwnerPromote` and cite it.
+    let bundle: Vec<Candidate> = authenticated
+        .entries
+        .values()
+        .map(V2Entry::candidate)
+        .chain(std::iter::once(cut.clone()))
+        .collect();
+    let authority = fold::v2::V2Authority::resolve(frozen, &bundle);
+    match authority.verdict(&cut.hash()) {
+        fold::v2::V2Verdict::Authorized => {},
+        fold::v2::V2Verdict::Condemned => return Ok(Verdict::Rejected(RejectCause::Condemned)),
+        _ => return Ok(Verdict::Rejected(RejectCause::Inadmissible)),
     }
 
     // Only the identities the operation's own manifest named; an ordinary operation names none.
-    // Each one's own authority is judged inside the execution, never assumed from having been
-    // named here.
+    // Being named is not authority: each one's verdict comes from the resolution above.
     let nominated: Vec<Candidate> = plan
         .root()
         .into_iter()
@@ -133,9 +146,20 @@ pub(in crate::account) fn execute(
         .filter_map(|hash| authenticated.entries.get(hash))
         .map(V2Entry::candidate)
         .collect();
-    let applied =
-        fold::v2::apply_cut(fold::v2::CutExecution { frozen, nominated: &nominated, cut: &cut });
-    Ok(Verdict::Applied { registers: applied.registers, credit: applied.credit })
+    Ok(
+        match fold::v2::apply_cut(fold::v2::CutExecution {
+            frozen,
+            authority: &authority,
+            nominated: &nominated,
+            cut: &cut,
+        }) {
+            fold::v2::CutOutcome::Applied(applied) =>
+                Verdict::Applied { registers: applied.registers, credit: applied.credit },
+            fold::v2::CutOutcome::Rejected(reason) =>
+                Verdict::Rejected(RejectCause::Precondition(reason)),
+            fold::v2::CutOutcome::Parked(_) => Verdict::Parked(ParkCause::CutTarget),
+        },
+    )
 }
 
 /// One authenticated v2 entry: the verified envelope and the inner v1 operation it carries.
@@ -158,9 +182,9 @@ struct Authenticated {
     headers: HashMap<AccountEntryHash, AccountEntryHeader>,
 }
 
-/// Why authentication could not complete. The two cases carry different consequences, so they are
-/// never collapsed: absent certification is a property of the account, unverifiable bytes are a
-/// property of the bundle.
+/// Why authentication could not complete. The two cases are never collapsed: bytes that fail under
+/// a key we hold are a bad bundle and refuse it, while an author no supplied key names is only
+/// evidence we do not have yet.
 enum AuthFailure {
     Malformed(anyhow::Error),
     UnknownSigner,
@@ -170,6 +194,9 @@ enum AuthFailure {
 /// already-authenticated v2 enrollment introduces. An entry may introduce a key, but only once it
 /// has itself authenticated: pooling unverified introductions would admit a mutually-introducing
 /// cycle that a fresh receiver can never reproduce.
+/// Each entry is visited once, and an enrolment wakes only the entries actually waiting on the key
+/// it introduces, so the work is linear in the objects supplied rather than quadratic in their
+/// worst ordering — the declared evidence budget then bounds it, as the module claims.
 fn authenticate(
     plan: &views::ReplayPlan,
     frozen: &fold::v2::FrozenLegacy,
@@ -179,51 +206,42 @@ fn authenticate(
         frozen.entries().iter().map(|entry| (entry.entry_hash, entry.header.clone())).collect();
     let mut entries: BTreeMap<AccountEntryHash, V2Entry> = BTreeMap::new();
     let mut consumer = None;
-    let mut pending: Vec<&SignedAccountEntry> =
-        plan.candidates().chain(std::iter::once(plan.consumer())).collect();
-    while !pending.is_empty() {
-        let before = pending.len();
-        let mut remaining = Vec::new();
-        for signed in pending {
-            let Some(key) = keys.get(&signed.header.device_fingerprint).copied() else {
-                remaining.push(signed);
-                continue;
-            };
-            // A key exists for this author, so the bytes now have to verify under it.
-            let verified = DevicePublic::from_bytes(&key)
-                .and_then(|key| envelope::verify_account_signed(&signed.signed_bytes, &key))
-                .map_err(AuthFailure::Malformed)?;
-            let op = ops::decode(verified.header.entry_type, &verified.payload)
-                .map_err(AuthFailure::Malformed)?
-                .op;
-            // A v2 enrollment certifies the added device's key exactly as its v1 counterpart does.
-            if let AccountOp::DeviceAdd { device_fingerprint, ed25519_pubkey, .. } = &op {
-                keys.insert(*device_fingerprint, *ed25519_pubkey);
-            }
-            headers.insert(verified.entry_hash, verified.header.clone());
-            let entry = V2Entry { verified, op };
-            if signed.entry_hash == plan.consumer().entry_hash {
-                consumer = Some(entry);
-            } else {
-                entries.insert(signed.entry_hash, entry);
-            }
+    let mut waiting: HashMap<DeviceFingerprint, Vec<&SignedAccountEntry>> = HashMap::new();
+    let mut ready: Vec<&SignedAccountEntry> = Vec::new();
+    for signed in plan.candidates().chain(std::iter::once(plan.consumer())) {
+        if keys.contains_key(&signed.header.device_fingerprint) {
+            ready.push(signed);
+        } else {
+            waiting.entry(signed.header.device_fingerprint).or_default().push(signed);
         }
-        if remaining.len() == before {
-            return Err(AuthFailure::UnknownSigner);
+    }
+    while let Some(signed) = ready.pop() {
+        let key = keys[&signed.header.device_fingerprint];
+        // A key exists for this author, so the bytes now have to verify under it.
+        let verified = DevicePublic::from_bytes(&key)
+            .and_then(|key| envelope::verify_account_signed(&signed.signed_bytes, &key))
+            .map_err(AuthFailure::Malformed)?;
+        let op = ops::decode(verified.header.entry_type, &verified.payload)
+            .map_err(AuthFailure::Malformed)?
+            .op;
+        // A v2 enrolment certifies the added device's key exactly as its v1 counterpart does. It
+        // does NOT confer authority — `V2Authority` judges that separately.
+        if let AccountOp::DeviceAdd { device_fingerprint, ed25519_pubkey, .. } = &op {
+            keys.insert(*device_fingerprint, *ed25519_pubkey);
+            ready.extend(waiting.remove(device_fingerprint).unwrap_or_default());
         }
-        pending = remaining;
+        headers.insert(verified.entry_hash, verified.header.clone());
+        let entry = V2Entry { verified, op };
+        if signed.entry_hash == plan.consumer().entry_hash {
+            consumer = Some(entry);
+        } else {
+            entries.insert(signed.entry_hash, entry);
+        }
+    }
+    if !waiting.is_empty() {
+        return Err(AuthFailure::UnknownSigner);
     }
     Ok(Authenticated { consumer: consumer.ok_or(AuthFailure::UnknownSigner)?, entries, headers })
-}
-
-/// Whether `entry` mints an owner incarnation for `device`. A v2 entry's hash becomes the
-/// `owner_id` exactly as a v1 mint's does.
-fn mints_owner_for(entry: &V2Entry, device: DeviceFingerprint) -> bool {
-    match &entry.op {
-        AccountOp::DeviceAdd { device_fingerprint, role: DeviceRole::Owner, .. }
-        | AccountOp::OwnerPromote { device_fingerprint } => *device_fingerprint == device,
-        _ => false,
-    }
 }
 
 /// Why an ancestry walk did not land.
@@ -259,7 +277,9 @@ fn chain_reaches_accepted_legacy(
         if reached.contains(&hash) {
             break;
         }
-        if walked.len() >= views::MAX_ENTRIES {
+        // The budget counts the v2 links; the legacy entry the walk terminates on sits one beyond
+        // it, so a chain filling the largest bundle `plan_replay` accepts still lands.
+        if walked.len() > views::MAX_ENTRIES {
             return Err(WalkError::OverBudget);
         }
         let missing = if walked.is_empty() { ParkCause::ChainHead } else { ParkCause::Ancestry };
@@ -277,7 +297,13 @@ fn chain_reaches_accepted_legacy(
             }
             break;
         }
-        hash = header.prev_hash.ok_or(WalkError::Incomplete(ParkCause::Ancestry))?;
+        // A device first enrolled at version 2 roots its OWN chain at seq 0, exactly as the
+        // starting entry may. Reaching that origin completes the walk rather than failing it: what
+        // binds such a device to the account is the authority rule, never this chain.
+        let Some(prev) = header.prev_hash else {
+            break;
+        };
+        hash = prev;
         expected_seq = expected_seq.saturating_sub(1);
     }
     reached.extend(walked);
@@ -344,7 +370,9 @@ mod tests {
             Err(WalkError::OverBudget)
         ));
 
-        // The identical walk lands once it is short enough to fit the budget.
+        // The identical walk lands once it is short enough to fit the budget. These links are v2,
+        // so reaching the seq-0 origin COMPLETES the walk: a device first enrolled at version 2
+        // roots its own chain there, and the authority rule is what binds it to the account.
         let short = headers[&link(4)].clone();
         assert!(matches!(
             chain_reaches_accepted_legacy(
@@ -353,9 +381,7 @@ mod tests {
                 proof.frozen_legacy(),
                 &mut HashSet::new()
             ),
-            // Reaching seq 0 without meeting a legacy entry is a chain rooted outside the
-            // checkpoint, which parks rather than spinning.
-            Err(WalkError::Incomplete(ParkCause::Ancestry))
+            Ok(())
         ));
     }
 }

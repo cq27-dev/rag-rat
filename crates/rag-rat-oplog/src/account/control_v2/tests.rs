@@ -369,15 +369,6 @@ fn checkpoint_mismatch_and_duplicate_evidence_are_rejected() {
 }
 
 #[test]
-fn no_lifetime_limit_is_stricter_than_the_declared_evidence_budget() {
-    // Every view and every reference has to be supplied as bytes, so the storage budget already
-    // bounds the work. A tighter view or reference cap would only limit how long an account may
-    // keep revoking, which is not a bound on anything a receiver spends.
-    assert_eq!(views::MAX_VIEWS, views::MAX_ENTRIES);
-    assert_eq!(views::MAX_REFERENCES, views::MAX_BYTES / 32);
-}
-
-#[test]
 fn aggregate_manifests_are_bounded_by_the_declared_evidence_byte_budget() {
     let (checkpoint, device) = checkpoint();
     let chunk = views::MAX_BYTES / 128;
@@ -518,7 +509,7 @@ fn unverifiable_evidence_is_a_bad_bundle_not_a_permanently_rejected_operation() 
 }
 
 #[test]
-fn an_author_no_certified_key_names_is_rejected_rather_than_refused() {
+fn an_author_no_supplied_key_names_parks_because_its_enrolment_may_be_withheld() {
     let (checkpoint, device) = checkpoint();
     let mut chain = Chain::new(&checkpoint, &device);
     let operation = chain.add(1);
@@ -535,7 +526,9 @@ fn an_author_no_certified_key_names_is_rejected_rather_than_refused() {
             label: None,
         },
     };
-    // Perfectly well-formed and correctly self-signed — nothing in the account certifies its key.
+    // Perfectly well-formed and correctly self-signed. Nothing supplied certifies its key — but a
+    // v2 enrolment can introduce any key, so the receiver cannot tell "never enrolled" from
+    // "enrolment withheld", and must not condemn a sound operation over an attachment either way.
     let foreign = envelope::sign_account_entry(
         &stranger.secret,
         &AccountEntryHeader {
@@ -558,8 +551,83 @@ fn an_author_no_certified_key_names_is_rejected_rather_than_refused() {
     assert!(matches!(
         executor::execute(&checkpoint, &operation.signed_bytes, &[], &[foreign.signed_bytes])
             .unwrap(),
-        executor::Verdict::Rejected(executor::RejectCause::Unauthenticated)
+        executor::Verdict::Parked(executor::ParkCause::Signer)
     ));
+    // Without the attachment the very same operation applies, so the park withheld nothing of its
+    // own and one uncertified object cannot condemn it.
+    assert!(matches!(
+        executor::execute(&checkpoint, &operation.signed_bytes, &[], &[]).unwrap(),
+        executor::Verdict::Applied { .. }
+    ));
+}
+
+#[test]
+fn a_member_cannot_promote_itself_into_the_authority_it_then_cites() {
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let member = Dev::new(77);
+    // The founder enrols the member, so the accepted epoch certifies its KEY. That is all it
+    // certifies: the roster says nothing about authority to act.
+    let enrolment = chain.author(ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: member.fp,
+            ed25519_pubkey: member.ed,
+            x25519_pubkey: member.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    });
+    let sign = |seq: u64, prev: Option<AccountEntryHash>, op: ops::ControlOp| {
+        envelope::sign_account_entry(
+            &member.secret,
+            &AccountEntryHeader {
+                account_id: checkpoint.pin().account_id,
+                log_id: 0,
+                device_fingerprint: member.fp,
+                seq,
+                prev_hash: prev,
+                parent_ref: prev,
+                entry_type: legacy::entry_type_of(&op.op),
+                op_version: ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: (seq != 0).then(|| prev.unwrap().into()),
+            },
+            &op.encode().unwrap(),
+        )
+        .unwrap()
+    };
+    // A self-serving mint, then a cut of the founder's chain citing it.
+    let mint = sign(0, None, ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::OwnerPromote { device_fingerprint: member.fp },
+    });
+    let view = manifest(&checkpoint, vec![]);
+    let cut = sign(1, Some(mint.entry_hash), ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: Some(view.digest().unwrap()),
+        op: AccountOp::DeviceRemove {
+            device_fingerprint: device.fingerprint(),
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "seized".into(),
+        },
+    });
+    // Everything else about this bundle is in order: both entries authenticate under keys the
+    // account certifies, both chain to a root this bundle supplies, and the view the cut names is
+    // present. Only the authority rule stands between a Member and the founder's chain.
+    let manifests = [view.encode().unwrap()];
+    let evidence = bytes(&[enrolment, mint]);
+    let verdict = executor::execute(&checkpoint, &cut.signed_bytes, &manifests, &evidence).unwrap();
+    assert!(
+        matches!(verdict, executor::Verdict::Rejected(executor::RejectCause::Inadmissible)),
+        "a member's self-minted authority must be refused, got {verdict:?}",
+    );
 }
 
 fn plan_replay(
