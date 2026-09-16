@@ -5,7 +5,7 @@ use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader, SignedAccountEntry};
 use super::super::fold;
 use super::super::id::{AccountEntryHash, OwnerId};
-use super::super::ops::{self as legacy, AccountOp, DeviceCut, DeviceRole};
+use super::super::ops::{self as legacy, AccountOp, DeviceRole};
 use super::super::test_support::Dev;
 use super::{executor, ops, views};
 use crate::identity::LocalDevice;
@@ -45,12 +45,7 @@ fn revocation(demote: bool) -> ops::ControlOp {
             reason: "revoked".into(),
         }
     };
-    ops::ControlOp {
-        checkpoint: [1; 32],
-        pre_cut_view: Some([2; 32]),
-        op,
-        credit_frontier: Some(vec![]),
-    }
+    ops::ControlOp { checkpoint: [1; 32], pre_cut_view: Some([2; 32]), op }
 }
 
 fn manifest(
@@ -161,7 +156,6 @@ impl<'a> Chain<'a> {
                 role: DeviceRole::Member,
                 label: None,
             },
-            credit_frontier: None,
         })
     }
 
@@ -178,7 +172,6 @@ impl<'a> Chain<'a> {
                 content_cuts: vec![],
                 reason: format!("revoked {index}"),
             },
-            credit_frontier: Some(vec![]),
         })
     }
 }
@@ -188,14 +181,9 @@ fn bytes(entries: &[SignedAccountEntry]) -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn revocations_bind_both_view_and_frontier_without_changing_v1_bytes() {
+fn revocations_bind_their_pre_cut_view_without_changing_v1_bytes() {
     for demote in [false, true] {
         let mut op = revocation(demote);
-        op.credit_frontier = Some(vec![DeviceCut {
-            device_fingerprint: DeviceFingerprint::from_bytes([7; 32]),
-            seq: 4,
-            hash: [8; 32].into(),
-        }]);
         let tag = legacy::entry_type_of(&op.op);
         let old = legacy::encode(&op.op).unwrap();
         let bytes = op.encode().unwrap();
@@ -259,31 +247,17 @@ fn payload_fit_does_not_bypass_the_complete_signed_envelope_limit() {
 }
 
 #[test]
-fn view_and_frontier_slots_are_present_exactly_for_a_revocation() {
+fn the_pre_cut_view_is_the_only_slot_and_is_present_exactly_for_a_revocation() {
     let mut op = revocation(false);
-    op.credit_frontier = None;
-    assert!(op.encode().is_err(), "a revocation carries a frontier");
-    op.credit_frontier = Some(vec![]);
     op.pre_cut_view = None;
     assert!(op.encode().is_err(), "a revocation nominates a view");
     op.pre_cut_view = Some([2; 32]);
-    let head = DeviceCut {
-        device_fingerprint: DeviceFingerprint::from_bytes([3; 32]),
-        seq: 0,
-        hash: [4; 32].into(),
-    };
-    op.credit_frontier = Some(vec![head.clone(), head.clone()]);
-    assert!(op.encode().is_err());
-    op.credit_frontier = Some(vec![DeviceCut { seq: u64::MAX, ..head.clone() }]);
-    assert!(op.encode().is_err());
-    op.credit_frontier = Some(vec![head; ops::FRONTIER_MAX + 1]);
-    assert!(op.encode().is_err());
+    let revoking = op.encode().unwrap();
+    assert_eq!(ops::decode(legacy::entry_type_of(&op.op), &revoking).unwrap(), op);
 
-    // An ordinary operation carries neither, and needs no historical evidence to be read.
+    // An ordinary operation nominates none, and needs no historical evidence to be read. The
+    // payload carries no other slot: credit evidence is the detached manifest alone.
     op.op = AccountOp::OwnerPromote { device_fingerprint: DeviceFingerprint::from_bytes([3; 32]) };
-    op.credit_frontier = Some(vec![]);
-    assert!(op.encode().is_err());
-    op.credit_frontier = None;
     assert!(op.encode().is_err(), "an ordinary operation nominates no view");
     op.pre_cut_view = None;
     let bytes = op.encode().unwrap();

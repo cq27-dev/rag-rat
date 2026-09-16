@@ -487,7 +487,6 @@ mod tests {
                 role: DeviceRole::Member,
                 label: None,
             },
-            credit_frontier: None,
         });
         let cut = sign(tip.seq + 2, extra.hash(), v2_ops::ControlOp {
             checkpoint: checkpoint.pin().checkpoint_digest,
@@ -499,7 +498,6 @@ mod tests {
                 content_cuts: vec![],
                 reason: "revoked".into(),
             },
-            credit_frontier: Some(vec![]),
         });
         (cut, if nominate_unrelated { vec![extra] } else { Vec::new() })
     }
