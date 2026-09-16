@@ -455,6 +455,13 @@ mod coverage_ceiling_tests {
 
     /// `MAX_VIEW_ENTRIES` is a promise that a view that large can actually be SIGNED, so measure
     /// the signed envelope rather than the payload — the payload is the smaller of the two.
+    ///
+    /// The header measured is the one [`author_view_manifest_in_tx`] actually writes, in BOTH
+    /// shapes it can take, because the production case is the expensive one: a manifest names no
+    /// root and no incarnation, but it does chain, so every manifest after a device's first
+    /// carries a `prev_hash` and a grown `seq`/`auth_len`. Measuring only the origin shape would
+    /// leave the question a reader actually has — does a real chained manifest still fit? —
+    /// answerable only by building that header by hand.
     #[test]
     fn a_view_at_the_declared_bound_fits_one_signed_annex_entry() {
         let view = |entries: usize| views::ViewManifest {
@@ -467,24 +474,48 @@ mod coverage_ceiling_tests {
                 })
                 .collect(),
         };
-        let header = AccountEntryHeader {
+        let manifest_header = |linked: bool| AccountEntryHeader {
+            seq: if linked { u64::MAX } else { 0 },
+            prev_hash: linked.then(|| AccountEntryHash::from_bytes([3; 32])),
+            parent_ref: None,
             entry_type: super::super::ops::entry_type::VIEW_MANIFEST,
+            auth_len: if linked { u64::MAX } else { 0 },
+            authority_ref: None,
             ..header()
         };
         let payload = view(views::MAX_VIEW_ENTRIES).encode().expect("the declared bound encodes");
-        assert!(
-            envelope::entry_fits_envelope(&header, &payload),
-            "a view at the declared bound must actually sign",
-        );
         assert!(view(views::MAX_VIEW_ENTRIES + 1).encode().is_err(), "one past it is refused");
 
-        // And the bound is HONEST rather than arbitrarily cautious: the envelope really does run
-        // out just above it, so lowering the constant would silently shrink what a cut may name.
-        let spare =
-            limits::ACCOUNT_ENVELOPE_MAX_BYTES - envelope::signed_entry_len(&header, &payload);
+        let (origin, chained) = (manifest_header(false), manifest_header(true));
         assert!(
-            spare < 34 * 64,
-            "the declared bound should sit just under the real ceiling; {spare} bytes spare",
+            envelope::entry_fits_envelope(&chained, &payload),
+            "a view at the declared bound must actually sign, on a CHAINED manifest and not only \
+             on a device's first",
+        );
+        let spare = |header: &AccountEntryHeader| {
+            limits::ACCOUNT_ENVELOPE_MAX_BYTES - envelope::signed_entry_len(header, &payload)
+        };
+        let (origin_spare, chained_spare) = (spare(&origin), spare(&chained));
+        assert!(chained_spare < origin_spare, "chaining a manifest costs envelope, not saves it");
+
+        // Two bounds, because either one alone answers nothing. The UPPER bound is measured on the
+        // loosest shape: if even a device's FIRST manifest has this little room, the declared bound
+        // really does sit just under the ceiling and is not arbitrarily cautious — lowering the
+        // constant would silently shrink what a cut may name.
+        assert!(
+            origin_spare < 34 * 64,
+            "the declared bound should sit just under the real ceiling; origin {origin_spare}, \
+             chained {chained_spare}",
+        );
+        // The LOWER bound is measured on the TIGHTEST shape, and it is the margin a new header
+        // field would have to eat before the declared bound became unsignable in production. A
+        // 32-byte field costs ~34 bytes on this wire, so this leaves room for about three of them;
+        // a change that eats past it has to bring `MAX_VIEW_ENTRIES` down with it rather than
+        // discover the ceiling at signing time.
+        assert!(
+            chained_spare > 128,
+            "a chained manifest at the declared bound has too little margin left; origin \
+             {origin_spare}, chained {chained_spare}",
         );
     }
 
