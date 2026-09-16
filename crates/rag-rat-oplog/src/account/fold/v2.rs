@@ -64,6 +64,13 @@
 //! cut may condemn what the legacy epoch left standing, but it cannot revive a branch loser, awaken
 //! a legacy parked cut, or undo a legacy tombstone — and a legacy entry that was already out of the
 //! frozen effective count earns no credit for being removed a second time.
+//!
+//! **Composition, not a live path.** [`pinned_history`] extends that frozen history with the
+//! register effects of the operations a refold applied. Nothing reaches it in production yet: the
+//! only operations installing a register are revocations, and a revocation names a detached pre-cut
+//! manifest no refold supplies, so it parks. The seam exists so the projection is already correct
+//! when manifests become durable; until then a pinned account's composed history equals its frozen
+//! one.
 
 use super::*;
 
@@ -438,6 +445,149 @@ fn register_precondition(
         candidate::validate_cut_target(cut, coord, &view) == candidate::CutBinding::Mismatch
     });
     misbound.then_some(CutOutcome::Rejected(RejectReason::CutTargetMismatch))
+}
+
+/// One v2 operation the executor applied, carried together with the registers [`apply_cut`]
+/// installed for it.
+///
+/// The registers travel WITH the entry rather than being re-derived from its op at the projection.
+/// A second derivation is exactly how a roster and a credit end up disagreeing about what a cut
+/// took away; both now read the one `apply_cut` result.
+pub(in crate::account) struct AppliedOperation<'a> {
+    pub(in crate::account) entry: &'a Candidate,
+    pub(in crate::account) registers: &'a [(RegisterKey, Cut)],
+}
+
+/// The authority history of an account under a control pin this binary EXECUTES: the checkpoint's
+/// frozen legacy history, extended by the register effects of the v2 operations the executor
+/// applied.
+///
+/// Derived, never mutated — the frozen history is immutable and the certificate commits to it.
+/// Replaying the legacy epoch through [`derive_authority_facts`] reproduces the frozen facts
+/// exactly, because that is the function the frozen fold built them with; the cuts then take effect
+/// on top, at epochs above every legacy one.
+///
+/// **This has no production caller yet.** The only operations that install a register are
+/// revocations, and every revocation names a detached pre-cut manifest that `execute_held` cannot
+/// supply and nothing persists, so each one parks — no refold reaches this with a cut to apply.
+/// This is the seam the composition lands at, not a live path; making it live means making
+/// manifests durable, not changing anything here.
+///
+/// With no cut applied the composed registers ARE the frozen ones, and **no frozen register scopes
+/// a forked entry** — which is what makes the composition exact. `forked` only ever grows from
+/// entries that were `effective` in some round (`newly_forked = effective.difference(&accepted)`),
+/// and a register-condemned entry is never effective, so a register-scoped entry cannot reach the
+/// fork stage at all. That leaves a forked entry as the only candidate in
+/// [`FrozenLegacy::foldable`] the frozen history has no outcome for: a parked or readiness-excluded
+/// entry carries its own, and an unfoldable entry never enters `foldable`.
+///
+/// The invariant depends on registers not GROWING across elimination rounds, and the residual is
+/// that converse direction alone: removing a forked entry can let a previously-ineffective cut
+/// become effective and install a register scoping an already-forked entry, and the overlay then
+/// hands it a `Condemned` the frozen history lacks. That has not been constructed and is not worth
+/// chasing — the effective set and the projection hash are untouched, so the only observable is an
+/// `account_entry_status` label moving from `retained_unfolded` to `condemned` for such a row.
+///
+/// **Only a register-installing cut projects**, which splits an applied operation three ways.
+///
+/// A REVOCATION (`DeviceRemove` / `OwnerDemote`) carries registers and projects. That is the whole
+/// reason the composition exists.
+///
+/// An operation that GRANTS authority — a v2 enrolment, promotion, ownership or grant — is
+/// deliberately left out. Execution evaluates no state preconditions (see this module's header), so
+/// projecting one unjudged would re-enroll a tombstoned device or promote an unenrolled one:
+/// authority this account's own history never conferred. Omitting it can only UNDER-grant, which is
+/// why the operational gates stay shut; what it cannot do is under-revoke.
+///
+/// A `CutExtend` falls out too, and silently: [`cut_op_registers`] returns nothing for it, so an
+/// applied one reports `Applied` while raising no register here. v1 raises it separately through
+/// [`cut_extend_register`], which this composition never calls, so a §11.4 re-blessing is dropped
+/// and the register stays LOWER than its author meant. That over-revokes rather than under-revokes,
+/// so the shut gates cover it — but do not read `Applied` as "took effect".
+pub(in crate::account) fn pinned_history(
+    frozen: &FrozenLegacy,
+    applied: &[AppliedOperation<'_>],
+) -> AccountAuthHistory {
+    let mut cuts: Vec<&AppliedOperation<'_>> =
+        applied.iter().filter(|op| !op.registers.is_empty()).collect();
+    // Total and deterministic, and causal within one device's chain — the only order that matters,
+    // since a cut's effect never depends on a cut authored on someone else's chain.
+    cuts.sort_by_key(|op| (op.entry.header().seq, op.entry.hash()));
+
+    let mut candidates = frozen.foldable();
+    candidates.extend(cuts.iter().map(|op| op.entry.clone()));
+    let headers: HashMap<AccountEntryHash, &AccountEntryHeader> = frozen
+        .entries()
+        .iter()
+        .map(|entry| (entry.entry_hash, &entry.header))
+        .chain(candidates.iter().map(|c| (c.hash(), c.header())))
+        .collect();
+    let view = CandidateView { headers: &headers };
+
+    let mut registers = frozen.registers.clone();
+    for op in &cuts {
+        for (key, cut) in op.registers {
+            // A join that is not `Applied` leaves the HELD register standing and drops the
+            // newcomer's watermark — an under-revocation. Two authorized cuts disagreeing about one
+            // chain's valid prefix is the compromise case, so close the chain instead: the empty
+            // cut is the one answer that cannot admit an entry either author meant to
+            // cut.
+            if !matches!(
+                join_register(&mut registers, key.clone(), cut.clone(), &view),
+                RegisterJoin::Applied
+            ) {
+                registers.insert(key.clone(), Cut::Empty);
+            }
+        }
+    }
+
+    let mut outcomes = frozen.history.outcomes.clone();
+    // The frozen epochs are normalized to `0..effective_count`, so the cuts take the slots above
+    // them and `derive_authority_facts` replays the whole legacy epoch before any of them.
+    for (offset, op) in cuts.iter().enumerate() {
+        outcomes.insert(op.entry.hash(), Outcome::Effective {
+            auth_epoch: frozen.history.effective_count + offset as u64,
+        });
+    }
+    // A v2 cut may condemn what the legacy epoch left standing. This only ever downgrades, so it
+    // can revive no branch loser, and the genesis is exempt for the reason `rederive_condemnation`
+    // exempts it: a self-removal on the founder's chain would otherwise leave the account with no
+    // effective root.
+    for candidate in &candidates {
+        if Some(candidate.hash()) == frozen.history.genesis_hash {
+            continue;
+        }
+        if let RegisterVerdict::Condemned(reason) = register_verdict(candidate, &registers, &view) {
+            outcomes.insert(candidate.hash(), Outcome::Condemned(reason));
+        }
+    }
+    let effective_count = normalize_auth_epochs(&mut outcomes);
+
+    let mut tombstoned = frozen.history.tombstoned.clone();
+    for op in &cuts {
+        // An effective removal tombstones the device (I4: never re-enroll), as `apply_effect` does
+        // for v1. A cut its own registers condemned removed nothing.
+        if let AccountOp::DeviceRemove { device_fingerprint, .. } = &op.entry.op
+            && outcomes.get(&op.entry.hash()).is_some_and(Outcome::is_effective)
+        {
+            tombstoned.insert(*device_fingerprint);
+        }
+    }
+
+    let facts = derive_authority_facts(&candidates, &outcomes, &registers);
+    AccountAuthHistory {
+        outcomes,
+        classification: frozen.history.classification,
+        contested_successor: frozen.history.contested_successor,
+        effective_count,
+        roster_refs: facts.roster_refs,
+        owner_incarnations: facts.owner_incarnations,
+        stream_ownership: facts.stream_ownership,
+        grants: facts.grants,
+        grant_cuts: facts.grant_cuts,
+        tombstoned,
+        genesis_hash: frozen.history.genesis_hash,
+    }
 }
 
 /// The credit `input.cut` earns under `scope`, over one shared baseline. Production only ever asks
@@ -1368,6 +1518,330 @@ mod tests {
             apply_cut(CutExecution { frozen, authority: &withheld, nominated: &[], cut: &citing }),
             CutOutcome::Parked(ParkReason::UnknownOwnerRef)
         ));
+    }
+
+    /// The roster fact the history holds for `device`, whatever its state.
+    fn roster_fact_for(
+        history: &AccountAuthHistory,
+        device: DeviceFingerprint,
+    ) -> Option<(&RosterRef, &RosterFact)> {
+        history.roster_facts().find(|(_, fact)| fact.authority.device_fingerprint == device)
+    }
+
+    fn projection_hash(history: &AccountAuthHistory) -> [u8; 32] {
+        crate::account::snapshot::projection::folded_state_hash(history)
+    }
+
+    /// Composing NO v2 operation must reproduce the frozen fold exactly, byte for byte in the
+    /// canonical projection. `derive_authority_facts` is the function the frozen fold built its own
+    /// facts with, so replaying the legacy epoch through it can only agree — if this fails, the
+    /// composition is re-deriving something the checkpoint already decided.
+    #[test]
+    fn composing_no_v2_operation_reproduces_the_frozen_projection() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let composed = pinned_history(frozen, &[]);
+        assert_eq!(projection_hash(&composed), projection_hash(frozen.history()));
+        // The canonical projection encodes only `effective_entries()`, so the hash alone would not
+        // notice a candidate gaining or losing a NON-effective outcome. Compare the map too.
+        assert_eq!(
+            composed.outcomes,
+            frozen.history().outcomes,
+            "every candidate keeps the exact outcome the checkpoint decided for it",
+        );
+    }
+
+    /// The genesis is the account's ROOT AXIOM and survives a cut over its own chain. A founder
+    /// removal installs a device register with an empty cut, which puts EVERY seq on the founder's
+    /// chain beyond the watermark — seq 0 included. Without the exemption the account folds `Live`
+    /// with no effective root, which is why `rederive_condemnation` carries the same carve-out.
+    #[test]
+    fn a_cut_on_the_founders_own_chain_never_condemns_the_genesis_root() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let genesis = frozen.history().genesis_hash().expect("the fixture has a root");
+        let tip = founder_tip(&fixture);
+        // A second owner is open, so the I2 last-owner guard does not refuse this.
+        let cut = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &AccountOp::DeviceRemove {
+                device_fingerprint: fixture.founder.fingerprint(),
+                control_cut: Cut::Empty,
+                secrets_cut: Cut::Empty,
+                content_cuts: vec![],
+                reason: "revoked".into(),
+            },
+            v2_ops::CONTROL_VERSION,
+        );
+        let outcome = applied(frozen, &[], &cut);
+        let history = pinned_history(frozen, &[AppliedOperation {
+            entry: &cut,
+            registers: &outcome.registers,
+        }]);
+        // Non-vacuous: the register really does scope the founder's own chain.
+        assert!(
+            matches!(history.outcome(&tip.hash), Some(Outcome::Condemned(_))),
+            "the founder's later entries are condemned by its own removal",
+        );
+        assert!(
+            history.outcome(&genesis).is_some_and(|o| o.is_effective()),
+            "the genesis root axiom is never condemnable",
+        );
+    }
+
+    /// A register-scoped equivocation is condemned by the FOLD, before branch selection runs, so
+    /// its siblings never reach the fork stage at all.
+    ///
+    /// This demonstrates that STRUCTURE; it is NOT coverage of the outcome-less forked candidate.
+    /// Both siblings here end `Condemned(BeyondCut)`, so neither is forked and the fold's `forked`
+    /// set stays empty. By the same structure that path cannot be built this way — an entry a
+    /// register condemns is never forked — so reaching it needs a register admitted LATER than the
+    /// round the entry forked in. [`pinned_history`] states why that residue is harmless.
+    #[test]
+    fn composing_no_v2_operation_agrees_over_a_register_scoped_equivocation() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 1).unwrap();
+        let founder = crate::local_device(&conn, 1).unwrap();
+        let genesis =
+            storage::account_entries_for_enrollment(&conn, account).unwrap()[0].entry_hash;
+        let subject = Dev::new(23);
+
+        let author = |signer: &crate::device::DeviceSecret,
+                      seq: u64,
+                      prev: Option<AccountEntryHash>,
+                      authority: OwnerId,
+                      op: &AccountOp| {
+            let signed = envelope::sign_account_entry(
+                signer,
+                &AccountEntryHeader {
+                    account_id: account,
+                    log_id: 0,
+                    device_fingerprint: signer.public().fingerprint(),
+                    seq,
+                    prev_hash: prev,
+                    parent_ref: Some(genesis),
+                    entry_type: ops::entry_type_of(op),
+                    op_version: 1,
+                    crypto_suite: 0,
+                    auth_len: 1,
+                    key_id: None,
+                    authority_ref: Some(authority),
+                },
+                &ops::encode(op).unwrap(),
+            )
+            .unwrap();
+            storage::account_ingest(&conn, &signed.signed_bytes, 1).unwrap();
+            signed.entry_hash
+        };
+        let member = |seed: u8| {
+            let other = Dev::new(seed);
+            AccountOp::DeviceAdd {
+                device_fingerprint: other.fp,
+                ed25519_pubkey: other.ed,
+                x25519_pubkey: other.x,
+                role: DeviceRole::Member,
+                label: None,
+            }
+        };
+
+        let incarnation: OwnerId = author(founder.secret(), 1, Some(genesis), genesis.into(), &{
+            AccountOp::DeviceAdd {
+                device_fingerprint: subject.fp,
+                ed25519_pubkey: subject.ed,
+                x25519_pubkey: subject.x,
+                role: DeviceRole::Owner,
+                label: None,
+            }
+        })
+        .into();
+        // The subject EQUIVOCATES at seq 0: one sibling is accepted, the other forks.
+        let sibling_a = author(&subject.secret, 0, None, incarnation, &member(24));
+        let sibling_b = author(&subject.secret, 0, None, incarnation, &member(25));
+        // And the founder then cuts the subject's whole chain, scoping BOTH siblings.
+        author(founder.secret(), 2, Some(incarnation.into()), genesis.into(), &{
+            AccountOp::DeviceRemove {
+                device_fingerprint: subject.fp,
+                control_cut: Cut::Empty,
+                secrets_cut: Cut::Empty,
+                content_cuts: vec![],
+                reason: "revoked".into(),
+            }
+        });
+
+        let tx = conn.transaction().unwrap();
+        let bundle = checkpoint::prepare_checkpoint_in_tx(&tx, account, &founder).unwrap();
+        let proof = checkpoint::verify_checkpoint(
+            TrustedCheckpointPin {
+                account_id: account,
+                checkpoint_digest: bundle.certificate_digest(),
+                required_control_version: 2,
+            },
+            &bundle,
+        )
+        .unwrap();
+        drop(tx);
+
+        let frozen = proof.frozen_legacy();
+        let composed = pinned_history(frozen, &[]);
+        for hash in [sibling_a, sibling_b] {
+            assert!(
+                !frozen.accepted_at_checkpoint(&hash),
+                "both equivocating siblings are out of the accepted set",
+            );
+            assert!(
+                matches!(frozen.history().outcome(&hash), Some(Outcome::Condemned(_))),
+                "the register condemned them in the FOLD, so neither is merely forked",
+            );
+            assert_eq!(
+                composed.outcome(&hash),
+                frozen.history().outcome(&hash),
+                "and the composition repeats that verdict exactly",
+            );
+        }
+        assert_eq!(
+            composed.outcomes,
+            frozen.history().outcomes,
+            "no candidate gains or loses an outcome the checkpoint did not decide",
+        );
+    }
+
+    /// THE under-revocation this composition closes. Without the register effects the roster fact
+    /// stays open with both chains unbounded, so a device an authorized v2 cut removed still reads
+    /// as a live member whose entries are still effective.
+    #[test]
+    fn an_applied_v2_device_remove_revokes_the_subject_in_the_rebuilt_projection() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, nominated) = v2_cut(&fixture, false);
+        let outcome = applied(frozen, &nominated, &cut);
+        let subject = fixture.subject.fp;
+
+        // The checkpoint's own history is the baseline: the subject is an open roster member and
+        // its seq-0 entry is effective, which is exactly what an authorized cut has to be
+        // able to change.
+        let (before_ref, before) = roster_fact_for(frozen.history(), subject).expect("enrolled");
+        assert!(before.closed_at.is_none(), "the frozen epoch leaves the subject enrolled");
+        assert!(matches!(
+            frozen.history().roster_ref_effective(*before_ref, subject),
+            AuthorityQuery::Effective(_)
+        ));
+        assert!(
+            frozen
+                .history()
+                .outcome(&fixture.accepted_victim)
+                .is_some_and(|outcome| outcome.is_effective())
+        );
+
+        let history = pinned_history(frozen, &[AppliedOperation {
+            entry: &cut,
+            registers: &outcome.registers,
+        }]);
+
+        let (roster_ref, fact) = roster_fact_for(&history, subject).expect("the fact is kept");
+        assert!(fact.closed_at.is_some(), "the removal closes the subject's roster fact");
+        assert_eq!(fact.control_boundary, AuthorityBoundary::Closed, "control chain bounded");
+        assert_eq!(fact.secrets_boundary, AuthorityBoundary::Closed, "secrets chain bounded");
+        assert!(history.tombstoned().any(|d| *d == subject), "I4: a removal tombstones");
+        // Not a member,
+        assert!(
+            !matches!(
+                history.roster_ref_effective(*roster_ref, subject),
+                AuthorityQuery::Effective(_)
+            ),
+            "a revoked device is not an effective roster member",
+        );
+        // and not a writer: the device register condemns what was still standing on its chain.
+        assert!(
+            matches!(history.outcome(&fixture.accepted_victim), Some(Outcome::Condemned(_))),
+            "a revoked device's surviving entry is condemned",
+        );
+    }
+
+    /// The projection and the credit view must not disagree about what a cut took away. Both read
+    /// the ONE `apply_cut` result — the credit it returned and the registers it installed — so the
+    /// entries the rebuilt history newly drops out of the effective count are exactly what that cut
+    /// was credited for.
+    #[test]
+    fn the_rebuilt_projection_and_the_cuts_credit_agree_on_what_it_removed() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, nominated) = v2_cut(&fixture, false);
+        let outcome = applied(frozen, &nominated, &cut);
+        let history = pinned_history(frozen, &[AppliedOperation {
+            entry: &cut,
+            registers: &outcome.registers,
+        }]);
+        let newly_removed = frozen
+            .entries()
+            .iter()
+            .filter(|entry| {
+                frozen.history().outcome(&entry.entry_hash).is_some_and(|o| o.is_effective())
+                    && !history.outcome(&entry.entry_hash).is_some_and(|o| o.is_effective())
+            })
+            .count() as u64;
+        assert_eq!(outcome.credit, 1, "one of the subject's entries was still in the frozen count");
+        assert_eq!(
+            newly_removed, outcome.credit,
+            "the projection removed exactly what the cut was credited for",
+        );
+    }
+
+    /// An operation that installs NO register is deliberately not projected. Execution evaluates no
+    /// state preconditions, so projecting a v2 enrolment unjudged would put a device on the roster
+    /// this account's own history never admitted — a tombstoned one included. Omitting it can only
+    /// under-GRANT, which the operational gates cover; what it can never do is under-revoke.
+    #[test]
+    fn a_v2_operation_that_installs_no_register_grants_no_authority() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (_, nominated) = v2_cut(&fixture, true);
+        let enrolment = &nominated[0];
+        let outcome = applied(frozen, &[], enrolment);
+        assert!(outcome.registers.is_empty(), "an enrolment installs no register");
+        let history = pinned_history(frozen, &[AppliedOperation {
+            entry: enrolment,
+            registers: &outcome.registers,
+        }]);
+        assert_eq!(
+            projection_hash(&history),
+            projection_hash(frozen.history()),
+            "a v2 enrolment leaves the frozen projection untouched",
+        );
+    }
+
+    /// A register join the evidence cannot decide — an incomparable pair, or a watermark naming an
+    /// entry nothing holds — must not leave the HELD register standing. That would silently drop
+    /// the newcomer's watermark and admit entries a cut meant to condemn. The chain closes
+    /// instead: the empty cut is the one answer neither author can be under-served by, and a
+    /// later refold recomputes it once the evidence arrives.
+    #[test]
+    fn a_register_join_the_evidence_cannot_decide_closes_the_chain() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, _) = v2_cut(&fixture, false);
+        let key = RegisterKey::Device {
+            account: fixture.checkpoint.pin().account_id,
+            log: CONTROL_LOG,
+            device: fixture.subject.fp,
+        };
+        let registers = [
+            (key.clone(), Cut::At { seq: 1, hash: fixture.condemned_victim }),
+            // A watermark on a chain nothing in this view holds: the join is undecidable.
+            (key.clone(), Cut::At { seq: 9, hash: AccountEntryHash::from_bytes([0x5c; 32]) }),
+        ];
+        let history =
+            pinned_history(frozen, &[AppliedOperation { entry: &cut, registers: &registers }]);
+        let (_, fact) = roster_fact_for(&history, fixture.subject.fp).expect("enrolled");
+        assert_eq!(
+            fact.control_boundary,
+            AuthorityBoundary::Closed,
+            "an undecidable join closes the chain rather than keeping one side's watermark",
+        );
     }
 
     #[test]

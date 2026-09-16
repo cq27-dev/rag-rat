@@ -621,7 +621,7 @@ fn require_subject<T, S: PartialEq>(actual: S, expected: S) -> Result<(), Author
 
 /// A structurally-valid, signature-valid candidate the fold considers: the verified entry + its
 /// decoded KNOWN op. (Unknown ops classify `RetainedUnfolded` and are never folded.)
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(in crate::account) struct Candidate {
     entry: VerifiedAccountEntry,
     op: AccountOp,
@@ -2290,9 +2290,15 @@ fn derive_authority_facts(
             },
             AccountOp::OwnerPromote { device_fingerprint } => {
                 let hash = candidate.hash();
-                let roster_ref = roster
-                    .get(device_fingerprint)
-                    .expect("promoted device has an active roster fact");
+                // A promote of a device with no ACTIVE enrollment confers nothing. The v1 fold
+                // cannot reach this — `settle_authority_dependencies` rejects such a promote
+                // `Ineffective` — but `v2::pinned_history` composes a history without replaying the
+                // effect pass, and there a v2 cut can condemn the `DeviceAdd` that enrolled the
+                // subject while a promote authored on another chain stays effective. Total rather
+                // than an assertion, so that case grants nothing instead of panicking.
+                let Some(roster_ref) = roster.get(device_fingerprint) else {
+                    continue;
+                };
                 facts
                     .roster_refs
                     .get_mut(roster_ref)
