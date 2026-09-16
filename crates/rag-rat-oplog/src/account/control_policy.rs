@@ -1,5 +1,8 @@
-//! External trust is independent of the mutable authority projection. Control v2 execution is
-//! deliberately unsupported until the complete frozen-legacy and bounded-credit path is ready.
+//! External trust is independent of the mutable authority projection.
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::checkpoint::{self, CheckpointBundle, TrustedCheckpointPin, VerifiedCheckpoint};
@@ -8,7 +11,23 @@ use super::id::{self, AccountId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountControlPolicy {
     LegacyV1,
+    /// Pinned at a control version this binary EXECUTES: the account folds from its checkpoint
+    /// instead of being retracted. Operational authority is still refused — see
+    /// [`require_supported_account_control`].
+    ControlV2(TrustedCheckpointPin),
+    /// Pinned at a control version this binary cannot execute. Acceptance and every derived
+    /// projection are retracted; the signed candidates stay for a binary that can execute it.
     UnsupportedVersion(TrustedCheckpointPin),
+}
+
+impl AccountControlPolicy {
+    /// The pin this policy names, whatever version it requires.
+    fn pin(self) -> Option<TrustedCheckpointPin> {
+        match self {
+            Self::LegacyV1 => None,
+            Self::ControlV2(pin) | Self::UnsupportedVersion(pin) => Some(pin),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,7 +51,11 @@ pub enum PinInstallOutcome {
     AlreadyPinned,
 }
 
-/// Snapshot-local policy read. Every installed checkpoint currently requires unsupported v2.
+/// Snapshot-local policy read, dispatching on the version the pin itself names.
+///
+/// The dispatch is per-ACCOUNT, never a global constant: an UNPINNED account keeps folding v1
+/// whatever versions its rows carry, quarantining a v2 entry it meets, and that is what keeps an
+/// un-upgraded peer converging on the same accepted set as everyone else.
 pub fn account_control_policy(
     conn: &Connection,
     account: AccountId,
@@ -55,38 +78,58 @@ pub fn account_control_policy(
     };
     match row {
         None => Ok(AccountControlPolicy::LegacyV1),
-        Some((digest, version)) =>
-            Ok(AccountControlPolicy::UnsupportedVersion(TrustedCheckpointPin {
+        Some((digest, version)) => {
+            let pin = TrustedCheckpointPin {
                 account_id: account,
                 checkpoint_digest: id::fixed(&digest)?,
                 required_control_version: version,
-            })),
+            };
+            Ok(policy_for(pin))
+        },
     }
 }
 
-/// Whether `account` sits under a permanent control pin this binary cannot execute. The one
-/// predicate every cleanup path asks; operational paths use [`require_supported_account_control`]
-/// and fail closed instead.
-pub fn account_is_pinned(conn: &Connection, account: AccountId) -> anyhow::Result<bool> {
-    Ok(matches!(
-        account_control_policy(conn, account)?,
-        AccountControlPolicy::UnsupportedVersion(_)
-    ))
+/// The version dispatch itself. Split out because V130's `CHECK(required_version=2)` means no
+/// stored row can reach the unsupported branch today — this is the only place the forward-compat
+/// half of the dispatch can be exercised.
+fn policy_for(pin: TrustedCheckpointPin) -> AccountControlPolicy {
+    if pin.required_control_version == super::control_v2::ops::CONTROL_VERSION {
+        AccountControlPolicy::ControlV2(pin)
+    } else {
+        AccountControlPolicy::UnsupportedVersion(pin)
+    }
 }
 
-/// Whether `stream` is routed to a pinned account, by ownership or by the pin's routing table.
+/// Whether `account` sits under ANY permanent control pin. Nothing operational can be done with
+/// such an account whichever version it names — [`require_supported_account_control`] refuses for
+/// both — so this is the "there is nothing to reach here" predicate.
+///
+/// It is NOT a claim that the account's derived state is gone: a pin this binary executes folds
+/// from its checkpoint and KEEPS its authority projection. What every pin still retracts is
+/// content, which [`stream_control_pinned`] answers for.
+pub fn account_is_pinned(conn: &Connection, account: AccountId) -> anyhow::Result<bool> {
+    Ok(account_control_policy(conn, account)?.pin().is_some())
+}
+
+/// Whether `stream` is routed to ANY pinned account, by ownership or by the pin's routing table.
 /// The routing table is derived from the authenticated checkpoint proof, so this is the tightest
 /// "the pin retracted this stream" answer a cleanup consumer can ask.
+///
+/// Content is retracted under EVERY pin, including one this binary folds: the content acceptance
+/// path resolves stream authority through gated reads (`account_is_contested` and the
+/// ownership/access-mode lookups), and those keep refusing until an executable pin can also be
+/// operated under. Narrowing this to the unsupported case would un-retract a stream whose content
+/// still cannot be evaluated.
 pub fn stream_control_pinned(
     conn: &Connection,
     stream: crate::stream::StreamId,
 ) -> anyhow::Result<bool> {
-    match require_supported_stream_control(conn, stream) {
-        Ok(()) => Ok(false),
-        Err(error) if error.downcast_ref::<UnsupportedAccountControlVersion>().is_some() =>
-            Ok(true),
-        Err(error) => Err(error),
+    for account in pin_routed_accounts(conn, stream)? {
+        if account_is_pinned(conn, account)? {
+            return Ok(true);
+        }
     }
+    Ok(false)
 }
 
 /// Call inside the SAME snapshot as the authorized read or the SAME write transaction as mutation.
@@ -96,7 +139,10 @@ pub fn require_supported_account_control(
 ) -> anyhow::Result<()> {
     match account_control_policy(conn, account)? {
         AccountControlPolicy::LegacyV1 => Ok(()),
-        AccountControlPolicy::UnsupportedVersion(pin) =>
+        // BOTH pinned states refuse, and the executable one is not an oversight: a pin this binary
+        // can FOLD is not one it can operate under, because the authority projection a support gate
+        // reads does not yet carry the register effects of the account's v2 operations.
+        AccountControlPolicy::ControlV2(pin) | AccountControlPolicy::UnsupportedVersion(pin) =>
             Err(UnsupportedAccountControlVersion { pin }.into()),
     }
 }
@@ -109,9 +155,7 @@ pub fn pin_checkpoint_in_tx(
     proof: &VerifiedCheckpoint,
 ) -> anyhow::Result<PinInstallOutcome> {
     anyhow::ensure!(expected == proof.pin(), "checkpoint proof differs from expected pin");
-    if let AccountControlPolicy::UnsupportedVersion(existing) =
-        account_control_policy(tx, expected.account_id)?
-    {
+    if let Some(existing) = account_control_policy(tx, expected.account_id)?.pin() {
         anyhow::ensure!(existing == expected, "conflicting permanent account control pin");
         return Ok(PinInstallOutcome::AlreadyPinned);
     }
@@ -152,7 +196,10 @@ pub fn pin_checkpoint_in_tx(
             )?;
         }
     }
-    super::storage::clear_unsupported_authority_in_tx(tx, expected.account_id)?;
+    // Re-derive everything the pin changes, inside the install transaction. A pin this binary
+    // executes rebuilds its projection from the checkpoint; one it cannot execute retracts it. Both
+    // verdicts come from the dispatch a later fold takes, so install and refold can never disagree.
+    super::storage::refold_after_pin_install_in_tx(tx, expected.account_id)?;
     Ok(PinInstallOutcome::Installed)
 }
 
@@ -162,10 +209,21 @@ pub fn export_account_checkpoint(
     account: AccountId,
 ) -> anyhow::Result<Option<(TrustedCheckpointPin, CheckpointBundle)>> {
     let _snapshot = read_snapshot(conn)?;
-    let AccountControlPolicy::UnsupportedVersion(pin) = account_control_policy(conn, account)?
-    else {
+    let Some(pin) = account_control_policy(conn, account)?.pin() else {
         return Ok(None);
     };
+    let bundle = stored_checkpoint_bundle(conn, account)?;
+    checkpoint::verify_checkpoint(pin, &bundle)?;
+    Ok(Some((pin, bundle)))
+}
+
+/// The durable certificate and evidence rows behind `account`'s pin, exactly as installed.
+/// Deliberately unverified: both callers verify, and the caching one keys on the digest the
+/// certificate hashes to.
+fn stored_checkpoint_bundle(
+    conn: &Connection,
+    account: AccountId,
+) -> anyhow::Result<CheckpointBundle> {
     let certificate = conn.query_row(
         "SELECT certificate FROM account_control_pins WHERE account_id=?1",
         [account.to_bytes().as_slice()],
@@ -178,9 +236,46 @@ pub fn export_account_checkpoint(
     let evidence = stmt
         .query_map([account.to_bytes().as_slice()], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<Vec<u8>>>>()?;
-    let bundle = CheckpointBundle { certificate, evidence };
-    checkpoint::verify_checkpoint(pin, &bundle)?;
-    Ok(Some((pin, bundle)))
+    Ok(CheckpointBundle { certificate, evidence })
+}
+
+/// Verified checkpoints keyed by the account and the exact digest its pin names.
+type CheckpointCache = HashMap<(AccountId, [u8; 32]), Rc<VerifiedCheckpoint>>;
+
+thread_local! {
+    /// Reconstructing a checkpoint re-verifies every evidence signature, and a pinned account
+    /// reconstructs it on EVERY fold. Both inputs are immutable — the V130 triggers refuse UPDATE
+    /// and DELETE on the pin row and its evidence — and the pinned digest commits to the exact
+    /// evidence set, so a hit under the same key can only be the proof this call would rebuild.
+    ///
+    /// Thread-local, not process-global: process-global test state passes nextest and then fails
+    /// the single-process coverage run. It never evicts, which is bounded by the number of pinned
+    /// accounts a thread touches — a pin is permanent and operator-installed, so that set does not
+    /// grow with traffic.
+    static VERIFIED_CHECKPOINTS: RefCell<CheckpointCache> = RefCell::new(CheckpointCache::new());
+}
+
+/// The verified checkpoint behind `account`'s executable pin.
+///
+/// Errors when the account carries no pin this binary executes, and when the durable proof does not
+/// verify. The second is deliberately not a retraction: those rows are immutable, so a proof that
+/// stopped verifying is local corruption, and folding an account on a pin that does not verify is
+/// the one thing the pin exists to prevent.
+pub(super) fn verified_checkpoint(
+    conn: &Connection,
+    account: AccountId,
+) -> anyhow::Result<Rc<VerifiedCheckpoint>> {
+    let AccountControlPolicy::ControlV2(pin) = account_control_policy(conn, account)? else {
+        anyhow::bail!("account carries no control pin this binary executes");
+    };
+    let key = (account, pin.checkpoint_digest);
+    if let Some(cached) = VERIFIED_CHECKPOINTS.with(|cache| cache.borrow().get(&key).cloned()) {
+        return Ok(cached);
+    }
+    let bundle = stored_checkpoint_bundle(conn, account)?;
+    let proof = Rc::new(checkpoint::verify_checkpoint(pin, &bundle)?);
+    VERIFIED_CHECKPOINTS.with(|cache| cache.borrow_mut().insert(key, Rc::clone(&proof)));
+    Ok(proof)
 }
 
 /// A content header identifies its owner through the stream. Keep that route after projection
@@ -189,6 +284,20 @@ pub(super) fn require_supported_stream_control(
     conn: &Connection,
     stream: crate::stream::StreamId,
 ) -> anyhow::Result<()> {
+    for account in pin_routed_accounts(conn, stream)? {
+        require_supported_account_control(conn, account)?;
+    }
+    Ok(())
+}
+
+/// The accounts a stream is routed to: its folded owner, plus any pin whose routing table still
+/// names the stream after the ownership row was suppressed. Shared so the retraction predicate and
+/// the support gate can never disagree about WHICH accounts a stream answers to — only about what
+/// each one's policy means.
+fn pin_routed_accounts(
+    conn: &Connection,
+    stream: crate::stream::StreamId,
+) -> anyhow::Result<Vec<AccountId>> {
     let mut stmt = match conn.prepare(
         "SELECT account_id FROM account_control_pin_streams WHERE stream_id=?1 UNION SELECT \
          account_id FROM account_stream_ownership WHERE stream_id=?1",
@@ -196,17 +305,14 @@ pub(super) fn require_supported_stream_control(
         Ok(stmt) => stmt,
         Err(error) if missing_table(&error, "account_control_pin_streams") => {
             require_pre_pin_schema(conn)?;
-            return Ok(());
+            return Ok(Vec::new());
         },
         Err(error) => return Err(error.into()),
     };
     let accounts = stmt
         .query_map([stream.to_bytes().as_slice()], |r| r.get::<_, Vec<u8>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for account in accounts {
-        require_supported_account_control(conn, AccountId::from_bytes(id::fixed(&account)?))?;
-    }
-    Ok(())
+    accounts.iter().map(|account| Ok(AccountId::from_bytes(id::fixed(account)?))).collect()
 }
 
 fn missing_table(error: &rusqlite::Error, table: &str) -> bool {
@@ -234,6 +340,7 @@ pub(crate) fn read_snapshot(conn: &Connection) -> rusqlite::Result<Option<Transa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::{control_v2, envelope, fold, ops, storage, test_support};
 
     fn proof(conn: &Connection, account: AccountId) -> VerifiedCheckpoint {
         let device = crate::local_device(conn, 0).unwrap();
@@ -289,7 +396,8 @@ mod tests {
         assert!(pin_checkpoint_in_tx(&tx, first.pin(), &first).is_err());
         assert_eq!(
             account_control_policy(&tx, account).unwrap(),
-            AccountControlPolicy::UnsupportedVersion(expected)
+            AccountControlPolicy::ControlV2(expected),
+            "the schema admits only version 2, so every installed pin is one this binary executes",
         );
         let other = TrustedCheckpointPin { checkpoint_digest: [3; 32], ..expected };
         assert!(pin_checkpoint_in_tx(&tx, other, &proof).is_err());
@@ -301,7 +409,11 @@ mod tests {
         let roster: i64 = conn
             .query_row("SELECT count(*) FROM account_roster_history", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(roster, 0);
+        assert_eq!(
+            roster, 1,
+            "a pin this binary executes REBUILDS the roster from its checkpoint rather than \
+             emptying it — the founder's own enrolment is the fixture's whole roster",
+        );
         drop(conn);
         let reopened = Connection::open(path).unwrap();
         let (pin, bundle) = export_account_checkpoint(&reopened, account).unwrap().unwrap();
@@ -428,5 +540,323 @@ mod tests {
             account_control_policy(&conn, AccountId::from_bytes([1; 32])).unwrap(),
             AccountControlPolicy::LegacyV1
         );
+    }
+
+    /// Author one control-log `DeviceAdd` at seq 1 on `device`'s own chain, continuing from
+    /// `genesis` and citing the founder incarnation `genesis` names. `version` is the whole point:
+    /// a v1 sibling and a v2 continuation differ only in the header's `op_version` and the payload
+    /// framing that version selects, so every test here builds both from one helper.
+    fn device_add_entry(
+        account: AccountId,
+        device: &crate::identity::LocalDevice,
+        genesis: super::id::AccountEntryHash,
+        checkpoint_digest: [u8; 32],
+        version: u32,
+        seed: u8,
+    ) -> envelope::SignedAccountEntry {
+        let enrolled = test_support::Dev::new(seed);
+        let op = ops::AccountOp::DeviceAdd {
+            device_fingerprint: enrolled.fp,
+            ed25519_pubkey: enrolled.ed,
+            x25519_pubkey: enrolled.x,
+            role: ops::DeviceRole::Member,
+            label: None,
+        };
+        let payload = if version == control_v2::ops::CONTROL_VERSION {
+            control_v2::ops::ControlOp {
+                checkpoint: checkpoint_digest,
+                pre_cut_view: None,
+                op: op.clone(),
+            }
+            .encode()
+            .unwrap()
+        } else {
+            ops::encode(&op).unwrap()
+        };
+        envelope::sign_account_entry(
+            device.secret(),
+            &envelope::AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: device.fingerprint(),
+                seq: 1,
+                prev_hash: Some(genesis),
+                parent_ref: Some(genesis),
+                entry_type: ops::entry_type_of(&op),
+                op_version: version,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(genesis.into()),
+            },
+            &payload,
+        )
+        .unwrap()
+    }
+
+    fn accepted_flag(conn: &Connection, hash: super::id::AccountEntryHash) -> i64 {
+        conn.query_row(
+            "SELECT accepted FROM account_entries WHERE entry_hash = ?1",
+            [hash.as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn row_count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+    }
+
+    /// A local account whose founder has enrolled one member at seq 1. Returns the account, the
+    /// founder device, the genesis hash (which is also the founder's owner incarnation) and the
+    /// accepted seq-1 entry.
+    fn account_with_one_enrolment(
+        conn: &Connection,
+    ) -> (
+        AccountId,
+        crate::identity::LocalDevice,
+        super::id::AccountEntryHash,
+        super::id::AccountEntryHash,
+    ) {
+        let account = crate::local_account(conn, 1).unwrap();
+        let device = crate::local_device(conn, 1).unwrap();
+        let genesis = crate::read_local_account_genesis(conn).unwrap().unwrap();
+        let add = device_add_entry(account, &device, genesis, [0; 32], 1, 7);
+        storage::account_ingest(conn, &add.signed_bytes, 1).unwrap();
+        assert_eq!(
+            accepted_flag(conn, add.entry_hash),
+            1,
+            "the enrolment is accepted before the pin"
+        );
+        (account, device, genesis, add.entry_hash)
+    }
+
+    fn install_pin(conn: &Connection, account: AccountId) -> TrustedCheckpointPin {
+        let proof = proof(conn, account);
+        let tx =
+            Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        pin_checkpoint_in_tx(&tx, proof.pin(), &proof).unwrap();
+        tx.commit().unwrap();
+        proof.pin()
+    }
+
+    /// THE constraint the pinned fold rests on. A v1 control entry that arrives AFTER the pin is
+    /// not in the checkpoint's evidence, so it never becomes effective and never reaches the
+    /// min-hash tiebreak. Account ingest is NOT pin-gated, so without this an ordinary v1 sibling
+    /// with a smaller entry hash would demote the checkpoint's own winner and collapse that
+    /// device's accepted chain — reviving a frozen branch loser out of ordinary v1 traffic.
+    #[test]
+    fn a_post_pin_v1_sibling_with_a_smaller_hash_cannot_displace_the_checkpoints_winner() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, device, genesis, accepted) = account_with_one_enrolment(&conn);
+        install_pin(&conn, account);
+
+        // A sibling at the SAME slot whose hash sorts BELOW the accepted entry's — the side that
+        // wins `select_coherent_branches`' min-hash tiebreak whenever both are effective.
+        let sibling = (20u8..=200)
+            .map(|seed| device_add_entry(account, &device, genesis, [0; 32], 1, seed))
+            .find(|entry| entry.entry_hash < accepted)
+            .expect("a smaller-hash sibling exists");
+        storage::account_ingest(&conn, &sibling.signed_bytes, 2).unwrap();
+
+        assert_eq!(accepted_flag(&conn, accepted), 1, "the checkpoint's winner keeps its slot");
+        assert_eq!(
+            accepted_flag(&conn, sibling.entry_hash),
+            0,
+            "a post-pin v1 sibling never competes for a slot the checkpoint decided",
+        );
+    }
+
+    /// A v2 continuation may EXTEND a device's accepted chain but never CONTEST a slot the
+    /// checkpoint already decided.
+    ///
+    /// Such an entry really is authorized: its `prev_hash` is checkpoint-accepted so the ancestry
+    /// walk lands, and the founder signing it cites its own live incarnation, so the executor
+    /// applies it. The min-hash tiebreak is symmetric, so without the frozen-slot guard an applied
+    /// v2 entry with the smaller hash displaces the checkpoint's own winner and collapses the
+    /// accepted chain above it — selecting a different historical branch, which is the frozen
+    /// branch-loser revival the pin exists to prevent. Being authorized is not permission to
+    /// rewrite what the pin froze.
+    #[test]
+    fn an_applied_v2_entry_cannot_contest_a_slot_the_checkpoint_already_decided() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, device, genesis, accepted) = account_with_one_enrolment(&conn);
+        let digest = install_pin(&conn, account).checkpoint_digest;
+
+        // Same slot as the accepted enrolment, and the smaller hash — the side that wins the
+        // min-hash tiebreak the moment both are effective.
+        let contender = (20u8..=200)
+            .map(|seed| device_add_entry(account, &device, genesis, digest, 2, seed))
+            .find(|entry| entry.entry_hash < accepted)
+            .expect("a smaller-hash v2 contender exists");
+        storage::account_ingest(&conn, &contender.signed_bytes, 2).unwrap();
+
+        assert_eq!(accepted_flag(&conn, accepted), 1, "the checkpoint's winner keeps its slot");
+        assert_eq!(
+            accepted_flag(&conn, contender.entry_hash),
+            0,
+            "an APPLIED v2 entry still never displaces a slot the checkpoint decided",
+        );
+    }
+
+    /// Installing a pin must not fail merely because an enrollment invite is outstanding.
+    ///
+    /// The fold's reservation top-up resolves the account's streams through the GATED
+    /// `owned_streams_for_account`, which refuses under either pin state — and it short-circuits
+    /// when nothing is outstanding, so a fixture without a reservation never reached it. There is
+    /// nothing to reserve capacity for on an account no enrollment can redeem against, so the whole
+    /// top-up is skipped under a pin; running it would fail the fold, and the pin install with it,
+    /// blaming a version mismatch that is not the cause.
+    #[test]
+    fn a_pin_installs_with_an_enrollment_reservation_outstanding() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, _device, _genesis, enrolled) = account_with_one_enrolment(&conn);
+        {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            crate::upsert_account_candidate_reservation_in_tx(
+                &tx,
+                account,
+                [9; 32],
+                4,
+                4096,
+                2,
+                rag_rat_base::time::now_ms() + 3_600_000,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        install_pin(&conn, account);
+        assert_eq!(
+            accepted_flag(&conn, enrolled),
+            1,
+            "the pin installed and folded with the reservation still outstanding",
+        );
+        storage::refold_account(&conn, account).unwrap();
+        assert_eq!(accepted_flag(&conn, enrolled), 1, "and every later fold is equally unaffected");
+    }
+
+    /// Two v2 continuations at ONE chain slot resolve to exactly one accepted entry, and to the
+    /// same one whichever order they arrive in. Selection never PROMOTES: an applied v2 entry only
+    /// becomes EFFECTIVE, and the ordinary coherence walk then picks the sibling by min hash.
+    /// Both orders replay against a BYTE-IDENTICAL database, copied once the pin has landed: a
+    /// local account mints fresh keys on every call, so two separately built stores would compare
+    /// the winners of two different accounts and prove nothing about ordering.
+    #[test]
+    fn two_v2_siblings_at_one_slot_resolve_to_one_accepted_under_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin.sqlite");
+        let siblings = {
+            let conn = Connection::open(&origin).unwrap();
+            rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+            let account = crate::local_account(&conn, 1).unwrap();
+            let device = crate::local_device(&conn, 1).unwrap();
+            let genesis = crate::read_local_account_genesis(&conn).unwrap().unwrap();
+            let digest = install_pin(&conn, account).checkpoint_digest;
+            let siblings: Vec<_> = [31u8, 32]
+                .iter()
+                .map(|seed| device_add_entry(account, &device, genesis, digest, 2, *seed))
+                .collect();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            siblings
+        };
+        let winner_of = |name: &str, order: [usize; 2]| {
+            let path = dir.path().join(name);
+            std::fs::copy(&origin, &path).unwrap();
+            let conn = Connection::open(&path).unwrap();
+            for index in order {
+                storage::account_ingest(&conn, &siblings[index].signed_bytes, 2).unwrap();
+            }
+            let accepted: Vec<_> = siblings
+                .iter()
+                .filter(|entry| accepted_flag(&conn, entry.entry_hash) == 1)
+                .map(|entry| entry.entry_hash)
+                .collect();
+            assert_eq!(accepted.len(), 1, "exactly one v2 sibling holds the slot");
+            accepted[0]
+        };
+        let forward = winner_of("forward.sqlite", [0, 1]);
+        assert_eq!(
+            forward,
+            winner_of("reverse.sqlite", [1, 0]),
+            "the surviving sibling does not depend on arrival order",
+        );
+        assert_eq!(
+            forward,
+            siblings.iter().map(|entry| entry.entry_hash).min().unwrap(),
+            "and the survivor is the min-hash sibling the coherence walk picks",
+        );
+    }
+
+    /// A pinned account's authority projection is REBUILT from its checkpoint, not emptied. The
+    /// retraction made such an account survivable; a pin this binary executes has to do better.
+    #[test]
+    fn an_executable_pin_rebuilds_the_authority_projection_instead_of_emptying_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, _device, _genesis, enrolled) = account_with_one_enrolment(&conn);
+        install_pin(&conn, account);
+
+        assert!(account_is_pinned(&conn, account).unwrap());
+        assert_eq!(row_count(&conn, "account_roster_history"), 2, "founder plus the enrolment");
+        assert_eq!(row_count(&conn, "account_owner_incarnations"), 1, "the founder's incarnation");
+        assert_eq!(row_count(&conn, "account_auth_state"), 1, "classified, not absent");
+        assert_eq!(
+            row_count(&conn, "account_entries WHERE accepted = 1"),
+            2,
+            "the checkpoint's accepted control chain keeps its acceptance",
+        );
+        assert_eq!(accepted_flag(&conn, enrolled), 1);
+        // Folding is not operating: the support gate is deliberately untouched by this dispatch.
+        assert!(require_supported_account_control(&conn, account).is_err());
+    }
+
+    /// The retraction path is reached only by a pin naming a version this binary cannot execute,
+    /// and V130's `CHECK(required_version=2)` means no stored row can name one yet. Drive it
+    /// directly so the forward-compat branch still works when a later schema admits one.
+    #[test]
+    fn the_retraction_path_still_empties_every_projection_it_owns() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, _device, _genesis, enrolled) = account_with_one_enrolment(&conn);
+        let tx =
+            Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate).unwrap();
+        storage::clear_unsupported_authority_in_tx(&tx, account).unwrap();
+        tx.commit().unwrap();
+        for table in [
+            "account_roster_content_boundaries",
+            "account_roster_history",
+            "account_owner_incarnations",
+            "account_stream_ownership",
+            "account_stream_grants",
+            "account_stream_grant_cuts",
+            "account_auth_state",
+            "account_repo_incarnation_current",
+        ] {
+            assert_eq!(row_count(&conn, table), 0, "{table} is retracted");
+        }
+        assert_eq!(accepted_flag(&conn, enrolled), 0, "acceptance is retracted too");
+    }
+
+    /// The forward-compat half of the version dispatch, unreachable through a stored row while the
+    /// V130 CHECK admits only version 2.
+    #[test]
+    fn the_version_dispatch_executes_two_and_refuses_anything_else() {
+        let pin = |version| TrustedCheckpointPin {
+            account_id: AccountId::from_bytes([1; 32]),
+            checkpoint_digest: [2; 32],
+            required_control_version: version,
+        };
+        assert_eq!(policy_for(pin(2)), AccountControlPolicy::ControlV2(pin(2)));
+        for version in [0, 1, 3, 99] {
+            assert_eq!(
+                policy_for(pin(version)),
+                AccountControlPolicy::UnsupportedVersion(pin(version)),
+                "version {version} is not one this binary can execute",
+            );
+        }
     }
 }

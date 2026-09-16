@@ -361,6 +361,10 @@ impl SyncStore for OplogContentSyncStore<'_> {
             // contribution sits on a public stream.
             // A pinned foreign author resolves the same way: not public here, dropped as
             // NoChange — the peer has no pin and re-offers every round.
+            // The `.ok()` below SWALLOWS the pinned-account refusal `stream_owner_account` raises.
+            // That is fail-closed only because the `account_is_pinned` term is evaluated first and
+            // already drops the entry; drop that term and a pinned owner would fall through as
+            // "not public" by accident rather than by rule. Keep them together.
             let public = !account_is_pinned(self.conn, entry_account)?
                 && stream_owner_account(self.conn, stream).ok().flatten().is_some_and(|owner| {
                     stream_access_mode(self.conn, owner, stream).ok()

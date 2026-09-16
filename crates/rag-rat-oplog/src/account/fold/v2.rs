@@ -91,6 +91,14 @@ impl FrozenLegacy {
         &self.entries
     }
 
+    /// The FINAL legacy fold the checkpoint committed to. A pinned refold projects this verbatim
+    /// rather than re-deriving it: the certificate's `projection_hash` is a commitment to exactly
+    /// this history, so re-folding the same evidence could only reproduce it or disagree with the
+    /// pin.
+    pub(in crate::account) fn history(&self) -> &AccountAuthHistory {
+        &self.history
+    }
+
     pub(in crate::account) fn accepted_entries(
         &self,
     ) -> impl Iterator<Item = AccountEntryHash> + '_ {

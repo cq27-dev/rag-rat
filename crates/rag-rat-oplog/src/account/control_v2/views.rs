@@ -172,7 +172,10 @@ pub(in crate::account) fn plan_replay(
     Ok(ReplayPlan { order, manifests: views, candidates, consumer, consumer_op })
 }
 
-fn decode_candidate(
+/// Decode one v2 control candidate for exactly this checkpoint. Also the membership test a driver
+/// uses to pick the held rows that form an execution pool: anything this refuses would refuse every
+/// bundle it appeared in, rather than only itself.
+pub(in crate::account) fn decode_candidate(
     pin: &super::super::checkpoint::TrustedCheckpointPin,
     bytes: &[u8],
 ) -> anyhow::Result<(SignedAccountEntry, ops::ControlOp)> {
