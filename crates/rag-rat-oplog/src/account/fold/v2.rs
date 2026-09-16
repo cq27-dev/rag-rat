@@ -284,13 +284,19 @@ impl V2Authority {
         // that mint authorizes the same operation — while one that dies at an object we hold, or
         // that cites nothing at all, is refused on its own merits. The frozen epoch never changes,
         // so only the first can ever be cleared, and only the first may park.
+        //
+        // One answer per incarnation rather than per entry: every link of a chain shares the
+        // terminal that answers it, so a bundle whose entries all cite one long unresolvable chain
+        // walks it once. That keeps this pass bounded by the incarnations the declared evidence
+        // budget admits, as the rest of the engine is.
+        let mut unsupplied: HashMap<OwnerId, bool> = HashMap::new();
         for candidate in bundle {
             if verdicts.contains_key(&candidate.hash()) {
                 continue;
             }
-            let withheld = incarnations
-                .author_incarnation_id(candidate)
-                .is_some_and(|cited| cites_unsupplied_mint(&incarnations, &headers, cited));
+            let withheld = incarnations.author_incarnation_id(candidate).is_some_and(|cited| {
+                cites_unsupplied_mint(&incarnations, &headers, &mut unsupplied, cited)
+            });
             let verdict =
                 if withheld { V2Verdict::MintNotSupplied } else { V2Verdict::Inadmissible };
             verdicts.insert(candidate.hash(), verdict);
@@ -320,24 +326,33 @@ impl V2Authority {
 fn cites_unsupplied_mint(
     incarnations: &Incarnations<'_>,
     headers: &HashMap<AccountEntryHash, &AccountEntryHeader>,
+    unsupplied: &mut HashMap<OwnerId, bool>,
     cited: OwnerId,
 ) -> bool {
-    let mut seen = HashSet::new();
+    let mut walked = HashSet::new();
     let mut node = cited;
-    loop {
+    let answer = loop {
+        if let Some(&answered) = unsupplied.get(&node) {
+            break answered;
+        }
         // A cycle resolves nothing, and nothing that arrives later breaks it.
-        if !seen.insert(node) {
-            return false;
+        if !walked.insert(node) {
+            break false;
         }
         let Some(mint) = incarnations.candidate(&node) else {
             let hash: AccountEntryHash = node.into();
-            return !headers.contains_key(&hash);
+            break !headers.contains_key(&hash);
         };
         match mint.header().authority_ref {
-            None => return false,
+            None => break false,
             Some(parent) => node = parent,
         }
+    };
+    // Every link walked ends at the terminal that answered it, so they all take that answer.
+    for link in walked {
+        unsupplied.insert(link, answer);
     }
+    answer
 }
 
 /// Execute one authorized operation. A non-cut installs nothing and earns nothing.
