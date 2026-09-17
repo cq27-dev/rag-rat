@@ -1506,6 +1506,87 @@ mod tests {
         assert_eq!(with.credit, 1);
     }
 
+    /// Author `op` as a v2 control entry at the founder's continuation tip and execute it against
+    /// the frozen legacy exactly as the executor does — one authority resolution, then `apply_cut`
+    /// reading that same resolution.
+    fn execute_v2_on_founder_chain(fixture: &DemotedOwner, op: &AccountOp) -> CutOutcome {
+        let tip = founder_tip(fixture);
+        let cut = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            op,
+            v2_ops::CONTROL_VERSION,
+        );
+        execute(fixture.checkpoint.frozen_legacy(), &[], &cut)
+    }
+
+    /// An `OwnerDemote` naming an incarnation this account cannot resolve PARKS rather than
+    /// rejects: the mint may simply have been withheld, and the same bundle plus that mint
+    /// authorizes the same operation. Rejecting would make a recoverable gap permanent.
+    #[test]
+    fn a_demote_of_an_unresolvable_incarnation_parks_rather_than_rejecting() {
+        let fixture = demoted_owner();
+        let outcome = execute_v2_on_founder_chain(&fixture, &AccountOp::OwnerDemote {
+            device_fingerprint: fixture.subject.fp,
+            owner_id: OwnerId::from_bytes([0x6d; 32]),
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            reason: "unresolvable".into(),
+        });
+        assert!(
+            matches!(outcome, CutOutcome::Parked(ParkReason::UnknownOwnerRef)),
+            "an incarnation nothing resolves is withheld evidence, not a refusal",
+        );
+    }
+
+    /// An `OwnerDemote` whose `owner_id` was minted for a DIFFERENT device than its subject is
+    /// rejected outright. Without this binding a demote could name any live incarnation and close
+    /// it while claiming to act on someone else's device.
+    #[test]
+    fn a_demote_whose_incarnation_was_minted_for_another_device_is_rejected() {
+        let fixture = demoted_owner();
+        // The FOUNDER's own live incarnation, but naming the SUBJECT device as the demote target:
+        // the incarnation resolves, and resolves to a different device than the op names.
+        let outcome = execute_v2_on_founder_chain(&fixture, &AccountOp::OwnerDemote {
+            device_fingerprint: fixture.subject.fp,
+            owner_id: fixture.incarnation,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            reason: "misbound".into(),
+        });
+        assert!(
+            matches!(outcome, CutOutcome::Rejected(RejectReason::WrongDevice)),
+            "the incarnation must have been minted for the device the demote names",
+        );
+    }
+
+    /// A revocation's watermark must name a coordinate on the chain its register bounds. This one
+    /// names an entry the account HOLDS — so it is not a withheld watermark, which parks — but on a
+    /// different device's chain than the register scopes. That is structural, and it rejects the
+    /// whole operation rather than installing a register whose watermark means nothing.
+    #[test]
+    fn a_cut_whose_watermark_names_another_devices_chain_is_rejected() {
+        let fixture = demoted_owner();
+        // The genesis: seq 0, held, and on the FOUNDER's chain — while the register this removal
+        // installs is scoped to the SUBJECT's chain. Of the coordinate's four conjuncts only the
+        // device differs, so the binding is `Mismatch` and never `TargetNotHeld`.
+        let genesis: AccountEntryHash = fixture.incarnation.into();
+        let outcome = execute_v2_on_founder_chain(&fixture, &AccountOp::DeviceRemove {
+            device_fingerprint: fixture.subject.fp,
+            control_cut: Cut::At { seq: 0, hash: genesis },
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "misbound".into(),
+        });
+        assert!(
+            matches!(outcome, CutOutcome::Rejected(RejectReason::CutTargetMismatch)),
+            "a watermark naming a different chain than its register rejects the whole op",
+        );
+    }
+
     /// The two ways a citation fails to resolve, told apart on ONE entry: the same operation citing
     /// the same hash, differing only in whether that object was supplied. An entry we hold that is
     /// not a mint never becomes one, so that refusal is final; an object nothing supplied may
