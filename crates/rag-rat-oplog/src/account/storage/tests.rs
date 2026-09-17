@@ -637,7 +637,7 @@ fn enrollment_budget_reports_raw_headroom_and_clamps_at_zero() {
     let conn = db();
     let account = AccountId::from_bytes([7; 32]);
     let local_fp = crate::local_device(&conn, NOW).unwrap().fingerprint();
-    let budget = super::super::bootstrap::enrollment_budget(&conn, account, NOW).unwrap();
+    let budget = super::super::bootstrap::enrollment_budget(&conn, account).unwrap();
     // The ORDINARY cap: an enrollment receipt is ordinary traffic, so the preflight measures it
     // against the budget above the view-manifest floor — the one admission will apply to it.
     assert_eq!(budget.account_entries_remaining as usize, ORDINARY_CANDIDATES_PER_ACCOUNT_MAX);
@@ -667,7 +667,7 @@ fn enrollment_budget_reports_raw_headroom_and_clamps_at_zero() {
         )
         .unwrap();
     }
-    let budget = super::super::bootstrap::enrollment_budget(&conn, account, NOW).unwrap();
+    let budget = super::super::bootstrap::enrollment_budget(&conn, account).unwrap();
     assert_eq!(
         budget.account_entries_remaining as usize,
         ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 100
@@ -682,7 +682,7 @@ fn enrollment_budget_reports_raw_headroom_and_clamps_at_zero() {
     // Past the grow-only caps the budget clamps at zero rather than wrapping.
     let clamped = db();
     seed_global_candidate_rows(&clamped, CANDIDATES_GLOBAL_MAX + 10, 1_000);
-    let budget = super::super::bootstrap::enrollment_budget(&clamped, account, NOW).unwrap();
+    let budget = super::super::bootstrap::enrollment_budget(&clamped, account).unwrap();
     assert_eq!(budget.global_entries_remaining, 0, "past-cap headroom clamps to zero");
 }
 
@@ -745,7 +745,7 @@ fn enrollment_budget_does_not_reserve_non_fatal_pre_verify_promotions() {
     )
     .unwrap();
 
-    let budget = super::super::bootstrap::enrollment_budget(&conn, account, NOW).unwrap();
+    let budget = super::super::bootstrap::enrollment_budget(&conn, account).unwrap();
     // Account and content retries happen only after every receipt entry wins admission, so
     // they cannot roll one-time adoption back even when they form a valid transitive closure.
     assert_eq!(budget.account_entries_remaining as usize, ORDINARY_CANDIDATES_PER_ACCOUNT_MAX);
@@ -791,7 +791,6 @@ fn enrollment_authoring_fits_gates_the_invite_boundary_on_candidate_headroom() {
         &[],
         DeviceRole::Member,
         Some("laptop"),
-        NOW,
     )
     .unwrap();
 
@@ -810,7 +809,6 @@ fn enrollment_authoring_fits_gates_the_invite_boundary_on_candidate_headroom() {
         &[],
         DeviceRole::Member,
         Some("laptop"),
-        NOW,
     )
     .expect_err("a store without headroom for the DeviceAdd itself must refuse");
     assert!(error.to_string().contains("unredeemable"), "unexpected error: {error}");
@@ -846,7 +844,6 @@ fn enrollment_authoring_fits_gates_the_invite_boundary_on_candidate_headroom() {
         &[],
         DeviceRole::Member,
         None,
-        NOW,
     )
     .expect("latent pre-verify work is not part of mandatory enrollment capacity");
 }
@@ -1062,57 +1059,139 @@ fn reservation_upsert_updates_and_release_is_idempotent() {
     assert_eq!(rows, 0, "releasing twice is a no-op, not an error");
 }
 
+/// Reserve two live key targets for `account` under `expires_at_ms`. The shape (3 entries /
+/// 100_000 bytes / 2 targets) is deliberately larger than the fixture's real live target set, so a
+/// top-up that runs is visible as a shrink and one that is skipped leaves the row verbatim.
+fn reserve_two_targets(
+    conn: &Connection,
+    account: AccountId,
+    reservation_id: [u8; 32],
+    expires_at_ms: i64,
+) {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+        &tx,
+        account,
+        reservation_id,
+        3,
+        100_000,
+        2,
+        expires_at_ms,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+fn reservation_row(conn: &Connection, reservation_id: [u8; 32]) -> (i64, i64, i64) {
+    conn.query_row(
+        "SELECT reserved_entries, reserved_bytes, reserved_targets
+               FROM account_candidate_reservations WHERE reservation_id = ?1",
+        [reservation_id.as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
+}
+
 #[test]
 fn invite_reservations_shrink_when_the_live_target_set_shrinks() {
     let conn = db();
     let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
     // A reservation recorded when two key targets were live must not keep their capacity
-    // after a fold reduces the live set: the top-up is bidirectional.
-    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
-        &tx,
-        account,
-        [0x52; 32],
-        3,
-        100_000,
-        2,
-        NOW + 1_000,
-    )
-    .unwrap();
-    tx.commit().unwrap();
+    // after a fold reduces the live set: the top-up is bidirectional. The expiry is WALL-CLOCK
+    // live, which is what makes the invite outstanding at all — `NOW` is a fixed past instant, so
+    // a TTL near it is expired and the top-up would correctly skip the row entirely.
+    reserve_two_targets(&conn, account, [0x52; 32], rag_rat_base::time::now_ms() + 3_600_000);
 
     refold_account(&conn, account).unwrap();
-    let (entries, bytes, targets): (i64, i64, i64) = conn
-        .query_row(
-            "SELECT reserved_entries, reserved_bytes, reserved_targets
-                   FROM account_candidate_reservations WHERE reservation_id = ?1",
-            [[0x52; 32].as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let (entries, bytes, targets) = reservation_row(&conn, [0x52; 32]);
     assert_eq!(targets, 0, "no live key targets remain");
     assert_eq!(entries, 1, "only the mandatory DeviceAdd stays reserved");
     assert!(bytes < 100_000, "the reclaimed wrap bytes return to the shared headroom");
 }
 
+/// An invite TTL is wall-clock, but `refold_account` folds with `coalesce(max(received_at_ms), 0)`
+/// — the newest entry's ARRIVAL. Any reservation minted after that arrival outranks the coordinate
+/// forever, so a long-lapsed invite would read as outstanding and keep reserving headroom against a
+/// ticket nothing can redeem (#1362).
+///
+/// Asserts a NEGATIVE — the row is left untouched — so a top-up that never runs at all also
+/// satisfies it. `invite_reservations_shrink_when_the_live_target_set_shrinks` and the two
+/// wall-clock-live enrollment tests in `rag-rat-sync`
+/// (`new_mandatory_key_targets_grow_an_outstanding_invites_reservation`,
+/// `synced_key_target_growth_tops_up_the_outstanding_reservation`) are what prove the top-up
+/// ever fires. Deleting those believing this pair covers the ground leaves a dead top-up
+/// uncaught.
+#[test]
+fn a_lapsed_reservation_is_not_outstanding_under_a_stale_fold_clock() {
+    let conn = db();
+    let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
+    // Expires just after the fixture's arrival stamp, and years before the real wall clock.
+    reserve_two_targets(&conn, account, [0x54; 32], NOW + 1_000);
+
+    refold_account(&conn, account).unwrap();
+
+    assert_eq!(
+        reservation_row(&conn, [0x54; 32]),
+        (3, 100_000, 2),
+        "a wall-clock-expired reservation is not outstanding, so the top-up leaves it untouched",
+    );
+}
+
+/// The same rule for the migration backfill, which replays every account with a literal `0` clock.
+/// The expiry comparison must not inherit that coordinate either — but note the backfill's `0` has
+/// to stay a replay coordinate for the authority projection it rewrites, which is why the wall
+/// clock is read inside the top-up rather than supplied by this caller.
+///
+/// Asserts a NEGATIVE — the row is left untouched — so a top-up that never runs at all also
+/// satisfies it. `invite_reservations_shrink_when_the_live_target_set_shrinks` and the two
+/// wall-clock-live enrollment tests in `rag-rat-sync`
+/// (`new_mandatory_key_targets_grow_an_outstanding_invites_reservation`,
+/// `synced_key_target_growth_tops_up_the_outstanding_reservation`) are what prove the top-up
+/// ever fires. Deleting those believing this pair covers the ground leaves a dead top-up
+/// uncaught.
+#[test]
+fn a_lapsed_reservation_is_not_outstanding_under_the_migration_backfill_clock() {
+    let conn = db();
+    let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
+    reserve_two_targets(&conn, account, [0x55; 32], NOW + 1_000);
+
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    backfill_authority_projection(&tx).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(
+        reservation_row(&conn, [0x55; 32]),
+        (3, 100_000, 2),
+        "the backfill's zero clock must not make a lapsed reservation outstanding",
+    );
+}
+
+/// Covers that a live reservation charges admission capacity and a lapsed one frees it.
+///
+/// The exact-millisecond boundary (`>` vs `>=` at the expiry instant) is deliberately NOT
+/// pinned. The predicate reads the wall clock, so no test can sit on that instant, and
+/// reintroducing an injected clock at the predicate to keep one assertion would undo the point
+/// of #1362. Getting the boundary wrong costs one millisecond of over- or under-reservation.
+/// Active-charges and lapsed-frees stay covered on both sides, which is the part that matters.
 #[test]
 fn enrollment_reservations_reserve_candidate_capacity_until_consumed_or_expired() {
     let conn = db();
     let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
-    let fits = |now_ms| {
+    let fits = || {
         super::super::authoring::enrollment_authoring_fits(
             &conn,
             account,
             &[],
             DeviceRole::Member,
             Some("laptop"),
-            now_ms,
         )
     };
-    fits(NOW).unwrap();
+    fits().unwrap();
 
     // An outstanding invite's reservation consumes the same grow-only counters ordinary
-    // ingest enforces, so the remaining headroom no longer fits another redemption.
+    // ingest enforces, so the remaining headroom no longer fits another redemption. The charging
+    // paths judge expiry against the wall clock (#1362), so the TTL is wall-clock live and this
+    // test moves the ROW's expiry rather than walking a caller's clock across it.
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
         &tx,
@@ -1121,24 +1200,83 @@ fn enrollment_reservations_reserve_candidate_capacity_until_consumed_or_expired(
         (CANDIDATES_PER_ACCOUNT_MAX - 1) as u64,
         0,
         0,
-        NOW + 100,
+        rag_rat_base::time::now_ms() + 3_600_000,
     )
     .unwrap();
     tx.commit().unwrap();
-    let error = fits(NOW + 1).expect_err("reserved headroom is not available to a new mint");
+    let error = fits().expect_err("reserved headroom is not available to a new mint");
     assert!(error.to_string().contains("unredeemable"), "unexpected error: {error}");
 
     // Expiry frees the reservation (the counters filter on `expires_at_ms > now`; pruning only
     // keeps the table bounded), and redemption's release removes the row outright.
-    fits(NOW + 99).expect_err("the reservation is still active before its expiry instant");
-    fits(NOW + 100).expect("an expired reservation frees its capacity");
+    conn.execute(
+        "UPDATE account_candidate_reservations SET expires_at_ms = ?1 WHERE reservation_id = ?2",
+        params![rag_rat_base::time::now_ms() - 1_000, [0x51u8; 32].as_slice()],
+    )
+    .unwrap();
+    fits().expect("an expired reservation frees its capacity");
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    super::super::bootstrap::prune_account_candidate_reservations_in_tx(&tx, NOW + 101).unwrap();
+    super::super::bootstrap::prune_account_candidate_reservations_in_tx(
+        &tx,
+        rag_rat_base::time::now_ms(),
+    )
+    .unwrap();
     tx.commit().unwrap();
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM account_candidate_reservations", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0, "pruning removes expired reservation rows");
+}
+
+/// `insert_candidate` charges outstanding invite reservations against the same grow-only counters
+/// as stored entries, and decides "outstanding" against the WALL CLOCK (#1362). Its `now_ms`
+/// parameter stamps `received_at_ms` — when the entry ARRIVED — and must never reach the expiry
+/// comparison: a lapsed reservation would then hold admission capacity for a ticket nothing can
+/// redeem.
+#[test]
+fn candidate_admission_charges_a_live_reservation_and_ignores_a_lapsed_one() {
+    let founder = Dev::new(1);
+    let (account_id, genesis_bytes, _) = genesis(&founder);
+    let verified =
+        envelope::verify_account_signed(&genesis_bytes, &founder.secret.public()).unwrap();
+    let reserve_whole_budget = |conn: &Connection, expires_at_ms: i64| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+            &tx,
+            account_id,
+            [0x58; 32],
+            ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as u64,
+            0,
+            0,
+            expires_at_ms,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    };
+
+    // Outstanding: the reservation holds the whole ordinary per-account budget, so admission
+    // refuses rather than consuming headroom the ticket was measured against.
+    let live = db();
+    reserve_whole_budget(&live, rag_rat_base::time::now_ms() + 3_600_000);
+    let tx = Transaction::new_unchecked(&live, TransactionBehavior::Immediate).unwrap();
+    assert_eq!(
+        insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
+        CandidateInsert::AtCapacity(CapacityScope::CandidateAccount),
+        "an outstanding reservation holds candidate admission capacity",
+    );
+    tx.rollback().unwrap();
+
+    // Lapsed: the identical reservation is not outstanding and charges nothing. `NOW` is a fixed
+    // past instant, so a caller clock would still count this row — that is what this pins.
+    let lapsed = db();
+    reserve_whole_budget(&lapsed, rag_rat_base::time::now_ms() - 1_000);
+    let tx = Transaction::new_unchecked(&lapsed, TransactionBehavior::Immediate).unwrap();
+    assert_eq!(
+        insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
+        CandidateInsert::Inserted,
+        "a lapsed reservation must not hold capacity against an unredeemable ticket",
+    );
+    tx.commit().unwrap();
 }
 
 #[test]

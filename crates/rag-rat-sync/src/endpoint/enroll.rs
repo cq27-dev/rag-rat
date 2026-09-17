@@ -43,7 +43,7 @@ pub async fn connect_and_enroll(
     // The QUIC connection authenticates as THIS endpoint's transport identity, so the request
     // must name it — a caller-supplied value is either redundant or a guaranteed WrongNode.
     request.transport_node_id = *endpoint.id().as_bytes();
-    request.budget = rag_rat_oplog::enrollment_budget(database, expected_account, now_ms)?;
+    request.budget = rag_rat_oplog::enrollment_budget(database, expected_account)?;
     request.held_entry_hashes =
         rag_rat_oplog::held_account_entry_hashes(database, expected_account)?
             .into_iter()

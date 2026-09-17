@@ -292,22 +292,22 @@ pub fn enrollment_authoring_requirements(
 /// Refuse when the grow-only account candidate store cannot fit the mandatory entries redeeming an
 /// enrollment invite authors: the `DeviceAdd` and one stream-key wrap per live key target across
 /// `streams`. Latent pre-verify promotion is best-effort maintenance after enrollment commits and
-/// never consumes this reservation. Headroom is net of every outstanding invite's reservation at
-/// `now_ms`, so two invites cannot be minted against the same capacity. Read in the caller's
-/// snapshot; the mint transaction re-reads it under the writer lock.
+/// never consumes this reservation. Headroom is net of every invite reservation outstanding NOW —
+/// judged against the wall clock, since an invite TTL is wall-clock (#1362) — so two invites cannot
+/// be minted against the same capacity. Read in the caller's snapshot; the mint transaction
+/// re-reads it under the writer lock.
 pub fn enrollment_authoring_fits(
     conn: &Connection,
     account_id: AccountId,
     streams: &[StreamId],
     role: ops::DeviceRole,
     label: Option<&str>,
-    now_ms: i64,
 ) -> anyhow::Result<()> {
     let (required_entries, required_bytes) =
         enrollment_authoring_requirements(conn, account_id, streams, role, label)?;
     let required_entries = i64::try_from(required_entries)?;
     let required_bytes = i64::try_from(required_bytes)?;
-    let headroom = storage::candidate_capacity_headroom(conn, account_id, now_ms)?;
+    let headroom = storage::candidate_capacity_headroom(conn, account_id)?;
     anyhow::ensure!(
         headroom.account_entries_remaining >= required_entries
             && headroom.global_entries_remaining >= required_entries

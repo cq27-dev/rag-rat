@@ -435,7 +435,7 @@ fn a_live_unpadded_cache_is_resealed_and_reused_across_restarts() {
                 ed25519_pubkey: joiner.ed25519_public_key(),
                 x25519_pubkey: joiner.x25519_public_key(),
                 transport_node_id: [9; 32],
-                budget: rag_rat_oplog::enrollment_budget(&joiner_conn, account, 1_000).unwrap(),
+                budget: rag_rat_oplog::enrollment_budget(&joiner_conn, account).unwrap(),
                 held_entry_hashes: Vec::new(),
             },
             [9; 32],

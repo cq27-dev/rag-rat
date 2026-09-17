@@ -128,7 +128,7 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
     // second mint cannot consume the headroom this ticket was measured against; the reservation
     // is released only by redemption (under the writer lock) or expiry.
     let streams = owned_streams_for_account(&tx, account_id)?;
-    enrollment_authoring_fits(&tx, account_id, &streams, role, label, now_ms)?;
+    enrollment_authoring_fits(&tx, account_id, &streams, role, label)?;
     let (reserved_entries, reserved_bytes) =
         rag_rat_oplog::enrollment_authoring_requirements(&tx, account_id, &streams, role, label)?;
     rag_rat_oplog::upsert_account_candidate_reservation_in_tx(
@@ -442,14 +442,7 @@ pub fn redeem_invite(
     // StreamOwn/StreamRevoke entries after startup; caching this set would either omit a newly
     // owned stream's key wrap or make a stale, no-longer-owned stream abort the whole enrollment.
     let streams = owned_streams_for_account(tx, account_id)?;
-    enrollment_authoring_fits(
-        tx,
-        account_id,
-        &streams,
-        role,
-        locked.invite.label.as_deref(),
-        commit_ms,
-    )?;
+    enrollment_authoring_fits(tx, account_id, &streams, role, locked.invite.label.as_deref())?;
     let device_add = author_enrollment_device_add_in_tx(
         tx,
         EnrollingDevice {

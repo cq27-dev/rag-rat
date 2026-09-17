@@ -739,7 +739,12 @@ pub(in crate::account) fn affected_streams_for_account(
 pub(super) fn refold_and_project_stream_in_tx(
     tx: &Transaction<'_>,
     stream_id: StreamId,
-    now_ms: i64,
+    // The settle timestamp this seam carries for the queued-notification hook below. Nothing in
+    // the current body reads it: reached from `refold_in_tx` it is the FOLD's replay
+    // coordinate (a zero clock under the migration backfill), so it must never reach a
+    // wall-clock expiry comparison — the reservation refresh reads its own clock instead
+    // (#1362).
+    _now_ms: i64,
 ) -> anyhow::Result<()> {
     refold_content_stream(tx, stream_id)?;
     if content_projected_tables_exist(tx)? {
@@ -751,7 +756,7 @@ pub(super) fn refold_and_project_stream_in_tx(
     // Accepted suite-1 content pins its sealing key as a live enrollment catch-up target, so
     // settling content can grow an outstanding invite's mandatory redemption cost without any
     // account fold — refresh reservations here, at the content-acceptance choke point (#945).
-    super::super::storage::refresh_enrollment_reservations_for_stream_in_tx(tx, stream_id, now_ms)?;
+    super::super::storage::refresh_enrollment_reservations_for_stream_in_tx(tx, stream_id)?;
     Ok(())
 }
 

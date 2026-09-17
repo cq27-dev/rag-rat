@@ -119,9 +119,8 @@ pub const ENROLLMENT_HELD_ENTRY_HASHES_MAX: usize = storage::CANDIDATES_PER_ACCO
 pub fn enrollment_budget(
     conn: &Connection,
     account_id: AccountId,
-    now_ms: i64,
 ) -> anyhow::Result<EnrollmentBudget> {
-    let headroom = storage::candidate_capacity_headroom(conn, account_id, now_ms)?;
+    let headroom = storage::candidate_capacity_headroom(conn, account_id)?;
     let clamp = |value: i64| u64::try_from(value).unwrap_or(0);
     Ok(EnrollmentBudget {
         account_entries_remaining: clamp(headroom.account_entries_remaining),

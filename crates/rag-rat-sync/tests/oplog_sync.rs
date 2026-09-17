@@ -44,7 +44,7 @@ async fn enroll_member_over_endpoint(
         ed25519_pubkey: local.ed25519_public_key(),
         x25519_pubkey: local.x25519_public_key(),
         transport_node_id: *joiner_endpoint.id().as_bytes(),
-        budget: rag_rat_oplog::enrollment_budget(joiner, account, NOW).unwrap(),
+        budget: rag_rat_oplog::enrollment_budget(joiner, account).unwrap(),
         held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(joiner, account)
             .unwrap()
             .into_iter()
@@ -2169,7 +2169,7 @@ async fn a_fresh_device_enrolls_then_restores_the_account_byte_for_byte() {
             ed25519_pubkey: local.ed25519_public_key(),
             x25519_pubkey: local.x25519_public_key(),
             transport_node_id: [0u8; 32],
-            budget: rag_rat_oplog::enrollment_budget(&joiner, account, NOW).unwrap(),
+            budget: rag_rat_oplog::enrollment_budget(&joiner, account).unwrap(),
             held_entry_hashes: Vec::new(),
         };
         let server = accept_enrollment(&owner_ep, &owner, || NOW);

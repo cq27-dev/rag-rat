@@ -221,7 +221,6 @@ fn enrollment_mint_ignores_non_fatal_content_promotions() {
         &[],
         crate::account::DeviceRole::Member,
         None,
-        1,
     )
     .expect("opaque parked content is not part of mandatory enrollment authoring");
 }
