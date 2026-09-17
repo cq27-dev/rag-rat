@@ -1523,6 +1523,116 @@ mod tests {
         execute(fixture.checkpoint.frozen_legacy(), &[], &cut)
     }
 
+    /// A watermark naming an entry the account does NOT hold still installs. The two refusals the
+    /// binding can produce are not alike: a coordinate mismatch is structural and rejects the whole
+    /// operation, while a target not yet held is withheld evidence — the register installs and the
+    /// watermark means what it says once the entry arrives. Widening the check to refuse both would
+    /// make a routine delivery order permanent.
+    #[test]
+    fn a_watermark_on_an_entry_not_yet_held_still_installs() {
+        let fixture = demoted_owner();
+        let outcome = execute_v2_on_founder_chain(&fixture, &AccountOp::DeviceRemove {
+            device_fingerprint: fixture.subject.fp,
+            // Nothing in this view holds the hash, so the binding returns `TargetNotHeld` before
+            // it compares any coordinate field — the seq here is never reached.
+            control_cut: Cut::At { seq: 4, hash: AccountEntryHash::from_bytes([0x9e; 32]) },
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "ahead of its evidence".into(),
+        });
+        assert!(
+            matches!(outcome, CutOutcome::Applied(_)),
+            "a not-yet-held watermark installs rather than rejecting",
+        );
+    }
+
+    /// EVERY proposed register's watermark is checked, not just the first. A revocation proposes a
+    /// control register and a secrets register; `Cut::Empty` binds `Ok` without consulting the
+    /// view, so a fixture that leaves the secrets cut empty can never observe whether the second
+    /// register is examined at all. Here the CONTROL cut is empty and the SECRETS cut is the
+    /// misbound one, which only a check that reaches index 1 can refuse.
+    #[test]
+    fn a_misbound_watermark_on_the_second_register_rejects_too() {
+        let fixture = demoted_owner();
+        // Held, and on the founder's chain — while the register it lands in is scoped to the
+        // subject's secrets chain.
+        let genesis: AccountEntryHash = fixture.incarnation.into();
+        let outcome = execute_v2_on_founder_chain(&fixture, &AccountOp::DeviceRemove {
+            device_fingerprint: fixture.subject.fp,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::At { seq: 0, hash: genesis },
+            content_cuts: vec![],
+            reason: "second register misbound".into(),
+        });
+        assert!(
+            matches!(outcome, CutOutcome::Rejected(RejectReason::CutTargetMismatch)),
+            "a watermark misbound on the secrets register rejects as readily as on the control one",
+        );
+    }
+
+    /// A demote resolved through the FROZEN epoch applies. Its incarnation is one the checkpoint
+    /// already holds, so the bundle-mint fallback is never consulted — which is what separates this
+    /// from the v2-promoted case below. Together the two say which lookup resolved the subject.
+    #[test]
+    fn a_demote_of_an_owner_the_checkpoint_already_holds_applies() {
+        let fixture = demoted_owner();
+        let outcome = execute_v2_on_founder_chain(&fixture, &AccountOp::OwnerDemote {
+            device_fingerprint: fixture.founder.fingerprint(),
+            owner_id: fixture.incarnation,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            reason: "demoted through the frozen epoch".into(),
+        });
+        assert!(
+            matches!(outcome, CutOutcome::Applied(_)),
+            "a demote whose incarnation the checkpoint holds must apply",
+        );
+    }
+
+    /// A demote of an owner PROMOTED AT VERSION 2 applies. The incarnation it names exists only in
+    /// this bundle, so resolving the frozen epoch alone would park it forever — and the evidence
+    /// that would clear the park is already supplied, which is the definition of a park that never
+    /// clears. This is the admitting side of the binding match: `Some(_)` must fall through.
+    #[test]
+    fn a_demote_of_an_owner_this_bundle_promoted_applies() {
+        let fixture = demoted_owner();
+        let tip = founder_tip(&fixture);
+        // The founder promotes a third device. State preconditions are not evaluated at execution,
+        // so this is authorized on its own citation and mints an incarnation keyed by its hash.
+        let promoted = Dev::new(51);
+        let promote = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &AccountOp::OwnerPromote { device_fingerprint: promoted.fp },
+            v2_ops::CONTROL_VERSION,
+        );
+        // ... and then demotes it, naming the incarnation that promote just minted.
+        let demote = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 2,
+            promote.hash(),
+            &AccountOp::OwnerDemote {
+                device_fingerprint: promoted.fp,
+                owner_id: promote.hash().into(),
+                control_cut: Cut::Empty,
+                secrets_cut: Cut::Empty,
+                reason: "demoted again".into(),
+            },
+            v2_ops::CONTROL_VERSION,
+        );
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let outcome = execute(frozen, std::slice::from_ref(&promote), &demote);
+        assert!(
+            matches!(outcome, CutOutcome::Applied(_)),
+            "a demote whose incarnation this bundle minted must apply",
+        );
+    }
+
     /// An `OwnerDemote` naming an incarnation this account cannot resolve PARKS rather than
     /// rejects: the mint may simply have been withheld, and the same bundle plus that mint
     /// authorizes the same operation. Rejecting would make a recoverable gap permanent.
