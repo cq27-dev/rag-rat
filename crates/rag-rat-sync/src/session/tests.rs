@@ -573,3 +573,90 @@ async fn a_mismatched_account_aborts_the_session() {
     assert!(matches!(ra, Err(SessionError::Protocol(_))));
     assert!(matches!(rb, Err(SessionError::Protocol(_))));
 }
+
+#[tokio::test]
+async fn a_page_of_large_entries_stays_inside_the_frame_cap() {
+    // Entries sized like a full content envelope (256 KiB). A count-only page of
+    // `MAX_ENTRIES_PER_PAGE` of these encodes to ~64 MiB — far past the codec's 24 MiB frame cap —
+    // and the sender refuses its own frame before writing a byte. The refusal is deterministic:
+    // the snapshot, the diff and the paging are pure functions of the store, so every retry
+    // re-forms the identical oversized page and the transfer never converges.
+    const ENTRY_BYTES: usize = 256 * 1024;
+    let make = |i: usize| -> (Hash, Vec<u8>) {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+        let mut bytes = vec![0xa5; ENTRY_BYTES];
+        bytes[..32].copy_from_slice(&hash);
+        (hash, bytes)
+    };
+    // Enough that a single count-capped page would exceed the frame cap on its own.
+    let count = MAX_ENTRIES_PER_PAGE + 8;
+    assert!(
+        count.min(MAX_ENTRIES_PER_PAGE) * ENTRY_BYTES > crate::codec::MAX_FRAME_BYTES as usize,
+        "fixture must cross the frame cap or it proves nothing",
+    );
+    let full: Vec<_> = (0..count).map(make).collect();
+    let mut server = MemStore::new([0xc4; 32], &full);
+    let mut reader = MemStore::new([0xc4; 32], &[]);
+    // Both halves run concurrently, so the reader drains while the writer fills: the pipe needs no
+    // more room than any other test here.
+    let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+    let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+    let (s, r) = tokio::join!(
+        run_session(
+            &mut server,
+            server_send,
+            server_recv,
+            AuthRole::Acceptor,
+            SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+        ),
+        run_session(
+            &mut reader,
+            reader_send,
+            reader_recv,
+            AuthRole::Dialer,
+            SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadWrite),
+        ),
+    );
+    let server_report = s.expect("the sender must not refuse its own frame");
+    r.expect("the receiver must not see an over-cap frame");
+    assert_eq!(server_report.entries_sent, count, "every entry is served");
+    assert_eq!(reader.entries.len(), count, "the reader converges on the full set");
+}
+
+#[tokio::test]
+async fn an_entry_over_the_page_byte_budget_is_served_rather_than_stalling_the_loop() {
+    // The byte budget is a PAGE bound, not an entry bound. An entry above it fills no page, so
+    // without the one-entry floor the sender writes an empty page — which the receiver rejects,
+    // closing the stream under the sender mid-drain. The budget sits below the codec's frame cap,
+    // so such an entry is served normally once the floor guarantees the page is non-empty.
+    let mut hash = [0u8; 32];
+    hash[..8].copy_from_slice(&7u64.to_be_bytes());
+    let mut bytes = vec![0x5c; MAX_ENTRIES_PAGE_BYTES + 1];
+    bytes[..32].copy_from_slice(&hash);
+    let oversized = vec![(hash, bytes)];
+
+    let mut server = MemStore::new([0xd1; 32], &oversized);
+    let mut reader = MemStore::new([0xd1; 32], &[]);
+    let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+    let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+    let (s, r) = tokio::join!(
+        run_session(
+            &mut server,
+            server_send,
+            server_recv,
+            AuthRole::Acceptor,
+            SessionCapabilities::new(PeerCapability::ReadWrite, PeerCapability::ReadOnly),
+        ),
+        run_session(
+            &mut reader,
+            reader_send,
+            reader_recv,
+            AuthRole::Dialer,
+            SessionCapabilities::new(PeerCapability::ReadOnly, PeerCapability::ReadWrite),
+        ),
+    );
+    assert_eq!(s.expect("the sender serves it").entries_sent, 1);
+    r.expect("the receiver takes it");
+    assert_eq!(reader.entries.len(), 1, "the reader converges on the oversized entry");
+}

@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::auth::{self, AuthRole, SessionCapabilities};
 use crate::codec::{self, CodecError};
-use crate::wire::{Frame, MAX_ENTRIES_PER_PAGE, MAX_HELLO_HASHES};
+use crate::wire::{Frame, MAX_ENTRIES_PAGE_BYTES, MAX_ENTRIES_PER_PAGE, MAX_HELLO_HASHES};
 
 type Hash = [u8; 32];
 
@@ -239,10 +239,29 @@ where
             to_send.truncate(kept);
         }
         let total = to_send.len();
-        // Drain into fixed pages so no single frame exceeds the per-page cap.
+        // Drain into pages bounded by BOTH the entry count and the entry bytes, whichever binds
+        // first — a count alone does not bound a frame, because this `Frame` serves lanes whose
+        // entries differ in size by 4x.
+        //
+        // Always take at least one entry, or an entry above the byte budget would yield an empty
+        // page and the loop would never advance. Such an entry is still SERVED: the budget leaves
+        // headroom under the codec's frame cap, so a single entry between the two is written
+        // normally, and only one past the frame cap is refused. No envelope that large can reach a
+        // snapshot today — both lanes cap their entries far below it — so the floor is about the
+        // loop's progress, not about serving oversized entries.
         let mut rest = to_send.split_off(0);
         while !rest.is_empty() {
-            let tail = rest.split_off(rest.len().min(MAX_ENTRIES_PER_PAGE));
+            let mut bytes = 0usize;
+            let take = rest
+                .iter()
+                .take(MAX_ENTRIES_PER_PAGE)
+                .take_while(|entry| {
+                    bytes += entry.len();
+                    bytes <= MAX_ENTRIES_PAGE_BYTES
+                })
+                .count()
+                .max(1);
+            let tail = rest.split_off(take);
             let page = std::mem::replace(&mut rest, tail);
             let more = !rest.is_empty();
             write_frame_before(&mut send, &Frame::Entries { entries: page, more }, idle_timeout)
