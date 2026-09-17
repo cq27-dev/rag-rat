@@ -1991,6 +1991,79 @@ mod tests {
         );
     }
 
+    /// Two applied operations, not one. Every other composition test applies a single cut, which
+    /// leaves the sort across operations ordering nothing and the epoch offset always 0, so adding
+    /// it and subtracting it compute the same answer.
+    ///
+    /// The observable is the EPOCH, not the boundary. Asserting only `Closed` is what let both
+    /// rows hide: it is identical under either ordering and under either sign.
+    #[test]
+    fn a_second_applied_cut_takes_the_epoch_slot_above_the_first() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let tip = founder_tip(&fixture);
+        let cut_at = |seq: u64, prev: AccountEntryHash, reason: &str| {
+            author_on_founder_chain(
+                &fixture.checkpoint,
+                &fixture.founder,
+                fixture.incarnation,
+                seq,
+                prev,
+                &AccountOp::DeviceRemove {
+                    device_fingerprint: fixture.subject.fp,
+                    control_cut: Cut::Empty,
+                    secrets_cut: Cut::Empty,
+                    content_cuts: vec![],
+                    reason: reason.to_owned(),
+                },
+                v2_ops::CONTROL_VERSION,
+            )
+        };
+        // The fixture signs with a fresh key each run, so entry hashes are random. Search for a
+        // pair whose HASH order OPPOSES their seq order: then only the seq component of the sort
+        // key can produce the epochs asserted below. Without this the hash tiebreak elects the same
+        // winner about half the time, and dropping seq from the key survives on those runs.
+        let (first, second) = (0..64)
+            .find_map(|nonce| {
+                let first = cut_at(tip.seq + 1, tip.hash, &format!("first {nonce}"));
+                let second = cut_at(tip.seq + 2, first.hash(), &format!("second {nonce}"));
+                (first.hash() > second.hash()).then_some((first, second))
+            })
+            .expect("a pair whose hash order opposes its seq order");
+        assert!(
+            first.hash() > second.hash(),
+            "the fixture must oppose hash order to seq order or the sort's seq component is masked",
+        );
+
+        let key = RegisterKey::Device {
+            account: fixture.checkpoint.pin().account_id,
+            log: CONTROL_LOG,
+            device: fixture.subject.fp,
+        };
+        let admits_accepted = [(key.clone(), Cut::At { seq: 0, hash: fixture.accepted_victim })];
+        let extends_to_condemned =
+            [(key.clone(), Cut::At { seq: 1, hash: fixture.condemned_victim })];
+        let base = frozen.history.effective_count();
+        let history = pinned_history(frozen, &[
+            AppliedOperation { entry: &first, registers: &admits_accepted },
+            AppliedOperation { entry: &second, registers: &extends_to_condemned },
+        ]);
+
+        // Epochs are assigned in sorted order and then normalized. The lower-SEQ cut lands first
+        // even though its hash sorts higher, so sorting by hash alone — or reversing the sort, or
+        // subtracting the offset instead of adding it — moves both of these.
+        assert_eq!(
+            history.outcome(&first.hash()),
+            Some(Outcome::Effective { auth_epoch: base }),
+            "the lower-seq cut takes the first slot above the frozen epochs",
+        );
+        assert_eq!(
+            history.outcome(&second.hash()),
+            Some(Outcome::Effective { auth_epoch: base + 1 }),
+            "the higher-seq cut takes the slot above it",
+        );
+    }
+
     #[test]
     fn the_composed_boundary_is_a_function_of_the_register_multiset_not_its_order() {
         // Closure being absorbing is what makes the boundary order-free. Replicas holding different
