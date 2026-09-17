@@ -18,6 +18,17 @@ pub const MAX_TABLE_CHAINS_PER_SESSION: usize = 65_536;
 pub const MAX_TABLE_ENTRIES_PER_PAGE: usize = 32;
 pub const MAX_TABLE_ENTRY_BYTES: usize = rag_rat_oplog::TABLE_SYNC_ENTRY_MAX_BYTES;
 
+// A full page must encode within the frame cap. This lane bounds its entries individually — at both
+// send and decode — so the count cap does bound the frame here, but only while the per-entry cap
+// stays small relative to it. That cap is another crate's constant, so raising it there would
+// otherwise reintroduce the account/content lane's defect (#1371) with no signal on this side.
+// Headroom covers the CBOR the encoder wraps around a full page (outer array, domain, tag, array
+// header, per-entry length headers), which is a few hundred bytes.
+const _: () = assert!(
+    MAX_TABLE_ENTRIES_PER_PAGE * MAX_TABLE_ENTRY_BYTES + 64 * 1024
+        <= crate::table_codec::MAX_TABLE_FRAME_BYTES as usize
+);
+
 type Hash = [u8; 32];
 
 /// One stream route advertised after mutual account authorization.

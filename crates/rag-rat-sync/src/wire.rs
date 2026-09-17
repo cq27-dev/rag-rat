@@ -42,6 +42,25 @@ const FRAME_DOMAIN: &str = "rag-rat/sync-frame/1";
 /// force an unbounded allocation on the receiver (#406: bounded frames, no amplification).
 pub const MAX_ENTRIES_PER_PAGE: usize = 256;
 
+/// The maximum entry bytes a single [`Frame::Entries`] page carries. A count cap alone does not
+/// bound a frame: the same [`Frame`] serves lanes whose entries differ in size by 4x, so
+/// [`MAX_ENTRIES_PER_PAGE`] full-size content entries encode far past the codec's frame cap and the
+/// sender refuses its own frame before writing a byte. Paging honours BOTH caps, whichever binds
+/// first; a lane's entry size is then irrelevant to whether a page fits.
+pub const MAX_ENTRIES_PAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Headroom between a full page's entry bytes and the codec's frame cap, covering the CBOR the
+/// encoder wraps around them: the outer 4-element array, the domain string, the tag, the entries
+/// array header, the trailing `more` bool, and one length header per entry (at most 9 bytes each).
+/// Rounded far up — the real overhead for a full page is a few KiB.
+const ENTRIES_PAGE_OVERHEAD_BYTES: usize = 64 * 1024;
+
+// A page that honours `MAX_ENTRIES_PAGE_BYTES` must always encode within the codec's frame cap,
+// whatever the lane. This is the tie the count cap alone cannot express.
+const _: () = assert!(
+    MAX_ENTRIES_PAGE_BYTES + ENTRIES_PAGE_OVERHEAD_BYTES <= crate::codec::MAX_FRAME_BYTES as usize
+);
+
 /// The maximum entry hashes a single [`Frame::Hello`] inventory carries. Bounds the hello frame so
 /// a peer cannot force an unbounded allocation before any authentication. A sender with more
 /// entries than this advertises a bounded subset — still correct (the peer's extra sends are
