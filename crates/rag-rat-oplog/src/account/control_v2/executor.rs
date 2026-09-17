@@ -166,16 +166,9 @@ fn execute_shared(
         .map(V2Entry::candidate)
         .chain(std::iter::once(cut.clone()))
         .collect();
-    // Routed variant by variant: a wildcard here is how a refusal that cannot support permanence
-    // ends up claiming it anyway.
     let authority = fold::v2::V2Authority::resolve(frozen, &bundle);
-    match authority.verdict(&cut.hash()) {
-        fold::v2::V2Verdict::Authorized => {},
-        fold::v2::V2Verdict::Condemned => return Ok(Verdict::Rejected(RejectCause::Condemned)),
-        // The mint it cites is not in this bundle. That is withheld evidence like any other.
-        fold::v2::V2Verdict::MintNotSupplied => return Ok(Verdict::Parked(ParkCause::Mint)),
-        fold::v2::V2Verdict::Inadmissible | fold::v2::V2Verdict::WrongDevice =>
-            return Ok(Verdict::Rejected(RejectCause::Inadmissible)),
+    if let Some(refusal) = refuse(authority.verdict(&cut.hash())) {
+        return Ok(refusal);
     }
 
     // Only the identities the operation's own manifest named; an ordinary operation names none.
@@ -187,23 +180,46 @@ fn execute_shared(
         .filter_map(|hash| authenticated.entries.get(hash))
         .map(V2Entry::candidate)
         .collect();
-    Ok(
-        match fold::v2::apply_cut(fold::v2::CutExecution {
-            frozen,
-            authority: &authority,
-            nominated: &nominated,
-            cut: &cut,
-        }) {
-            fold::v2::CutOutcome::Applied(applied) => Verdict::Applied {
-                entry: Box::new(cut.clone()),
-                registers: applied.registers,
-                credit: applied.credit,
-            },
-            fold::v2::CutOutcome::Rejected(reason) =>
-                Verdict::Rejected(RejectCause::Precondition(reason)),
-            fold::v2::CutOutcome::Parked(_) => Verdict::Parked(ParkCause::CutTarget),
+    let outcome = fold::v2::apply_cut(fold::v2::CutExecution {
+        frozen,
+        authority: &authority,
+        nominated: &nominated,
+        cut: &cut,
+    });
+    Ok(settle(outcome, cut))
+}
+
+/// The verdict to return for a bundle authority answer, or `None` to admit.
+///
+/// Variant by variant, never a wildcard — a wildcard is how a refusal that cannot support
+/// permanence ends up claiming it anyway. `MintNotSupplied` is the one that must not: the cited
+/// mint is simply absent from this bundle, which is withheld evidence like any other, so it parks
+/// and the same operation with that mint attached is authorized.
+fn refuse(verdict: fold::v2::V2Verdict) -> Option<Verdict> {
+    match verdict {
+        fold::v2::V2Verdict::Authorized => None,
+        fold::v2::V2Verdict::Condemned => Some(Verdict::Rejected(RejectCause::Condemned)),
+        fold::v2::V2Verdict::MintNotSupplied => Some(Verdict::Parked(ParkCause::Mint)),
+        fold::v2::V2Verdict::Inadmissible | fold::v2::V2Verdict::WrongDevice =>
+            Some(Verdict::Rejected(RejectCause::Inadmissible)),
+    }
+}
+
+/// Route the register-pass outcome into the executor's verdict.
+///
+/// Takes `cut` by value: the caller is done with it, so the applied arm moves it into the verdict
+/// and the refusal arms drop it. Nothing is cloned on any path.
+fn settle(outcome: fold::v2::CutOutcome, cut: Candidate) -> Verdict {
+    match outcome {
+        fold::v2::CutOutcome::Applied(applied) => Verdict::Applied {
+            entry: Box::new(cut),
+            registers: applied.registers,
+            credit: applied.credit,
         },
-    )
+        fold::v2::CutOutcome::Rejected(reason) =>
+            Verdict::Rejected(RejectCause::Precondition(reason)),
+        fold::v2::CutOutcome::Parked(_) => Verdict::Parked(ParkCause::CutTarget),
+    }
 }
 
 /// One authenticated v2 entry: the verified envelope and the inner v1 operation it carries.
@@ -527,6 +543,93 @@ mod tests {
             ),
             "a chain exactly filling the evidence budget lands rather than being refused",
         );
+    }
+
+    /// A synthetic candidate. `settle` never inspects it — it only decides whether to materialize
+    /// one — so a header literal is enough and no signature is needed.
+    fn synthetic_candidate() -> Candidate {
+        let header = AccountEntryHeader {
+            account_id: checkpoint_proof().pin().account_id,
+            log_id: fold::CONTROL_LOG,
+            device_fingerprint: subject_device(),
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: 2,
+            op_version: ops::CONTROL_VERSION,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: None,
+        };
+        Candidate::new(
+            VerifiedAccountEntry { header, payload: Vec::new(), entry_hash: link(0) },
+            AccountOp::OwnerPromote { device_fingerprint: subject_device() },
+        )
+    }
+
+    /// Every authority verdict routes to exactly one answer. `refuse`'s `match` is what the
+    /// compiler forces to stay exhaustive — a new `V2Verdict` variant fails to build there, not
+    /// here — so this table is a convention that must be extended alongside it, not a guarantee.
+    ///
+    /// The distinction it exists to hold is permanence. `MintNotSupplied` is the only verdict that
+    /// is not a property of the operation: the same operation with its mint attached is
+    /// authorized, so it must park. Routing it to a rejection would make withheld evidence
+    /// permanent.
+    #[test]
+    fn every_authority_verdict_routes_to_one_answer() {
+        use fold::v2::V2Verdict;
+        assert!(refuse(V2Verdict::Authorized).is_none());
+        assert!(matches!(
+            refuse(V2Verdict::Condemned),
+            Some(Verdict::Rejected(RejectCause::Condemned))
+        ));
+        assert!(matches!(
+            refuse(V2Verdict::MintNotSupplied),
+            Some(Verdict::Parked(ParkCause::Mint))
+        ));
+        assert!(matches!(
+            refuse(V2Verdict::Inadmissible),
+            Some(Verdict::Rejected(RejectCause::Inadmissible))
+        ));
+        assert!(matches!(
+            refuse(V2Verdict::WrongDevice),
+            Some(Verdict::Rejected(RejectCause::Inadmissible))
+        ));
+    }
+
+    /// Every register-pass outcome routes to exactly one verdict, and the applied arm carries its
+    /// registers and credit through untouched — a non-empty register set, so a pass-through that
+    /// dropped or replaced it fails here rather than only in the fixture tests downstream.
+    #[test]
+    fn every_cut_outcome_routes_to_one_verdict() {
+        use fold::v2::{AppliedCut, CutOutcome};
+        let key = RegisterKey::Device {
+            account: checkpoint_proof().pin().account_id,
+            log: fold::CONTROL_LOG,
+            device: subject_device(),
+        };
+        let registers = vec![(key.clone(), Cut::At { seq: 3, hash: link(3) })];
+        let applied = settle(
+            CutOutcome::Applied(AppliedCut { registers: registers.clone(), credit: 7 }),
+            synthetic_candidate(),
+        );
+        match applied {
+            Verdict::Applied { registers: got, credit, .. } => {
+                assert_eq!(credit, 7);
+                assert_eq!(got, registers, "the applied arm carries its registers through");
+            },
+            other => panic!("expected an applied verdict, got {other:?}"),
+        }
+
+        assert!(matches!(
+            settle(CutOutcome::Rejected(RejectReason::LastOwner), synthetic_candidate()),
+            Verdict::Rejected(RejectCause::Precondition(RejectReason::LastOwner))
+        ));
+        assert!(matches!(
+            settle(CutOutcome::Parked(fold::ParkReason::UnknownCutTarget), synthetic_candidate()),
+            Verdict::Parked(ParkCause::CutTarget)
+        ));
     }
 
     /// A short, complete, walkable v2 chain plus the pieces to perturb one link of it. Every step
