@@ -2773,12 +2773,19 @@ pub(super) fn insert_candidate(
     // counters until they are consumed or expire (#945): candidate capacity is grow-only, so
     // without charging reservations here, ordinary ingest or a second invite could consume
     // headroom an already-minted ticket was measured against and strand it permanently.
+    //
+    // Whether a reservation has LAPSED is judged against the wall clock, never against `now_ms`
+    // (#1362). The caller's clock is the right stamp for when this entry ARRIVED — that is what it
+    // records below — and the wrong one for deciding whether something else has expired: an invite
+    // TTL is wall-clock, so any caller threading a fold or replay coordinate in here would charge
+    // capacity for tickets that can no longer be redeemed.
+    let expiry_now_ms = rag_rat_base::time::now_ms();
     let candidate_count: i64 = tx.query_row(
         "SELECT (SELECT COUNT(*) FROM account_entries WHERE account_id = ?1)
               + (SELECT COALESCE(SUM(reserved_entries), 0)
                    FROM account_candidate_reservations
                   WHERE account_id = ?1 AND expires_at_ms > ?2)",
-        params![h.account_id.to_bytes().as_slice(), now_ms],
+        params![h.account_id.to_bytes().as_slice(), expiry_now_ms],
         |row| row.get(0),
     )?;
     if candidate_count >= account_entries_max as i64 {
@@ -2790,7 +2797,7 @@ pub(super) fn insert_candidate(
               + (SELECT COALESCE(SUM(reserved_bytes), 0)
                    FROM account_candidate_reservations
                   WHERE account_id = ?1 AND expires_at_ms > ?2)",
-        params![h.account_id.to_bytes().as_slice(), now_ms],
+        params![h.account_id.to_bytes().as_slice(), expiry_now_ms],
         |row| row.get(0),
     )?;
     if candidate_bytes.saturating_add(signed_bytes.len() as i64) > account_bytes_max as i64 {
@@ -2801,7 +2808,7 @@ pub(super) fn insert_candidate(
               + (SELECT COALESCE(SUM(reserved_entries), 0)
                    FROM account_candidate_reservations
                   WHERE expires_at_ms > ?1)",
-        [now_ms],
+        [expiry_now_ms],
         |row| row.get(0),
     )?;
     if global_candidate_count >= CANDIDATES_GLOBAL_MAX as i64 {
@@ -2812,7 +2819,7 @@ pub(super) fn insert_candidate(
               + (SELECT COALESCE(SUM(reserved_bytes), 0)
                    FROM account_candidate_reservations
                   WHERE expires_at_ms > ?1)",
-        [now_ms],
+        [expiry_now_ms],
         |row| row.get(0),
     )?;
     if global_candidate_bytes.saturating_add(signed_bytes.len() as i64)
@@ -2855,11 +2862,16 @@ pub(crate) struct CandidateCapacityHeadroom {
     pub(crate) global_bytes_remaining: i64,
 }
 
+///
+/// Takes NO clock: it answers "what fits NOW", and every value it reads a clock for is an expiry
+/// comparison against an invite's wall-clock TTL (#1362). An injected clock here would be correct
+/// only by virtue of what today's callers happen to pass, and a future caller threading a fold or
+/// replay coordinate would silently charge capacity for tickets nothing can redeem.
 pub(crate) fn candidate_capacity_headroom(
     conn: &Connection,
     account_id: AccountId,
-    now_ms: i64,
 ) -> rusqlite::Result<CandidateCapacityHeadroom> {
+    let now_ms = rag_rat_base::time::now_ms();
     let account_count: i64 = conn.query_row(
         "SELECT (SELECT COUNT(*) FROM account_entries WHERE account_id = ?1)
               + (SELECT COALESCE(SUM(reserved_entries), 0)
@@ -2972,7 +2984,7 @@ pub(super) fn top_up_account_candidate_reservations_in_tx(
     if !grew {
         return Ok(());
     }
-    let headroom = candidate_capacity_headroom(tx, account_id, now_ms)?;
+    let headroom = candidate_capacity_headroom(tx, account_id)?;
     anyhow::ensure!(
         headroom.account_entries_remaining >= 0
             && headroom.account_bytes_remaining >= 0

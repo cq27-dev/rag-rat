@@ -644,6 +644,9 @@ fn an_outstanding_invite_reservation_gates_the_next_mint_until_expiry() {
     // Simulate an already-minted invite whose reservation consumes the whole per-account
     // candidate budget: the next mint must refuse rather than distribute a ticket the first
     // redemption would strand.
+    // The TTL is wall-clock live: the mint preflight charges reservations that are outstanding
+    // against the WALL CLOCK (#1362), so a TTL anchored to the fixture's fixed past `NOW` would
+    // already have lapsed and would gate nothing.
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     rag_rat_oplog::upsert_account_candidate_reservation_in_tx(
         &tx,
@@ -652,7 +655,7 @@ fn an_outstanding_invite_reservation_gates_the_next_mint_until_expiry() {
         4_096,
         0,
         0,
-        NOW + 1_000,
+        rag_rat_base::time::now_ms() + 3_600_000,
     )
     .unwrap();
     tx.commit().unwrap();
@@ -670,8 +673,14 @@ fn an_outstanding_invite_reservation_gates_the_next_mint_until_expiry() {
     let invites: i64 =
         conn.query_row("SELECT COUNT(*) FROM sync_invites", [], |row| row.get(0)).unwrap();
     assert_eq!(invites, 0, "no second invite may be minted against reserved capacity");
-    // After the outstanding reservation expires, minting prunes it and succeeds.
-    let _ = mint_invite(&conn, spec(&|| NOW + 1_001)).expect("expiry frees the reservation");
+    // After the outstanding reservation expires, minting prunes it and succeeds. Expiry is judged
+    // against the wall clock, so lapse the ROW rather than advancing the mint's own clock.
+    conn.execute(
+        "UPDATE account_candidate_reservations SET expires_at_ms = ?1 WHERE reservation_id = ?2",
+        params![rag_rat_base::time::now_ms() - 1_000, [0x77u8; 32].as_slice()],
+    )
+    .unwrap();
+    let _ = mint_invite(&conn, spec(&|| NOW)).expect("expiry frees the reservation");
 }
 
 #[test]
