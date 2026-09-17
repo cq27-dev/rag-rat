@@ -526,8 +526,36 @@ pub(in crate::account) fn pinned_history(
     let view = CandidateView { headers: &headers };
 
     let mut registers = frozen.registers.clone();
+    // Keys whose chain is closed. `Cut::Empty` alone cannot carry that state: it is the join's
+    // BOTTOM (`join_cuts(Empty, other) -> Extended(other)`, §11.3), so ANY later pair for the same
+    // key absorbs it and reinstates a watermark — the under-revocation closure exists to prevent.
+    // Closure is a property of the KEY, not a value the register can hold.
+    //
+    // Seeded from the frozen set, not just from failures here: a legacy cut naming no entry freezes
+    // its register at `Cut::Empty`, and without the seed ONE authorized pair carrying a fabricated
+    // watermark would join `Applied` against it and reopen a chain the checkpoint closed. Seeding
+    // is safe in this composition specifically because it raises no `CutExtend` register at all
+    // (see this function's header), so there is no legitimate §11.4 re-blessing for it to
+    // block. What it CAN block is a further revocation of a chain already at the bottom, where
+    // `beyond` already holds for every seq — strictly weaker than what stands.
+    //
+    // The seed covers keys HELD at `Cut::Empty`, which is not the same set as "keys whose fact
+    // reads Closed": `derive_authority_facts` also closes a fact whose key is ABSENT, and an absent
+    // key is not seeded. That gap is unreachable while an effective remove always installs its
+    // registers and an op with an undecidable register parks whole.
+    let mut closed_keys: HashSet<RegisterKey> = registers
+        .iter()
+        .filter(|(_, cut)| matches!(cut, Cut::Empty))
+        .map(|(key, _)| key.clone())
+        .collect();
     for op in &cuts {
         for (key, cut) in op.registers {
+            // A closed chain admits nothing further. This also swallows a `Contested` join on an
+            // already-closed key; nothing reads one here today, and anything that starts to must
+            // evaluate it before this skip.
+            if closed_keys.contains(key) {
+                continue;
+            }
             // A join that is not `Applied` leaves the HELD register standing and drops the
             // newcomer's watermark — an under-revocation. Two authorized cuts disagreeing about one
             // chain's valid prefix is the compromise case, so close the chain instead: the empty
@@ -538,6 +566,7 @@ pub(in crate::account) fn pinned_history(
                 RegisterJoin::Applied
             ) {
                 registers.insert(key.clone(), Cut::Empty);
+                closed_keys.insert(key.clone());
             }
         }
     }
@@ -1842,6 +1871,126 @@ mod tests {
             fact.control_boundary,
             AuthorityBoundary::Closed,
             "an undecidable join closes the chain rather than keeping one side's watermark",
+        );
+    }
+
+    #[test]
+    fn a_closed_chain_stays_closed_when_a_later_register_could_decide() {
+        // Closure must be a property of the KEY, not of the value the register holds. `Cut::Empty`
+        // cannot carry it: it is the join's bottom, so a decidable watermark arriving afterwards
+        // absorbs it and reinstates the very prefix the failed join refused to choose between.
+        //
+        // Three registers are the minimum that shows it. The first installs on a fresh key without
+        // joining anything; the second fails its join and closes the chain; only the THIRD has an
+        // `Empty` standing to absorb. With two, both orders close and the property is invisible.
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, _) = v2_cut(&fixture, false);
+        let key = RegisterKey::Device {
+            account: fixture.checkpoint.pin().account_id,
+            log: CONTROL_LOG,
+            device: fixture.subject.fp,
+        };
+        let watermark = Cut::At { seq: 1, hash: fixture.condemned_victim };
+        let registers = [
+            // Installs on a fresh key — no join runs.
+            (key.clone(), watermark.clone()),
+            // Undecidable against it: a watermark on a chain nothing in this view holds. Closes.
+            (key.clone(), Cut::At { seq: 9, hash: AccountEntryHash::from_bytes([0x5c; 32]) }),
+            // Decidable, and the one that would absorb the closure's `Empty`.
+            (key.clone(), watermark.clone()),
+        ];
+        let history =
+            pinned_history(frozen, &[AppliedOperation { entry: &cut, registers: &registers }]);
+        let (_, fact) = roster_fact_for(&history, fixture.subject.fp).expect("enrolled");
+        assert_eq!(
+            fact.control_boundary,
+            AuthorityBoundary::Closed,
+            "a chain closed by an undecidable join stays closed against a later decidable one",
+        );
+    }
+
+    #[test]
+    fn the_composed_boundary_is_a_function_of_the_register_multiset_not_its_order() {
+        // Closure being absorbing is what makes the boundary order-free. Replicas holding different
+        // evidence subsets disagree about WHICH pair is undecidable, so without it they would
+        // derive different boundaries from the same registers and diverge. Three of these six
+        // orders previously yielded a watermark instead of `Closed`.
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, _) = v2_cut(&fixture, false);
+        let key = RegisterKey::Device {
+            account: fixture.checkpoint.pin().account_id,
+            log: CONTROL_LOG,
+            device: fixture.subject.fp,
+        };
+        let a = Cut::At { seq: 0, hash: fixture.accepted_victim };
+        let b = Cut::At { seq: 1, hash: fixture.condemned_victim };
+        // A watermark on a chain nothing in this view holds: the join cannot be decided.
+        let u = Cut::At { seq: 9, hash: AccountEntryHash::from_bytes([0x5c; 32]) };
+
+        for order in
+            [[&a, &b, &u], [&a, &u, &b], [&b, &a, &u], [&b, &u, &a], [&u, &a, &b], [&u, &b, &a]]
+        {
+            let registers: Vec<_> = order.iter().map(|cut| (key.clone(), (*cut).clone())).collect();
+            let history =
+                pinned_history(frozen, &[AppliedOperation { entry: &cut, registers: &registers }]);
+            let (_, fact) = roster_fact_for(&history, fixture.subject.fp).expect("enrolled");
+            assert_eq!(
+                fact.control_boundary,
+                AuthorityBoundary::Closed,
+                "every order of the same registers must close the chain; this one did not",
+            );
+        }
+    }
+
+    #[test]
+    fn a_frozen_closed_chain_is_not_reopened_by_one_authorized_register() {
+        // The checkpoint froze this chain closed: a legacy cut naming no entry leaves `Cut::Empty`
+        // standing in the frozen registers. Because `Empty` is the join's bottom, a SINGLE pair
+        // naming any watermark would otherwise join `Applied` against it and reopen the chain —
+        // no ordering trick and no evidence required. The fixture's own `OwnerDemote` carries
+        // `secrets_cut: Cut::Empty`, so the frozen slot is already occupied here, which is what
+        // the three-register test cannot exercise.
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let (cut, _) = v2_cut(&fixture, false);
+        // An `OwnerIncarnation` register governs the OWNER INCARNATION fact, not the roster device
+        // fact: `derive_authority_facts` projects onto a roster fact only from
+        // `RegisterKey::Device` registers. Read the surface this key actually reaches.
+        let (key, _) = frozen
+            .registers
+            .iter()
+            .find(|(key, cut)| {
+                matches!(key, RegisterKey::OwnerIncarnation { .. }) && matches!(cut, Cut::Empty)
+            })
+            .expect("the legacy OwnerDemote closed the secrets chain with an empty cut");
+        let owner_id = match key {
+            RegisterKey::OwnerIncarnation { owner_id, .. } => *owner_id,
+            other => panic!("expected an owner-incarnation key, got {other:?}"),
+        };
+        let secrets_boundary = |history: &AccountAuthHistory| {
+            history
+                .owner_incarnation_facts()
+                .find(|(id, _)| **id == owner_id)
+                .map(|(_, fact)| fact.secrets_boundary)
+        };
+        let before = secrets_boundary(frozen.history());
+
+        let registers =
+            [(key.clone(), Cut::At { seq: 42, hash: AccountEntryHash::from_bytes([0xfa; 32]) })];
+        let history =
+            pinned_history(frozen, &[AppliedOperation { entry: &cut, registers: &registers }]);
+
+        assert_eq!(
+            before,
+            Some(AuthorityBoundary::Closed),
+            "the fixture must start from a frozen-closed chain or this proves nothing",
+        );
+        assert_eq!(
+            secrets_boundary(&history),
+            Some(AuthorityBoundary::Closed),
+            "a chain the checkpoint froze closed stays closed against a later authorized register",
         );
     }
 
