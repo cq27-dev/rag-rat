@@ -42,8 +42,8 @@ mod pre_verify;
 mod registers;
 // C4.2b: the account secrets log (`log_id = 1`) — the `StreamKeyWrap` op + owner-gated acceptance
 // evaluator, consuming the control fold's authority projection (#607).
+mod annex;
 mod secrets;
-mod snapshot;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -52,6 +52,14 @@ mod test_support;
 // `owned_stream_v2_id` (pure derivation — the live seam's stream resolver) and
 // `established_owned_stream_v2` (derivation + effective-ownership fact — the reconcile's fast-path
 // probe). #664 wires all three into `query::memory`, so they are plain re-exports.
+// The C6 snapshot-authoring seam (#609). No caller fires it yet, and that is deliberate rather
+// than an oversight: a snapshot is only worth minting once something reads one. #406 owns both
+// halves — it is what consumes manifests ("window pruning only against verified snapshot
+// manifests") and it owns the maintenance path device-side sync piggybacks. Authoring on a
+// cadence before then would write entries nothing reads into a capacity-bounded candidate
+// store that cannot yet prune them, since the tombstone horizon is still outstanding on #609.
+#[allow(unused_imports, reason = "C6 authoring seam is frozen before transport wiring lands")]
+pub use annex::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use authoring::{
     EnrollingDevice, RevokeReason, StreamRevocation, author_device_add_in_tx,
     author_enrollment_device_add_in_tx, author_stream_grant_in_tx, author_stream_revoke_in_tx,
@@ -142,14 +150,6 @@ pub use secrets::{
     mint_and_author_stream_key_wrap_in_tx, repo_incarnation_state, rotate_stream_key_in_tx,
     select_current_sealing_wrap, stream_key_rotation_needed,
 };
-// The C6 snapshot-authoring seam (#609). No caller fires it yet, and that is deliberate rather
-// than an oversight: a snapshot is only worth minting once something reads one. #406 owns both
-// halves — it is what consumes manifests ("window pruning only against verified snapshot
-// manifests") and it owns the maintenance path device-side sync piggybacks. Authoring on a
-// cadence before then would write entries nothing reads into a capacity-bounded candidate
-// store that cannot yet prune them, since the tombstone horizon is still outstanding on #609.
-#[allow(unused_imports, reason = "C6 authoring seam is frozen before transport wiring lands")]
-pub use snapshot::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use storage::{
     CapacityScope, IngestOutcome, PromotionOutcome, StreamGrantListing, SyncAccountEntry,
     account_effective_count, account_entries_for_enrollment, account_entries_for_sync,

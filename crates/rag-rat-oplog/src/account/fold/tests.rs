@@ -2,7 +2,7 @@ use super::super::test_support;
 use super::*;
 use crate::account::envelope::{sign_account_entry, verify_account_signed};
 use crate::account::test_support::Dev;
-use crate::account::{AccountId, ops as account_ops, snapshot};
+use crate::account::{AccountId, annex, ops as account_ops};
 use crate::device::{DeviceSecret, DeviceX25519Secret};
 use crate::stream::StreamId;
 
@@ -249,11 +249,11 @@ fn projection_fixture() -> Fixture {
 #[test]
 fn a_shuffled_fold_produces_identical_projection_bytes() {
     let f = projection_fixture();
-    let baseline = snapshot::projection::encoded(&f.fold());
+    let baseline = annex::projection::encoded(&f.fold());
     assert!(baseline.len() > 200, "the fixture must exercise a non-trivial projection");
     for rot in 0..f.entries.len() {
         assert_eq!(
-            snapshot::projection::encoded(&f.fold_rotated(rot)),
+            annex::projection::encoded(&f.fold_rotated(rot)),
             baseline,
             "arrival order rotated by {rot} changed the canonical bytes",
         );
@@ -264,7 +264,7 @@ fn a_shuffled_fold_produces_identical_projection_bytes() {
 
 /// Build the manifest target a HONEST author would publish for this fixture: every device's
 /// control-chain head, and the hash its own fold produces.
-fn honest_target(f: &Fixture) -> snapshot::ops::SnapshotTarget {
+fn honest_target(f: &Fixture) -> annex::ops::SnapshotTarget {
     let history = f.fold();
     let mut heads: HashMap<DeviceFingerprint, (u64, [u8; 32])> = HashMap::new();
     for entry in &f.entries {
@@ -274,14 +274,14 @@ fn honest_target(f: &Fixture) -> snapshot::ops::SnapshotTarget {
             *slot = (h.seq, entry.entry_hash.into());
         }
     }
-    snapshot::ops::SnapshotTarget {
+    annex::ops::SnapshotTarget {
         log_id: 0,
         stream_id: None,
         subject_account_id: None,
-        folded_state_hash: snapshot::projection::folded_state_hash(&history),
+        folded_state_hash: annex::projection::folded_state_hash(&history),
         covered: heads
             .into_iter()
-            .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+            .map(|(device_fingerprint, (seq, entry_hash))| annex::ops::CoveredWatermark {
                 device_fingerprint,
                 seq,
                 entry_hash: AccountEntryHash::from_bytes(entry_hash),
@@ -294,8 +294,8 @@ fn honest_target(f: &Fixture) -> snapshot::ops::SnapshotTarget {
 fn an_honest_snapshot_verifies_against_a_local_refold() {
     let f = projection_fixture();
     assert_eq!(
-        snapshot::verify::verify_snapshot(&f.entries, &[honest_target(&f)]),
-        snapshot::verify::SnapshotVerdict::Verified,
+        annex::verify::verify_snapshot(&f.entries, &[honest_target(&f)]),
+        annex::verify::SnapshotVerdict::Verified,
     );
 }
 
@@ -306,8 +306,8 @@ fn a_false_coverage_claim_is_a_mismatch() {
     let mut lying = honest_target(&f);
     lying.folded_state_hash = [0xff; 32];
     assert_eq!(
-        snapshot::verify::verify_snapshot(&f.entries, &[lying]),
-        snapshot::verify::SnapshotVerdict::Mismatch,
+        annex::verify::verify_snapshot(&f.entries, &[lying]),
+        annex::verify::SnapshotVerdict::Mismatch,
     );
 }
 
@@ -322,10 +322,8 @@ fn a_device_lacking_the_covered_history_reports_unverifiable_not_a_judgement() {
 
     // Hold nothing at all: the heads themselves are absent.
     assert_eq!(
-        snapshot::verify::verify_snapshot(&[], std::slice::from_ref(&target)),
-        snapshot::verify::SnapshotVerdict::Unverifiable(
-            snapshot::verify::Unverifiable::WatermarkNotHeld
-        ),
+        annex::verify::verify_snapshot(&[], std::slice::from_ref(&target)),
+        annex::verify::SnapshotVerdict::Unverifiable(annex::verify::Unverifiable::WatermarkNotHeld),
     );
 
     // Hold the heads but not a link beneath them: a claim this device cannot reconstruct.
@@ -337,10 +335,8 @@ fn a_device_lacking_the_covered_history_reports_unverifiable_not_a_judgement() {
         .collect();
     assert!(heads.len() < f.entries.len(), "the fixture must have interior entries");
     assert_eq!(
-        snapshot::verify::verify_snapshot(&heads, &[target]),
-        snapshot::verify::SnapshotVerdict::Unverifiable(
-            snapshot::verify::Unverifiable::IncompleteChain
-        ),
+        annex::verify::verify_snapshot(&heads, &[target]),
+        annex::verify::SnapshotVerdict::Unverifiable(annex::verify::Unverifiable::IncompleteChain),
     );
 }
 
@@ -361,8 +357,8 @@ fn a_snapshot_of_one_branch_is_refused_by_a_device_holding_the_equivocation() {
 
     // Without the sibling, the claim verifies — the branch it names is real.
     assert_eq!(
-        snapshot::verify::verify_snapshot(&f.entries, std::slice::from_ref(&target)),
-        snapshot::verify::SnapshotVerdict::Verified,
+        annex::verify::verify_snapshot(&f.entries, std::slice::from_ref(&target)),
+        annex::verify::SnapshotVerdict::Verified,
     );
 
     // Now equivocate at a covered coordinate: a second entry at a `(device, seq)` the claim's
@@ -385,8 +381,8 @@ fn a_snapshot_of_one_branch_is_refused_by_a_device_holding_the_equivocation() {
     );
 
     assert_eq!(
-        snapshot::verify::verify_snapshot(&f.entries, &[target]),
-        snapshot::verify::SnapshotVerdict::IgnoresHeldEvidence,
+        annex::verify::verify_snapshot(&f.entries, &[target]),
+        annex::verify::SnapshotVerdict::IgnoresHeldEvidence,
         "a device holding the sibling must not trust a snapshot that folded only one branch",
     );
 }
@@ -396,11 +392,11 @@ fn a_target_naming_an_unsupported_log_is_unverifiable_not_failed() {
     // The wire admits secrets/content targets so #406 needs no bump; this binary has no
     // projection for them and must say so rather than call the snapshot wrong.
     let f = projection_fixture();
-    let secrets_target = snapshot::ops::SnapshotTarget { log_id: 1, ..honest_target(&f) };
+    let secrets_target = annex::ops::SnapshotTarget { log_id: 1, ..honest_target(&f) };
     assert_eq!(
-        snapshot::verify::verify_snapshot(&f.entries, &[secrets_target]),
-        snapshot::verify::SnapshotVerdict::Unverifiable(
-            snapshot::verify::Unverifiable::UnsupportedTargets
+        annex::verify::verify_snapshot(&f.entries, &[secrets_target]),
+        annex::verify::SnapshotVerdict::Unverifiable(
+            annex::verify::Unverifiable::UnsupportedTargets
         ),
     );
 }
@@ -413,10 +409,8 @@ fn a_forged_chain_link_is_not_walkable_into_the_verification_input() {
     let mut forged = honest_target(&f);
     forged.covered[0].seq = forged.covered[0].seq.wrapping_add(7);
     assert_eq!(
-        snapshot::verify::verify_snapshot(&f.entries, &[forged]),
-        snapshot::verify::SnapshotVerdict::Unverifiable(
-            snapshot::verify::Unverifiable::IncompleteChain
-        ),
+        annex::verify::verify_snapshot(&f.entries, &[forged]),
+        annex::verify::SnapshotVerdict::Unverifiable(annex::verify::Unverifiable::IncompleteChain),
     );
 }
 
@@ -426,7 +420,7 @@ fn a_forged_chain_link_is_not_walkable_into_the_verification_input() {
 /// into a pinned vector. This checks the shape rather than the digest.
 #[test]
 fn the_projection_is_one_complete_canonical_cbor_item() {
-    let bytes = snapshot::projection::encoded(&projection_fixture().fold());
+    let bytes = annex::projection::encoded(&projection_fixture().fold());
     crate::cbor::require_canonical_cbor(&bytes)
         .expect("the canonical projection must decode as exactly one canonical CBOR item");
 }
@@ -439,7 +433,7 @@ fn the_projection_is_one_complete_canonical_cbor_item() {
 /// `SNAPSHOT_STATE_FORMAT_V1` bump, not a refactor.
 #[test]
 fn golden_projection_pins_the_canonical_encoding() {
-    let hash = snapshot::projection::folded_state_hash(&projection_fixture().fold());
+    let hash = annex::projection::folded_state_hash(&projection_fixture().fold());
     // Recomputed when the fixture's `stream_own` moved to `PublicRead` (grants fold only on
     // public streams): the ENCODING is unchanged — the fixture's stream id and spec bytes
     // are what moved. A change to what `folded_state_hash` covers is still a
@@ -454,14 +448,14 @@ fn golden_projection_pins_the_canonical_encoding() {
 /// that silently dropped a collection would still pass the determinism test above.
 #[test]
 fn the_projection_hash_moves_with_every_bound_collection() {
-    let base = snapshot::projection::folded_state_hash(&projection_fixture().fold());
+    let base = annex::projection::folded_state_hash(&projection_fixture().fold());
 
     // A roster/effective-set change.
     let mut roster = projection_fixture();
     let g = roster.genesis_hash;
     roster.author(&Dev::new(1), Some(g.into()), &device_add(&Dev::new(7), DeviceRole::Member));
     assert_ne!(
-        snapshot::projection::folded_state_hash(&roster.fold()),
+        annex::projection::folded_state_hash(&roster.fold()),
         base,
         "an added device must change the hash",
     );
@@ -478,7 +472,7 @@ fn the_projection_hash_moves_with_every_bound_collection() {
         reason: "revoked".to_string(),
     });
     assert_ne!(
-        snapshot::projection::folded_state_hash(&tombstone.fold()),
+        annex::projection::folded_state_hash(&tombstone.fold()),
         base,
         "a tombstoned device must change the hash",
     );
@@ -493,7 +487,7 @@ fn the_projection_hash_moves_with_every_bound_collection() {
         grant_role: GrantRole::Reader,
     });
     assert_ne!(
-        snapshot::projection::folded_state_hash(&grant.fold()),
+        annex::projection::folded_state_hash(&grant.fold()),
         base,
         "an added grant must change the hash",
     );
@@ -504,10 +498,10 @@ fn the_projection_hash_moves_with_every_bound_collection() {
 #[test]
 fn a_different_covered_prefix_projects_differently() {
     let f = projection_fixture();
-    let full = snapshot::projection::folded_state_hash(&f.fold());
+    let full = annex::projection::folded_state_hash(&f.fold());
     let withheld = f.entries.last().expect("fixture has entries").entry_hash;
     assert_ne!(
-        snapshot::projection::folded_state_hash(&f.fold_without(withheld.into())),
+        annex::projection::folded_state_hash(&f.fold_without(withheld.into())),
         full,
         "folding a shorter prefix must project differently",
     );

@@ -37,6 +37,11 @@
 //! do not exist yet. The decision table is pinned by `the_version_decision_table_is_total` — extend
 //! that test rather than reasoning about it fresh.
 //!
+//! The whole version boundary above is a rule of the SNAPSHOT tag. The view-manifest tag has no
+//! format axis at all: its payload is the planner's own canonical encoding, carried verbatim
+//! because a cut names it by `sha256` of exactly those bytes. A different manifest wire would
+//! therefore be a different annex tag, not a second format under this one.
+//!
 //! Like the control and secrets ops, this layer owns STRUCTURAL wire validity only. Whether a
 //! snapshot's claim is TRUE — whether re-folding its covered prefix reproduces `folded_state_hash`
 //! — is a read-time question and is deliberately not answerable here: it depends on what this
@@ -46,6 +51,7 @@
 use minicbor::decode::{Decoder, Error as CborError};
 
 use super::super::AccountId;
+use super::super::control_v2::views;
 use super::super::id::AccountEntryHash;
 use crate::cbor;
 use crate::op::DeviceFingerprint;
@@ -56,6 +62,9 @@ use crate::stream::StreamId;
 pub(in crate::account) mod entry_type {
     /// A signed coverage claim over folded history (§4.7).
     pub(in crate::account) const SNAPSHOT: u32 = 0;
+    /// A control-v2 cut's DETACHED pre-cut view manifest. Its wire belongs to the planner that
+    /// reads it ([`super::views`]); this log only carries the bytes.
+    pub(in crate::account) const VIEW_MANIFEST: u32 = 1;
 }
 
 /// The canonical-projection encoding a `folded_state_hash` is taken over, and the only format this
@@ -89,10 +98,11 @@ pub(in crate::account) struct SnapshotTarget {
     pub(in crate::account) covered: Vec<CoveredWatermark>,
 }
 
-/// The annex ops. One today; the log is named for the CLASS (authority-inert bookkeeping) rather
-/// than the op, so the next inert artifact takes tag 1 instead of minting a fourth log.
+/// The annex ops. The log is named for the CLASS (authority-inert bookkeeping) rather than for its
+/// first op, which is why the second inert artifact took tag 1 here instead of minting a fourth
+/// log.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::account) enum SnapshotOp {
+pub(in crate::account) enum AnnexOp {
     Snapshot {
         state_format_version: u32,
         /// Reserved for the §4.4 moderation epoch (#407); MUST be 0 at format 1. Reserved rather
@@ -101,14 +111,18 @@ pub(in crate::account) enum SnapshotOp {
         moderation_epoch: u64,
         targets: Vec<SnapshotTarget>,
     },
+    /// One control-v2 pre-cut view, carried as the manifest's OWN canonical encoding verbatim. A
+    /// cut names its evidence by `sha256` of that payload, so re-framing it here — even into an
+    /// equally canonical wrapper — would store an artifact no cut could ever name.
+    ViewManifest(views::ViewManifest),
 }
 
 /// The result of decoding an annex payload. Three outcomes, and only the first is interpreted:
 /// everything this binary cannot interpret is RETAINED rather than rejected, so it stays a valid,
 /// chainable entry for the peer or future binary that can.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::account) enum DecodedSnapshotOp {
-    Known(SnapshotOp),
+pub(in crate::account) enum DecodedAnnexOp {
+    Known(AnnexOp),
     /// A tag this binary does not know (forward-compat within the annex log).
     UnknownTag {
         entry_type: u32,
@@ -123,16 +137,22 @@ pub(in crate::account) enum DecodedSnapshotOp {
     },
 }
 
-pub(in crate::account) fn entry_type_of(op: &SnapshotOp) -> u32 {
+pub(in crate::account) fn entry_type_of(op: &AnnexOp) -> u32 {
     match op {
-        SnapshotOp::Snapshot { .. } => entry_type::SNAPSHOT,
+        AnnexOp::Snapshot { .. } => entry_type::SNAPSHOT,
+        AnnexOp::ViewManifest(_) => entry_type::VIEW_MANIFEST,
     }
 }
 
-/// Author a payload. This binary authors only the format it implements — signing a version it
-/// cannot itself validate would be signing a claim it cannot check.
-pub(in crate::account) fn encode(op: &SnapshotOp) -> Result<Vec<u8>, CborError> {
-    Ok(format_v1::encode_canonical(&format_v1::canonicalize(op)?))
+/// Author a payload. For a snapshot this binary authors only the format it implements — signing a
+/// version it cannot itself validate would be signing a claim it cannot check. A manifest owns its
+/// own canonical encoding and is passed through untouched.
+pub(in crate::account) fn encode(op: &AnnexOp) -> Result<Vec<u8>, CborError> {
+    match op {
+        AnnexOp::Snapshot { .. } => format_v1::encode_canonical(&format_v1::canonicalize(op)?),
+        AnnexOp::ViewManifest(view) =>
+            view.encode().map_err(|err| CborError::message(format!("view manifest: {err}"))),
+    }
 }
 
 /// The framing every snapshot format shares, and the ONLY thing read before the version dispatch: a
@@ -152,7 +172,16 @@ fn peek_state_format_version(bytes: &[u8]) -> Result<u32, CborError> {
 pub(in crate::account) fn decode(
     entry_type: u32,
     bytes: &[u8],
-) -> Result<DecodedSnapshotOp, CborError> {
+) -> Result<DecodedAnnexOp, CborError> {
+    if entry_type == entry_type::VIEW_MANIFEST {
+        // The planner owns this wire and runs its own `encode(decode) == bytes` check, so a stored
+        // manifest is byte-identical to what the cut's digest commits to. Nothing is retained
+        // opaque here: the tag carries no format version, so a payload that does not decode is not
+        // a newer manifest, it is a malformed one.
+        return views::decode_manifest(bytes)
+            .map(|view| DecodedAnnexOp::Known(AnnexOp::ViewManifest(view)))
+            .map_err(|err| CborError::message(format!("view manifest: {err}")));
+    }
     if entry_type != entry_type::SNAPSHOT {
         // A forward-version annex op is RETAINED opaque, but it must STILL be exactly one canonical
         // CBOR array — otherwise a future binary that learns this tag would run the
@@ -160,7 +189,7 @@ pub(in crate::account) fn decode(
         // consensus on a signed log. Mirrors the control and secrets decoders.
         cbor::require_canonical_cbor(bytes)?;
         cbor::expect_definite_len(&mut Decoder::new(bytes))?;
-        return Ok(DecodedSnapshotOp::UnknownTag { entry_type, bytes: bytes.to_vec() });
+        return Ok(DecodedAnnexOp::UnknownTag { entry_type, bytes: bytes.to_vec() });
     }
 
     // ---- the entire version boundary, in one place ----
@@ -172,22 +201,22 @@ pub(in crate::account) fn decode(
         return Err(CborError::message("snapshot state_format_version 0 is reserved"));
     }
     if state_format_version != SNAPSHOT_STATE_FORMAT_V1 {
-        return Ok(DecodedSnapshotOp::FutureFormat { state_format_version, bytes: bytes.to_vec() });
+        return Ok(DecodedAnnexOp::FutureFormat { state_format_version, bytes: bytes.to_vec() });
     }
 
     let op = format_v1::decode(bytes)?;
     // Canonicity guarantee for an INTERPRETED op: the decoded value must re-encode to the exact
     // wire, which rejects non-minimal ints, unsorted coverage, and trailing bytes in one check.
-    if format_v1::encode_canonical(&op) != bytes {
+    if format_v1::encode_canonical(&op)? != bytes {
         return Err(CborError::message("annex op payload is not canonical"));
     }
-    Ok(DecodedSnapshotOp::Known(op))
+    Ok(DecodedAnnexOp::Known(op))
 }
 
 /// The ingest-time structural gate for an annex payload (the per-log twin of the control and
 /// secrets validators): an interpretable payload is fully decoded, and anything else must still be
 /// well-framed to be storable.
-pub(in crate::account) fn validate_storable_snapshot_payload(
+pub(in crate::account) fn validate_storable_annex_payload(
     entry_type: u32,
     payload: &[u8],
 ) -> Result<(), CborError> {
@@ -206,7 +235,7 @@ mod format_v1 {
     use super::super::super::limits::{SNAPSHOT_COVERED_MAX, SNAPSHOT_TARGETS_MAX};
     use super::super::super::ops::{decode_opt_b32, encode_opt_b32};
     use super::{
-        AccountEntryHash, CoveredWatermark, SNAPSHOT_STATE_FORMAT_V1, SnapshotOp, SnapshotTarget,
+        AccountEntryHash, AnnexOp, CoveredWatermark, SNAPSHOT_STATE_FORMAT_V1, SnapshotTarget,
     };
     use crate::cbor::{self, VecEncoderExt};
     use crate::op::DeviceFingerprint;
@@ -224,21 +253,25 @@ mod format_v1 {
     /// decoder (and peers) would reject.
     ///
     /// The version check here is what makes every other rule in this module unconditional.
-    pub(super) fn canonicalize(op: &SnapshotOp) -> Result<SnapshotOp, CborError> {
+    pub(super) fn canonicalize(op: &AnnexOp) -> Result<AnnexOp, CborError> {
         match op {
-            SnapshotOp::Snapshot { state_format_version, moderation_epoch, targets } => {
+            AnnexOp::Snapshot { state_format_version, moderation_epoch, targets } => {
                 if *state_format_version != SNAPSHOT_STATE_FORMAT_V1 {
                     return Err(CborError::message(
                         "this binary authors only snapshot state format 1",
                     ));
                 }
                 check_reserved_epoch(*moderation_epoch)?;
-                Ok(SnapshotOp::Snapshot {
+                Ok(AnnexOp::Snapshot {
                     state_format_version: *state_format_version,
                     moderation_epoch: *moderation_epoch,
                     targets: canonical_targets(targets)?,
                 })
             },
+            // Format 1 is a snapshot format. The manifest tag has no format axis and never reaches
+            // here; spelling it out keeps that true by construction rather than by convention.
+            AnnexOp::ViewManifest(_) =>
+                Err(CborError::message("snapshot state format 1 encodes only the snapshot tag")),
         }
     }
 
@@ -332,12 +365,16 @@ mod format_v1 {
         )
     }
 
-    pub(super) fn encode_canonical(op: &SnapshotOp) -> Vec<u8> {
+    pub(super) fn encode_canonical(op: &AnnexOp) -> Result<Vec<u8>, CborError> {
         let mut buf = Vec::with_capacity(128);
         {
             let mut enc = Encoder::new(&mut buf);
             match op {
-                SnapshotOp::Snapshot { state_format_version, moderation_epoch, targets } => {
+                AnnexOp::ViewManifest(_) =>
+                    return Err(CborError::message(
+                        "snapshot state format 1 encodes only the snapshot tag",
+                    )),
+                AnnexOp::Snapshot { state_format_version, moderation_epoch, targets } => {
                     enc.put_array(3);
                     enc.put_u32(*state_format_version);
                     enc.put_u64(*moderation_epoch);
@@ -362,10 +399,10 @@ mod format_v1 {
                 },
             }
         }
-        buf
+        Ok(buf)
     }
 
-    pub(super) fn decode(bytes: &[u8]) -> Result<SnapshotOp, CborError> {
+    pub(super) fn decode(bytes: &[u8]) -> Result<AnnexOp, CborError> {
         let mut d = Decoder::new(bytes);
         cbor::expect_array(&mut d, 3)?;
         let state_format_version = d.u32()?;
@@ -402,7 +439,7 @@ mod format_v1 {
             prev_key = Some(key);
             targets.push(target);
         }
-        Ok(SnapshotOp::Snapshot { state_format_version, moderation_epoch, targets })
+        Ok(AnnexOp::Snapshot { state_format_version, moderation_epoch, targets })
     }
 
     fn decode_covered(d: &mut Decoder<'_>) -> Result<Vec<CoveredWatermark>, CborError> {
@@ -450,8 +487,8 @@ mod tests {
         rag_rat_base::hash::hex_lower(bytes)
     }
 
-    fn snapshot(targets: Vec<SnapshotTarget>) -> SnapshotOp {
-        SnapshotOp::Snapshot {
+    fn snapshot(targets: Vec<SnapshotTarget>) -> AnnexOp {
+        AnnexOp::Snapshot {
             state_format_version: SNAPSHOT_STATE_FORMAT_V1,
             moderation_epoch: 0,
             targets,
@@ -475,7 +512,7 @@ mod tests {
         }
     }
 
-    fn sample() -> SnapshotOp {
+    fn sample() -> AnnexOp {
         snapshot(vec![SnapshotTarget {
             folded_state_hash: [0x2a; 32],
             covered: vec![CoveredWatermark {
@@ -525,7 +562,7 @@ mod tests {
 
         // version 1 — INTERPRETED, with every format-1 rule enforced.
         let v1 = encode(&sample()).unwrap();
-        assert!(matches!(decode(entry_type::SNAPSHOT, &v1).unwrap(), DecodedSnapshotOp::Known(_)));
+        assert!(matches!(decode(entry_type::SNAPSHOT, &v1).unwrap(), DecodedAnnexOp::Known(_)));
 
         // versions 2.. — RETAINED, never interpreted and never rejected. Crucially this holds even
         // when the payload would violate format-1 rules (different field count, a moderation epoch,
@@ -535,7 +572,7 @@ mod tests {
             for extra_fields in [0usize, 1, 2, 5] {
                 let bytes = peer_payload(version, extra_fields);
                 match decode(entry_type::SNAPSHOT, &bytes).unwrap() {
-                    DecodedSnapshotOp::FutureFormat { state_format_version, bytes: retained } => {
+                    DecodedAnnexOp::FutureFormat { state_format_version, bytes: retained } => {
                         assert_eq!(state_format_version, version);
                         assert_eq!(retained, bytes, "retained verbatim, never re-encoded");
                     },
@@ -545,7 +582,7 @@ mod tests {
         }
 
         // An unknown TAG is the other retention axis and behaves the same way.
-        assert!(matches!(decode(9, &[0x81, 0x01]).unwrap(), DecodedSnapshotOp::UnknownTag {
+        assert!(matches!(decode(9, &[0x81, 0x01]).unwrap(), DecodedAnnexOp::UnknownTag {
             entry_type: 9,
             ..
         }));
@@ -555,14 +592,14 @@ mod tests {
     fn only_the_implemented_format_can_be_authored() {
         // Signing a version this binary cannot validate would be signing a claim it cannot check.
         // This is also what makes every rule inside `format_v1` provably unconditional.
-        let future = SnapshotOp::Snapshot {
+        let future = AnnexOp::Snapshot {
             state_format_version: SNAPSHOT_STATE_FORMAT_V1 + 1,
             moderation_epoch: 0,
             targets: vec![account_target(0, &[0x11])],
         };
         assert!(encode(&future).is_err(), "a future format is retained on read, never authored");
 
-        let reserved = SnapshotOp::Snapshot {
+        let reserved = AnnexOp::Snapshot {
             state_format_version: 0,
             moderation_epoch: 0,
             targets: vec![account_target(0, &[0x11])],
@@ -587,7 +624,54 @@ mod tests {
         // Annex tag 0 is SNAPSHOT, not control's AccountGenesis. Decode is only ever reached with
         // `log_id == ANNEX_LOG`, so the numbering cannot collide across logs.
         assert_eq!(entry_type::SNAPSHOT, 0);
+        assert_eq!(entry_type::VIEW_MANIFEST, 1);
         assert_eq!(entry_type_of(&sample()), entry_type::SNAPSHOT);
+        assert_eq!(entry_type_of(&manifest_op()), entry_type::VIEW_MANIFEST);
+    }
+
+    fn manifest_op() -> AnnexOp {
+        AnnexOp::ViewManifest(views::ViewManifest {
+            checkpoint: [0x7c; 32],
+            entries: vec![AccountEntryHash::from_bytes([0x11; 32])],
+        })
+    }
+
+    #[test]
+    fn a_view_manifest_is_carried_under_the_exact_digest_its_cut_names() {
+        // A cut names its evidence by `sha256` of the manifest's own canonical encoding. Storing
+        // anything else — even an equally canonical re-framing — would put the artifact beyond the
+        // reach of the only name a cut can use for it.
+        let AnnexOp::ViewManifest(view) = manifest_op() else { panic!("manifest fixture") };
+        let payload = encode(&manifest_op()).unwrap();
+        assert_eq!(payload, view.encode().unwrap(), "the annex payload is the manifest wire");
+        assert_eq!(
+            cbor::sha256(&payload),
+            view.digest().unwrap(),
+            "and hashes to what a cut names"
+        );
+        assert_eq!(
+            decode(entry_type::VIEW_MANIFEST, &payload).unwrap(),
+            DecodedAnnexOp::Known(manifest_op()),
+        );
+    }
+
+    #[test]
+    fn a_malformed_view_manifest_is_refused_while_an_unknown_tag_is_still_retained() {
+        // The manifest tag carries no format version, so a payload that does not decode is
+        // malformed — never a newer format to keep opaque. Ingest is where that is decided.
+        assert!(validate_storable_annex_payload(entry_type::VIEW_MANIFEST, &[0x81, 0x01]).is_err());
+        assert!(
+            validate_storable_annex_payload(
+                entry_type::VIEW_MANIFEST,
+                &encode(&manifest_op()).unwrap()
+            )
+            .is_ok(),
+        );
+        // Taking tag 1 did not close the forward-compat door on the tags above it.
+        assert!(matches!(decode(2, &[0x81, 0x01]).unwrap(), DecodedAnnexOp::UnknownTag {
+            entry_type: 2,
+            ..
+        }));
     }
 
     #[test]
@@ -608,7 +692,7 @@ mod tests {
             },
         ]);
         let bytes = encode(&op).unwrap();
-        assert_eq!(decode(entry_type::SNAPSHOT, &bytes).unwrap(), DecodedSnapshotOp::Known(op));
+        assert_eq!(decode(entry_type::SNAPSHOT, &bytes).unwrap(), DecodedAnnexOp::Known(op));
     }
 
     #[test]
@@ -685,7 +769,7 @@ mod tests {
     fn the_reserved_moderation_epoch_is_enforced_on_both_paths() {
         // `fold_exclude` does not exist (#407), so a non-zero epoch names semantics nothing can
         // evaluate. An unenforced "MUST be 0" is just a comment.
-        let nonzero = SnapshotOp::Snapshot {
+        let nonzero = AnnexOp::Snapshot {
             state_format_version: SNAPSHOT_STATE_FORMAT_V1,
             moderation_epoch: 1,
             targets: vec![account_target(0, &[0x11])],
@@ -765,7 +849,7 @@ mod tests {
     fn an_unknown_annex_tag_is_retained_not_rejected() {
         // Forward-compat: an annex tag this binary does not know stays a valid, chainable entry...
         let payload = vec![0x81, 0x01];
-        assert_eq!(decode(7, &payload).unwrap(), DecodedSnapshotOp::UnknownTag {
+        assert_eq!(decode(7, &payload).unwrap(), DecodedAnnexOp::UnknownTag {
             entry_type: 7,
             bytes: payload
         });

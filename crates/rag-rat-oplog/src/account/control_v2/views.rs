@@ -23,6 +23,22 @@ use crate::cbor::{self, VecEncoderExt};
 const DOMAIN: &str = "rag-rat/control-view/2";
 pub(in crate::account) const MAX_ENTRIES: usize = 4096;
 pub(in crate::account) const MAX_BYTES: usize = 16 * 1024 * 1024;
+// The declared evidence budget IS the candidate store's own per-account budget, so the entire held
+// set always fits one bundle by construction — which is what lets a refold hand the executor every
+// row it holds without deciding what to leave out. The two pairs are declared independently, so
+// pin the equality here rather than leaving it to a comment that cannot fail.
+const _: () = assert!(MAX_ENTRIES == super::super::storage::CANDIDATES_PER_ACCOUNT_MAX);
+const _: () = assert!(MAX_BYTES == super::super::storage::CANDIDATE_BYTES_PER_ACCOUNT_MAX);
+/// The most identities ONE view may name.
+///
+/// A manifest is carried as a single annex entry, so the §18a 64 KiB envelope — not
+/// [`MAX_ENTRIES`] — is what actually binds one view: at 34 bytes per reference a signed manifest
+/// runs out of envelope in the low 1,900s. Declaring [`MAX_ENTRIES`] here would promise a view no
+/// author could ever sign, and the first account to need one would discover that at signing time.
+///
+/// Splitting a view across entries is NOT the alternative: a cut names its evidence by one digest
+/// over one payload, so half a view is simply a different view.
+pub(in crate::account) const MAX_VIEW_ENTRIES: usize = 1_900;
 /// Every distinct view still has to be supplied and folded once, so the number of them a bundle may
 /// carry is the number of signed objects it may carry. A stricter number would be an arbitrary
 /// lifetime limit on how long an account may keep revoking, not a bound on work.
@@ -39,7 +55,7 @@ pub(in crate::account) struct ViewManifest {
 
 impl ViewManifest {
     pub(in crate::account) fn encode(&self) -> anyhow::Result<Vec<u8>> {
-        anyhow::ensure!(self.entries.len() <= MAX_ENTRIES, "view entries exceed limit");
+        anyhow::ensure!(self.entries.len() <= MAX_VIEW_ENTRIES, "view entries exceed limit");
         let mut entries = self.entries.clone();
         entries.sort_unstable();
         anyhow::ensure!(entries.windows(2).all(|p| p[0] != p[1]), "duplicate view entry");
@@ -60,15 +76,19 @@ impl ViewManifest {
     }
 }
 
-fn decode(bytes: &[u8]) -> anyhow::Result<ViewManifest> {
+/// Decode one detached manifest payload — and, because a manifest is stored as an annex entry
+/// verbatim, the annex log's structural gate for the view-manifest tag. There is no format axis
+/// inside the tag: this wire either decodes or it does not, and a different manifest wire would be
+/// a different tag.
+pub(in crate::account) fn decode_manifest(bytes: &[u8]) -> anyhow::Result<ViewManifest> {
     // Check before recursively validating the CBOR item or allocating its arrays.
-    anyhow::ensure!(bytes.len() <= MAX_ENTRIES * 34 + 128, "view manifest too large");
+    anyhow::ensure!(bytes.len() <= MAX_VIEW_ENTRIES * 34 + 128, "view manifest too large");
     cbor::require_canonical_cbor(bytes)?;
     let mut d = Decoder::new(bytes);
     anyhow::ensure!(d.array()? == Some(3) && d.str()? == DOMAIN, "view grammar");
     let checkpoint = id::fixed(d.bytes()?)?;
     let n = d.array()?.ok_or_else(|| anyhow::anyhow!("indefinite view entries"))?;
-    anyhow::ensure!(n <= MAX_ENTRIES as u64, "view entries exceed limit");
+    anyhow::ensure!(n <= MAX_VIEW_ENTRIES as u64, "view entries exceed limit");
     let mut entries = Vec::with_capacity(n as usize);
     for _ in 0..n {
         entries.push(id::fixed::<32>(d.bytes()?)?.into());
@@ -154,7 +174,7 @@ pub(in crate::account) fn plan_replay(
     let mut views: BTreeMap<[u8; 32], ViewManifest> = BTreeMap::new();
     let mut references = 0usize;
     for bytes in manifests {
-        let view = decode(bytes)?;
+        let view = decode_manifest(bytes)?;
         require(view.checkpoint == pin.checkpoint_digest, "view checkpoint mismatch")?;
         references += view.entries.len();
         require(references <= MAX_REFERENCES, "aggregate view reference limit")?;

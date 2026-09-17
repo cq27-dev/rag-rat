@@ -638,7 +638,9 @@ fn enrollment_budget_reports_raw_headroom_and_clamps_at_zero() {
     let account = AccountId::from_bytes([7; 32]);
     let local_fp = crate::local_device(&conn, NOW).unwrap().fingerprint();
     let budget = super::super::bootstrap::enrollment_budget(&conn, account, NOW).unwrap();
-    assert_eq!(budget.account_entries_remaining as usize, CANDIDATES_PER_ACCOUNT_MAX);
+    // The ORDINARY cap: an enrollment receipt is ordinary traffic, so the preflight measures it
+    // against the budget above the view-manifest floor — the one admission will apply to it.
+    assert_eq!(budget.account_entries_remaining as usize, ORDINARY_CANDIDATES_PER_ACCOUNT_MAX);
     assert_eq!(budget.global_entries_remaining as usize, CANDIDATES_GLOBAL_MAX);
 
     // 100 one-byte held candidates plus parked rows that are malformed or claim an unrelated
@@ -666,9 +668,15 @@ fn enrollment_budget_reports_raw_headroom_and_clamps_at_zero() {
         .unwrap();
     }
     let budget = super::super::bootstrap::enrollment_budget(&conn, account, NOW).unwrap();
-    assert_eq!(budget.account_entries_remaining as usize, CANDIDATES_PER_ACCOUNT_MAX - 100);
+    assert_eq!(
+        budget.account_entries_remaining as usize,
+        ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 100
+    );
     assert_eq!(budget.global_entries_remaining as usize, CANDIDATES_GLOBAL_MAX - 100);
-    assert_eq!(budget.account_bytes_remaining as usize, CANDIDATE_BYTES_PER_ACCOUNT_MAX - 100);
+    assert_eq!(
+        budget.account_bytes_remaining as usize,
+        ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX - 100
+    );
     assert_eq!(budget.global_bytes_remaining as usize, CANDIDATE_BYTES_GLOBAL_MAX - 100);
 
     // Past the grow-only caps the budget clamps at zero rather than wrapping.
@@ -740,7 +748,7 @@ fn enrollment_budget_does_not_reserve_non_fatal_pre_verify_promotions() {
     let budget = super::super::bootstrap::enrollment_budget(&conn, account, NOW).unwrap();
     // Account and content retries happen only after every receipt entry wins admission, so
     // they cannot roll one-time adoption back even when they form a valid transitive closure.
-    assert_eq!(budget.account_entries_remaining as usize, CANDIDATES_PER_ACCOUNT_MAX);
+    assert_eq!(budget.account_entries_remaining as usize, ORDINARY_CANDIDATES_PER_ACCOUNT_MAX);
     assert_eq!(budget.global_entries_remaining as usize, CANDIDATES_GLOBAL_MAX);
 }
 
@@ -767,7 +775,7 @@ fn a_real_wrap_entry_fits_the_enrollment_preflight_bound() {
     let device_add =
         super::super::authoring::device_add_envelope_bytes(DeviceRole::Member, None).unwrap();
     assert!(
-        256 * bound + device_add <= CANDIDATE_BYTES_PER_ACCOUNT_MAX,
+        256 * bound + device_add <= ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX,
         "256 live targets fit the per-account byte budget"
     );
 }
@@ -789,7 +797,13 @@ fn enrollment_authoring_fits_gates_the_invite_boundary_on_candidate_headroom() {
 
     // Saturate the account's grow-only candidate budget so not even the DeviceAdd fits:
     // minting here would distribute a permanently unredeemable ticket.
-    seed_candidate_rows(&conn, account, Dev::new(9).fp, 42, CANDIDATES_PER_ACCOUNT_MAX - 1);
+    seed_candidate_rows(
+        &conn,
+        account,
+        Dev::new(9).fp,
+        42,
+        ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 1,
+    );
     let error = super::super::authoring::enrollment_authoring_fits(
         &conn,
         account,
@@ -805,7 +819,13 @@ fn enrollment_authoring_fits_gates_the_invite_boundary_on_candidate_headroom() {
     // after enrollment commits and therefore cannot make this exact preflight refuse.
     let conn = db();
     let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
-    seed_candidate_rows(&conn, account, Dev::new(8).fp, 43, CANDIDATES_PER_ACCOUNT_MAX - 2);
+    seed_candidate_rows(
+        &conn,
+        account,
+        Dev::new(8).fp,
+        43,
+        ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 2,
+    );
     conn.execute(
         "INSERT INTO account_pre_verify(
                  signed_hash, entry_hash, claimed_account_id, claimed_fingerprint, raw_bytes,
@@ -2661,8 +2681,8 @@ fn an_annex_entry_is_stored_inert_and_never_touches_control_acceptance() {
     let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
     account_ingest(&conn, &genesis_bytes, NOW).unwrap();
 
-    let manifest = snapshot::ops::encode(&snapshot::ops::SnapshotOp::Snapshot {
-        state_format_version: snapshot::ops::SNAPSHOT_STATE_FORMAT_V1,
+    let manifest = annex::ops::encode(&annex::ops::AnnexOp::Snapshot {
+        state_format_version: annex::ops::SNAPSHOT_STATE_FORMAT_V1,
         moderation_epoch: 0,
         targets: Vec::new(),
     })
@@ -2674,7 +2694,7 @@ fn an_annex_entry_is_stored_inert_and_never_touches_control_acceptance() {
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 0,
         auth_len: 1,
@@ -2713,6 +2733,136 @@ fn an_annex_entry_is_stored_inert_and_never_touches_control_acceptance() {
     assert_eq!(status(&conn, &annex.entry_hash.into()).as_deref(), Some("retained_unfolded"));
 }
 
+/// Sign one control-v2 view manifest as an annex entry of `signer`'s own chain.
+fn view_manifest_entry(
+    account_id: AccountId,
+    signer: &Dev,
+    seq: u64,
+) -> envelope::SignedAccountEntry {
+    let view = crate::account::control_v2::views::ViewManifest {
+        checkpoint: [0x5c; 32],
+        entries: Vec::new(),
+    };
+    let header = AccountEntryHeader {
+        account_id,
+        log_id: fold::ANNEX_LOG,
+        device_fingerprint: signer.fp,
+        seq,
+        prev_hash: None,
+        parent_ref: None,
+        entry_type: annex::ops::entry_type::VIEW_MANIFEST,
+        op_version: fold::SUPPORTED_OP_VERSION,
+        crypto_suite: 0,
+        auth_len: 0,
+        key_id: None,
+        authority_ref: None,
+    };
+    sign_account_entry(&signer.secret, &header, &view.encode().unwrap()).unwrap()
+}
+
+/// The branch an ingest took, as a stable token an assertion message can name.
+///
+/// Assertions about an ingest name the branch instead of interpolating the `IngestOutcome`: the
+/// outcome is a value `account_ingest` returned, and formatting a returned value into a panic
+/// message is the shape a cleartext-logging scan reads as writing it to a log. A closed match to
+/// string literals carries nothing out of the outcome, so there is no value to leak — and a new
+/// variant breaks this arm rather than going unnamed in a failure.
+fn ingest_branch(outcome: &IngestOutcome) -> &'static str {
+    match outcome {
+        IngestOutcome::Rejected(_) => "rejected",
+        IngestOutcome::PreVerify => "pre_verify",
+        IngestOutcome::PreVerifyWithEviction { .. } => "pre_verify_with_eviction",
+        IngestOutcome::CapacityReached { .. } => "capacity_reached",
+        IngestOutcome::Ingested { .. } => "ingested",
+    }
+}
+
+#[test]
+fn a_view_manifest_reaches_capacity_an_ordinary_candidate_cannot() {
+    // A cut names its evidence as a DETACHED manifest that competes for the same grow-only budget
+    // as ordinary traffic. Without a floor reserved for it, an insider who exhausts the account's
+    // budget parks every revocation on `ParkCause::Manifest` permanently — leaving the devices
+    // those cuts revoke un-revoked — and capacity never drains, so that state is terminal.
+    // The account is filled through the reservation counters rather than with seeded rows: a
+    // manifest arrival refolds, and a refold re-decodes every stored candidate, so filler bytes
+    // that are not real entries would fail the load rather than the budget.
+    let ordinary_and_manifest = |reserved_entries: u64, reserved_bytes: u64| {
+        let conn = db();
+        // An outstanding reservation puts the fold's invite top-up on the path, and that resolves
+        // key targets through the local device.
+        crate::local_device(&conn, NOW).unwrap();
+        let founder = Dev::new(0x91);
+        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+            &tx,
+            account_id,
+            [0x7f; 32],
+            reserved_entries,
+            reserved_bytes,
+            0,
+            i64::MAX,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let member = Dev::new(0x92);
+        let (add_bytes, _) = op(
+            account_id,
+            &founder,
+            1,
+            Some(genesis_hash),
+            Some(OwnerId::from_bytes(genesis_hash)),
+            &device_add(&member, DeviceRole::Member),
+        );
+        let ordinary = account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+        let manifest = view_manifest_entry(account_id, &founder, 0);
+        let reserved = account_ingest(&conn, &manifest.signed_bytes, NOW + 2).unwrap();
+        (ordinary, reserved)
+    };
+
+    // The entry floor: the account already holds (or has spoken for) every candidate slot ordinary
+    // traffic may take — the genesis is one of them.
+    let (ordinary, reserved) =
+        ordinary_and_manifest((ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 1) as u64, 0);
+    assert_eq!(ordinary, IngestOutcome::CapacityReached { scope: CapacityScope::CandidateAccount });
+    assert_eq!(ingest_branch(&reserved), "ingested", "a view manifest reaches the reserved slots",);
+
+    // The byte floor is a separate counter and needs its own case: entry slots are free here, and
+    // only the ordinary byte budget is spoken for.
+    let (ordinary, reserved) =
+        ordinary_and_manifest(0, ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX as u64);
+    assert_eq!(ordinary, IngestOutcome::CapacityReached {
+        scope: CapacityScope::CandidateAccountBytes
+    });
+    assert_eq!(ingest_branch(&reserved), "ingested", "a view manifest reaches the reserved bytes",);
+}
+
+#[test]
+fn a_view_manifest_from_an_uncertified_device_is_only_parked() {
+    // Why a manifest must be authored by the device that authors its cut: an unknown signer lands
+    // in the pre-verify queue, which is capped per account and evicts oldest-first. Evidence a cut
+    // depends on for as long as the cut exists cannot live somewhere it can be evicted from.
+    let conn = db();
+    let founder = Dev::new(0x95);
+    let (account_id, genesis_bytes, _) = genesis(&founder);
+    account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+    let manifest = view_manifest_entry(account_id, &Dev::new(0x96), 0);
+    assert_eq!(
+        account_ingest(&conn, &manifest.signed_bytes, NOW + 1).unwrap(),
+        IngestOutcome::PreVerify
+    );
+    let held: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_entries WHERE entry_hash = ?1)",
+            [manifest.entry_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!held, "a manifest no held key certifies never becomes durable evidence");
+}
+
 #[test]
 fn a_garbage_annex_manifest_is_refused_at_ingest() {
     // The manifest is structurally validated at ingest (the per-log twin of the control and
@@ -2729,7 +2879,7 @@ fn a_garbage_annex_manifest_is_refused_at_ingest() {
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 0,
         auth_len: 1,
@@ -2927,7 +3077,7 @@ fn a_sealed_snapshot_is_refused_rather_than_retained() {
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 1,
         key_id: Some([0x77; 32]),
@@ -2983,7 +3133,7 @@ fn author_snapshot_over(
     account_id: AccountId,
     founder: &Dev,
     genesis_hash: AccountEntryHash,
-    mangle: impl FnOnce(&mut snapshot::ops::SnapshotTarget),
+    mangle: impl FnOnce(&mut annex::ops::SnapshotTarget),
 ) -> [u8; 32] {
     // The honest claim: every device's control-chain head, and the hash of folding exactly
     // that.
@@ -3004,16 +3154,14 @@ fn author_snapshot_over(
     }
     let control_only: Vec<_> =
         held.iter().filter(|e| e.header.log_id == fold::CONTROL_LOG).cloned().collect();
-    let mut target = snapshot::ops::SnapshotTarget {
+    let mut target = annex::ops::SnapshotTarget {
         log_id: fold::CONTROL_LOG,
         stream_id: None,
         subject_account_id: None,
-        folded_state_hash: snapshot::projection::folded_state_hash(&fold::fold_account(
-            &control_only,
-        )),
+        folded_state_hash: annex::projection::folded_state_hash(&fold::fold_account(&control_only)),
         covered: heads
             .into_iter()
-            .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+            .map(|(device_fingerprint, (seq, entry_hash))| annex::ops::CoveredWatermark {
                 device_fingerprint,
                 seq,
                 entry_hash: AccountEntryHash::from_bytes(entry_hash),
@@ -3022,8 +3170,8 @@ fn author_snapshot_over(
     };
     mangle(&mut target);
 
-    let payload = snapshot::ops::encode(&snapshot::ops::SnapshotOp::Snapshot {
-        state_format_version: snapshot::ops::SNAPSHOT_STATE_FORMAT_V1,
+    let payload = annex::ops::encode(&annex::ops::AnnexOp::Snapshot {
+        state_format_version: annex::ops::SNAPSHOT_STATE_FORMAT_V1,
         moderation_epoch: 0,
         targets: vec![target],
     })
@@ -3035,7 +3183,7 @@ fn author_snapshot_over(
         seq: 0,
         prev_hash: None,
         parent_ref: None,
-        entry_type: snapshot::ops::entry_type::SNAPSHOT,
+        entry_type: annex::ops::entry_type::SNAPSHOT,
         op_version: 1,
         crypto_suite: 0,
         auth_len: 1,
@@ -3073,7 +3221,7 @@ fn a_stored_snapshot_verifies_end_to_end_and_a_forged_one_does_not() {
     );
     assert_eq!(
         verify_stored_snapshots(&conn, account_id).unwrap(),
-        vec![(honest.into(), snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(honest.into(), annex::verify::SnapshotVerdict::Verified)],
         "an honest claim over stored history verifies through the real read path",
     );
 
@@ -3093,7 +3241,7 @@ fn a_stored_snapshot_verifies_end_to_end_and_a_forged_one_does_not() {
     );
     assert_eq!(verify_stored_snapshots(&conn, account_id).unwrap(), vec![(
         forged.into(),
-        snapshot::verify::SnapshotVerdict::Mismatch
+        annex::verify::SnapshotVerdict::Mismatch
     )],);
     assert_eq!(
         status(&conn, &forged).as_deref(),
@@ -3121,10 +3269,10 @@ fn an_authored_snapshot_verifies_and_is_selected_through_production_code() {
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account.account_id, NOW + 2).unwrap();
+        annex::author::author_snapshot_in_tx(&tx, &device, account.account_id, NOW + 2).unwrap();
     tx.commit().unwrap();
 
-    let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+    let annex::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
         panic!("the local founder is an open owner with history");
     };
 
@@ -3132,7 +3280,7 @@ fn an_authored_snapshot_verifies_and_is_selected_through_production_code() {
     // watermark vector — the whole point of sharing the prefix walk.
     assert_eq!(
         verify_stored_snapshots(&conn, account.account_id).unwrap(),
-        vec![(hash, snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(hash, annex::verify::SnapshotVerdict::Verified)],
         "an authored snapshot must verify against the history it was authored over",
     );
     assert_eq!(
@@ -3198,11 +3346,10 @@ fn a_member_device_has_no_authority_to_cite_and_authors_nothing() {
     account_ingest(&conn, &add_local, NOW + 1).unwrap();
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 2).unwrap();
+    let outcome = annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 2).unwrap();
     tx.commit().unwrap();
 
-    assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::NotAnOpenOwner);
+    assert_eq!(outcome, annex::author::SnapshotAuthorOutcome::NotAnOpenOwner);
     assert!(
         usable_snapshots(&conn, account_id).unwrap().is_empty(),
         "reporting the state must not have minted anything",
@@ -3282,11 +3429,10 @@ fn a_contested_account_is_never_snapshotted_even_by_an_open_owner() {
     );
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 6).unwrap();
+    let outcome = annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 6).unwrap();
     tx.commit().unwrap();
 
-    assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::AccountNotLive);
+    assert_eq!(outcome, annex::author::SnapshotAuthorOutcome::AccountNotLive);
     assert!(
         usable_snapshots(&conn, account_id).unwrap().is_empty(),
         "declining must not have minted anything",
@@ -3365,10 +3511,9 @@ fn a_snapshot_parents_the_canonical_genesis_not_a_lower_hashed_impostor() {
     account_ingest(&conn, &add_local, NOW + 2).unwrap();
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 3).unwrap();
+    let outcome = annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 3).unwrap();
     tx.commit().unwrap();
-    let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+    let annex::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
         panic!("the account still folds Live despite the impostor");
     };
 
@@ -3446,15 +3591,14 @@ fn a_snapshot_binds_the_total_tombstone_set_so_a_deep_removal_still_bars_re_enro
     }
 
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 20).unwrap();
+    let outcome = annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 20).unwrap();
     tx.commit().unwrap();
-    let snapshot::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
+    let annex::author::SnapshotAuthorOutcome::Authored(hash) = outcome else {
         panic!("the local founder is an open owner of a live account");
     };
     assert_eq!(
         verify_stored_snapshots(&conn, account_id).unwrap(),
-        vec![(hash, snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(hash, annex::verify::SnapshotVerdict::Verified)],
         "the snapshot must verify, or it binds nothing at all",
     );
 
@@ -3466,8 +3610,8 @@ fn a_snapshot_binds_the_total_tombstone_set_so_a_deep_removal_still_bars_re_enro
     let usable = usable_snapshots(&conn, account_id).unwrap();
     let covered = &usable[0].targets[0].covered;
     let by_hash = held.held().iter().map(|entry| (entry.entry_hash, entry)).collect();
-    let prefix = snapshot::verify::on_branch_prefix(covered, &by_hash)
-        .expect("the covered prefix is walkable");
+    let prefix =
+        annex::verify::on_branch_prefix(covered, &by_hash).expect("the covered prefix is walkable");
     let bound = fold::fold_account(&prefix);
     assert!(
         bound.tombstoned().any(|fingerprint| *fingerprint == doomed.fp),
@@ -3571,10 +3715,9 @@ fn a_coverage_claim_names_the_accepted_fork_not_the_losing_one() {
     // the artifact would be refused by this very device and would only burn candidate capacity.
     let effective_before = account_effective_count(&conn, account_id).unwrap();
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    let outcome =
-        snapshot::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 4).unwrap();
+    let outcome = annex::author::author_snapshot_in_tx(&tx, &device, account_id, NOW + 4).unwrap();
     tx.commit().unwrap();
-    assert_eq!(outcome, snapshot::author::SnapshotAuthorOutcome::HeldEvidenceOffBranch);
+    assert_eq!(outcome, annex::author::SnapshotAuthorOutcome::HeldEvidenceOffBranch);
     assert!(
         verify_stored_snapshots(&conn, account_id).unwrap().is_empty(),
         "declining must not have stored a snapshot to verify",
@@ -3626,7 +3769,7 @@ fn padding_a_manifest_with_unverifiable_coverage_does_not_win_selection() {
         &founder,
         AccountEntryHash::from_bytes(genesis_hash),
         |target| {
-            target.covered.push(snapshot::ops::CoveredWatermark {
+            target.covered.push(annex::ops::CoveredWatermark {
                 device_fingerprint: member.fp,
                 seq: 0,
                 entry_hash: AccountEntryHash::from_bytes([0xcd; 32]),
@@ -3640,7 +3783,7 @@ fn padding_a_manifest_with_unverifiable_coverage_does_not_win_selection() {
     // verify — the first line of defence. What matters for selection is that a snapshot cannot
     // gain rank from coverage that was never checked.
     assert!(
-        usable.iter().all(|s| s.targets.iter().all(snapshot::verify::is_supported_target)),
+        usable.iter().all(|s| s.targets.iter().all(annex::verify::is_supported_target)),
         "only verified targets may reach the selector",
     );
     assert_eq!(
@@ -3708,7 +3851,7 @@ fn closing_an_incarnation_makes_every_snapshot_it_authored_unusable() {
 
     assert_eq!(
         verify_stored_snapshots(&conn, account_id).unwrap(),
-        vec![(snapshot_hash.into(), snapshot::verify::SnapshotVerdict::Verified)],
+        vec![(snapshot_hash.into(), annex::verify::SnapshotVerdict::Verified)],
         "the claim is still true — revocation is about authority, not correctness",
     );
     assert!(
@@ -4278,7 +4421,15 @@ fn promotion_at_the_last_slot_is_stable_across_opposite_arrival_orders() {
                 PreVerifyInsert::Parked { evicted: Vec::new() },
             );
         }
-        seed_candidate_rows(&conn, account_id, founder.fp, 50, CANDIDATES_PER_ACCOUNT_MAX - 2);
+        // One free slot at the cap ORDINARY traffic reaches — the view-manifest floor above it is
+        // not a slot a promoted control entry may take.
+        seed_candidate_rows(
+            &conn,
+            account_id,
+            founder.fp,
+            50,
+            ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 2,
+        );
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         let outcome = promote_pre_verify(&tx, account_id, NOW + 1).unwrap();
         tx.commit().unwrap();

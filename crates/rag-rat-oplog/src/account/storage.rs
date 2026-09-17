@@ -18,7 +18,7 @@ use super::fold::{self, AuthorityChain, EntryStatus};
 use super::id::{self, AccountEntryHash, GrantId, OwnerId, RosterRef, SignedHash};
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
-use super::{AccountId, content, secrets, snapshot};
+use super::{AccountId, annex, content, secrets};
 use crate::cbor;
 use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
@@ -39,8 +39,26 @@ const PRE_VERIFY: PreVerifyQueue =
     PreVerifyQueue { table: "account_pre_verify", owner_column: "claimed_account_id" };
 pub(super) const CANDIDATES_PER_ACCOUNT_MAX: usize = 4_096;
 const CANDIDATES_GLOBAL_MAX: usize = 16_384;
-const CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize = 16 * 1024 * 1024;
+pub(super) const CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize = 16 * 1024 * 1024;
 const CANDIDATE_BYTES_GLOBAL_MAX: usize = 64 * 1024 * 1024;
+/// The slice of the per-account budget reachable ONLY by a control-v2 view manifest.
+///
+/// A cut's evidence is a DETACHED manifest that competes for the same grow-only budget as ordinary
+/// traffic, and the cut can land first. Without a floor an insider can fill the budget and leave
+/// every honest manifest permanently unadmitted — which parks the cuts naming them forever, so the
+/// devices those cuts revoke stay un-revoked. Capacity never drains, so that state is terminal.
+///
+/// A manifest naming the maximum `control_v2::views::MAX_VIEW_ENTRIES` identities signs to roughly
+/// 64 KiB, so the byte floor holds sixteen of the largest an account can produce and hundreds of
+/// ordinary ones. The floor is per-ACCOUNT only: a globally exhausted store is an operator-level
+/// condition no per-account arithmetic can rescue.
+const VIEW_MANIFEST_FLOOR_ENTRIES: usize = 64;
+const VIEW_MANIFEST_FLOOR_BYTES: usize = 1024 * 1024;
+/// The per-account caps an ORDINARY candidate may reach — everything above the manifest floor.
+pub(super) const ORDINARY_CANDIDATES_PER_ACCOUNT_MAX: usize =
+    CANDIDATES_PER_ACCOUNT_MAX - VIEW_MANIFEST_FLOOR_ENTRIES;
+pub(super) const ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize =
+    CANDIDATE_BYTES_PER_ACCOUNT_MAX - VIEW_MANIFEST_FLOOR_BYTES;
 
 pub(super) struct AccountProjection {
     pub(super) history: fold::AccountAuthHistory,
@@ -670,7 +688,7 @@ fn owner_chain_authority_in_snapshot(
 
 /// Verify every snapshot this device holds for `account_id` against the account history it holds.
 ///
-/// The read/query surface for [`snapshot::verify`], and deliberately READ-ONLY: it returns verdicts
+/// The read/query surface for [`annex::verify`], and deliberately READ-ONLY: it returns verdicts
 /// and changes nothing. A `Mismatch` here does not delete, condemn, or unaccept the entry — a
 /// snapshot whose claim is false stays stored and is simply never trusted. Nothing may feed a
 /// verdict back into acceptance, because verifying consults the local candidate inventory and an
@@ -682,7 +700,7 @@ fn owner_chain_authority_in_snapshot(
 pub(in crate::account) fn verify_stored_snapshots(
     conn: &Connection,
     account_id: AccountId,
-) -> anyhow::Result<Vec<(AccountEntryHash, snapshot::verify::SnapshotVerdict)>> {
+) -> anyhow::Result<Vec<(AccountEntryHash, annex::verify::SnapshotVerdict)>> {
     let rows = load_candidates(conn, account_id)?;
     let held: Vec<envelope::VerifiedAccountEntry> =
         rows.iter().map(|row| row.verified.clone()).collect();
@@ -695,16 +713,15 @@ pub(in crate::account) fn verify_stored_snapshots(
         {
             continue;
         }
-        let Ok(snapshot::ops::DecodedSnapshotOp::Known(snapshot::ops::SnapshotOp::Snapshot {
-            targets,
-            ..
-        })) = snapshot::ops::decode(header.entry_type, &row.verified.payload)
+        let Ok(annex::ops::DecodedAnnexOp::Known(annex::ops::AnnexOp::Snapshot {
+            targets, ..
+        })) = annex::ops::decode(header.entry_type, &row.verified.payload)
         else {
             // An unknown tag or a future state format is retained and uninterpretable here — not a
             // verdict, and not an error.
             continue;
         };
-        verdicts.push((row.entry_hash, snapshot::verify::verify_snapshot(&held, &targets)));
+        verdicts.push((row.entry_hash, annex::verify::verify_snapshot(&held, &targets)));
     }
     verdicts.sort_unstable_by_key(|(hash, _)| *hash);
     Ok(verdicts)
@@ -715,7 +732,7 @@ pub(in crate::account) fn verify_stored_snapshots(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::account) struct UsableSnapshot {
     pub(in crate::account) entry_hash: AccountEntryHash,
-    pub(in crate::account) targets: Vec<snapshot::ops::SnapshotTarget>,
+    pub(in crate::account) targets: Vec<annex::ops::SnapshotTarget>,
 }
 
 /// Every stored snapshot that verified AND whose author's cited incarnation is still open.
@@ -746,10 +763,9 @@ pub(in crate::account) fn usable_snapshots(
         {
             continue;
         }
-        let Ok(snapshot::ops::DecodedSnapshotOp::Known(snapshot::ops::SnapshotOp::Snapshot {
-            targets,
-            ..
-        })) = snapshot::ops::decode(header.entry_type, &row.verified.payload)
+        let Ok(annex::ops::DecodedAnnexOp::Known(annex::ops::AnnexOp::Snapshot {
+            targets, ..
+        })) = annex::ops::decode(header.entry_type, &row.verified.payload)
         else {
             continue;
         };
@@ -762,8 +778,8 @@ pub(in crate::account) fn usable_snapshots(
         ) {
             continue;
         }
-        if snapshot::verify::verify_snapshot(&held, &targets)
-            != snapshot::verify::SnapshotVerdict::Verified
+        if annex::verify::verify_snapshot(&held, &targets)
+            != annex::verify::SnapshotVerdict::Verified
         {
             continue;
         }
@@ -771,7 +787,7 @@ pub(in crate::account) fn usable_snapshots(
         // carrying unverified targets would let an author pad a manifest with fabricated secrets or
         // content coverage and outrank an honest snapshot on claims nobody validated.
         let verified_targets: Vec<_> =
-            targets.into_iter().filter(snapshot::verify::is_supported_target).collect();
+            targets.into_iter().filter(annex::verify::is_supported_target).collect();
         usable.push(UsableSnapshot { entry_hash: row.entry_hash, targets: verified_targets });
     }
     usable.sort_unstable_by_key(|snapshot| snapshot.entry_hash);
@@ -785,11 +801,11 @@ pub(in crate::account) fn selected_snapshot(
     account_id: AccountId,
 ) -> anyhow::Result<Option<UsableSnapshot>> {
     let usable = usable_snapshots(conn, account_id)?;
-    let candidates: Vec<snapshot::select::Candidate<'_>> = usable
+    let candidates: Vec<annex::select::Candidate<'_>> = usable
         .iter()
-        .map(|s| snapshot::select::Candidate { entry_hash: s.entry_hash, targets: &s.targets })
+        .map(|s| annex::select::Candidate { entry_hash: s.entry_hash, targets: &s.targets })
         .collect();
-    let Some(chosen) = snapshot::select::select(&candidates) else {
+    let Some(chosen) = annex::select::select(&candidates) else {
         return Ok(None);
     };
     Ok(usable.into_iter().find(|s| s.entry_hash == chosen))
@@ -2199,6 +2215,22 @@ fn load_control_log_bytes(
         .collect::<rusqlite::Result<Vec<Vec<u8>>>>()?)
 }
 
+/// The detached pre-cut manifests this store holds for the account: annex payloads at the
+/// view-manifest tag, VERBATIM. A cut names its evidence by `sha256` of exactly those bytes.
+///
+/// Deliberately NOT filtered the way [`usable_snapshots`] filters a snapshot, and the divergence is
+/// the point. A snapshot is a CLAIM its author asserts, so it is usable only while the owner
+/// incarnation it cites is still open. A manifest asserts nothing — its integrity is the digest the
+/// cut signed, which holds whoever carried the bytes. Gating it on its carrier's live authority
+/// would make a revoked author's manifest vanish and RE-PARK a cut that had already applied,
+/// un-revoking a device with the very revocation that removed its author.
+fn held_view_manifests(rows: &[CandidateRow]) -> Vec<Vec<u8>> {
+    rows.iter()
+        .filter(|row| is_view_manifest(&row.verified.header))
+        .map(|row| row.verified.payload.clone())
+        .collect()
+}
+
 /// The projection of an account under a control pin THIS binary executes.
 ///
 /// The checkpoint fixes the legacy epoch, so the legacy fold is never RE-DERIVED here: the
@@ -2240,7 +2272,11 @@ fn derive_pinned_projection(
         .filter(|entry| accepted_at_checkpoint.contains(&entry.entry_hash))
         .map(|entry| (entry.header.log_id, entry.header.device_fingerprint, entry.header.seq))
         .collect();
-    let verdicts = super::control_v2::executor::execute_held(checkpoint, control_log);
+    let verdicts = super::control_v2::executor::execute_held(
+        checkpoint,
+        control_log,
+        &held_view_manifests(rows),
+    );
     // An entry at a slot the checkpoint already decided contributes NOTHING — not its acceptance
     // and not its registers. Being authorized is not permission to rewrite what the pin froze.
     let contests_frozen_slot: HashSet<AccountEntryHash> = rows
@@ -2396,9 +2432,7 @@ impl AccountEntriesView {
     /// Accepted rather than merely held: the accepted branch is the coherent one, and a watermark
     /// pointing at a forked head would name a branch the receiving verifier cannot reconcile with
     /// its own view of that device's chain.
-    pub(in crate::account) fn accepted_control_heads(
-        &self,
-    ) -> Vec<snapshot::ops::CoveredWatermark> {
+    pub(in crate::account) fn accepted_control_heads(&self) -> Vec<annex::ops::CoveredWatermark> {
         let mut heads: HashMap<DeviceFingerprint, (u64, AccountEntryHash)> = HashMap::new();
         for entry in &self.held {
             if entry.header.log_id != fold::CONTROL_LOG
@@ -2413,9 +2447,9 @@ impl AccountEntriesView {
                 *slot = (entry.header.seq, entry.entry_hash);
             }
         }
-        let mut covered: Vec<snapshot::ops::CoveredWatermark> = heads
+        let mut covered: Vec<annex::ops::CoveredWatermark> = heads
             .into_iter()
-            .map(|(device_fingerprint, (seq, entry_hash))| snapshot::ops::CoveredWatermark {
+            .map(|(device_fingerprint, (seq, entry_hash))| annex::ops::CoveredWatermark {
                 device_fingerprint,
                 seq,
                 entry_hash,
@@ -2728,6 +2762,13 @@ pub(super) fn insert_candidate(
     if already_present {
         return Ok(CandidateInsert::AlreadyPresent);
     }
+    // A view manifest reaches the whole per-account budget; everything else stops at the floor that
+    // keeps a cut's evidence admissible (see [`VIEW_MANIFEST_FLOOR_ENTRIES`]).
+    let (account_entries_max, account_bytes_max) = if is_view_manifest(h) {
+        (CANDIDATES_PER_ACCOUNT_MAX, CANDIDATE_BYTES_PER_ACCOUNT_MAX)
+    } else {
+        (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX, ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX)
+    };
     // Outstanding enrollment invites reserve their mandatory DeviceAdd + wraps in these SAME
     // counters until they are consumed or expire (#945): candidate capacity is grow-only, so
     // without charging reservations here, ordinary ingest or a second invite could consume
@@ -2740,7 +2781,7 @@ pub(super) fn insert_candidate(
         params![h.account_id.to_bytes().as_slice(), now_ms],
         |row| row.get(0),
     )?;
-    if candidate_count >= CANDIDATES_PER_ACCOUNT_MAX as i64 {
+    if candidate_count >= account_entries_max as i64 {
         return Ok(CandidateInsert::AtCapacity(CapacityScope::CandidateAccount));
     }
     let candidate_bytes: i64 = tx.query_row(
@@ -2752,9 +2793,7 @@ pub(super) fn insert_candidate(
         params![h.account_id.to_bytes().as_slice(), now_ms],
         |row| row.get(0),
     )?;
-    if candidate_bytes.saturating_add(signed_bytes.len() as i64)
-        > CANDIDATE_BYTES_PER_ACCOUNT_MAX as i64
-    {
+    if candidate_bytes.saturating_add(signed_bytes.len() as i64) > account_bytes_max as i64 {
         return Ok(CandidateInsert::AtCapacity(CapacityScope::CandidateAccountBytes));
     }
     let global_candidate_count: i64 = tx.query_row(
@@ -2855,8 +2894,10 @@ pub(crate) fn candidate_capacity_headroom(
         |row| row.get(0),
     )?;
     Ok(CandidateCapacityHeadroom {
-        account_entries_remaining: (CANDIDATES_PER_ACCOUNT_MAX as i64) - account_count,
-        account_bytes_remaining: (CANDIDATE_BYTES_PER_ACCOUNT_MAX as i64) - account_bytes,
+        // The ORDINARY caps: an enrollment receipt is ordinary traffic, so a preflight measured
+        // against the whole budget would promise a ticket the admission path then refuses.
+        account_entries_remaining: (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as i64) - account_count,
+        account_bytes_remaining: (ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX as i64) - account_bytes,
         global_entries_remaining: (CANDIDATES_GLOBAL_MAX as i64) - global_count,
         global_bytes_remaining: (CANDIDATE_BYTES_GLOBAL_MAX as i64) - global_bytes,
     })
@@ -3498,9 +3539,15 @@ fn is_current_annex_plaintext(header: &AccountEntryHeader) -> bool {
 /// as uninterpretable as a current one. If a later version ever wants a sealed coverage artifact it
 /// is a different class and takes a different annex tag — tags 1.. are free, and that is cheaper
 /// than leaving a grow-only hole here that no verifier could ever evaluate.
+/// A current-version, plaintext control-v2 view manifest on the annex log — the exact shape a
+/// pinned refold can read back and hand to the planner as a cut's evidence.
+fn is_view_manifest(header: &AccountEntryHeader) -> bool {
+    is_current_annex_plaintext(header) && header.entry_type == annex::ops::entry_type::VIEW_MANIFEST
+}
+
 fn is_sealed_snapshot(header: &AccountEntryHeader) -> bool {
     header.log_id == fold::ANNEX_LOG
-        && header.entry_type == snapshot::ops::entry_type::SNAPSHOT
+        && header.entry_type == annex::ops::entry_type::SNAPSHOT
         && header.crypto_suite != 0
 }
 
@@ -3527,7 +3574,7 @@ pub(super) fn validate_storable_header_payload(
         // can never chain; an unknown tag is retained opaque. This is STRUCTURAL only — whether the
         // manifest's coverage claim is true is a read-time question, and asking it here would make
         // storage depend on what this device happens to hold.
-        snapshot::ops::validate_storable_snapshot_payload(header.entry_type, payload)
+        annex::ops::validate_storable_annex_payload(header.entry_type, payload)
             .map_err(|err| format!("annex op payload decode failed: {err}"))?;
     }
     Ok(())
