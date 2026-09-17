@@ -1166,6 +1166,13 @@ fn a_lapsed_reservation_is_not_outstanding_under_the_migration_backfill_clock() 
     );
 }
 
+/// Covers that a live reservation charges admission capacity and a lapsed one frees it.
+///
+/// The exact-millisecond boundary (`>` vs `>=` at the expiry instant) is deliberately NOT
+/// pinned. The predicate reads the wall clock, so no test can sit on that instant, and
+/// reintroducing an injected clock at the predicate to keep one assertion would undo the point
+/// of #1362. Getting the boundary wrong costs one millisecond of over- or under-reservation.
+/// Active-charges and lapsed-frees stay covered on both sides, which is the part that matters.
 #[test]
 fn enrollment_reservations_reserve_candidate_capacity_until_consumed_or_expired() {
     let conn = db();
@@ -1219,6 +1226,57 @@ fn enrollment_reservations_reserve_candidate_capacity_until_consumed_or_expired(
         .query_row("SELECT COUNT(*) FROM account_candidate_reservations", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 0, "pruning removes expired reservation rows");
+}
+
+/// `insert_candidate` charges outstanding invite reservations against the same grow-only counters
+/// as stored entries, and decides "outstanding" against the WALL CLOCK (#1362). Its `now_ms`
+/// parameter stamps `received_at_ms` — when the entry ARRIVED — and must never reach the expiry
+/// comparison: a lapsed reservation would then hold admission capacity for a ticket nothing can
+/// redeem.
+#[test]
+fn candidate_admission_charges_a_live_reservation_and_ignores_a_lapsed_one() {
+    let founder = Dev::new(1);
+    let (account_id, genesis_bytes, _) = genesis(&founder);
+    let verified =
+        envelope::verify_account_signed(&genesis_bytes, &founder.secret.public()).unwrap();
+    let reserve_whole_budget = |conn: &Connection, expires_at_ms: i64| {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+            &tx,
+            account_id,
+            [0x58; 32],
+            ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as u64,
+            0,
+            0,
+            expires_at_ms,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    };
+
+    // Outstanding: the reservation holds the whole ordinary per-account budget, so admission
+    // refuses rather than consuming headroom the ticket was measured against.
+    let live = db();
+    reserve_whole_budget(&live, rag_rat_base::time::now_ms() + 3_600_000);
+    let tx = Transaction::new_unchecked(&live, TransactionBehavior::Immediate).unwrap();
+    assert_eq!(
+        insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
+        CandidateInsert::AtCapacity(CapacityScope::CandidateAccount),
+        "an outstanding reservation holds candidate admission capacity",
+    );
+    tx.rollback().unwrap();
+
+    // Lapsed: the identical reservation is not outstanding and charges nothing. `NOW` is a fixed
+    // past instant, so a caller clock would still count this row — that is what this pins.
+    let lapsed = db();
+    reserve_whole_budget(&lapsed, rag_rat_base::time::now_ms() - 1_000);
+    let tx = Transaction::new_unchecked(&lapsed, TransactionBehavior::Immediate).unwrap();
+    assert_eq!(
+        insert_candidate(&tx, &verified, &genesis_bytes, NOW).unwrap(),
+        CandidateInsert::Inserted,
+        "a lapsed reservation must not hold capacity against an unredeemable ticket",
+    );
+    tx.commit().unwrap();
 }
 
 #[test]
