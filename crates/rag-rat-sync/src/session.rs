@@ -173,11 +173,20 @@ pub struct SessionLimits<F = fn() -> i64> {
     /// `Default` clock always answers 0, so a caller that sets `egress` must set this too —
     /// `SessionLimits { egress: Some(..), ..Default::default() }` would meter against the epoch.
     pub now_ms: F,
+    /// The most entries this session will ACCEPT from the peer before aborting. Defaults to
+    /// [`MAX_SESSION_ENTRIES`]; injectable so a test can reach the ceiling without streaming a
+    /// million entries, the same seam the table lane carries as `entries_per_session`.
+    pub entries_per_session: usize,
 }
 
 impl Default for SessionLimits {
     fn default() -> Self {
-        Self { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress: None, now_ms: || 0 }
+        Self {
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            egress: None,
+            now_ms: || 0,
+            entries_per_session: MAX_SESSION_ENTRIES,
+        }
     }
 }
 
@@ -199,7 +208,7 @@ where
     W: AsyncWrite + Unpin,
     F: Fn() -> i64,
 {
-    let SessionLimits { idle_timeout, egress, now_ms } = limits;
+    let SessionLimits { idle_timeout, egress, now_ms, entries_per_session } = limits;
     let account_id = store.account_id();
     let snapshot = store.snapshot().map_err(SessionError::Store)?;
     let have = bounded_inventory(snapshot.iter().map(|(h, _)| *h));
@@ -323,9 +332,9 @@ where
                     }
                     for bytes in entries {
                         received += 1;
-                        if received > MAX_SESSION_ENTRIES {
+                        if received > entries_per_session {
                             return Err(SessionError::Protocol(format!(
-                                "peer streamed more than {MAX_SESSION_ENTRIES} entries",
+                                "peer streamed more than {entries_per_session} entries",
                             )));
                         }
                         match store.ingest(&bytes).map_err(SessionError::Store)? {

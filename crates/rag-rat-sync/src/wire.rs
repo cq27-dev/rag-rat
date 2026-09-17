@@ -333,6 +333,22 @@ mod tests {
     }
 
     #[test]
+    fn an_over_cap_hello_inventory_is_rejected_before_it_is_allocated() {
+        // The declared element count is the only thing standing between a peer and
+        // `Vec::with_capacity(n)`. Refusing it must happen at the array header, before any element
+        // is read — so the frame carries NO hashes at all and is still rejected on the count alone.
+        let mut buf = Vec::new();
+        let mut enc = Encoder::new(&mut buf);
+        enc.array(3).unwrap();
+        enc.str(FRAME_DOMAIN).unwrap();
+        enc.u8(tag::HELLO).unwrap();
+        enc.array(2).unwrap();
+        enc.bytes(&[7u8; 32]).unwrap();
+        enc.array((MAX_HELLO_HASHES + 1) as u64).unwrap();
+        assert!(matches!(Frame::decode(&buf), Err(WireError::OverCap(_))));
+    }
+
+    #[test]
     fn a_foreign_domain_is_rejected() {
         // A CBOR array that is well-formed but not our protocol.
         let mut buf = Vec::new();
