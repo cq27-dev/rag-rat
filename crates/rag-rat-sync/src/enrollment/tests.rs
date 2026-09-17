@@ -708,7 +708,19 @@ fn mint_reads_the_clock_once_after_acquiring_the_writer_lock() {
 fn new_mandatory_key_targets_grow_an_outstanding_invites_reservation() {
     let conn = db();
     let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
-    let ticket = ticket(&conn, account, DeviceRole::Member);
+    // Minted against the WALL CLOCK rather than the shared `ticket` helper's fixed `NOW`: the
+    // top-up decides an invite is outstanding by the real clock (#1362), so a TTL anchored to a
+    // past instant is already lapsed and its reservation would correctly never grow.
+    let ticket = mint_invite(&conn, InviteSpec {
+        account_id: account,
+        inviter_node_id: crate::endpoint::node_id_from_secret([2; 32]),
+        relay_url: "https://relay.example".into(),
+        role: DeviceRole::Member,
+        label: Some("laptop"),
+        now_ms: &rag_rat_base::time::now_ms,
+        ttl: Duration::from_secs(3600),
+    })
+    .unwrap();
     let reservation_of = |nonce: [u8; 32]| {
         conn.query_row(
             "SELECT reserved_entries, reserved_bytes
@@ -806,7 +818,9 @@ fn synced_key_target_growth_tops_up_the_outstanding_reservation() {
     tx.commit().unwrap();
     let entries = rag_rat_oplog::account_entries_for_sync(&inviter, account).unwrap();
 
-    // An outstanding invite on this store reserved only the DeviceAdd (no targets yet).
+    // An outstanding invite on this store reserved only the DeviceAdd (no targets yet). Its TTL is
+    // wall-clock live, which is what makes it outstanding to the top-up (#1362) — the fixture's
+    // `NOW` is a fixed past instant, so a TTL near it has already lapsed.
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     rag_rat_oplog::upsert_account_candidate_reservation_in_tx(
         &tx,
@@ -815,7 +829,7 @@ fn synced_key_target_growth_tops_up_the_outstanding_reservation() {
         1,
         200,
         0,
-        NOW + 10_000,
+        rag_rat_base::time::now_ms() + 3_600_000,
     )
     .unwrap();
     tx.commit().unwrap();

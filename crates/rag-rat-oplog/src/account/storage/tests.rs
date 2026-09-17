@@ -1062,37 +1062,95 @@ fn reservation_upsert_updates_and_release_is_idempotent() {
     assert_eq!(rows, 0, "releasing twice is a no-op, not an error");
 }
 
+/// Reserve two live key targets for `account` under `expires_at_ms`. The shape (3 entries /
+/// 100_000 bytes / 2 targets) is deliberately larger than the fixture's real live target set, so a
+/// top-up that runs is visible as a shrink and one that is skipped leaves the row verbatim.
+fn reserve_two_targets(
+    conn: &Connection,
+    account: AccountId,
+    reservation_id: [u8; 32],
+    expires_at_ms: i64,
+) {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+        &tx,
+        account,
+        reservation_id,
+        3,
+        100_000,
+        2,
+        expires_at_ms,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+fn reservation_row(conn: &Connection, reservation_id: [u8; 32]) -> (i64, i64, i64) {
+    conn.query_row(
+        "SELECT reserved_entries, reserved_bytes, reserved_targets
+               FROM account_candidate_reservations WHERE reservation_id = ?1",
+        [reservation_id.as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .unwrap()
+}
+
 #[test]
 fn invite_reservations_shrink_when_the_live_target_set_shrinks() {
     let conn = db();
     let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
     // A reservation recorded when two key targets were live must not keep their capacity
-    // after a fold reduces the live set: the top-up is bidirectional.
-    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
-        &tx,
-        account,
-        [0x52; 32],
-        3,
-        100_000,
-        2,
-        NOW + 1_000,
-    )
-    .unwrap();
-    tx.commit().unwrap();
+    // after a fold reduces the live set: the top-up is bidirectional. The expiry is WALL-CLOCK
+    // live, which is what makes the invite outstanding at all — `NOW` is a fixed past instant, so
+    // a TTL near it is expired and the top-up would correctly skip the row entirely.
+    reserve_two_targets(&conn, account, [0x52; 32], rag_rat_base::time::now_ms() + 3_600_000);
 
     refold_account(&conn, account).unwrap();
-    let (entries, bytes, targets): (i64, i64, i64) = conn
-        .query_row(
-            "SELECT reserved_entries, reserved_bytes, reserved_targets
-                   FROM account_candidate_reservations WHERE reservation_id = ?1",
-            [[0x52; 32].as_slice()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let (entries, bytes, targets) = reservation_row(&conn, [0x52; 32]);
     assert_eq!(targets, 0, "no live key targets remain");
     assert_eq!(entries, 1, "only the mandatory DeviceAdd stays reserved");
     assert!(bytes < 100_000, "the reclaimed wrap bytes return to the shared headroom");
+}
+
+/// An invite TTL is wall-clock, but `refold_account` folds with `coalesce(max(received_at_ms), 0)`
+/// — the newest entry's ARRIVAL. Any reservation minted after that arrival outranks the coordinate
+/// forever, so a long-lapsed invite would read as outstanding and keep reserving headroom against a
+/// ticket nothing can redeem (#1362).
+#[test]
+fn a_lapsed_reservation_is_not_outstanding_under_a_stale_fold_clock() {
+    let conn = db();
+    let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
+    // Expires just after the fixture's arrival stamp, and years before the real wall clock.
+    reserve_two_targets(&conn, account, [0x54; 32], NOW + 1_000);
+
+    refold_account(&conn, account).unwrap();
+
+    assert_eq!(
+        reservation_row(&conn, [0x54; 32]),
+        (3, 100_000, 2),
+        "a wall-clock-expired reservation is not outstanding, so the top-up leaves it untouched",
+    );
+}
+
+/// The same rule for the migration backfill, which replays every account with a literal `0` clock.
+/// The expiry comparison must not inherit that coordinate either — but note the backfill's `0` has
+/// to stay a replay coordinate for the authority projection it rewrites, which is why the wall
+/// clock is read inside the top-up rather than supplied by this caller.
+#[test]
+fn a_lapsed_reservation_is_not_outstanding_under_the_migration_backfill_clock() {
+    let conn = db();
+    let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
+    reserve_two_targets(&conn, account, [0x55; 32], NOW + 1_000);
+
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    backfill_authority_projection(&tx).unwrap();
+    tx.commit().unwrap();
+
+    assert_eq!(
+        reservation_row(&conn, [0x55; 32]),
+        (3, 100_000, 2),
+        "the backfill's zero clock must not make a lapsed reservation outstanding",
+    );
 }
 
 #[test]
