@@ -18,8 +18,8 @@ use crate::enrollment::{
     ENROLL_ALPN, EnrollmentAcceptorOutcome, InviteError, run_enrollment_acceptor,
 };
 use crate::session::{
-    DEFAULT_IDLE_TIMEOUT, ServeScope, SessionError, SessionLimits, SessionReport, SyncStore,
-    run_session_limited,
+    DEFAULT_IDLE_TIMEOUT, MAX_SESSION_ENTRIES, ServeScope, SessionError, SessionLimits,
+    SessionReport, SyncStore, run_session_limited,
 };
 use crate::store::{OplogContentSyncStore, OplogSyncStore};
 use crate::table_session::{TableSessionError, run_table_session};
@@ -141,7 +141,12 @@ async fn run_dispatched<C: SyncStore>(
     // The account-log and content lanes are the anonymous-servable paths, so their egress is
     // metered against the shared budget. Table sync is pinned `Closed` (unreachable by an
     // anonymous peer), so it carries no anonymous egress and is left unmetered here.
-    let limits = SessionLimits { idle_timeout: DEFAULT_IDLE_TIMEOUT, egress, now_ms };
+    let limits = SessionLimits {
+        idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        egress,
+        now_ms,
+        entries_per_session: MAX_SESSION_ENTRIES,
+    };
     let report = match stream {
         SyncAlpn::Account =>
             run_session_limited(account_store, send, recv, AuthRole::Acceptor, capabilities, limits)

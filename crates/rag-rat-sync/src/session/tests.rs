@@ -95,6 +95,7 @@ async fn an_exhausted_egress_budget_serves_nothing_then_converges_after_refill()
                     idle_timeout: DEFAULT_IDLE_TIMEOUT,
                     egress: Some(egress.clone()),
                     now_ms: move || now,
+                    entries_per_session: MAX_SESSION_ENTRIES,
                 },
             ),
             run_session(
@@ -129,6 +130,7 @@ async fn an_exhausted_egress_budget_serves_nothing_then_converges_after_refill()
                     idle_timeout: DEFAULT_IDLE_TIMEOUT,
                     egress: Some(egress.clone()),
                     now_ms: move || later,
+                    entries_per_session: MAX_SESSION_ENTRIES,
                 },
             ),
             run_session(
@@ -143,6 +145,51 @@ async fn an_exhausted_egress_budget_serves_nothing_then_converges_after_refill()
         r.unwrap();
         assert_eq!(reader.entries.len(), full.len(), "after refill the withheld set is served");
     }
+}
+
+#[tokio::test]
+async fn a_peer_streaming_past_the_session_entry_ceiling_is_cut_off() {
+    // The ceiling bounds how much verification and storage work ONE session can impose. It is a
+    // million in production, so the seam exists to reach it: the table lane carries the same
+    // `entries_per_session` knob for the same reason. Nothing else stops a peer that keeps sending
+    // — the idle timeout resets on every frame.
+    let full: Vec<_> = (0u8..5).map(entry).collect();
+    let mut server = MemStore::new([0xf1; 32], &full);
+    let mut reader = MemStore::new([0xf1; 32], &[]);
+    let (server_send, reader_recv) = tokio::io::duplex(1 << 20);
+    let (reader_send, server_recv) = tokio::io::duplex(1 << 20);
+    let (s, r) = tokio::join!(
+        run_session(
+            &mut server,
+            server_send,
+            server_recv,
+            AuthRole::Acceptor,
+            SessionCapabilities::bidirectional(),
+        ),
+        run_session_limited(
+            &mut reader,
+            reader_send,
+            reader_recv,
+            AuthRole::Dialer,
+            SessionCapabilities::bidirectional(),
+            SessionLimits { entries_per_session: 2, ..Default::default() },
+        ),
+    );
+    let err = r.expect_err("the receiver must refuse the peer past its ceiling");
+    assert!(
+        matches!(&err, SessionError::Protocol(msg) if msg.contains("more than 2 entries")),
+        "unexpected error: {err}",
+    );
+    // EXACTLY the ceiling, not at-most: the bound is `received > ceiling`, so the ceiling'th entry
+    // is the last one admitted. An `<=` assertion here would hold just as well under `>=`, which
+    // cuts an honest peer off one entry early and leaves it unable to converge.
+    assert_eq!(reader.entries.len(), 2, "the ceiling'th entry is admitted and the next is refused",);
+    // The sender learns the transfer died rather than reporting a clean finish — the other half of
+    // "cut off", and deterministic here because all five entries ride in one page.
+    assert!(
+        matches!(s, Err(SessionError::Protocol(_))),
+        "the sender must see the truncated transfer, got {s:?}",
+    );
 }
 
 #[tokio::test]
@@ -176,6 +223,7 @@ async fn a_generous_egress_budget_serves_a_multi_page_transfer_intact() {
                 idle_timeout: DEFAULT_IDLE_TIMEOUT,
                 egress: Some(egress),
                 now_ms: || 1_700_000_000_000,
+                entries_per_session: MAX_SESSION_ENTRIES,
             },
         ),
         run_session(
