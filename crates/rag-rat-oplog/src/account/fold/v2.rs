@@ -65,12 +65,12 @@
 //! a legacy parked cut, or undo a legacy tombstone — and a legacy entry that was already out of the
 //! frozen effective count earns no credit for being removed a second time.
 //!
-//! **Composition, not a live path.** [`pinned_history`] extends that frozen history with the
-//! register effects of the operations a refold applied. Nothing reaches it in production yet: the
-//! only operations installing a register are revocations, and a revocation names a detached pre-cut
-//! manifest no refold supplies, so it parks. The seam exists so the projection is already correct
-//! when manifests become durable; until then a pinned account's composed history equals its frozen
-//! one.
+//! **Composition.** [`pinned_history`] extends that frozen history with the register effects of the
+//! operations a refold applied. The only operations installing a register are revocations, and a
+//! revocation names a detached pre-cut manifest — an ordinary annex entry the refold supplies from
+//! held rows. While that manifest is not held the cut parks and composes nothing; storing it is
+//! what lets the refold hand the executor its evidence and project the register. What no production
+//! path does is AUTHOR a v2 cut or a manifest: installing a pin is test-only.
 
 use super::*;
 
@@ -467,11 +467,12 @@ pub(in crate::account) struct AppliedOperation<'a> {
 /// exactly, because that is the function the frozen fold built them with; the cuts then take effect
 /// on top, at epochs above every legacy one.
 ///
-/// **This has no production caller yet.** The only operations that install a register are
-/// revocations, and every revocation names a detached pre-cut manifest that `execute_held` cannot
-/// supply and nothing persists, so each one parks — no refold reaches this with a cut to apply.
-/// This is the seam the composition lands at, not a live path; making it live means making
-/// manifests durable, not changing anything here.
+/// A refold reaches this with cuts to apply. The only operations that install a register are
+/// revocations; `execute_held` is handed the view manifests the account holds, so a revocation
+/// whose detached pre-cut manifest is stored applies and composes here, and one whose manifest is
+/// missing parks and composes nothing
+/// (`a_v2_revocation_parks_for_want_of_its_manifest_and_applies_once_it_is_stored`). What no
+/// production path does is AUTHOR a v2 cut or a manifest: installing a pin is test-only.
 ///
 /// With no cut applied the composed registers ARE the frozen ones, and **no frozen register scopes
 /// a forked entry** — which is what makes the composition exact. `forked` only ever grows from

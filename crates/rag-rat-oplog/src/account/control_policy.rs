@@ -607,6 +607,18 @@ mod tests {
         conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap()
     }
 
+    /// Whether `fingerprint` still holds an OPEN roster seat. Named rather than counted: a
+    /// revocation assertion that counts open seats also passes when the WRONG seat closed.
+    fn seat_open(conn: &Connection, fingerprint: crate::op::DeviceFingerprint) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_roster_history WHERE device_fingerprint = ?1 AND \
+             closed_at IS NULL)",
+            [fingerprint.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
     /// A local account whose founder has enrolled one member at seq 1. Returns the account, the
     /// founder device, the genesis hash (which is also the founder's owner incarnation) and the
     /// accepted seq-1 entry.
@@ -899,6 +911,9 @@ mod tests {
     /// The manifest carries no owner incarnation, which is also deliberate: `held_view_manifests`
     /// must not gate a manifest on its carrier's live authority the way `usable_snapshots` gates a
     /// snapshot, and a gate copied from that sibling would refuse this one outright.
+    ///
+    /// `a_forked_v2_revocations_registers_revoke_nothing` is the negative complement: the same cut,
+    /// forked at its slot, closes no seat at all.
     #[test]
     fn a_v2_revocation_parks_for_want_of_its_manifest_and_applies_once_it_is_stored() {
         let conn = Connection::open_in_memory().unwrap();
@@ -929,17 +944,9 @@ mod tests {
             )
             .unwrap()
         };
-        let open_roster = |conn: &Connection| -> i64 {
-            conn.query_row(
-                "SELECT count(*) FROM account_roster_history WHERE closed_at IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
         assert_eq!(status(&conn), "retained_unfolded", "the executor applied nothing for it");
         assert_eq!(accepted_flag(&conn, remove.entry_hash), 0, "and it is not accepted");
-        assert_eq!(open_roster(&conn), 2, "the subject is still an open roster member");
+        assert!(seat_open(&conn, subject), "the subject is still an open roster member");
 
         // Storing the manifest is the ONLY thing that changes.
         {
@@ -950,7 +957,64 @@ mod tests {
         }
         assert_eq!(status(&conn), "accepted", "the cut now verifies from held rows alone");
         assert_eq!(accepted_flag(&conn, remove.entry_hash), 1);
-        assert_eq!(open_roster(&conn), 1, "and the revocation closed the subject's roster seat");
+        assert!(!seat_open(&conn, subject), "and the revocation closed the SUBJECT's roster seat");
+        assert!(
+            seat_open(&conn, device.fingerprint()),
+            "the seat it named, not merely one of them — the founder's is untouched",
+        );
+    }
+
+    /// A FORKED revocation's registers revoke nothing. Two revocations at one chain slot each cite
+    /// the manifest they need, so the executor applies BOTH, and the coherence walk then keeps the
+    /// min-hash sibling and forks the other. The forked one named the enrolled member, and that
+    /// member keeps its seat — which is why [`super::storage`]'s pinned projection composes
+    /// `pinned_history` INSIDE its elimination loop rather than once above it: a history composed
+    /// over the pre-fork set carries the loser's register too, and closes a seat no accepted entry
+    /// ever cut.
+    ///
+    /// `a_v2_revocation_parks_for_want_of_its_manifest_and_applies_once_it_is_stored` is the
+    /// positive complement: there the revocation is accepted, and it does close its subject's seat.
+    #[test]
+    fn a_forked_v2_revocations_registers_revoke_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, device, genesis, enrolled) = account_with_one_enrolment(&conn);
+        let digest = install_pin(&conn, account).checkpoint_digest;
+        let view = control_v2::views::ViewManifest { checkpoint: digest, entries: Vec::new() };
+        let manifest = view.digest().unwrap();
+        // Both cuts name this one manifest, so neither parks for want of its evidence and the
+        // fork — not a missing manifest — is the only thing separating them.
+        {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            annex::author::author_view_manifest_in_tx(&tx, &device, account, &view, 4).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let revoke = |subject| {
+            device_remove_entry(account, &device, enrolled, 2, genesis, digest, manifest, subject)
+        };
+        let member = test_support::Dev::new(7).fp;
+        let loser = revoke(member);
+        // The same slot, a DIFFERENT subject, and the smaller hash — the side the min-hash
+        // tiebreak keeps, which leaves the member's revocation forked.
+        let winner = (20u8..=200)
+            .map(|seed| revoke(test_support::Dev::new(seed).fp))
+            .find(|entry| entry.entry_hash < loser.entry_hash)
+            .expect("a smaller-hash sibling revocation exists");
+        storage::account_ingest(&conn, &loser.signed_bytes, 5).unwrap();
+        storage::account_ingest(&conn, &winner.signed_bytes, 6).unwrap();
+
+        assert_eq!(
+            accepted_flag(&conn, winner.entry_hash),
+            1,
+            "the min-hash sibling applied and holds the slot",
+        );
+        assert_eq!(accepted_flag(&conn, loser.entry_hash), 0, "the member's revocation forked");
+        assert!(
+            seat_open(&conn, member),
+            "a forked revocation's registers revoke nothing: its subject keeps its roster seat",
+        );
     }
 
     /// The same operation WITHOUT a pre-cut view cannot even be authored: the presence rule is a
