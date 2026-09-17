@@ -426,17 +426,16 @@ mod tests {
     use super::*;
     use crate::account::checkpoint::{self, TrustedCheckpointPin};
 
-    /// Exercise the walk's declared budget with synthetic headers: the step bound must hold for a
-    /// complete chain longer than the evidence budget, not only for a broken one.
-    #[test]
-    fn ancestry_longer_than_the_evidence_budget_is_refused_not_walked() {
+    /// A verified checkpoint over a fresh account. The account id its entries must name is
+    /// `proof.pin().account_id`.
+    fn checkpoint_proof() -> checkpoint::VerifiedCheckpoint {
         let mut conn = rusqlite::Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
         let account = crate::local_account(&conn, 1).unwrap();
         let device = crate::local_device(&conn, 1).unwrap();
         let tx = conn.transaction().unwrap();
         let bundle = checkpoint::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
-        let proof = checkpoint::verify_checkpoint(
+        checkpoint::verify_checkpoint(
             TrustedCheckpointPin {
                 account_id: account,
                 checkpoint_digest: bundle.certificate_digest(),
@@ -444,14 +443,29 @@ mod tests {
             },
             &bundle,
         )
-        .unwrap();
+        .unwrap()
+    }
 
-        let subject = DeviceFingerprint::from_bytes([0xab; 32]);
-        let link = |seq: u64| {
-            let mut hash = [0u8; 32];
-            hash[..8].copy_from_slice(&seq.to_be_bytes());
-            AccountEntryHash::from_bytes(hash)
-        };
+    /// The synthetic chain-link hash for `seq`. Distinct per seq and never equal to a real content
+    /// hash, so a checkpoint never accepts one.
+    fn link(seq: u64) -> AccountEntryHash {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&seq.to_be_bytes());
+        AccountEntryHash::from_bytes(hash)
+    }
+
+    /// The device every synthetic chain below is authored by.
+    fn subject_device() -> DeviceFingerprint {
+        DeviceFingerprint::from_bytes([0xab; 32])
+    }
+
+    /// Exercise the walk's declared budget with synthetic headers: the step bound must hold for a
+    /// complete chain longer than the evidence budget, not only for a broken one.
+    #[test]
+    fn ancestry_longer_than_the_evidence_budget_is_refused_not_walked() {
+        let proof = checkpoint_proof();
+        let account = proof.pin().account_id;
+        let subject = subject_device();
         let overlong = views::MAX_ENTRIES as u64 + 4;
         let mut headers = HashMap::new();
         for seq in 0..=overlong {
@@ -494,5 +508,238 @@ mod tests {
             ),
             Ok(())
         ));
+
+        // The exact boundary the comment above the bound claims: a chain filling the largest
+        // bundle still LANDS. Walking from seq `MAX_ENTRIES + 1` pushes `MAX_ENTRIES + 1` links and
+        // tests the bound at most at `MAX_ENTRIES`, so `>` accepts it and `>=` would not. Without
+        // this case both comparisons refuse the overlong chain above and the off-by-one is
+        // invisible.
+        let boundary = headers[&link(views::MAX_ENTRIES as u64 + 1)].clone();
+        assert!(
+            matches!(
+                chain_reaches_accepted_legacy(
+                    &boundary,
+                    &headers,
+                    proof.frozen_legacy(),
+                    &mut HashSet::new()
+                ),
+                Ok(())
+            ),
+            "a chain exactly filling the evidence budget lands rather than being refused",
+        );
+    }
+
+    /// A short, complete, walkable v2 chain plus the pieces to perturb one link of it. Every step
+    /// guard below starts from a chain the walk ACCEPTS, so a test that fails proves its own
+    /// perturbation was the cause rather than an unwalkable fixture.
+    struct Walk {
+        proof: checkpoint::VerifiedCheckpoint,
+        headers: HashMap<AccountEntryHash, AccountEntryHeader>,
+        head: AccountEntryHeader,
+    }
+
+    fn walk_fixture() -> Walk {
+        let proof = checkpoint_proof();
+        let account = proof.pin().account_id;
+        let mut headers = HashMap::new();
+        for seq in 0..=4 {
+            headers.insert(link(seq), AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: subject_device(),
+                seq,
+                prev_hash: (seq != 0).then(|| link(seq - 1)),
+                parent_ref: None,
+                entry_type: 2,
+                op_version: ops::CONTROL_VERSION,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: None,
+            });
+        }
+        let head = headers[&link(4)].clone();
+        Walk { proof, headers, head }
+    }
+
+    impl Walk {
+        fn walk(&self) -> Result<(), WalkError> {
+            self.walk_from(&mut HashSet::new())
+        }
+
+        /// The same walk against a caller-supplied `reached` set, which `execute_shared` shares
+        /// across a whole pool rather than resetting per entry.
+        fn walk_from(&self, reached: &mut HashSet<AccountEntryHash>) -> Result<(), WalkError> {
+            chain_reaches_accepted_legacy(
+                &self.head,
+                &self.headers,
+                self.proof.frozen_legacy(),
+                reached,
+            )
+        }
+
+        /// The same walk against a caller-supplied header set, for perturbing the headers without
+        /// disturbing the fixture's own.
+        fn walk_with(
+            &self,
+            headers: &HashMap<AccountEntryHash, AccountEntryHeader>,
+        ) -> Result<(), WalkError> {
+            chain_reaches_accepted_legacy(
+                &self.head,
+                headers,
+                self.proof.frozen_legacy(),
+                &mut HashSet::new(),
+            )
+        }
+    }
+
+    /// Each step must belong to the SAME device chain. Without this a walk hops onto another
+    /// device's entries and a continuation inherits a chain its author never wrote.
+    #[test]
+    fn a_step_on_another_device_chain_parks_the_walk() {
+        let mut f = walk_fixture();
+        assert!(
+            matches!(f.walk(), Ok(())),
+            "the unperturbed chain must walk, or this proves nothing"
+        );
+
+        let hash = link(2);
+        f.headers.get_mut(&hash).unwrap().device_fingerprint =
+            DeviceFingerprint::from_bytes([0xcd; 32]);
+        assert!(
+            matches!(f.walk(), Err(WalkError::Incomplete(ParkCause::Ancestry))),
+            "a step signed by a different device cannot continue this chain",
+        );
+    }
+
+    /// Each step must occupy the exact predecessor slot. Without this a gapped chain walks, and the
+    /// step budget stops bounding the walk because a repeat becomes reachable.
+    #[test]
+    fn a_step_at_the_wrong_sequence_slot_parks_the_walk() {
+        let mut f = walk_fixture();
+        assert!(
+            matches!(f.walk(), Ok(())),
+            "the unperturbed chain must walk, or this proves nothing"
+        );
+
+        let hash = link(2);
+        f.headers.get_mut(&hash).unwrap().seq = 7;
+        assert!(
+            matches!(f.walk(), Err(WalkError::Incomplete(ParkCause::Ancestry))),
+            "a step off the expected predecessor slot cannot continue this chain",
+        );
+    }
+
+    /// Each step must be on the CONTROL log. Without this a secrets- or annex-log entry satisfies a
+    /// control-chain step, and authority is derived from a log that never carried it.
+    #[test]
+    fn a_step_on_another_log_parks_the_walk() {
+        let mut f = walk_fixture();
+        assert!(
+            matches!(f.walk(), Ok(())),
+            "the unperturbed chain must walk, or this proves nothing"
+        );
+
+        let hash = link(2);
+        f.headers.get_mut(&hash).unwrap().log_id = fold::ANNEX_LOG;
+        assert!(
+            matches!(f.walk(), Err(WalkError::Incomplete(ParkCause::Ancestry))),
+            "a step on a non-control log cannot continue a control chain",
+        );
+    }
+
+    /// A walk terminating on a LEGACY link lands only if the checkpoint accepted that link. Without
+    /// this a v2 continuation revives a branch the checkpoint rejected — the one outcome the pin
+    /// exists to prevent.
+    #[test]
+    fn a_walk_terminating_on_an_unaccepted_legacy_entry_parks() {
+        let mut f = walk_fixture();
+        assert!(
+            matches!(f.walk(), Ok(())),
+            "the unperturbed chain must walk, or this proves nothing"
+        );
+
+        // Make the seq-0 root a LEGACY entry. The checkpoint was prepared over an account that
+        // never held this synthetic hash, so it is held-but-not-accepted.
+        let root = link(0);
+        f.headers.get_mut(&root).unwrap().op_version = 1;
+        assert!(
+            !f.proof.frozen_legacy().accepted_at_checkpoint(&root),
+            "the fixture root must be unaccepted at the checkpoint or this proves nothing",
+        );
+        assert!(
+            matches!(f.walk(), Err(WalkError::Incomplete(ParkCause::Ancestry))),
+            "a legacy terminus the checkpoint did not accept is a branch loser, not a root",
+        );
+    }
+
+    /// A link already in `reached` stops the walk. `execute_shared` shares one set across the whole
+    /// pool, so this is not mere memoization: without it every operation re-walks their common
+    /// prefix, and a long enough one tips the step budget and refuses the entire bundle.
+    #[test]
+    fn a_link_already_reached_stops_the_walk_instead_of_rewalking_it() {
+        let mut f = walk_fixture();
+        assert!(
+            matches!(f.walk(), Ok(())),
+            "the unperturbed chain must walk, or this proves nothing"
+        );
+
+        // A landing walk RECORDS what it walked. The read below is only meaningful because of this
+        // write: `execute_shared` shares one set across a whole pool, so without it every operation
+        // re-walks their common prefix and a long enough one tips the step budget, refusing the
+        // whole bundle rather than applying it.
+        let mut reached = HashSet::new();
+        assert!(matches!(f.walk_from(&mut reached), Ok(())));
+        assert!(
+            reached.contains(&link(3)) && reached.contains(&link(2)),
+            "a landing walk records the links it walked",
+        );
+
+        // Remove the tail of the chain so a full walk CANNOT land, then pre-reach the link just
+        // above the hole. The walk must stop at the memo; without it, it reads on into the hole.
+        f.headers.remove(&link(0));
+        let mut parked = HashSet::new();
+        assert!(
+            matches!(f.walk_from(&mut parked), Err(WalkError::Incomplete(ParkCause::Ancestry))),
+            "with the root missing and nothing pre-reached the walk cannot land",
+        );
+        // A park must leave NOTHING behind: the prefix it crossed was never proven to reach an
+        // accepted branch, and the set it would poison is shared across the pool.
+        assert!(
+            parked.is_empty(),
+            "a parked walk memoizes no part of the chain it could not prove",
+        );
+
+        let mut reached = HashSet::from([link(1)]);
+        assert!(
+            matches!(f.walk_from(&mut reached), Ok(())),
+            "a pre-reached link completes the walk without descending past it",
+        );
+    }
+
+    /// The park cause names WHICH link is missing: the entry's own chain head, or a link deeper in
+    /// its ancestry. A receiver refetches on that distinction, so collapsing the two loses it.
+    #[test]
+    fn a_missing_chain_head_and_a_missing_ancestor_park_for_different_reasons() {
+        let mut f = walk_fixture();
+        assert!(
+            matches!(f.walk(), Ok(())),
+            "the unperturbed chain must walk, or this proves nothing"
+        );
+
+        // The head is seq 4, so its own predecessor slot is seq 3: the FIRST step.
+        let mut first_gap = f.headers.clone();
+        first_gap.remove(&link(3));
+        assert!(
+            matches!(f.walk_with(&first_gap), Err(WalkError::Incomplete(ParkCause::ChainHead))),
+            "the entry's own chain head is missing",
+        );
+
+        // One step deeper: the walk took a step, so the same absence is an ancestry gap.
+        f.headers.remove(&link(2));
+        assert!(
+            matches!(f.walk(), Err(WalkError::Incomplete(ParkCause::Ancestry))),
+            "a link below the chain head is missing",
+        );
     }
 }
