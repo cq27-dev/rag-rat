@@ -294,6 +294,14 @@ impl V2Authority {
                 V2Verdict::Condemned
             } else {
                 // Only an AUTHORIZED mint may certify anything citing it.
+                //
+                // This filter has ONE observable consumer: `mint_subject`, which answers the
+                // `owner_id` an `OwnerDemote` carries — a peer-supplied value that reaches it
+                // without passing the incarnation resolver. The liveness arm above cannot observe
+                // it, because `Incarnations::build` filters the SAME predicate and an entry citing
+                // a non-mint therefore never enters this walk at all. Both routes are shielded by
+                // one function, so they cannot drift apart; if stratification ever stops going
+                // through `Incarnations`, the arm above needs its own cover.
                 if candidate.is_mint() {
                     mints.insert(candidate.hash().into(), candidate.subject_device());
                 }
@@ -1649,6 +1657,74 @@ mod tests {
         assert!(
             matches!(outcome, CutOutcome::Parked(ParkReason::UnknownOwnerRef)),
             "an incarnation nothing resolves is withheld evidence, not a refusal",
+        );
+    }
+
+    /// The sibling above names a hash NOTHING supplied, so it parks whether or not the mint map is
+    /// filtered. This one names an entry the bundle HOLDS which is not a mint — and the `owner_id`
+    /// a demote carries is peer-supplied, so it reaches `mint_subject` without ever passing through
+    /// the incarnation resolver that would refuse it.
+    ///
+    /// Only the `is_mint()` filter on what an authorized entry contributes keeps it from answering:
+    /// without it a Member enrollment opens an "incarnation" no mint ever minted, and the subject
+    /// binding below cannot catch it, because the add names the very device the demote names.
+    #[test]
+    fn a_demote_naming_a_held_non_mint_as_its_incarnation_parks() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let tip = founder_tip(&fixture);
+        let enrolled = Dev::new(53);
+        // Authorized on the founder's own live incarnation, and deliberately a Member: `is_mint()`
+        // holds for AccountGenesis, an Owner DeviceAdd and OwnerPromote — no other role.
+        let add = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &AccountOp::DeviceAdd {
+                device_fingerprint: enrolled.fp,
+                ed25519_pubkey: enrolled.ed,
+                x25519_pubkey: enrolled.x,
+                role: DeviceRole::Member,
+                label: None,
+            },
+            v2_ops::CONTROL_VERSION,
+        );
+        let cut = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 2,
+            add.hash(),
+            &AccountOp::OwnerDemote {
+                device_fingerprint: enrolled.fp,
+                owner_id: add.hash().into(),
+                control_cut: Cut::Empty,
+                secrets_cut: Cut::Empty,
+                reason: "never minted".into(),
+            },
+            v2_ops::CONTROL_VERSION,
+        );
+        let authority = V2Authority::resolve(frozen, &[add.clone(), cut.clone()]);
+        // Both preconditions are load-bearing, because `UnknownOwnerRef` has more than one source
+        // here and the variant alone separates none of them. The add must be AUTHORIZED, since only
+        // an authorized entry reaches the map at all; and the CUT must be authorized too, or it
+        // parks upstream for want of its own citation and never reaches the owner_id lookup. Either
+        // way the assertion below would hold for a reason that has nothing to do with minting.
+        assert_eq!(authority.verdict(&add.hash()), V2Verdict::Authorized);
+        assert_eq!(authority.verdict(&cut.hash()), V2Verdict::Authorized);
+        assert!(
+            matches!(
+                apply_cut(CutExecution {
+                    frozen,
+                    authority: &authority,
+                    nominated: &[],
+                    cut: &cut,
+                }),
+                CutOutcome::Parked(ParkReason::UnknownOwnerRef)
+            ),
+            "a held entry that is not a mint never opens an incarnation a demote can close",
         );
     }
 
