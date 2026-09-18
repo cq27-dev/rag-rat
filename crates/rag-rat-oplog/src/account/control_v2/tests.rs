@@ -620,48 +620,67 @@ fn missing_dependencies_never_return_a_partial_plan() {
     );
 }
 
+/// A view must name the checkpoint its plan is for. The digest inside the manifest is the only
+/// thing binding it, `decode_manifest` will decode one built for any checkpoint, and nothing
+/// downstream re-checks it — so admitting one would fold another checkpoint's references into this
+/// account's refold.
 #[test]
-fn checkpoint_mismatch_and_duplicate_evidence_are_rejected() {
+fn a_manifest_for_another_checkpoint_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let foreign = views::ViewManifest { checkpoint: [99; 32], entries: vec![] };
+    match plan_replay(
+        &checkpoint,
+        &device,
+        foreign.digest().unwrap(),
+        &[foreign.encode().unwrap()],
+        &[],
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("view checkpoint mismatch"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("a manifest for another checkpoint must be refused"),
+    }
+}
+
+/// One view must not enter the plan twice. Views are keyed by digest, so a second copy is the same
+/// key: without the refusal the duplicate is silently absorbed and the bundle's declared view count
+/// stops matching what the plan folds.
+#[test]
+fn the_same_view_supplied_twice_is_refused() {
     let (checkpoint, device) = checkpoint();
     let empty = manifest(&checkpoint, vec![]);
     let bytes = empty.encode().unwrap();
-    let entry = signed(&checkpoint, &device, empty.digest().unwrap(), 0);
-    let duplicates = [entry.signed_bytes.clone(), entry.signed_bytes];
-    assert!(matches!(
-        plan_replay(
-            &checkpoint,
-            &device,
-            empty.digest().unwrap(),
-            std::slice::from_ref(&bytes),
-            &duplicates
+    match plan_replay(&checkpoint, &device, empty.digest().unwrap(), &[bytes.clone(), bytes], &[]) {
+        Err(views::PlanError::Invalid(error)) =>
+            assert!(error.to_string().contains("duplicate view"), "unexpected refusal: {error}",),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("the same view supplied twice must be refused"),
+    }
+}
+
+/// The checkpoint's own legacy evidence is v1 and is implicit in every view already. Handing it
+/// back as v2 candidate evidence must be refused by the same decode every candidate goes through,
+/// rather than quietly double-counting history the plan already carries.
+#[test]
+fn the_checkpoints_legacy_evidence_is_not_v2_candidate_evidence() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    match plan_replay(
+        &checkpoint,
+        &device,
+        empty.digest().unwrap(),
+        &[empty.encode().unwrap()],
+        &checkpoint.bundle().evidence,
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("not a v2 control candidate"),
+            "unexpected refusal: {error}",
         ),
-        Err(views::PlanError::Invalid(_))
-    ));
-    assert!(matches!(
-        plan_replay(&checkpoint, &device, empty.digest().unwrap(), &[bytes.clone(), bytes], &[]),
-        Err(views::PlanError::Invalid(_))
-    ));
-    let foreign = views::ViewManifest { checkpoint: [99; 32], entries: vec![] };
-    assert!(matches!(
-        plan_replay(
-            &checkpoint,
-            &device,
-            foreign.digest().unwrap(),
-            &[foreign.encode().unwrap()],
-            &[]
-        ),
-        Err(views::PlanError::Invalid(_))
-    ));
-    assert!(matches!(
-        plan_replay(
-            &checkpoint,
-            &device,
-            empty.digest().unwrap(),
-            &[empty.encode().unwrap()],
-            &checkpoint.bundle().evidence
-        ),
-        Err(views::PlanError::Invalid(_))
-    ));
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("legacy evidence must not be admitted as v2 candidates"),
+    }
 }
 
 #[test]
@@ -675,6 +694,55 @@ fn aggregate_manifests_are_bounded_by_the_declared_evidence_byte_budget() {
         matches!(result, Err(views::PlanError::Invalid(error)) if error.to_string().contains("byte limit")),
         "individually small manifests still have to fit the aggregate budget",
     );
+}
+
+/// `MAX_VIEWS` is checked before ANYTHING is decoded, which is why the fixture need not be a
+/// well-formed manifest — and is what makes the bound cheap to cross: a few thousand one-byte
+/// objects rather than a few thousand signed entries.
+///
+/// The precondition is load-bearing, so it has to count what `plan_replay` counts. The byte budget
+/// is checked immediately after this bound and spans the manifests, the evidence AND the consuming
+/// operation, so the consumer's own length belongs in the sum; a fixture crossing both limits would
+/// be refused either way and the test would pin nothing.
+#[test]
+fn more_views_than_the_bundle_may_carry_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let manifests = vec![vec![0u8; 1]; views::MAX_VIEWS + 1];
+    // The same consumer the helper below builds, so the sum matches the one the guard sees.
+    let consumer = signed(&checkpoint, &device, [0; 32], 255).signed_bytes.len();
+    assert!(
+        consumer + manifests.iter().map(Vec::len).sum::<usize>() < views::MAX_BYTES,
+        "the count bound must be what refuses here, not the byte budget below it",
+    );
+    match plan_replay(&checkpoint, &device, [0; 32], &manifests, &[]) {
+        Err(views::PlanError::Invalid(error)) =>
+            assert!(error.to_string().contains("too many views"), "unexpected refusal: {error}",),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("more views than the bundle may carry must be refused"),
+    }
+}
+
+/// `MAX_ENTRIES` has the same shape as the view bound above: checked before any candidate is
+/// decoded, so the fixture is raw bytes rather than signed entries, and its precondition counts the
+/// consuming operation alongside the evidence because the byte budget below it does.
+#[test]
+fn more_v2_entries_than_the_bundle_may_carry_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let evidence = vec![vec![0u8; 1]; views::MAX_ENTRIES + 1];
+    // The same consumer the helper below builds, so the sum matches the one the guard sees.
+    let consumer = signed(&checkpoint, &device, [0; 32], 255).signed_bytes.len();
+    assert!(
+        consumer + evidence.iter().map(Vec::len).sum::<usize>() < views::MAX_BYTES,
+        "the count bound must be what refuses here, not the byte budget below it",
+    );
+    match plan_replay(&checkpoint, &device, [0; 32], &[], &evidence) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("too many v2 entries"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("more v2 entries than the bundle may carry must be refused"),
+    }
 }
 
 #[test]
