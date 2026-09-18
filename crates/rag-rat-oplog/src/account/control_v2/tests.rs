@@ -309,6 +309,73 @@ fn diamond_dependencies_are_planned_once_in_dependency_order() {
     assert_eq!(order, reordered.views().map(|(hash, _)| hash).collect::<Vec<_>>());
 }
 
+/// A plan's evidence may not contain the very operation it is planning for.
+///
+/// This is bundle hygiene, not a self-citation defence — and the distinction matters, because a
+/// later reader could otherwise trust this guard for a job it does not do. Self-counting is blocked
+/// two layers down and independently: `execute` diverts any entry whose hash equals the plan's
+/// consumer, and the credit pass builds its candidate set so the consumer appears exactly once.
+/// Deleting this check changes no verdict. What it changes is whether a redundant object is an
+/// error or is silently ignored, and this module's posture is that malformed input is an error.
+#[test]
+fn evidence_containing_its_own_consumer_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    // The same value is handed in as both the operation and its own evidence.
+    let consumer = signed(&checkpoint, &device, root, 255);
+    let manifests = [empty.encode().unwrap()];
+    match views::plan_replay(
+        &checkpoint,
+        &consumer.signed_bytes,
+        &manifests,
+        std::slice::from_ref(&consumer.signed_bytes),
+    ) {
+        // The FULL message: `order_views` emits "pre-cut view contains its consumer", which shares
+        // the shorter substring. That one is unreachable here only because a consumer committing to
+        // a view that names it would be a hash fixed point — a property of SHA-256, not of this
+        // assertion, so the assertion should not lean on it.
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("pre-cut evidence contains its consumer"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("a plan whose evidence contains its consumer must be refused"),
+    }
+}
+
+/// Every candidate's `seq` must fit SQLite's signed INTEGER. A `u64` seq above `i64::MAX` decodes
+/// and verifies fine but can never be stored, so it is refused at the plan boundary rather than
+/// after a caller has already committed to replaying it.
+#[test]
+fn a_candidate_whose_seq_exceeds_sqlite_integer_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    // Everything a candidate needs, then the one field under test.
+    let template = signed(&checkpoint, &device, root, 7);
+    let mut header = template.header.clone();
+    header.seq = i64::MAX as u64 + 1;
+    let oversized =
+        envelope::sign_account_entry(device.secret(), &header, &template.payload).unwrap();
+
+    let consumer = signed(&checkpoint, &device, root, 255);
+    let manifests = [empty.encode().unwrap()];
+    match views::plan_replay(
+        &checkpoint,
+        &consumer.signed_bytes,
+        &manifests,
+        std::slice::from_ref(&oversized.signed_bytes),
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("not a v2 control candidate"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("a seq above i64::MAX must be refused at the plan boundary"),
+    }
+}
+
 #[test]
 fn missing_dependencies_never_return_a_partial_plan() {
     let (checkpoint, device) = checkpoint();
