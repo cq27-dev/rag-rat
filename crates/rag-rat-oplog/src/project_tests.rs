@@ -421,12 +421,17 @@ fn content_is_last_writer_wins_by_lamport() {
 #[test]
 fn equal_lamport_is_tie_broken_by_device() {
     // Same Lamport, different device: the larger device fingerprint wins the register.
+    //
+    // The titles run OPPOSITE to the devices on purpose. Sorting by device puts 9 last; sorting by
+    // the canonical op bytes — the third component — would put "z" last, which is device 2. Only
+    // the device component can elect 9, so this cannot pass with that component deleted. Titles
+    // that agree with the device order let the byte tie-break mask it.
     let low = project(&[
-        at(7, 9, update("mem_a", "device_9")),
+        at(7, 9, update("mem_a", "a")),
         at(0, 0, create("mem_a", "seed")),
-        at(7, 2, update("mem_a", "device_2")),
+        at(7, 2, update("mem_a", "z")),
     ]);
-    assert_eq!(low.nodes[&NodeId::from("mem_a")].content.title, "device_9");
+    assert_eq!(low.nodes[&NodeId::from("mem_a")].content.title, "a");
 }
 
 #[test]
@@ -553,6 +558,14 @@ fn fold_is_deterministic_under_shuffling_and_idempotent() {
         at(3, 1, MemoryOp::EdgeAdd { edge: edge.clone() }),
         at(9, 1, MemoryOp::EdgeRemove { edge_key: key.clone() }),
         at(5, 2, MemoryOp::EdgeAdd { edge }),
+        // Two updates at ONE `(lamport, device)`, plus the create they need. Every other entry
+        // here is distinct in that pair, so without the duplicate the sort never reaches its
+        // third component and a shuffle cannot observe it: a stable sort would preserve input
+        // order and still agree across rotations. The canonical op bytes are the only thing
+        // deciding which of these two lands last.
+        at(2, 1, create("mem_c", "c")),
+        at(7, 1, update("mem_c", "x")),
+        at(7, 1, update("mem_c", "y")),
     ];
     let baseline = project(&entries);
 
@@ -566,6 +579,13 @@ fn fold_is_deterministic_under_shuffling_and_idempotent() {
     assert!(!baseline.edges.contains_key(&key));
     assert_eq!(node(&baseline, "mem_a").content.title, "v2");
     assert_eq!(node(&baseline, "mem_a").status, NodeStatus::Obsolete);
+    // The tie-break is canonical op bytes ASCENDING, and the walk overwrites, so the greater
+    // encoding wins. Naming the winner pins the rule, not merely that some winner is stable.
+    assert_eq!(
+        node(&baseline, "mem_c").content.title,
+        "y",
+        "the higher canonical op bytes win a duplicate (lamport, device)",
+    );
 
     // Idempotent: re-folding a single-create restatement of the converged state is stable, and
     // re-running `project` on the same input never drifts.
