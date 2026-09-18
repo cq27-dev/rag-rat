@@ -4,7 +4,7 @@ use super::super::checkpoint::{self, TrustedCheckpointPin, VerifiedCheckpoint};
 use super::super::cut::Cut;
 use super::super::envelope::{self, AccountEntryHeader, SignedAccountEntry};
 use super::super::fold;
-use super::super::id::{AccountEntryHash, OwnerId};
+use super::super::id::{AccountEntryHash, AccountId, OwnerId};
 use super::super::ops::{self as legacy, AccountOp, DeviceRole};
 use super::super::test_support::Dev;
 use super::{executor, ops, views};
@@ -55,17 +55,20 @@ fn manifest(
     views::ViewManifest { checkpoint: checkpoint.pin().checkpoint_digest, entries }
 }
 
+/// `distinguisher` only varies the operation's reason string, so two otherwise identical fixtures
+/// hash differently. It is not a salt and nothing derives a key from it — the name matters because
+/// a parameter called `salt` reads to a scanner as cryptographic material.
 fn signed(
     checkpoint: &VerifiedCheckpoint,
     device: &LocalDevice,
     pre_cut_view: [u8; 32],
-    salt: u8,
+    distinguisher: u8,
 ) -> SignedAccountEntry {
     let mut op = revocation(false);
     op.checkpoint = checkpoint.pin().checkpoint_digest;
     op.pre_cut_view = Some(pre_cut_view);
     if let AccountOp::DeviceRemove { reason, .. } = &mut op.op {
-        *reason = format!("revoked {salt}");
+        *reason = format!("revoked {distinguisher}");
     }
     let tip = &checkpoint.continuation_heads()[0];
     envelope::sign_account_entry(
@@ -359,11 +362,11 @@ fn a_candidate_whose_seq_exceeds_sqlite_integer_is_refused() {
     let oversized =
         envelope::sign_account_entry(device.secret(), &header, &template.payload).unwrap();
 
-    let consumer = signed(&checkpoint, &device, root, 255);
     let manifests = [empty.encode().unwrap()];
-    match views::plan_replay(
+    match plan_replay(
         &checkpoint,
-        &consumer.signed_bytes,
+        &device,
+        root,
         &manifests,
         std::slice::from_ref(&oversized.signed_bytes),
     ) {
@@ -373,6 +376,232 @@ fn a_candidate_whose_seq_exceeds_sqlite_integer_is_refused() {
         ),
         Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
         Ok(_) => panic!("a seq above i64::MAX must be refused at the plan boundary"),
+    }
+}
+
+/// Evidence must name THIS account. A candidate signed for another account verifies fine on
+/// its own terms, so nothing downstream re-checks it — admitting one would let a plan replay a
+/// foreign account's history as if it were this one's.
+#[test]
+fn evidence_signed_for_another_account_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    // Everything a candidate needs, then the one field under test.
+    let template = signed(&checkpoint, &device, root, 7);
+    let mut header = template.header.clone();
+    header.account_id = AccountId::from_bytes([0xaf; 32]);
+    let foreign =
+        envelope::sign_account_entry(device.secret(), &header, &template.payload).unwrap();
+
+    let manifests = [empty.encode().unwrap()];
+    match plan_replay(
+        &checkpoint,
+        &device,
+        root,
+        &manifests,
+        std::slice::from_ref(&foreign.signed_bytes),
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("not a v2 control candidate"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("evidence for a foreign account must be refused"),
+    }
+}
+
+/// Evidence must sit on the CONTROL log. An annex- or secrets-log entry carries no control
+/// operation, so admitting one would put a payload the planner cannot judge into the order.
+#[test]
+fn evidence_on_another_log_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    // Everything a candidate needs, then the one field under test.
+    let template = signed(&checkpoint, &device, root, 7);
+    let mut header = template.header.clone();
+    header.log_id = 3;
+    let foreign =
+        envelope::sign_account_entry(device.secret(), &header, &template.payload).unwrap();
+
+    let manifests = [empty.encode().unwrap()];
+    match plan_replay(
+        &checkpoint,
+        &device,
+        root,
+        &manifests,
+        std::slice::from_ref(&foreign.signed_bytes),
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("not a v2 control candidate"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("evidence off the control log must be refused"),
+    }
+}
+
+/// Evidence must be at the control version this planner executes. A v1 entry decodes under a
+/// different operation grammar, and the checkpoint is what fixes which grammar applies.
+#[test]
+fn evidence_at_another_op_version_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    // Everything a candidate needs, then the one field under test.
+    let template = signed(&checkpoint, &device, root, 7);
+    let mut header = template.header.clone();
+    header.op_version = 1;
+    let foreign =
+        envelope::sign_account_entry(device.secret(), &header, &template.payload).unwrap();
+
+    let manifests = [empty.encode().unwrap()];
+    match plan_replay(
+        &checkpoint,
+        &device,
+        root,
+        &manifests,
+        std::slice::from_ref(&foreign.signed_bytes),
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("not a v2 control candidate"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("evidence at another op version must be refused"),
+    }
+}
+
+/// Evidence must be plaintext, and this guard refuses on the DECLARED suite — before the payload
+/// is looked at. Nothing stands behind it: the fixture below carries a conformant plaintext payload
+/// under `crypto_suite = 1`, and with the suite check disabled the plan resolves, so `ops::decode`
+/// is no backstop. Genuinely sealed bytes reaching it would be refused only by the accident of
+/// ciphertext failing to parse as CBOR. Weakening this check does not fall through to a second line
+/// of defense, because there is none.
+#[test]
+fn sealed_evidence_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    // Everything a candidate needs, then the one field under test.
+    let template = signed(&checkpoint, &device, root, 7);
+    let mut header = template.header.clone();
+    header.crypto_suite = 1;
+    // The envelope couples the two: a non-zero suite REQUIRES a key id, and signing refuses the
+    // header outright otherwise — so without this the candidate never reaches the planner at all.
+    header.key_id = Some([0x11; 32]);
+    let foreign =
+        envelope::sign_account_entry(device.secret(), &header, &template.payload).unwrap();
+
+    let manifests = [empty.encode().unwrap()];
+    match plan_replay(
+        &checkpoint,
+        &device,
+        root,
+        &manifests,
+        std::slice::from_ref(&foreign.signed_bytes),
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("not a v2 control candidate"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("sealed evidence must be refused"),
+    }
+}
+
+/// The control for every refusal above. `plan_replay` decodes the CONSUMER before any evidence,
+/// through the same `decode_candidate` and with the same refusal message — so if the shared
+/// template ever stopped being admissible, those tests would still pass while asserting a message
+/// the consumer produced and never examining their evidence at all.
+///
+/// It supplies the template as EVIDENCE rather than resolving a bare consumer, so it also covers
+/// the evidence-side work the refusals never reach: the distinctness check against the consumer,
+/// the duplicate-candidate insert, and the citation record. Ordering is NOT reachable from here —
+/// the root view is empty, so the citations map is written and never read; that path is covered by
+/// `diamond_dependencies_are_planned_once_in_dependency_order`, whose root names its candidates.
+/// A new evidence-side refusal that the conformant template also tripped would otherwise leave
+/// every test above green — each asserts the shared message, and the new failure produces it —
+/// with nothing red to say the file went vacuous.
+#[test]
+fn the_shared_template_is_itself_admissible() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    let manifests = [empty.encode().unwrap()];
+    // Distinguisher 7 against the consumer's 255: a distinct candidate, as the refusals all supply.
+    let template = signed(&checkpoint, &device, root, 7);
+    plan_replay(
+        &checkpoint,
+        &device,
+        root,
+        &manifests,
+        std::slice::from_ref(&template.signed_bytes),
+    )
+    .expect("the conformant template must resolve, or the refusals above prove nothing");
+}
+
+/// One candidate must not enter the execution pool twice. The insert is the only thing that can
+/// refuse this: both copies are distinct from the consumer, so the check above it passes for each,
+/// and the payload decodes fine — a bundle that names the same entry twice would otherwise be
+/// ordered with a candidate count that disagrees with the evidence it was built from.
+///
+/// `checkpoint_mismatch_and_duplicate_evidence_are_rejected` already reaches this guard, but every
+/// one of its four assertions is a bare `Invalid(_)`: it goes red if the guard is DELETED and stays
+/// green if the guard is replaced by any other refusal. This asserts the refusal's own message —
+/// which is not the shared one — so it is attributable without a control, and it distinguishes this
+/// guard from every sibling that reports through the same error variant.
+#[test]
+fn the_same_candidate_supplied_twice_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    let manifests = [empty.encode().unwrap()];
+    let template = signed(&checkpoint, &device, root, 7);
+    let twice = [template.signed_bytes.clone(), template.signed_bytes];
+    match plan_replay(&checkpoint, &device, root, &manifests, &twice) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("duplicate v2 candidate"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("the same candidate supplied twice must be refused"),
+    }
+}
+
+/// A candidate's PAYLOAD must name the checkpoint this plan is for. The header can be entirely
+/// conformant while the operation inside commits to a different checkpoint — and since this same
+/// decode is the membership test for the execution pool, admitting one would draw an operation
+/// bound to another checkpoint into this account's refold.
+#[test]
+fn a_candidate_naming_another_checkpoint_is_refused() {
+    let (checkpoint, device) = checkpoint();
+    let empty = manifest(&checkpoint, vec![]);
+    let root = empty.digest().unwrap();
+    // A conformant header, and a payload naming a checkpoint that is not this plan's.
+    let template = signed(&checkpoint, &device, root, 7);
+    let mut op = revocation(false);
+    op.checkpoint = [0x5c; 32];
+    op.pre_cut_view = Some(root);
+    let foreign =
+        envelope::sign_account_entry(device.secret(), &template.header, &op.encode().unwrap())
+            .unwrap();
+
+    let manifests = [empty.encode().unwrap()];
+    match plan_replay(
+        &checkpoint,
+        &device,
+        root,
+        &manifests,
+        std::slice::from_ref(&foreign.signed_bytes),
+    ) {
+        Err(views::PlanError::Invalid(error)) => assert!(
+            error.to_string().contains("candidate checkpoint mismatch"),
+            "unexpected refusal: {error}",
+        ),
+        Err(other) => panic!("expected an invalid-plan refusal, got {other:?}"),
+        Ok(_) => panic!("a candidate naming another checkpoint must be refused"),
     }
 }
 
