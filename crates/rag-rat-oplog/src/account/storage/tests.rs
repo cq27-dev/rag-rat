@@ -5963,7 +5963,7 @@ fn a_fold_whose_new_key_targets_no_longer_fit_refuses() {
     let entry_len = add_bytes.len() as i64;
     let before = super::candidate_capacity_headroom(&conn, account).unwrap();
     let pad = before.account_bytes_remaining - (entry_len + (wrap - entry_len).max(2) / 2);
-    assert!(pad > 0, "no room to pad: {}", before.account_bytes_remaining);
+    assert!(pad > 0, "no room to pad the account into the band");
     let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
     super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
         &tx, account, [0x14; 32], 0, pad as u64, 0, live_ttl,
@@ -5972,16 +5972,27 @@ fn a_fold_whose_new_key_targets_no_longer_fit_refuses() {
     tx.commit().unwrap();
 
     let banded = super::candidate_capacity_headroom(&conn, account).unwrap();
-    assert!(
-        banded.account_bytes_remaining >= entry_len
-            && banded.account_bytes_remaining < entry_len + wrap,
-        "remaining {} is outside the band [{entry_len}, {}) — the entry must fit while the raise \
-         does not, or this pins nothing",
-        banded.account_bytes_remaining,
-        entry_len + wrap,
-    );
+    // Named as a token rather than interpolated: a headroom figure is a value the store returned,
+    // and formatting one into a panic message is the shape a cleartext-logging scan reads as
+    // writing it to a log (see `ingest_branch`). The token still says which way the fixture missed.
+    let band = if banded.account_bytes_remaining < entry_len {
+        "below the band: the entry itself would not be admitted"
+    } else if banded.account_bytes_remaining >= entry_len + wrap {
+        "above the band: the raise would still fit, so the guard is never reached"
+    } else {
+        "inside"
+    };
+    assert_eq!(band, "inside", "the entry must fit while the raise does not, or this pins nothing");
 
-    let err = account_ingest(&conn, &add_bytes, NOW + 2)
-        .expect_err("the fold must refuse when the new key targets no longer fit");
-    assert!(err.to_string().contains("do not fit"), "unexpected refusal: {err}",);
+    // The refusal is matched on its own text and named by a token, so nothing derived from the
+    // signed entry reaches the panic message.
+    let refusal = match account_ingest(&conn, &add_bytes, NOW + 2) {
+        Err(err) if err.to_string().contains("do not fit") => "headroom",
+        Err(_) => "other_error",
+        Ok(_) => "admitted",
+    };
+    assert_eq!(
+        refusal, "headroom",
+        "the fold must refuse when the new mandatory key targets no longer fit",
+    );
 }
