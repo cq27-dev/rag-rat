@@ -2250,6 +2250,148 @@ mod tests {
         );
     }
 
+    /// A cut the registers CONDEMNED removed nothing, so it must not tombstone the device it names.
+    /// Tombstoning is I4 — never re-enroll — and nothing downstream undoes one, so applying it from
+    /// an ineffective operation bars a device permanently on the strength of an op that took no
+    /// effect. Every cut is seeded `Effective` and only then overwritten by the condemnation pass,
+    /// so the tombstone loop is reading the result of that overwrite rather than a fresh judgement.
+    ///
+    /// Two owners revoking each other concurrently, which is the case that produces this state. The
+    /// SECOND owner cuts the founder's control chain at its tip; the founder's own removal sits one
+    /// seq above that watermark and is condemned by it. `beyond` is seq-only, so the condemnation
+    /// needs no ancestry to resolve.
+    ///
+    /// Both operations carry exactly the registers `cut_op_registers` derives from them — keyed on
+    /// the op's own target, holding the op's own watermarks — so this is a composition an executor
+    /// reaches, not one only a test can build. That is load-bearing rather than tidy:
+    /// `AppliedOperation` exists so registers travel WITH the entry instead of being re-derived,
+    /// and a fixture whose registers contradicted its ops would pin the guard while
+    /// demonstrating nothing about whether the state is reachable.
+    #[test]
+    fn a_condemned_removal_does_not_tombstone_the_device_it_names() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let tip = founder_tip(&fixture);
+        let account = fixture.checkpoint.pin().account_id;
+        // The second owner `demoted_owner` enrolls precisely so that a cut of the founder is not
+        // the I2 last-owner case.
+        let second = Dev::new(41);
+        let second_incarnation = *frozen
+            .open_owners()
+            .get(&second.fp)
+            .expect("the fixture's second owner holds an open incarnation");
+        // A device nothing else in the fixture enrolls, removes or demotes, and the legacy fixture
+        // authors no removal at all — so the frozen tombstone set is empty and only the condemned
+        // cut below could ever bar it.
+        let barred = Dev::new(57);
+
+        let author = |signer: &crate::device::DeviceSecret,
+                      incarnation: OwnerId,
+                      seq: u64,
+                      prev: AccountEntryHash,
+                      op: &AccountOp| {
+            let payload = v2_ops::ControlOp {
+                checkpoint: fixture.checkpoint.pin().checkpoint_digest,
+                pre_cut_view: Some([9; 32]),
+                op: op.clone(),
+            }
+            .encode()
+            .unwrap();
+            let signed = envelope::sign_account_entry(
+                signer,
+                &AccountEntryHeader {
+                    account_id: account,
+                    log_id: 0,
+                    device_fingerprint: signer.public().fingerprint(),
+                    seq,
+                    // The envelope refuses a `prev_hash` on a chain's FIRST entry — it must be null
+                    // iff seq == 0, and the second owner has authored nothing before this one. A
+                    // header that violates it never reaches the planner, so the fixture would be
+                    // testing nothing.
+                    prev_hash: (seq != 0).then_some(prev),
+                    parent_ref: Some(prev),
+                    entry_type: ops::entry_type_of(op),
+                    op_version: v2_ops::CONTROL_VERSION,
+                    crypto_suite: 0,
+                    auth_len: 1,
+                    key_id: None,
+                    authority_ref: Some(incarnation),
+                },
+                &payload,
+            )
+            .unwrap();
+            Candidate::new(
+                VerifiedAccountEntry {
+                    header: signed.header,
+                    payload: signed.payload,
+                    entry_hash: signed.entry_hash,
+                },
+                op.clone(),
+            )
+        };
+
+        let condemner_op = AccountOp::DeviceRemove {
+            device_fingerprint: fixture.founder.fingerprint(),
+            control_cut: Cut::At { seq: tip.seq, hash: tip.hash },
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "the second owner revokes the founder".into(),
+        };
+        let condemner = author(&second.secret, second_incarnation, 0, tip.hash, &condemner_op);
+
+        let victim_op = AccountOp::DeviceRemove {
+            device_fingerprint: barred.fp,
+            control_cut: Cut::Empty,
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "condemned, so removes nothing".into(),
+        };
+        let victim = author(
+            fixture.founder.secret(),
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &victim_op,
+        );
+
+        let founder_fp = fixture.founder.fingerprint();
+        let condemns = [
+            (RegisterKey::Device { account, log: CONTROL_LOG, device: founder_fp }, Cut::At {
+                seq: tip.seq,
+                hash: tip.hash,
+            }),
+            (RegisterKey::Device { account, log: SECRETS_LOG, device: founder_fp }, Cut::Empty),
+        ];
+        // Scopes nothing, since `barred` has authored no entry — but it is what puts the victim in
+        // `cuts`, which `pinned_history` filters on `!registers.is_empty()` before the tombstone
+        // loop. An op dropped there would pass this test while pinning nothing.
+        let victim_registers = [
+            (RegisterKey::Device { account, log: CONTROL_LOG, device: barred.fp }, Cut::Empty),
+            (RegisterKey::Device { account, log: SECRETS_LOG, device: barred.fp }, Cut::Empty),
+        ];
+
+        let history = pinned_history(frozen, &[
+            AppliedOperation { entry: &condemner, registers: &condemns },
+            AppliedOperation { entry: &victim, registers: &victim_registers },
+        ]);
+
+        // Both preconditions are load-bearing. An ineffective condemner would leave the victim
+        // standing, and a victim that was never condemned would tombstone legitimately — either way
+        // the assertion below would hold for a reason that has nothing to do with the guard.
+        assert!(
+            matches!(history.outcome(&condemner.hash()), Some(Outcome::Effective { .. })),
+            "the condemning cut must itself take effect",
+        );
+        assert!(
+            matches!(history.outcome(&victim.hash()), Some(Outcome::Condemned(_))),
+            "the removal must actually be condemned, or this test pins nothing",
+        );
+        assert!(
+            !history.tombstoned().any(|d| *d == barred.fp),
+            "a condemned removal removed nothing, so I4 must not bar the device it named",
+        );
+    }
+
     #[test]
     fn the_composed_boundary_is_a_function_of_the_register_multiset_not_its_order() {
         // Closure being absorbing is what makes the boundary order-free. Replicas holding different
