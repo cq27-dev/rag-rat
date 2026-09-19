@@ -63,6 +63,7 @@ pub fn migration_hooks() -> rag_rat_db::MigrationHooks {
         rebuild_papertrail_fts: rag_rat_papertrail::rebuild_fts,
         purge_legacy_lamport_violators: rag_rat_oplog::purge_legacy_lamport_violators,
         backfill_content_lamport: rag_rat_oplog::backfill_content_lamport,
+        backfill_cited_view_digests: rag_rat_oplog::backfill_cited_view_digests,
         realign_logical_symbol_ids: graph_index::realign_logical_symbol_ids,
     }
 }

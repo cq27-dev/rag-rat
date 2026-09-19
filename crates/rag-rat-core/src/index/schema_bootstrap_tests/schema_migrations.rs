@@ -1811,7 +1811,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 130, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 131, "move this pin with the next schema migration");
 
     let conn = fresh_conn();
     conn.execute_batch(
@@ -2583,7 +2583,10 @@ fn migration_130_replays_real_authority_hooks_before_pin_tables_exist() {
     .unwrap();
     // The full replay calls current oplog code from historical migrations before reaching V130.
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
-    assert_eq!(schema::status(&conn).unwrap().current_version, 130);
+    // The tip, not a literal: this asserts the replay ran the ladder to completion, which is true
+    // of whatever the newest migration is. The deliberate version tripwire is the pin in
+    // `migration_103_syncable_memory_bindings`, and one of those is enough.
+    assert_eq!(schema::status(&conn).unwrap().current_version, schema::LATEST_SCHEMA_VERSION);
     assert!(conn_table_exists(&conn, "account_control_pins"));
     rag_rat_oplog::require_supported_account_control(&conn, account).unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();

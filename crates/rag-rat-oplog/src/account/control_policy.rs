@@ -535,7 +535,15 @@ mod tests {
         rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn.execute_batch("DROP TABLE account_control_pins").unwrap();
         assert!(account_control_policy(&conn, AccountId::from_bytes([1; 32])).is_err());
-        conn.execute("DELETE FROM schema_version WHERE id='130_account_control_pins'", []).unwrap();
+        // Every row at or beyond V130, not just V130's own. `require_pre_pin_schema` asks whether
+        // the ladder reached the pin schema AT ALL, so a later migration's row answers yes on its
+        // own — and a ledger carrying one of those while missing V130's is a state the ordered
+        // ladder cannot produce, so deleting a single id stops describing a pre-pin store.
+        conn.execute(
+            "DELETE FROM schema_version WHERE CAST(substr(id, 1, 3) AS INTEGER) >= 130",
+            [],
+        )
+        .unwrap();
         assert_eq!(
             account_control_policy(&conn, AccountId::from_bytes([1; 32])).unwrap(),
             AccountControlPolicy::LegacyV1
