@@ -18,7 +18,7 @@ use super::fold::{self, AuthorityChain, EntryStatus};
 use super::id::{self, AccountEntryHash, GrantId, OwnerId, RosterRef, SignedHash};
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceCut, DeviceRole, GrantRole};
 use super::pre_verify::{BudgetOutcome, PreVerifyQueue, QueueBudget};
-use super::{AccountId, annex, content, secrets};
+use super::{AccountId, annex, content, control_v2, secrets};
 use crate::cbor;
 use crate::device::{DevicePublic, DeviceX25519Public};
 use crate::op::DeviceFingerprint;
@@ -2762,9 +2762,25 @@ pub(super) fn insert_candidate(
     if already_present {
         return Ok(CandidateInsert::AlreadyPresent);
     }
-    // A view manifest reaches the whole per-account budget; everything else stops at the floor that
-    // keeps a cut's evidence admissible (see [`VIEW_MANIFEST_FLOOR_ENTRIES`]).
-    let (account_entries_max, account_bytes_max) = if is_view_manifest(h) {
+    // A view manifest reaches the whole per-account budget ONLY while a stored cut names it;
+    // everything else stops at the floor that keeps a cut's evidence admissible (see
+    // [`VIEW_MANIFEST_FLOOR_ENTRIES`]). An UNCITED manifest is ordinary traffic and is charged as
+    // such: the tag alone cannot be the key, or anything wearing it reaches the reserve, and
+    // filling the reserve with manifests no cut names leaves an honest cut's evidence permanently
+    // unadmitted — the terminal state the reserve exists to prevent (#1367).
+    //
+    // CITATION, not authority. The naming cut need only be STORED: its verdict, and whether its
+    // signer has since been revoked, are not read here. Gating on the carrier's live authority
+    // would make a revoked author's evidence vanish and RE-PARK a cut that had already applied,
+    // un-revoking a device with the very revocation that removed its author — the hazard
+    // [`held_view_manifests`] exists to avoid.
+    //
+    // Manifest-first stays legitimate; it is simply not widened. Replication orders entries
+    // `log_id, seq, entry_hash`, and control is log 0 to the annex's log 3, so cut-before-manifest
+    // is the DEFAULT arrival order and the citation is already stored when the manifest is charged.
+    let cited_manifest =
+        is_view_manifest(h) && a_stored_cut_cites(tx, h.account_id, &verified.payload)?;
+    let (account_entries_max, account_bytes_max) = if cited_manifest {
         (CANDIDATES_PER_ACCOUNT_MAX, CANDIDATE_BYTES_PER_ACCOUNT_MAX)
     } else {
         (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX, ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX)
@@ -2832,8 +2848,8 @@ pub(super) fn insert_candidate(
     let inserted = tx.execute(
         "INSERT OR IGNORE INTO account_entries(
              entry_hash, account_id, log_id, device_fingerprint, seq, prev_hash, parent_ref,
-             authority_ref, entry_type, accepted, signed_bytes, received_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)",
+             authority_ref, entry_type, accepted, signed_bytes, received_at_ms, cited_view_digest)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12)",
         params![
             verified.entry_hash.as_slice(),
             h.account_id.to_bytes().as_slice(),
@@ -2846,6 +2862,7 @@ pub(super) fn insert_candidate(
             h.entry_type,
             signed_bytes,
             now_ms,
+            cited_view_digest(h, &verified.payload).map(|digest| digest.to_vec()),
         ],
     )?;
     Ok(if inserted == 1 { CandidateInsert::Inserted } else { CandidateInsert::AlreadyPresent })
@@ -3563,6 +3580,93 @@ fn is_current_annex_plaintext(header: &AccountEntryHeader) -> bool {
 /// pinned refold can read back and hand to the planner as a cut's evidence.
 fn is_view_manifest(header: &AccountEntryHeader) -> bool {
     is_current_annex_plaintext(header) && header.entry_type == annex::ops::entry_type::VIEW_MANIFEST
+}
+
+/// The pre-cut view a control-v2 cut names as its evidence, or `None` for an entry naming none.
+///
+/// Spelled against the same triple [`control_v2::views::decode_candidate`] requires rather than
+/// reusing [`is_current_control_plaintext`]: a v2 cut carries `op_version == CONTROL_VERSION`, and
+/// that predicate is pinned to `SUPPORTED_OP_VERSION`, so it excludes exactly these entries.
+///
+/// A payload that does not decode names nothing rather than refusing the entry. Nothing validates a
+/// v2 control payload at this seam — [`validate_storable_header_payload`] has no arm for one — so
+/// refusing here would reject entries this store admits today.
+fn cited_view_digest(header: &AccountEntryHeader, payload: &[u8]) -> Option<[u8; 32]> {
+    if header.log_id != fold::CONTROL_LOG
+        || header.crypto_suite != 0
+        || header.op_version != control_v2::ops::CONTROL_VERSION
+    {
+        return None;
+    }
+    control_v2::ops::decode(header.entry_type, payload).ok()?.pre_cut_view
+}
+
+/// Whether a stored cut on this account names this manifest payload as its evidence.
+///
+/// The digest is `sha256` of exactly the payload bytes — the value a cut signs and the planner keys
+/// manifests by — NOT the entry hash, which covers the header and signature too.
+fn a_stored_cut_cites(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    payload: &[u8],
+) -> rusqlite::Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM account_entries
+                        WHERE account_id = ?1 AND cited_view_digest = ?2)",
+        params![account_id.to_bytes().as_slice(), cbor::sha256(payload).as_slice()],
+        |row| row.get(0),
+    )
+}
+
+/// The V131 backfill hook: fill `account_entries.cited_view_digest` from each stored signed control
+/// payload, once. Insert sites write the column from then on.
+///
+/// Without it a cut admitted before V131 names nothing [`a_stored_cut_cites`] can see, so the
+/// manifest it cites is charged the ordinary budget — and the reserve exists precisely for the case
+/// where that budget is exhausted. Those rows would keep the defect V131 fixes, permanently, since
+/// candidate history is grow-only.
+///
+/// Scoped to the control log: no other log carries a cut, so decoding their envelopes could only
+/// cost time. A row that does not decode, or that names no view, keeps NULL — the same answer the
+/// gate gives it. Idempotent (`WHERE cited_view_digest IS NULL`), so a ladder replay re-decodes
+/// nothing already filled.
+///
+/// Paged by entry-hash keyset, never buffered whole: an account may hold thousands of entries at up
+/// to the envelope maximum, so collecting every `signed_bytes` first would scale peak heap with the
+/// whole control log during a required migration. The keyset (not a bare `LIMIT`) is what keeps the
+/// rows that stay NULL from pinning the loop in place.
+pub fn backfill_cited_view_digests(conn: &Connection) -> rusqlite::Result<()> {
+    const PAGE: i64 = 256;
+    let mut cursor: Vec<u8> = Vec::new();
+    loop {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT entry_hash, signed_bytes FROM account_entries
+                 WHERE cited_view_digest IS NULL AND log_id = ?1 AND entry_hash > ?2
+                 ORDER BY entry_hash LIMIT ?3",
+            )?;
+            let rows = stmt
+                .query_map(params![fold::CONTROL_LOG, cursor.as_slice(), PAGE], |row| {
+                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let Some((last, _)) = rows.last() else {
+            return Ok(());
+        };
+        cursor = last.clone();
+        for (entry_hash, signed_bytes) in &rows {
+            let Ok(signed) = envelope::decode_account_signed(signed_bytes) else {
+                continue;
+            };
+            if let Some(digest) = cited_view_digest(&signed.header, &signed.payload) {
+                conn.execute(
+                    "UPDATE account_entries SET cited_view_digest = ?1 WHERE entry_hash = ?2",
+                    params![digest.as_slice(), entry_hash.as_slice()],
+                )?;
+            }
+        }
+    }
 }
 
 fn is_sealed_snapshot(header: &AccountEntryHeader) -> bool {

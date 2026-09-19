@@ -2871,16 +2871,60 @@ fn an_annex_entry_is_stored_inert_and_never_touches_control_acceptance() {
     assert_eq!(status(&conn, &annex.entry_hash.into()).as_deref(), Some("retained_unfolded"));
 }
 
+/// The view a manifest fixture carries, so a cut fixture can name exactly the manifest a test also
+/// ingests — and so a test can name a DIFFERENT digest to get an uncited one.
+fn fixture_view() -> crate::account::control_v2::views::ViewManifest {
+    crate::account::control_v2::views::ViewManifest { checkpoint: [0x5c; 32], entries: Vec::new() }
+}
+
+/// Sign one control-v2 cut naming `cites` as the detached manifest that bounds its credit.
+fn citing_cut_entry(
+    account_id: AccountId,
+    signer: &Dev,
+    seq: u64,
+    prev: [u8; 32],
+    authority: OwnerId,
+    cites: [u8; 32],
+) -> envelope::SignedAccountEntry {
+    let op = AccountOp::DeviceRemove {
+        device_fingerprint: Dev::new(0xd0).fp,
+        control_cut: crate::account::cut::Cut::Empty,
+        secrets_cut: crate::account::cut::Cut::Empty,
+        content_cuts: vec![],
+        reason: "revoked".into(),
+    };
+    // A revocation MUST name a pre-cut view — `ControlOp::encode` refuses otherwise.
+    let payload = control_v2::ops::ControlOp {
+        checkpoint: [0x5c; 32],
+        pre_cut_view: Some(cites),
+        op: op.clone(),
+    }
+    .encode()
+    .unwrap();
+    let header = AccountEntryHeader {
+        account_id,
+        log_id: fold::CONTROL_LOG,
+        device_fingerprint: signer.fp,
+        seq,
+        prev_hash: Some(AccountEntryHash::from_bytes(prev)),
+        parent_ref: Some(AccountEntryHash::from_bytes(prev)),
+        entry_type: ops::entry_type_of(&op),
+        op_version: control_v2::ops::CONTROL_VERSION,
+        crypto_suite: 0,
+        auth_len: 1,
+        key_id: None,
+        authority_ref: Some(authority),
+    };
+    sign_account_entry(&signer.secret, &header, &payload).unwrap()
+}
+
 /// Sign one control-v2 view manifest as an annex entry of `signer`'s own chain.
 fn view_manifest_entry(
     account_id: AccountId,
     signer: &Dev,
     seq: u64,
 ) -> envelope::SignedAccountEntry {
-    let view = crate::account::control_v2::views::ViewManifest {
-        checkpoint: [0x5c; 32],
-        entries: Vec::new(),
-    };
+    let view = fixture_view();
     let header = AccountEntryHeader {
         account_id,
         log_id: fold::ANNEX_LOG,
@@ -2915,65 +2959,189 @@ fn ingest_branch(outcome: &IngestOutcome) -> &'static str {
     }
 }
 
+/// Drive an ordinary candidate and then a view manifest into an account whose ORDINARY budget is
+/// already spoken for, with one stored control-v2 cut naming `cites`.
+///
+/// The account is filled through the reservation counters rather than with seeded rows: a manifest
+/// arrival refolds, and a refold re-decodes every stored candidate, so filler bytes that are not
+/// real entries would fail the load rather than the budget.
+///
+/// Every case stores the SAME shape — a genesis and one cut — so the only thing that varies between
+/// the cited and uncited cases is which view that cut names.
+fn ordinary_and_manifest_against_a_full_ordinary_budget(
+    reserved_entries: u64,
+    reserved_bytes: u64,
+    cites: [u8; 32],
+) -> (IngestOutcome, IngestOutcome) {
+    let conn = db();
+    // An outstanding reservation puts the fold's invite top-up on the path, and that resolves
+    // key targets through the local device.
+    crate::local_device(&conn, NOW).unwrap();
+    let founder = Dev::new(0x91);
+    let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+    account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+    // The cut is stored BEFORE the manifest is charged: replication orders entries
+    // `log_id, seq, entry_hash`, and control is log 0 to the annex's log 3, so cut-before-manifest
+    // is the default arrival order rather than an edge case.
+    let cut = citing_cut_entry(
+        account_id,
+        &founder,
+        1,
+        genesis_hash,
+        OwnerId::from_bytes(genesis_hash),
+        cites,
+    );
+    assert_eq!(
+        ingest_branch(&account_ingest(&conn, &cut.signed_bytes, NOW).unwrap()),
+        "ingested",
+        "the citing cut must be STORED for the gate to have anything to read",
+    );
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+        &tx,
+        account_id,
+        [0x7f; 32],
+        reserved_entries,
+        reserved_bytes,
+        0,
+        i64::MAX,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let member = Dev::new(0x92);
+    let (add_bytes, _) = op(
+        account_id,
+        &founder,
+        1,
+        Some(genesis_hash),
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_add(&member, DeviceRole::Member),
+    );
+    let ordinary = account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
+    let manifest = view_manifest_entry(account_id, &founder, 0);
+    let charged = account_ingest(&conn, &manifest.signed_bytes, NOW + 2).unwrap();
+    (ordinary, charged)
+}
+
 #[test]
-fn a_view_manifest_reaches_capacity_an_ordinary_candidate_cannot() {
+fn a_view_manifest_a_stored_cut_cites_reaches_capacity_an_ordinary_candidate_cannot() {
     // A cut names its evidence as a DETACHED manifest that competes for the same grow-only budget
-    // as ordinary traffic. Without a floor reserved for it, an insider who exhausts the account's
-    // budget parks every revocation on `ParkCause::Manifest` permanently — leaving the devices
-    // those cuts revoke un-revoked — and capacity never drains, so that state is terminal.
-    // The account is filled through the reservation counters rather than with seeded rows: a
-    // manifest arrival refolds, and a refold re-decodes every stored candidate, so filler bytes
-    // that are not real entries would fail the load rather than the budget.
-    let ordinary_and_manifest = |reserved_entries: u64, reserved_bytes: u64| {
-        let conn = db();
-        // An outstanding reservation puts the fold's invite top-up on the path, and that resolves
-        // key targets through the local device.
-        crate::local_device(&conn, NOW).unwrap();
-        let founder = Dev::new(0x91);
-        let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
-        account_ingest(&conn, &genesis_bytes, NOW).unwrap();
-        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
-        super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
-            &tx,
-            account_id,
-            [0x7f; 32],
-            reserved_entries,
-            reserved_bytes,
-            0,
-            i64::MAX,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        let member = Dev::new(0x92);
-        let (add_bytes, _) = op(
-            account_id,
-            &founder,
-            1,
-            Some(genesis_hash),
-            Some(OwnerId::from_bytes(genesis_hash)),
-            &device_add(&member, DeviceRole::Member),
-        );
-        let ordinary = account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
-        let manifest = view_manifest_entry(account_id, &founder, 0);
-        let reserved = account_ingest(&conn, &manifest.signed_bytes, NOW + 2).unwrap();
-        (ordinary, reserved)
-    };
+    // as ordinary traffic. Without a reserve for it, an insider who exhausts the account's budget
+    // parks every revocation on `ParkCause::Manifest` permanently — leaving the devices those cuts
+    // revoke un-revoked — and capacity never drains, so that state is terminal.
+    let cited = fixture_view().digest().unwrap();
 
     // The entry floor: the account already holds (or has spoken for) every candidate slot ordinary
-    // traffic may take — the genesis is one of them.
-    let (ordinary, reserved) =
-        ordinary_and_manifest((ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 1) as u64, 0);
+    // traffic may take — the genesis and the cut are two of them.
+    let (ordinary, charged) = ordinary_and_manifest_against_a_full_ordinary_budget(
+        (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 2) as u64,
+        0,
+        cited,
+    );
     assert_eq!(ordinary, IngestOutcome::CapacityReached { scope: CapacityScope::CandidateAccount });
-    assert_eq!(ingest_branch(&reserved), "ingested", "a view manifest reaches the reserved slots",);
+    assert_eq!(
+        ingest_branch(&charged),
+        "ingested",
+        "a manifest a stored cut cites reaches the reserved slots",
+    );
 
     // The byte floor is a separate counter and needs its own case: entry slots are free here, and
     // only the ordinary byte budget is spoken for.
-    let (ordinary, reserved) =
-        ordinary_and_manifest(0, ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX as u64);
+    let (ordinary, charged) = ordinary_and_manifest_against_a_full_ordinary_budget(
+        0,
+        ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX as u64,
+        cited,
+    );
     assert_eq!(ordinary, IngestOutcome::CapacityReached {
         scope: CapacityScope::CandidateAccountBytes
     });
-    assert_eq!(ingest_branch(&reserved), "ingested", "a view manifest reaches the reserved bytes",);
+    assert_eq!(
+        ingest_branch(&charged),
+        "ingested",
+        "a manifest a stored cut cites reaches the reserved bytes",
+    );
+}
+
+#[test]
+fn a_view_manifest_no_stored_cut_cites_is_charged_the_ordinary_budget() {
+    // The reserve exists to keep a CUT'S EVIDENCE admissible, so the manifest tag alone cannot open
+    // it: anything wearing the tag would reach the reserve, and filling the reserve with manifests
+    // no cut names leaves an honest cut's evidence permanently unadmitted — the terminal state the
+    // reserve exists to prevent (#1367). Refusing it is not an outage: an uncited manifest is
+    // ordinary traffic and is admitted wherever ordinary headroom remains.
+    let uncited = [0x11; 32];
+    assert_ne!(uncited, fixture_view().digest().unwrap(), "the stored cut names a different view");
+
+    let (_, charged) = ordinary_and_manifest_against_a_full_ordinary_budget(
+        (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 2) as u64,
+        0,
+        uncited,
+    );
+    assert_eq!(
+        charged,
+        IngestOutcome::CapacityReached { scope: CapacityScope::CandidateAccount },
+        "an uncited manifest stops at the ordinary slot ceiling",
+    );
+
+    let (_, charged) = ordinary_and_manifest_against_a_full_ordinary_budget(
+        0,
+        ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX as u64,
+        uncited,
+    );
+    assert_eq!(
+        charged,
+        IngestOutcome::CapacityReached { scope: CapacityScope::CandidateAccountBytes },
+        "an uncited manifest stops at the ordinary byte ceiling",
+    );
+}
+
+#[test]
+fn the_citation_backfill_recovers_a_cut_stored_before_the_column_existed() {
+    // A cut admitted before V131 names nothing the gate can see, so the manifest it cites would be
+    // charged the ordinary budget — and the reserve exists precisely for the case where that budget
+    // is exhausted. Left NULL, those rows would keep the defect V131 fixes, permanently, because
+    // candidate history is grow-only.
+    let conn = db();
+    let founder = Dev::new(0x93);
+    let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+    account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+    let cited = fixture_view().digest().unwrap();
+    let cut = citing_cut_entry(
+        account_id,
+        &founder,
+        1,
+        genesis_hash,
+        OwnerId::from_bytes(genesis_hash),
+        cited,
+    );
+    account_ingest(&conn, &cut.signed_bytes, NOW + 1).unwrap();
+    // Return the store to its pre-V131 shape: the column is there, nothing has filled it.
+    conn.execute("UPDATE account_entries SET cited_view_digest = NULL", []).unwrap();
+
+    backfill_cited_view_digests(&conn).unwrap();
+
+    let digest = |hash: &[u8]| -> Option<Vec<u8>> {
+        conn.query_row(
+            "SELECT cited_view_digest FROM account_entries WHERE entry_hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        digest(cut.entry_hash.as_slice()).as_deref(),
+        Some(cited.as_slice()),
+        "the stored cut's citation is recovered from its signed payload",
+    );
+    assert_eq!(digest(genesis_hash.as_slice()), None, "an entry naming no view stays NULL");
+
+    // Idempotent: the second pass has nothing left to decode and changes nothing.
+    backfill_cited_view_digests(&conn).unwrap();
+    assert_eq!(
+        digest(cut.entry_hash.as_slice()).as_deref(),
+        Some(cited.as_slice()),
+        "a ladder replay re-decodes nothing already filled",
+    );
 }
 
 #[test]

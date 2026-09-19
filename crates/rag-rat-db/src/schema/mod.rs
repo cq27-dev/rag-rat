@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 130;
+pub const LATEST_SCHEMA_VERSION: u32 = 131;
 
 /// The `files.kind` token of a deletion tombstone — the row `mark_file_deleted` /
 /// `write_tombstone_in_scope` leave for a path the checkout no longer serves. It is outside
@@ -1166,6 +1166,15 @@ additive_migrations! {
         "sha256:rag-rat-account-control-pins-v130",
         "Retain permanent external account checkpoint pins and signed evidence (#1311)",
     ) => MigrationFn::Plain(migrations::apply_account_control_pins);
+    MIGRATION_131_ID, MIGRATION_131_CHECKSUM, MIGRATION_131_DESCRIPTION = (
+        "131_account_view_citations",
+        "sha256:rag-rat-account-view-citations-v131",
+        "Record the pre-cut view a control-v2 cut names, so candidate admission grants the \
+         view-manifest reserve only to a manifest some stored cut cites; backfilled from the stored \
+         signed control payloads so cuts admitted before this migration still name their evidence \
+         (#1367)",
+    ) => MigrationFn::WithHooks(migrations::apply_account_view_citations),
+        ledger_atomic;
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1680,6 +1689,7 @@ mod ledger_atomicity {
         MIGRATION_115_ID,
         MIGRATION_121_ID,
         MIGRATION_125_ID,
+        MIGRATION_131_ID,
     ];
 
     /// The migrations whose ledger step must refold every account's authority projection —
