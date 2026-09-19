@@ -45,6 +45,7 @@ use super::super::id::AccountEntryHash;
 use super::super::ops::AccountOp;
 use super::super::registers::RegisterKey;
 use super::{ops, views};
+use crate::cbor;
 use crate::device::DevicePublic;
 use crate::op::DeviceFingerprint;
 
@@ -173,6 +174,13 @@ fn execute_shared(
 
     // Only the identities the operation's own manifest named; an ordinary operation names none.
     // Being named is not authority: each one's verdict comes from the resolution above.
+    //
+    // The lookup is total, and must stay so: `plan_replay` refuses evidence carrying its consumer
+    // and `order_views` refuses a view naming it, so every named hash is a candidate this plan
+    // authenticated. A named entry that silently failed to resolve here would shrink the nominated
+    // set and under-count the cut's credit against the view its author signed — so an entry that
+    // cannot be authenticated must be kept OUT of the evidence (see [`execute_held`]), where the
+    // planner parks the cut, rather than dropped at this seam.
     let nominated: Vec<Candidate> = plan
         .root()
         .into_iter()
@@ -328,10 +336,19 @@ fn authenticate(
 /// its cut on [`ParkCause::Manifest`] until it does, and an ordinary operation names no view at
 /// all.
 ///
-/// Rows that are not v2 candidates for THIS checkpoint are excluded from the pool rather than
-/// refused inside it: such a row would refuse every bundle it appeared in, not just its own. A
-/// bundle that still fails to verify yields no verdict for that ONE operation and never for the
-/// rest — a peer cannot silence an account's other operations by attaching one bad object.
+/// Everything the pass offers is filtered BEFORE execution, never refused inside a bundle. A shared
+/// pool makes the two the same decision for every operation at once: one object refused inside a
+/// bundle refuses every bundle it appears in, which is every operation on the account (#1395,
+/// #1396). Three filters, all here:
+///
+/// - rows that are not v2 candidates for this checkpoint, by [`views::decode_candidate`];
+/// - rows nothing in the pool can certify, by [`certified_pool`];
+/// - manifests that do not decode, name another checkpoint, or repeat one already supplied.
+///
+/// What survives is offered to everyone; what does not is still executed as its OWN consumer, where
+/// it earns its own verdict. An operation is therefore silenced only by evidence it actually needed
+/// — a view naming an uncertified entry parks on [`ParkCause::Evidence`], because that entry is not
+/// in the evidence its cut is offered.
 pub(in crate::account) fn execute_held(
     checkpoint: &VerifiedCheckpoint,
     held: &[Vec<u8>],
@@ -339,36 +356,114 @@ pub(in crate::account) fn execute_held(
 ) -> BTreeMap<AccountEntryHash, Verdict> {
     let pin = checkpoint.pin();
     let mut verdicts = BTreeMap::new();
-    let mut hashes = Vec::new();
-    let mut pool = Vec::new();
-    for row in held {
-        if let Ok((entry, _)) = views::decode_candidate(&pin, row) {
-            hashes.push(entry.entry_hash);
-            pool.push(row.clone());
+    let pool: Vec<SignedAccountEntry> = held
+        .iter()
+        .filter_map(|row| views::decode_candidate(&pin, row).ok().map(|(entry, _)| entry))
+        .collect();
+    // A manifest is content-addressed, so which cut can use one is decided by the digest that cut
+    // signed, never by who carried the bytes — every operation is offered the same set. That is
+    // exactly why an unusable one must be dropped here: `plan_replay` refuses the whole bundle over
+    // a foreign checkpoint or a repeat, and two devices authoring over one view is ordinary
+    // traffic.
+    let mut seen_views = HashSet::new();
+    let manifests: Vec<Vec<u8>> = manifests
+        .iter()
+        .filter(|bytes| {
+            views::decode_manifest(bytes).is_ok_and(|view| view.checkpoint == pin.checkpoint_digest)
+                && seen_views.insert(cbor::sha256(bytes))
+        })
+        .cloned()
+        .collect();
+
+    let mut memo = AuthMemo::default();
+    let certified = certified_pool(checkpoint.frozen_legacy(), &pool, &mut memo);
+    let (certified_rows, uncertified_rows): (Vec<&SignedAccountEntry>, Vec<&SignedAccountEntry>) =
+        pool.iter().partition(|entry| certified.contains(&entry.entry_hash));
+
+    let mut hashes: Vec<AccountEntryHash> =
+        certified_rows.iter().map(|entry| entry.entry_hash).collect();
+    let mut evidence: Vec<Vec<u8>> =
+        certified_rows.iter().map(|entry| entry.signed_bytes.clone()).collect();
+    if let Some(last) = evidence.len().checked_sub(1) {
+        for index in 0..evidence.len() {
+            // Rotate the consumer to the end so the remaining prefix is exactly its evidence
+            // without copying the pool once per operation — `plan_replay` refuses a bundle carrying
+            // its own consumer, so the consumer has to come out of the evidence one way or another.
+            hashes.swap(index, last);
+            evidence.swap(index, last);
+            let consumer = hashes[last];
+            let verdict = {
+                let (evidence, operation) = evidence.split_at(last);
+                execute_shared(checkpoint, &operation[0], &manifests, evidence, &mut memo)
+            };
+            hashes.swap(index, last);
+            evidence.swap(index, last);
+            if let Ok(verdict) = verdict {
+                verdicts.insert(consumer, verdict);
+            }
         }
     }
-    let Some(last) = pool.len().checked_sub(1) else {
-        return verdicts;
-    };
-    let mut memo = AuthMemo::default();
-    for index in 0..pool.len() {
-        // Rotate the consumer to the end so the remaining prefix is exactly its evidence without
-        // copying the pool once per operation — `plan_replay` refuses a bundle carrying its own
-        // consumer, so the consumer has to come out of the evidence one way or another.
-        hashes.swap(index, last);
-        pool.swap(index, last);
-        let consumer = hashes[last];
-        let verdict = {
-            let (evidence, operation) = pool.split_at(last);
-            execute_shared(checkpoint, &operation[0], manifests, evidence, &mut memo)
-        };
-        hashes.swap(index, last);
-        pool.swap(index, last);
-        if let Ok(verdict) = verdict {
-            verdicts.insert(consumer, verdict);
+    // An uncertified row is absent from the evidence, so the whole certified set is its evidence
+    // and no rotation is needed. It still reaches `authenticate` as its own consumer, which is
+    // where "no key names this author" becomes its own `Parked(Signer)` rather than everyone's.
+    for row in uncertified_rows {
+        if let Ok(verdict) =
+            execute_shared(checkpoint, &row.signed_bytes, &manifests, &evidence, &mut memo)
+        {
+            verdicts.insert(row.entry_hash, verdict);
         }
     }
     verdicts
+}
+
+/// The pooled entries whose signer the ACCEPTED legacy epoch certifies, or that an
+/// already-certified v2 enrolment introduces — the fixpoint [`authenticate`] runs over one bundle,
+/// taken once over the whole pool.
+///
+/// A v2 enrolment introduces a key only once it has itself verified, exactly as in `authenticate`:
+/// pooling unverified introductions would certify a mutually-introducing cycle that a fresh
+/// receiver can never reproduce. An entry whose bytes do not verify under the key its author
+/// resolves to is excluded rather than raised — as its own consumer it still reaches
+/// `authenticate`, which refuses that bundle on its own terms.
+fn certified_pool(
+    frozen: &fold::v2::FrozenLegacy,
+    pool: &[SignedAccountEntry],
+    memo: &mut AuthMemo,
+) -> HashSet<AccountEntryHash> {
+    let mut keys = frozen.device_pubkeys();
+    let mut certified = HashSet::new();
+    let mut waiting: HashMap<DeviceFingerprint, Vec<&SignedAccountEntry>> = HashMap::new();
+    let mut ready: Vec<&SignedAccountEntry> = Vec::new();
+    for signed in pool {
+        if keys.contains_key(&signed.header.device_fingerprint) {
+            ready.push(signed);
+        } else {
+            waiting.entry(signed.header.device_fingerprint).or_default().push(signed);
+        }
+    }
+    while let Some(signed) = ready.pop() {
+        let key = keys[&signed.header.device_fingerprint];
+        let entry = match memo.get(&(signed.entry_hash, key)) {
+            Some(entry) => entry.clone(),
+            None => {
+                let verified = DevicePublic::from_bytes(&key)
+                    .and_then(|key| envelope::verify_account_signed(&signed.signed_bytes, &key));
+                let Ok(verified) = verified else { continue };
+                let Ok(decoded) = ops::decode(verified.header.entry_type, &verified.payload) else {
+                    continue;
+                };
+                let entry = V2Entry { verified, op: decoded.op };
+                memo.insert((signed.entry_hash, key), entry.clone());
+                entry
+            },
+        };
+        certified.insert(signed.entry_hash);
+        if let AccountOp::DeviceAdd { device_fingerprint, ed25519_pubkey, .. } = &entry.op {
+            keys.insert(*device_fingerprint, *ed25519_pubkey);
+            ready.extend(waiting.remove(device_fingerprint).unwrap_or_default());
+        }
+    }
+    certified
 }
 
 /// Why an ancestry walk did not land.
