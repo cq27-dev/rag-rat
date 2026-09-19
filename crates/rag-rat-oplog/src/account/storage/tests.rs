@@ -5884,3 +5884,104 @@ fn malformed_persisted_owner_boundary_fails_closed() {
         "a closed roster and owner cannot jointly retain Open/Open authority",
     );
 }
+
+/// The reservation top-up refuses a fold whose new mandatory key targets no longer fit alongside
+/// the outstanding invite reservations. Nothing exercised it: the guard sits in a window about one
+/// wrap wide, because ingest admission charges the entry against the SAME counters the `ensure!`
+/// reads — the entry must fit while the raise that follows it does not.
+///
+/// The fixture authors its trigger at the control chain's TAIL. Authoring at `seq 1, prev =
+/// genesis` collides with the slot `ensure_owned_stream_v2_in_tx` already filled, which equivocates
+/// the chain; `select_coherent_branches` then resolves the slot by `min_by_key(entry_hash)`, and
+/// since the local device's key is minted per store, which sibling survives is a per-run coin flip.
+/// When the `StreamOwn` loses, stream ownership is dropped inside the failing ingest and the live
+/// target count reads 0, so the guard is never reached at all.
+#[test]
+fn a_fold_whose_new_key_targets_no_longer_fit_refuses() {
+    let wrap = super::super::secrets::single_recipient_wrap_envelope_bytes() as i64;
+    let conn = db();
+    let device = crate::local_device(&conn, NOW).unwrap();
+    let account = super::super::bootstrap::local_account(&conn, NOW).unwrap();
+
+    // Growth: an owned stream plus its key wrap, committed. The wrap lands on the SECRETS log, so
+    // it does not move the control-log tail.
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    let stream =
+        super::super::authoring::ensure_owned_stream_v2_in_tx(&tx, "repo-a", NOW + 1).unwrap();
+    super::super::secrets::mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW + 1).unwrap();
+    tx.commit().unwrap();
+
+    // Read the tail rather than computing it, and assert WHICH entry it is: a tail that is not the
+    // StreamOwn means the fixture would collide with it below.
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    let (tail_seq, tail_hash) = super::super::authoring::account_chain_tail(
+        &tx,
+        account,
+        device.fingerprint(),
+        super::super::fold::CONTROL_LOG,
+    )
+    .unwrap()
+    .expect("the control chain has a tail after the genesis");
+    let tail_type: i64 = tx
+        .query_row(
+            "SELECT entry_type FROM account_entries WHERE entry_hash = ?1",
+            [tail_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(tx);
+    assert_eq!(
+        tail_type as u32,
+        ops::entry_type::STREAM_OWN,
+        "the tail must be the StreamOwn, or the trigger below would collide with it",
+    );
+
+    // An outstanding invite whose reserved_targets lags the live set, so the next fold sees `grew`.
+    let live_ttl = rag_rat_base::time::now_ms() + 3_600_000;
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+        &tx, account, [0x13; 32], 0, 0, 0, live_ttl,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    // The trigger, authored ABOVE the tail.
+    let member = Dev::new(0x77);
+    let (add_bytes, _) = op_local(
+        account,
+        &device,
+        tail_seq + 1,
+        Some(tail_hash.into()),
+        Some(OwnerId::from_bytes(
+            super::account_entries_for_enrollment(&conn, account).unwrap()[0].entry_hash.into(),
+        )),
+        &device_add(&member, DeviceRole::Member),
+    );
+
+    // Pad so the entry is admitted while the raise that follows it is not. Computed from live
+    // headroom: the band is [entry_len, entry_len + wrap).
+    let entry_len = add_bytes.len() as i64;
+    let before = super::candidate_capacity_headroom(&conn, account).unwrap();
+    let pad = before.account_bytes_remaining - (entry_len + (wrap - entry_len).max(2) / 2);
+    assert!(pad > 0, "no room to pad: {}", before.account_bytes_remaining);
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+        &tx, account, [0x14; 32], 0, pad as u64, 0, live_ttl,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let banded = super::candidate_capacity_headroom(&conn, account).unwrap();
+    assert!(
+        banded.account_bytes_remaining >= entry_len
+            && banded.account_bytes_remaining < entry_len + wrap,
+        "remaining {} is outside the band [{entry_len}, {}) — the entry must fit while the raise \
+         does not, or this pins nothing",
+        banded.account_bytes_remaining,
+        entry_len + wrap,
+    );
+
+    let err = account_ingest(&conn, &add_bytes, NOW + 2)
+        .expect_err("the fold must refuse when the new key targets no longer fit");
+    assert!(err.to_string().contains("do not fit"), "unexpected refusal: {err}",);
+}
