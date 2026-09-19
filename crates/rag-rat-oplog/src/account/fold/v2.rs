@@ -1773,6 +1773,41 @@ mod tests {
         );
     }
 
+    /// `verdict` is TOTAL: absence means the caller asked about an entry this resolution was never
+    /// given, and the answer is that it holds no authority. That default is unreachable through any
+    /// production caller — the executor chains the cut into the bundle it resolves, and the fold
+    /// asks only about `candidates[legacy_count..]` — so nothing exercised it, and flipping it to
+    /// `Authorized` left the whole crate suite green.
+    ///
+    /// Asking directly is the witness. A `debug_assert!` was considered and rejected: it would turn
+    /// a documented total function into a partial one and still pin nothing.
+    #[test]
+    fn an_entry_this_resolution_never_saw_holds_no_authority() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        // Resolved over no bundle at all, then asked about a hash that is not in it.
+        let authority = V2Authority::resolve(frozen, &[]);
+        assert_eq!(
+            authority.verdict(&AccountEntryHash::from_bytes([0xd1; 32])),
+            V2Verdict::Inadmissible,
+            "an unknown entry must default to holding no authority, never to Authorized",
+        );
+        // And the same holds for a resolution that DID see a bundle: the default is about the
+        // entry being absent, not about the bundle being empty.
+        let (cut, _) = v2_cut(&fixture, false);
+        let resolved = V2Authority::resolve(frozen, std::slice::from_ref(&cut));
+        assert_eq!(
+            resolved.verdict(&cut.hash()),
+            V2Verdict::Authorized,
+            "the bundle member resolves"
+        );
+        assert_eq!(
+            resolved.verdict(&AccountEntryHash::from_bytes([0xd2; 32])),
+            V2Verdict::Inadmissible,
+            "a non-member still defaults to holding no authority",
+        );
+    }
+
     /// The two ways a citation fails to resolve, told apart on ONE entry: the same operation citing
     /// the same hash, differing only in whether that object was supplied. An entry we hold that is
     /// not a mint never becomes one, so that refusal is final; an object nothing supplied may
