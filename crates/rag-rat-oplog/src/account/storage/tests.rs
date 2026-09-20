@@ -2886,6 +2886,21 @@ fn citing_cut_entry(
     authority: OwnerId,
     cites: [u8; 32],
 ) -> envelope::SignedAccountEntry {
+    citing_cut_entry_with_checkpoint(account_id, signer, seq, prev, authority, cites, [0x5c; 32])
+}
+
+/// [`citing_cut_entry`] over a chosen checkpoint, so a cut can name one this account is not pinned
+/// to.
+#[allow(clippy::too_many_arguments)]
+fn citing_cut_entry_with_checkpoint(
+    account_id: AccountId,
+    signer: &Dev,
+    seq: u64,
+    prev: [u8; 32],
+    authority: OwnerId,
+    cites: [u8; 32],
+    checkpoint: [u8; 32],
+) -> envelope::SignedAccountEntry {
     let op = AccountOp::DeviceRemove {
         device_fingerprint: Dev::new(0xd0).fp,
         control_cut: crate::account::cut::Cut::Empty,
@@ -2894,13 +2909,10 @@ fn citing_cut_entry(
         reason: "revoked".into(),
     };
     // A revocation MUST name a pre-cut view — `ControlOp::encode` refuses otherwise.
-    let payload = control_v2::ops::ControlOp {
-        checkpoint: [0x5c; 32],
-        pre_cut_view: Some(cites),
-        op: op.clone(),
-    }
-    .encode()
-    .unwrap();
+    let payload =
+        control_v2::ops::ControlOp { checkpoint, pre_cut_view: Some(cites), op: op.clone() }
+            .encode()
+            .unwrap();
     let header = AccountEntryHeader {
         account_id,
         log_id: fold::CONTROL_LOG,
@@ -3230,6 +3242,55 @@ fn a_signers_manifest_share_binds_on_bytes_before_entries() {
     assert!(
         !signer_is_under_its_manifest_share(&tx, &probe, 1).unwrap(),
         "the byte share binds while twelve entry slots remain",
+    );
+}
+
+/// A cut naming a FOREIGN checkpoint still registers its citation, deliberately.
+///
+/// The column records a structural fact about the payload — which view this cut names — never that
+/// the cut is executable here. Candidate admission reads no pin state at all and a cut may arrive
+/// before any pin exists, so gating the citation on a matching checkpoint would record nothing for
+/// the cut that arrives first, which is the ordinary order the reserve depends on.
+///
+/// Tightening this is the change this test exists to stop: the checkpoint question belongs to
+/// execution, which holds the pin and drops a manifest naming another checkpoint, and the width is
+/// bounded by the per-signer share of the floor.
+#[test]
+fn a_cut_naming_a_foreign_checkpoint_still_registers_its_citation() {
+    let conn = db();
+    let founder = Dev::new(0x9a);
+    let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+    account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+    let cited = fixture_view().digest().unwrap();
+    let elsewhere = [0xfe; 32];
+    assert_ne!(elsewhere, fixture_view().checkpoint, "the cut names another checkpoint");
+
+    let foreign = citing_cut_entry_with_checkpoint(
+        account_id,
+        &founder,
+        1,
+        genesis_hash,
+        OwnerId::from_bytes(genesis_hash),
+        cited,
+        elsewhere,
+    );
+    assert_eq!(
+        ingest_branch(&account_ingest(&conn, &foreign.signed_bytes, NOW + 1).unwrap()),
+        "ingested",
+    );
+
+    let stored: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT cited_view_digest FROM account_entries WHERE entry_hash = ?1",
+            [foreign.entry_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some(cited.as_slice()),
+        "the citation comes from the payload, not from the checkpoint the cut names",
     );
 }
 
