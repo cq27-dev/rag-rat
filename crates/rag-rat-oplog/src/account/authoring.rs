@@ -67,6 +67,11 @@ pub fn ensure_owned_stream_v2_with_mode_in_tx(
         "cannot ensure a /2 owned stream before the store's local account is minted (call \
          local_account first)",
     )?;
+    // An ensure is AUTHORING intent, so it refuses under every pin — including one this binary
+    // folds. The check-fact-first read below answers from the rebuilt projection and would report
+    // an already-owned stream as ensured; the authoring branch past it is gated, but handing a
+    // caller success for a mutation this account cannot perform is the wrong answer.
+    super::control_policy::require_supported_account_control(tx, account_id)?;
     let mut spec = stream::owner_stream_v2(repo_id, account_id);
     spec.access_mode = access_mode;
     let stream_id = stream::derive_v2(&spec)?;

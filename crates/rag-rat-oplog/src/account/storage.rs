@@ -436,7 +436,7 @@ fn load_roster_fact(
     roster_ref: &RosterRef,
 ) -> anyhow::Result<Option<(fold::RosterAuthority, i64, Option<i64>)>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, String, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, role, effective_at, closed_at
@@ -1151,8 +1151,8 @@ pub fn grant_effective_for_device_in_snapshot(
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantDeviceAuthority>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
-    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, grantee_account_id)?;
     let row: Option<StoredGrantRow> = conn
         .query_row(
             "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
@@ -1202,7 +1202,7 @@ pub fn stream_owner_effective_in_snapshot(
     stream_id: StreamId,
 ) -> anyhow::Result<fold::AuthorityQuery<AccountEntryHash>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT own_id, effective_at FROM account_stream_ownership
@@ -1226,7 +1226,7 @@ pub(super) fn grant_device_cut(
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<Option<DeviceCut>>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
     let grant_exists: bool = conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM account_stream_grants
@@ -1324,13 +1324,18 @@ fn stream_owner_account_unchecked(
 /// unknown or not-yet-synced owner is treated as private, never public, so admission callers open
 /// nothing on a stream whose owner authority has not yet arrived. Resolve the owner FROM THE STREAM
 /// via [`stream_owner_account`] before calling — never from an attacker-settable claimed author.
+///
+/// That precondition is also what carries the pin refusal. This read answers from the folded
+/// projection under an executable pin, so a pinned owner's mode IS readable here; what withholds
+/// it is the caller's owner resolution ([`stream_owner_account`] keeps the strict stream gate) or
+/// an explicit pin check. Every current caller pre-filters one of those two ways.
 pub fn stream_access_mode(
     conn: &Connection,
     owner_account_id: AccountId,
     stream_id: StreamId,
 ) -> anyhow::Result<AccessMode> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
     let own_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT own_id FROM account_stream_ownership
@@ -1420,7 +1425,7 @@ pub fn account_is_fully_public(conn: &Connection, account_id: AccountId) -> anyh
 /// fail-closed: parked (quota-bounded), never accepted, and reclassified if the account recovers.
 pub fn account_is_contested(conn: &Connection, account_id: AccountId) -> anyhow::Result<bool> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let classification: Option<String> = conn
         .query_row(
             "SELECT classification FROM account_auth_state WHERE account_id = ?1",
@@ -1477,7 +1482,7 @@ pub fn held_control_log_len(conn: &Connection, account_id: AccountId) -> anyhow:
 /// before freshness).
 pub fn account_effective_count(conn: &Connection, account_id: AccountId) -> anyhow::Result<u64> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let effective_count: Option<i64> = conn
         .query_row(
             "SELECT effective_count FROM account_auth_state WHERE account_id = ?1",
@@ -1757,8 +1762,10 @@ fn fold_account_state_in_tx(
     };
     let unpinned = matches!(policy, super::control_policy::AccountControlPolicy::LegacyV1);
     // Content is retracted under EVERY pin, including one this binary folds: see
-    // [`retract_pinned_content_in_tx`]. A pinned account therefore reports no affected streams, so
-    // the ordinary finalize never walks the gated stream-authority chain.
+    // [`retract_pinned_content_in_tx`]. The ordinary finalize could only ever DECLASSIFY such a
+    // stream anyway — `stream_owner_account_for_cleanup` answers `None` for a pin-routed stream, so
+    // the content refold declassifies before it resolves any authority — so retract directly, once,
+    // and over the pin's routing table rather than the projection's owned set.
     let affected_streams = if unpinned {
         super::content::affected_streams_for_account(tx, account_id, &previously_owned)?
     } else {
@@ -1770,14 +1777,9 @@ fn fold_account_state_in_tx(
     // wrap a promoted DeviceAdd just certified). Top outstanding invite reservations up to the
     // new mandatory redemption cost inside the same transaction (#945).
     //
-    // Skipped under EVERY pin. There is nothing to reserve capacity for on an account no
-    // enrollment can redeem against, and the top-up resolves the account's streams through the
-    // GATED `owned_streams_for_account` — so running it here would fail the whole fold, including
-    // the pin install itself, and blame a version mismatch that is not the cause. Reaching for the
-    // ungated `owned_stream_bytes` instead would work mechanically and weaken the gate.
-    if unpinned {
-        top_up_account_candidate_reservations_in_tx(tx, account_id)?;
-    }
+    // Unconditional here: the pin skip lives INSIDE the callee, because content settlement reaches
+    // it by another route entirely (#1399).
+    top_up_account_candidate_reservations_in_tx(tx, account_id)?;
     Ok(AccountStateFold { statuses, affected_streams, rejected_content_promotions })
 }
 
@@ -1788,7 +1790,7 @@ pub fn owned_streams_for_account(
     account_id: AccountId,
 ) -> anyhow::Result<Vec<StreamId>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     owned_stream_bytes(conn, account_id)
         .map(|streams| streams.into_iter().map(StreamId::from_bytes).collect())
 }
@@ -1829,11 +1831,17 @@ fn pinned_affected_streams(
 /// Retract the content acceptance of a pinned account's streams and re-project them through the
 /// CLEANUP path.
 ///
-/// Content is retracted under EVERY pin, including one this binary executes and folds. The content
-/// acceptance path resolves stream authority through gated reads — [`account_is_contested`] and the
-/// ownership/access-mode lookups — and those refuse for any pin, so there is no evaluation to
-/// project. A pinned fold therefore retracts here and reports NO affected streams, rather than
-/// handing the ordinary finalize a stream whose gated chain would fail the fold.
+/// Content is retracted under EVERY pin, including one this binary executes and folds — and NOT
+/// because the authority reads refuse. Three boolean-keyed sites do the retracting, all on
+/// [`super::control_policy::account_is_pinned`] / [`super::control_policy::stream_control_pinned`]:
+/// [`stream_owner_account_for_cleanup`] answers `None` for a pin-routed stream, so the content
+/// refold DECLASSIFIES and returns before resolving any authority; `resolve_stream_authority` skips
+/// every pinned author's entries; and the projector loads none. Migrating an authority read to
+/// [`super::control_policy::require_foldable_account_control`] therefore un-retracts nothing.
+///
+/// Retracting here rather than leaving it to the ordinary finalize is an optimization plus a
+/// widening: the finalize could only declassify these streams, and this also covers the streams the
+/// pin's routing table names after the ownership rows are suppressed.
 fn retract_pinned_content_in_tx(tx: &Transaction<'_>, account_id: AccountId) -> anyhow::Result<()> {
     let affected = pinned_affected_streams(tx, account_id)?;
     let flipped = tx.execute(
@@ -2962,6 +2970,19 @@ pub(super) fn top_up_account_candidate_reservations_in_tx(
         |row| row.get(0),
     )?;
     if !table_exists {
+        return Ok(());
+    }
+    // A pinned account tops up nothing. Two paths reach this: the account fold, and content
+    // settlement through `refresh_enrollment_reservations_for_stream_in_tx`, which derives the
+    // owner from an ungated `account_stream_ownership` read. Under `ControlV2` that row exists —
+    // the projection is rebuilt, not emptied — so a pinned owner's stream reaches here from an
+    // unrelated contributor's fold (#1399). The guard lives HERE rather than at those two callers
+    // so a third one cannot reintroduce the hole by forgetting.
+    //
+    // Skipping is correct because redemption is refused under any pin (every
+    // `enrollment/redeem.rs` gate is the strict one), so no ticket exists whose headroom could be
+    // stranded. Restore the top-up in the same change that admits redemption under a pin.
+    if super::control_policy::account_is_pinned(tx, account_id)? {
         return Ok(());
     }
     let now_ms = rag_rat_base::time::now_ms();

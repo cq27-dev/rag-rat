@@ -115,11 +115,15 @@ pub fn account_is_pinned(conn: &Connection, account: AccountId) -> anyhow::Resul
 /// The routing table is derived from the authenticated checkpoint proof, so this is the tightest
 /// "the pin retracted this stream" answer a cleanup consumer can ask.
 ///
-/// Content is retracted under EVERY pin, including one this binary folds: the content acceptance
-/// path resolves stream authority through gated reads (`account_is_contested` and the
-/// ownership/access-mode lookups), and those keep refusing until an executable pin can also be
-/// operated under. Narrowing this to the unsupported case would un-retract a stream whose content
-/// still cannot be evaluated.
+/// Content is retracted under EVERY pin, including one this binary folds — and THIS predicate is
+/// one of the three things that does the retracting, not a consequence of the authority gates.
+/// `stream_owner_account_for_cleanup` answers `None` here and the content refold declassifies;
+/// `resolve_stream_authority` skips pinned authors; the projector loads none. So narrowing this to
+/// the unsupported case is not a documentation change — it is the decision to evaluate content
+/// under an executable pin, and it must be taken deliberately, with the whole set moved together.
+///
+/// It is unproven that the content evaluator is correct under `ControlV2`: every `content_cuts` in
+/// the v2 fixtures is empty, so a cut that condemns content has never been folded through a pin.
 pub fn stream_control_pinned(
     conn: &Connection,
     stream: crate::stream::StreamId,
@@ -139,9 +143,13 @@ pub fn require_supported_account_control(
 ) -> anyhow::Result<()> {
     match account_control_policy(conn, account)? {
         AccountControlPolicy::LegacyV1 => Ok(()),
-        // BOTH pinned states refuse, and the executable one is not an oversight: a pin this binary
-        // can FOLD is not one it can operate under, because the authority projection a support gate
-        // reads does not yet carry the register effects of the account's v2 operations.
+        // BOTH pinned states refuse, and the executable one is not an oversight — but not for the
+        // reason once recorded here. The projection DOES carry the register effects of the
+        // account's v2 operations; `pinned_history` composes them and the shared fold path writes
+        // them, which is what [`require_foldable_account_control`] rests on. What an executable pin
+        // still cannot do is OPERATE: authoring signs v1 bytes a pinned fold can never make
+        // effective, adoption and enrollment cannot transfer the pin, and a second checkpoint
+        // proposal on a permanent pin is meaningless.
         AccountControlPolicy::ControlV2(pin) | AccountControlPolicy::UnsupportedVersion(pin) =>
             Err(UnsupportedAccountControlVersion { pin }.into()),
     }
@@ -794,12 +802,11 @@ mod tests {
 
     /// Installing a pin must not fail merely because an enrollment invite is outstanding.
     ///
-    /// The fold's reservation top-up resolves the account's streams through the GATED
-    /// `owned_streams_for_account`, which refuses under either pin state — and it short-circuits
-    /// when nothing is outstanding, so a fixture without a reservation never reached it. There is
-    /// nothing to reserve capacity for on an account no enrollment can redeem against, so the whole
-    /// top-up is skipped under a pin; running it would fail the fold, and the pin install with it,
-    /// blaming a version mismatch that is not the cause.
+    /// The top-up short-circuits when nothing is outstanding, so a fixture without a reservation
+    /// never reaches it at all. With one outstanding it is reached and then skipped, by the pin
+    /// guard inside the top-up itself: there is nothing to reserve capacity for on an account no
+    /// enrollment can redeem against. That skip is what keeps installing a pin from depending on
+    /// enrollment state.
     #[test]
     fn a_pin_installs_with_an_enrollment_reservation_outstanding() {
         let conn = Connection::open_in_memory().unwrap();
@@ -915,6 +922,14 @@ mod tests {
         // and enrollment keep refusing, and content stays retracted under every pin.
         assert!(require_supported_account_control(&conn, account).is_err());
         assert!(require_foldable_account_control(&conn, account).is_ok());
+
+        // The reads the fold path takes answer from that rebuilt projection rather than refusing.
+        // The strict gate above still says no, so these pin the foldable gate's admission and not
+        // some general loosening: an account whose projection is rebuilt must be readable through
+        // the same reads an unpinned one uses, or the rebuild buys nothing.
+        assert!(storage::owned_streams_for_account(&conn, account).unwrap().is_empty());
+        assert!(!storage::account_is_contested(&conn, account).unwrap());
+        assert_eq!(storage::account_effective_count(&conn, account).unwrap(), 2);
     }
 
     /// The retraction path is reached only by a pin naming a version this binary cannot execute,

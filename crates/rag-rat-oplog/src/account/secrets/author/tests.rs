@@ -1335,3 +1335,52 @@ fn insert_forked_member_device_add(
     )
     .unwrap();
 }
+
+/// Install a REAL, verifiable pin: propose a checkpoint over the account's own evidence, verify
+/// it, and store it through the pin seam. A raw `INSERT` into `account_control_pins` yields a
+/// `ControlV2` policy whose digest matches no stored bundle, so the very next refold fails
+/// verification — a test resting on that proves nothing about authoring.
+fn install_real_pin(conn: &Connection, account: AccountId) {
+    let device = crate::local_device(conn, NOW).unwrap();
+    // Proposing is itself refused once pinned, so the proof must be built first.
+    let bundle = {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let bundle =
+            crate::account::checkpoint::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
+        tx.commit().unwrap();
+        bundle
+    };
+    let pin = crate::account::checkpoint::TrustedCheckpointPin {
+        account_id: account,
+        checkpoint_digest: bundle.certificate_digest(),
+        required_control_version: 2,
+    };
+    let proof = crate::account::checkpoint::verify_checkpoint(pin, &bundle).unwrap();
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+    crate::account::control_policy::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap();
+    tx.commit().unwrap();
+}
+
+/// A pinned account authors no secrets-log entries.
+///
+/// Every wrap seam resolves the local device's live owner incarnation and its effective
+/// control-fold length from the projection, and under a pin this binary EXECUTES both answer
+/// normally — such a pin rebuilds the projection rather than emptying it. Nothing on this path
+/// refuses on its own, so the refusal has to be stated at the seam. It cannot be left to the `/3`
+/// authoring gates: those run in a LATER transaction (sealed-authoring preparation commits its
+/// rotation transaction before reaching them), so a wrap gated only there would already be durable.
+#[test]
+fn a_pinned_account_cannot_author_a_stream_key_wrap() {
+    let conn = db();
+    let (account, stream) = account_with_owned_stream(&conn, "repo");
+    install_real_pin(&conn, account);
+
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    let err = mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW)
+        .expect_err("a pinned account must not author a StreamKeyWrap");
+    assert!(
+        err.downcast_ref::<crate::account::control_policy::UnsupportedAccountControlVersion>()
+            .is_some(),
+        "expected the typed pin refusal, got: {err}",
+    );
+}
