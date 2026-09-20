@@ -573,6 +573,12 @@ fn author_stream_key_wrap_batch_in_tx(
         "cannot author a StreamKeyWrap before the store's local account is minted (call \
          local_account first)",
     )?;
+    // Authoring is refused under EVERY pin, and the refusal belongs HERE. Every wrap seam funnels
+    // through this function, while the `/3` authoring gates run in a LATER transaction — the
+    // sealed-authoring preparation commits its rotation txn before reaching them — so a wrap gated
+    // only there would already be durable. Nothing else on this path refuses either: the reads
+    // above answer from the projection, which an executable pin rebuilds rather than empties.
+    super::super::control_policy::require_supported_account_control(tx, account_id)?;
     let device = local_device(tx, now_ms)?;
     let fingerprint = device.fingerprint();
 

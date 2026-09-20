@@ -4631,3 +4631,81 @@ fn no_writer_replaces_or_upserts_content_entries_behind_the_stats_triggers() {
          triggers cannot account for it (see the migration doc): {offenders:?}",
     );
 }
+
+/// A pin landing on an owner must not fail an UNRELATED contributor's later settlement (#1399).
+///
+/// The pin arrives AFTER the contributor's entry is accepted, because that is the only reachable
+/// shape: ingest onto an already-pinned owner's stream is refused up front by
+/// `require_supported_stream_control`. A later settle discharges
+/// `refold_and_project_stream_in_tx`, whose last step refreshes enrollment reservations for the
+/// stream's owner through an ungated ownership read. Under `ControlV2` that row survives — the
+/// projection is rebuilt, not emptied — so the pinned owner's top-up runs inside the
+/// contributor's fold, and the guard in `top_up_account_candidate_reservations_in_tx` is what
+/// keeps it from touching the reservation.
+///
+/// The pin row is seeded directly: `install_pin` is private to `control_policy`, and V130's
+/// triggers forbid only UPDATE/DELETE. That yields a `ControlV2` policy with no verified
+/// checkpoint behind it — enough here, because the top-up keys on the policy and on the
+/// ownership row and this seed reproduces both, but it exercises the guard, not a full pinned
+/// fold.
+#[test]
+fn a_pin_on_the_owner_does_not_fail_an_unrelated_contributors_settlement() {
+    let conn = db();
+    // A persisted device identity, so the top-up can run to completion when the guard is NOT
+    // there. Without one it dies on the enrollment-recovery preflight, and the guard would look
+    // proven by an error that has nothing to do with the pin.
+    crate::identity::local_device(&conn, NOW).unwrap();
+    let owner_secret = DeviceSecret::from_seed(&[0xc1; 32]);
+    let author_secret = DeviceSecret::from_seed(&[0xc2; 32]);
+    let owner = roster(&conn, &owner_secret).0;
+    let (author, author_genesis) = roster(&conn, &author_secret);
+    let grant_id = [0x6a; 32];
+    seed_ownership(&conn, owner);
+    seed_roster_fact(&conn, author_genesis.into(), author, &author_secret, "member");
+    seed_grant(&conn, GrantId::from_bytes(grant_id), owner, author, "writer");
+
+    let entry = authored(&author_secret, author, author_genesis.into(), ContentSpec {
+        grant_id: Some(GrantId::from_bytes(grant_id)),
+        ..ContentSpec::default()
+    });
+    assert_eq!(verdict_after_ingest(&conn, &entry), ("accepted".into(), 1));
+
+    // An outstanding invite on the owner: without one the top-up short-circuits on
+    // `any_outstanding` and never reaches the pinned path at all.
+    {
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        crate::upsert_account_candidate_reservation_in_tx(
+            &tx,
+            owner,
+            [0x9c; 32],
+            4,
+            4096,
+            2,
+            rag_rat_base::time::now_ms() + 3_600_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    conn.execute(
+        "INSERT INTO account_control_pins(account_id, checkpoint_digest, required_version, \
+         certificate) VALUES (?1, ?2, 2, ?3)",
+        params![owner.to_bytes().as_slice(), [0x7c_u8; 32].as_slice(), [0u8; 8].as_slice()],
+    )
+    .unwrap();
+
+    // The contributor's stream settles again with the pin now in place. Two things are asserted,
+    // one per half of the fix: the settle COMPLETES, because the reads it takes admit a folded
+    // pin; and the reservation below is UNTOUCHED, because the guard skipped the top-up.
+    run_account_trigger_owning(&conn, author, &[StreamId::from_bytes(STREAM).to_bytes()]);
+
+    // The pinned owner's reservation is untouched — the guard's own contract, distinct from the
+    // contributor's fold merely not erroring.
+    let targets: i64 = conn
+        .query_row(
+            "SELECT reserved_targets FROM account_candidate_reservations WHERE account_id = ?1",
+            [owner.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(targets, 2, "a pinned account's invite reservation is never topped up");
+}
