@@ -3627,6 +3627,17 @@ fn is_view_manifest(header: &AccountEntryHeader) -> bool {
 /// A payload that does not decode names nothing rather than refusing the entry. Nothing validates a
 /// v2 control payload at this seam — [`validate_storable_header_payload`] has no arm for one — so
 /// refusing here would reject entries this store admits today.
+///
+/// Deliberately NOT narrowed to a cut whose `op.checkpoint` matches this account's pin. What is
+/// recorded is a STRUCTURAL fact about the payload — which view this cut names — never a claim
+/// that the cut is executable here. Candidate admission reads no pin state at all, and a cut may
+/// arrive before any pin exists, so gating on a match would record nothing for the cut that
+/// arrives first — the ordinary order the manifest reserve depends on — and would make a stored
+/// column's meaning depend on mutable state that the V131 backfill would then have to replicate.
+///
+/// The checkpoint question belongs to execution, which holds the pin and drops a manifest naming
+/// another checkpoint. What this width admits is bounded: an admitted signer can spend its own
+/// share of the manifest floor on evidence the executor will never use, and no more (#1393).
 fn cited_view_digest(header: &AccountEntryHeader, payload: &[u8]) -> Option<[u8; 32]> {
     if header.log_id != fold::CONTROL_LOG
         || header.crypto_suite != 0
