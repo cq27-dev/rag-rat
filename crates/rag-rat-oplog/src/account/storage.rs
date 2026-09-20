@@ -597,7 +597,7 @@ fn owner_chain_authority_in_snapshot(
     chain: AuthorityChain,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerChainAuthority>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let chain = chain.column_prefix();
     let sql = format!(
         "SELECT o.device_fingerprint, o.effective_at, o.closed_at,
@@ -750,7 +750,7 @@ pub(in crate::account) fn usable_snapshots(
     account_id: AccountId,
 ) -> anyhow::Result<Vec<UsableSnapshot>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let rows = load_candidates(conn, account_id)?;
     let held: Vec<envelope::VerifiedAccountEntry> =
         rows.iter().map(|row| row.verified.clone()).collect();
@@ -818,7 +818,7 @@ pub fn owner_incarnation_effective(
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::OwnerAuthority>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, i64, Option<i64>)> = conn
         .query_row(
             "SELECT device_fingerprint, effective_at, closed_at
@@ -863,8 +863,8 @@ pub fn grant_effective_in_snapshot(
     grantee_account_id: AccountId,
 ) -> anyhow::Result<fold::AuthorityQuery<fold::GrantAuthority>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
-    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, grantee_account_id)?;
     let row: Option<StoredGrantRow> = conn
         .query_row(
             "SELECT stream_id, grantee_account_id, role, effective_at, closed_at
@@ -900,8 +900,8 @@ pub fn effective_writer_grant(
     grantee_account_id: AccountId,
 ) -> anyhow::Result<Option<GrantId>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
-    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, grantee_account_id)?;
     let grant_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT grant_id FROM account_stream_grants
@@ -933,8 +933,8 @@ pub fn open_writer_grants(
     grantee_account_id: AccountId,
 ) -> anyhow::Result<Vec<GrantId>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
-    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, grantee_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT grant_id FROM account_stream_grants
          WHERE owner_account_id = ?1 AND stream_id = ?2 AND grantee_account_id = ?3
@@ -976,7 +976,7 @@ pub fn stream_grants_for_owner(
     stream_id: StreamId,
 ) -> anyhow::Result<Vec<StreamGrantListing>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT grant_id, grantee_account_id, role, closed_at IS NULL
          FROM account_stream_grants
@@ -1018,7 +1018,7 @@ pub fn effective_writer_grantees(
     owner_account_id: AccountId,
 ) -> anyhow::Result<Vec<AccountId>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, owner_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, owner_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT DISTINCT grantee_account_id FROM account_stream_grants
          WHERE owner_account_id = ?1 AND role = ?2 AND closed_at IS NULL
@@ -1097,7 +1097,7 @@ pub fn account_holds_effective_public_writer_grant(
     grantee_account_id: AccountId,
 ) -> anyhow::Result<bool> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, grantee_account_id)?;
+    super::control_policy::require_foldable_account_control(conn, grantee_account_id)?;
     let mut stmt = conn.prepare(
         "SELECT owner_account_id, stream_id FROM account_stream_grants
          WHERE grantee_account_id = ?1 AND role = ?2 AND closed_at IS NULL",
@@ -1505,7 +1505,7 @@ pub(in crate::account) fn effective_owner_incarnation_for_device(
     device_fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<OwnerId>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let owner_id: Option<Vec<u8>> = conn
         .query_row(
             "SELECT owner_id FROM account_owner_incarnations
@@ -3142,7 +3142,7 @@ pub(super) fn list_effective_roster_x25519_pubkeys(
     account_id: AccountId,
 ) -> anyhow::Result<Vec<(DeviceFingerprint, DeviceX25519Public)>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     // The effective set + the enrolling entry each device's key must come from. DISTINCT because
     // one device can (in principle) key more than one `roster_ref` row.
     let mut stmt = conn.prepare(
@@ -3174,7 +3174,7 @@ pub(super) fn effective_roster_x25519_pubkey(
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<DeviceX25519Public>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let roster_ref: Option<Vec<u8>> = conn
         .query_row(
             "SELECT roster_ref FROM account_roster_history
@@ -3208,7 +3208,7 @@ pub(super) fn list_effective_roster_fingerprints(
     account_id: AccountId,
 ) -> anyhow::Result<Vec<DeviceFingerprint>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let mut stmt = conn.prepare(
         "SELECT DISTINCT device_fingerprint FROM account_roster_history
          WHERE account_id = ?1 AND closed_at IS NULL
@@ -3229,7 +3229,7 @@ pub(super) fn effective_roster_entry_in_snapshot(
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<Option<(RosterRef, ops::DeviceRole)>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, String)> = conn
         .query_row(
             "SELECT roster_ref, role FROM account_roster_history
@@ -3258,7 +3258,7 @@ pub(crate) fn device_is_effective_writer(
     fingerprint: DeviceFingerprint,
 ) -> anyhow::Result<bool> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     Ok(conn.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM account_roster_history

@@ -147,6 +147,33 @@ pub fn require_supported_account_control(
     }
 }
 
+/// The gate for READING folded authority: a pin this binary can FOLD answers from a real
+/// projection, so only a version it cannot execute refuses.
+///
+/// Deliberately a second predicate rather than a widening of
+/// [`require_supported_account_control`], which stays as the gate for everything that AUTHORS or
+/// ADOPTS. Both spellings are one line at a call site, so a reader cannot tell them apart by
+/// shape — the difference is which question the site is asking. Migrating a site is therefore an
+/// explicit diff line, and a site left on the stricter gate under-grants, which is fail-closed.
+///
+/// Sound only because `rewrite_authority_projection` runs on the SHARED fold path: under
+/// `ControlV2` the roster, incarnation, ownership and grant tables are rebuilt from the
+/// checkpoint's frozen history plus the v2 register effects, so these reads return real rows
+/// rather than the empties a retracted account would show.
+///
+/// It does NOT make an account operable. Content stays retracted under every pin, and authoring,
+/// adoption and enrollment keep refusing — see [`require_supported_account_control`].
+pub fn require_foldable_account_control(
+    conn: &Connection,
+    account: AccountId,
+) -> anyhow::Result<()> {
+    match account_control_policy(conn, account)? {
+        AccountControlPolicy::LegacyV1 | AccountControlPolicy::ControlV2(_) => Ok(()),
+        AccountControlPolicy::UnsupportedVersion(pin) =>
+            Err(UnsupportedAccountControlVersion { pin }.into()),
+    }
+}
+
 /// Persist independent trust and complete proof atomically. Caller owns the IMMEDIATE transaction.
 /// No peer advertisement, sync receipt, or ordinary account ingestion calls this API.
 pub fn pin_checkpoint_in_tx(
@@ -422,13 +449,29 @@ mod tests {
         let snapshot =
             Transaction::new_unchecked(&reopened, rusqlite::TransactionBehavior::Deferred).unwrap();
         assert_eq!(export_account_checkpoint(&snapshot, account).unwrap().unwrap().0, expected);
-        let error = super::super::storage::usable_snapshots(&snapshot, account).unwrap_err();
-        assert!(error.downcast_ref::<UnsupportedAccountControlVersion>().is_some());
-        let error = crate::sign_local_node_binding(&snapshot, account, &[0; 32], 0).unwrap_err();
-        assert!(error.downcast_ref::<UnsupportedAccountControlVersion>().is_some());
+        // Reads of folded authority answer from the rebuilt projection: this pin names a version
+        // this binary executes, so refusing them would be refusing data the fold just derived. The
+        // refusal these two used to assert belongs to a pin that cannot be executed, which
+        // `the_retraction_path_still_empties_every_projection_it_owns` drives directly.
+        // `usable_snapshots` answers from candidates plus the projection; the fixture purged its
+        // repo rows, so an empty list is the right answer and a refusal is not.
+        assert!(super::super::storage::usable_snapshots(&snapshot, account).unwrap().is_empty());
+        // Nested `Result`: the outer is the gate, the inner is whether a binding was actually
+        // signed. Asserting only the outer would pass on a `NodeAuthError::NotRosterDevice` —
+        // exactly the answer a pin that had emptied the roster would give.
+        assert!(
+            !crate::sign_local_node_binding(&snapshot, account, &[0; 32], 0)
+                .unwrap()
+                .unwrap()
+                .is_empty(),
+            "a foldable pin still mints a transport credential from the rebuilt roster",
+        );
+        // Operating is still refused. The support gate is the authoring/adoption question and is
+        // deliberately untouched by the read migration.
         let error = require_supported_account_control(&reopened, account).unwrap_err();
         assert!(error.downcast_ref::<UnsupportedAccountControlVersion>().is_some());
         require_supported_account_control(&reopened, AccountId::from_bytes([9; 32])).unwrap();
+        require_foldable_account_control(&reopened, account).unwrap();
     }
 
     /// A local account owning `repo` with one projected note on its stream.
@@ -858,8 +901,20 @@ mod tests {
             "the checkpoint's accepted control chain keeps its acceptance",
         );
         assert_eq!(accepted_flag(&conn, enrolled), 1);
-        // Folding is not operating: the support gate is deliberately untouched by this dispatch.
+
+        // The rows existing is not the same as a reader reaching them: every API over this
+        // projection is gated, so a rebuilt-but-unreadable projection would be indistinguishable
+        // from a retracted one at the seam that matters.
+        assert_eq!(
+            storage::list_effective_roster_fingerprints(&conn, account).unwrap().len(),
+            2,
+            "a foldable pin serves the roster it just rebuilt",
+        );
+
+        // Folding is still not operating. Reads answer from the projection; authoring, adoption
+        // and enrollment keep refusing, and content stays retracted under every pin.
         assert!(require_supported_account_control(&conn, account).is_err());
+        assert!(require_foldable_account_control(&conn, account).is_ok());
     }
 
     /// The retraction path is reached only by a pin naming a version this binary cannot execute,
