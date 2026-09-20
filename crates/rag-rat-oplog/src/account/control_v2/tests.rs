@@ -183,6 +183,121 @@ fn bytes(entries: &[SignedAccountEntry]) -> Vec<Vec<u8>> {
     entries.iter().map(|entry| entry.signed_bytes.clone()).collect()
 }
 
+/// A v2 operation signed by a device the frozen legacy epoch never certified — the shape a post-pin
+/// v1 `DeviceAdd` leaves behind, since ingest resolves a key from any stored candidate while
+/// execution certifies only the accepted epoch. Authored at the origin slot, so the ancestry walk
+/// continues nothing and the entry parks on its signer rather than its chain.
+fn uncertified(checkpoint: &VerifiedCheckpoint, seed: u8) -> SignedAccountEntry {
+    let stranger = Dev::new(seed);
+    let enrolled = Dev::new(seed.wrapping_add(1));
+    let op = ops::ControlOp {
+        checkpoint: checkpoint.pin().checkpoint_digest,
+        pre_cut_view: None,
+        op: AccountOp::DeviceAdd {
+            device_fingerprint: enrolled.fp,
+            ed25519_pubkey: enrolled.ed,
+            x25519_pubkey: enrolled.x,
+            role: DeviceRole::Member,
+            label: None,
+        },
+    };
+    envelope::sign_account_entry(
+        &stranger.secret,
+        &AccountEntryHeader {
+            account_id: checkpoint.pin().account_id,
+            log_id: 0,
+            device_fingerprint: stranger.fp,
+            seq: 0,
+            prev_hash: None,
+            parent_ref: None,
+            entry_type: legacy::entry_type_of(&op.op),
+            op_version: ops::CONTROL_VERSION,
+            crypto_suite: 0,
+            auth_len: 1,
+            key_id: None,
+            authority_ref: None,
+        },
+        &op.encode().unwrap(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn an_entry_nothing_certifies_parks_itself_and_leaves_the_pool_applying() {
+    // The pool is shared evidence, so a refusal raised INSIDE a bundle is a refusal of every
+    // operation on the account. One entry signed by a key the accepted epoch never certified is
+    // storable — ingest resolves keys from any stored candidate — and it must not silence the
+    // operations that never needed it (#1395).
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let first = chain.add(0x31);
+    let second = chain.add(0x32);
+    let stranger = uncertified(&checkpoint, 0x41);
+
+    let verdicts = executor::execute_held(
+        &checkpoint,
+        &bytes(&[first.clone(), second.clone(), stranger.clone()]),
+        &[],
+    );
+
+    assert!(
+        matches!(verdicts.get(&first.entry_hash), Some(executor::Verdict::Applied { .. })),
+        "a sound operation applies beside an entry nothing certifies",
+    );
+    assert!(
+        matches!(verdicts.get(&second.entry_hash), Some(executor::Verdict::Applied { .. })),
+        "and so does every other sound operation in the pass",
+    );
+    assert!(
+        matches!(
+            verdicts.get(&stranger.entry_hash),
+            Some(executor::Verdict::Parked(executor::ParkCause::Signer))
+        ),
+        "the uncertified entry parks on its own signer",
+    );
+}
+
+#[test]
+fn a_manifest_naming_another_checkpoint_leaves_the_pool_applying() {
+    // `plan_replay` refuses the whole bundle over a manifest for a different checkpoint, and the
+    // annex log cannot check a manifest against a pin, so one stored row would otherwise yield no
+    // verdict for any operation (#1396).
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let sound = chain.add(0x33);
+    let foreign =
+        views::ViewManifest { checkpoint: [0xAA; 32], entries: Vec::new() }.encode().unwrap();
+
+    let verdicts =
+        executor::execute_held(&checkpoint, &bytes(std::slice::from_ref(&sound)), &[foreign]);
+
+    assert!(
+        matches!(verdicts.get(&sound.entry_hash), Some(executor::Verdict::Applied { .. })),
+        "a manifest for another checkpoint is excluded, not a refusal of every operation",
+    );
+}
+
+#[test]
+fn one_view_held_twice_leaves_the_pool_applying() {
+    // Two devices authoring cuts over the same pre-cut view produce byte-identical manifests, and
+    // one manifest serving cuts from different authors is the documented property — so the
+    // planner's duplicate refusal must never reach a bundle assembled from stored rows (#1396).
+    let (checkpoint, device) = checkpoint();
+    let mut chain = Chain::new(&checkpoint, &device);
+    let sound = chain.add(0x34);
+    let view = manifest(&checkpoint, Vec::new()).encode().unwrap();
+
+    let verdicts = executor::execute_held(&checkpoint, &bytes(std::slice::from_ref(&sound)), &[
+        view.clone(),
+        view,
+    ]);
+
+    assert!(
+        matches!(verdicts.get(&sound.entry_hash), Some(executor::Verdict::Applied { .. })),
+        "one view held twice is ordinary traffic, not a poisoned pool",
+    );
+}
+
 #[test]
 fn revocations_bind_their_pre_cut_view_without_changing_v1_bytes() {
     for demote in [false, true] {

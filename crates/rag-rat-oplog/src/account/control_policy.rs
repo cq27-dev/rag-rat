@@ -554,6 +554,35 @@ mod tests {
     /// `genesis` and citing the founder incarnation `genesis` names. `version` is the whole point:
     /// a v1 sibling and a v2 continuation differ only in the header's `op_version` and the payload
     /// framing that version selects, so every test here builds both from one helper.
+    /// Search for an entry whose hash sorts BELOW `threshold`, varying only `build`'s
+    /// distinguisher.
+    ///
+    /// Every fixture hash here descends from a founder key `local_device` mints from OS entropy, so
+    /// `threshold` is fresh on every run and a FIXED window of candidates holds no smaller entry
+    /// about one run in 182 — measured at 2/300 and 3/300 for the two thresholds this replaces.
+    /// `Dev::new` takes a `u8`, so widening the seed window cannot get below ~1/257; the
+    /// distinguisher varies a semantically inert field instead, so the search is unbounded and the
+    /// odds stop mattering.
+    fn smaller_than(
+        threshold: super::id::AccountEntryHash,
+        build: impl Fn(u32) -> envelope::SignedAccountEntry,
+    ) -> envelope::SignedAccountEntry {
+        (1u32..)
+            .take(100_000)
+            .map(build)
+            .find(|entry| entry.entry_hash < threshold)
+            .expect("100000 candidates without a smaller hash is a fixture fault, not the odds")
+    }
+
+    /// `distinguisher` varies the signed payload without changing what any test asserts — the label
+    /// is inert here, and 0 emits the exact bytes this fixture produced before it existed, so a
+    /// caller that does not search keeps its hash. Nothing derives a key from it and it is not a
+    /// nonce: a parameter named for cryptographic material reads to a scanner as cryptographic
+    /// material, whatever it holds.
+    ///
+    /// It is also NOT the enrolled identity: that is `seed`, and it IS load-bearing
+    /// (`account_with_one_enrolment` enrols seed 7, which is the very seat
+    /// `a_forked_v2_revocations_registers_revoke_nothing` asserts stays open).
     fn device_add_entry(
         account: AccountId,
         device: &crate::identity::LocalDevice,
@@ -561,6 +590,7 @@ mod tests {
         checkpoint_digest: [u8; 32],
         version: u32,
         seed: u8,
+        distinguisher: u32,
     ) -> envelope::SignedAccountEntry {
         let enrolled = test_support::Dev::new(seed);
         let op = ops::AccountOp::DeviceAdd {
@@ -568,7 +598,7 @@ mod tests {
             ed25519_pubkey: enrolled.ed,
             x25519_pubkey: enrolled.x,
             role: ops::DeviceRole::Member,
-            label: None,
+            label: (distinguisher != 0).then(|| format!("n{distinguisher}")),
         };
         let payload = if version == control_v2::ops::CONTROL_VERSION {
             control_v2::ops::ControlOp {
@@ -641,7 +671,7 @@ mod tests {
         let account = crate::local_account(conn, 1).unwrap();
         let device = crate::local_device(conn, 1).unwrap();
         let genesis = crate::read_local_account_genesis(conn).unwrap().unwrap();
-        let add = device_add_entry(account, &device, genesis, [0; 32], 1, 7);
+        let add = device_add_entry(account, &device, genesis, [0; 32], 1, 7, 0);
         storage::account_ingest(conn, &add.signed_bytes, 1).unwrap();
         assert_eq!(
             accepted_flag(conn, add.entry_hash),
@@ -674,10 +704,9 @@ mod tests {
 
         // A sibling at the SAME slot whose hash sorts BELOW the accepted entry's — the side that
         // wins `select_coherent_branches`' min-hash tiebreak whenever both are effective.
-        let sibling = (20u8..=200)
-            .map(|seed| device_add_entry(account, &device, genesis, [0; 32], 1, seed))
-            .find(|entry| entry.entry_hash < accepted)
-            .expect("a smaller-hash sibling exists");
+        let sibling = smaller_than(accepted, |distinguisher| {
+            device_add_entry(account, &device, genesis, [0; 32], 1, 20, distinguisher)
+        });
         storage::account_ingest(&conn, &sibling.signed_bytes, 2).unwrap();
 
         assert_eq!(accepted_flag(&conn, accepted), 1, "the checkpoint's winner keeps its slot");
@@ -707,10 +736,9 @@ mod tests {
 
         // Same slot as the accepted enrolment, and the smaller hash — the side that wins the
         // min-hash tiebreak the moment both are effective.
-        let contender = (20u8..=200)
-            .map(|seed| device_add_entry(account, &device, genesis, digest, 2, seed))
-            .find(|entry| entry.entry_hash < accepted)
-            .expect("a smaller-hash v2 contender exists");
+        let contender = smaller_than(accepted, |distinguisher| {
+            device_add_entry(account, &device, genesis, digest, 2, 20, distinguisher)
+        });
         storage::account_ingest(&conn, &contender.signed_bytes, 2).unwrap();
 
         assert_eq!(accepted_flag(&conn, accepted), 1, "the checkpoint's winner keeps its slot");
@@ -778,7 +806,7 @@ mod tests {
             let digest = install_pin(&conn, account).checkpoint_digest;
             let siblings: Vec<_> = [31u8, 32]
                 .iter()
-                .map(|seed| device_add_entry(account, &device, genesis, digest, 2, *seed))
+                .map(|seed| device_add_entry(account, &device, genesis, digest, 2, *seed, 0))
                 .collect();
             conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             siblings
@@ -873,13 +901,22 @@ mod tests {
         checkpoint_digest: [u8; 32],
         pre_cut_view: [u8; 32],
         subject: crate::op::DeviceFingerprint,
+        distinguisher: u32,
     ) -> envelope::SignedAccountEntry {
         let op = ops::AccountOp::DeviceRemove {
             device_fingerprint: subject,
             control_cut: crate::account::cut::Cut::Empty,
             secrets_cut: crate::account::cut::Cut::Empty,
             content_cuts: vec![],
-            reason: "revoked".into(),
+            // Inert, and 0 keeps the bytes this fixture emitted before the parameter existed. It is
+            // not a nonce and nothing derives a key from it. The SUBJECT stays the caller's: which
+            // device a revocation names is what these tests assert about, so it can never be the
+            // thing a hash search varies.
+            reason: if distinguisher == 0 {
+                "revoked".into()
+            } else {
+                format!("revoked {distinguisher}")
+            },
         };
         // A revocation MUST name a pre-cut view — `ControlOp::encode` refuses otherwise.
         let payload = control_v2::ops::ControlOp {
@@ -941,6 +978,7 @@ mod tests {
             digest,
             view.digest().unwrap(),
             subject,
+            0,
         );
         storage::account_ingest(&conn, &remove.signed_bytes, 3).unwrap();
 
@@ -999,17 +1037,27 @@ mod tests {
             tx.commit().unwrap();
         }
 
-        let revoke = |subject| {
-            device_remove_entry(account, &device, enrolled, 2, genesis, digest, manifest, subject)
+        let revoke = |subject, distinguisher| {
+            device_remove_entry(
+                account,
+                &device,
+                enrolled,
+                2,
+                genesis,
+                digest,
+                manifest,
+                subject,
+                distinguisher,
+            )
         };
         let member = test_support::Dev::new(7).fp;
-        let loser = revoke(member);
+        let loser = revoke(member, 0);
         // The same slot, a DIFFERENT subject, and the smaller hash — the side the min-hash
-        // tiebreak keeps, which leaves the member's revocation forked.
-        let winner = (20u8..=200)
-            .map(|seed| revoke(test_support::Dev::new(seed).fp))
-            .find(|entry| entry.entry_hash < loser.entry_hash)
-            .expect("a smaller-hash sibling revocation exists");
+        // tiebreak keeps, which leaves the member's revocation forked. The subject is fixed and the
+        // distinguisher varies: revoking a different device is what makes this a fork rather than a
+        // duplicate, so it is not something the search may move.
+        let other = test_support::Dev::new(20).fp;
+        let winner = smaller_than(loser.entry_hash, |distinguisher| revoke(other, distinguisher));
         storage::account_ingest(&conn, &loser.signed_bytes, 5).unwrap();
         storage::account_ingest(&conn, &winner.signed_bytes, 6).unwrap();
 
