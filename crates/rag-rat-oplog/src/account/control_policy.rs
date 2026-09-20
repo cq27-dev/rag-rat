@@ -980,7 +980,9 @@ mod tests {
         let answer =
             storage::roster_content_authority(&conn, account, roster_ref, subject, stream).unwrap();
         let fold::AuthorityQuery::Effective(authority) = answer else {
-            panic!("expected an effective roster content authority, got {answer:?}");
+            // No interpolation: the query's value is taint-traced from the authority gate, and
+            // formatting it into the panic reads as writing authority state to a log.
+            panic!("roster content authority did not resolve effective under the pin");
         };
         assert_eq!(
             authority.boundary,
