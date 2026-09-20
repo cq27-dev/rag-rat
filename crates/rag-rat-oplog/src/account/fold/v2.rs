@@ -527,13 +527,16 @@ pub(in crate::account) fn pinned_history(
         applied.iter().filter(|op| !matches!(op.entry.op, AccountOp::CutExtend { .. })).collect();
     let mut cuts: Vec<&AppliedOperation<'_>> =
         projected.iter().copied().filter(|op| !op.registers.is_empty()).collect();
-    // Total and deterministic. Only the register COMPOSITION reads this order, and `⊔` is a join,
-    // so the composed boundary is a function of the multiset; the effect pass below imposes its own
-    // causal order by depth.
+    // Total and deterministic, and the determinism is load-bearing: `⊔` alone would be
+    // order-free, but `closed_keys` below is ABSORBING — once a key closes, later pairs for it are
+    // skipped, and whether a join returns `Applied` depends on what `registers` already holds. So
+    // three cuts on one key can close it in one order and leave a live watermark in another. This
+    // sort is what makes every peer pick the same one. The effect pass imposes its own causal order
+    // by depth and does not read this one.
     cuts.sort_by_key(|op| (op.entry.header().seq, op.entry.hash()));
 
-    let legacy_count = frozen.foldable().len();
     let mut candidates = frozen.foldable();
+    let legacy_count = candidates.len();
     candidates.extend(projected.iter().map(|op| op.entry.clone()));
     let headers: HashMap<AccountEntryHash, &AccountEntryHeader> = frozen
         .entries()
@@ -636,9 +639,18 @@ pub(in crate::account) fn pinned_history(
     // resolves for no candidate, so no v2 operation would stratify and there is nothing to seed.
     // The register sweep and dependency settle above still stand — neither needs a genesis — so
     // fall through to the frozen projection rather than inventing an owner id that names nothing.
+    //
+    // Every applied operation still has to leave with an OUTCOME: absent reads as effective at
+    // `derive_pinned_projection`, so falling through silently would admit the whole bundle
+    // unjudged. Park them for the same reason the stratification loop below does.
     let genesis_owner = match frozen.history.genesis_hash() {
         Some(genesis) => OwnerId::from(genesis),
         None => {
+            for candidate in &candidates[legacy_count..] {
+                outcomes
+                    .entry(candidate.hash())
+                    .or_insert(Outcome::Parked(ParkReason::UnknownOwnerRef));
+            }
             let effective_count = normalize_auth_epochs(&mut outcomes);
             let facts = derive_authority_facts(&candidates, &outcomes, &registers);
             return AccountAuthHistory {
@@ -674,11 +686,27 @@ pub(in crate::account) fn pinned_history(
     // within a stratum by `(device_fingerprint, seq, hash)` and has no depth awareness, so one flat
     // call would reject a dependent with `StaleAuthority` whenever its author's fingerprint sorts
     // before its mint's — half of all pairs, on every refold.
+    // No `NonGenesisOrigin` guard here, unlike the v1 pass. v1 rejects a seq-0 entry on the
+    // founder's chain that is not the genesis, because sorting before the root by hash it could
+    // take epoch 0 and mutate state before the root applies. Neither hazard reaches this
+    // composition: a v2 entry at the genesis's own slot is dropped by `derive_pinned_projection`
+    // as contesting a frozen slot, and v2 epochs start at `frozen.effective_count`, never 0. Both
+    // are properties of the CALLER, so a future caller that relaxes either must add the guard.
     let mut incarnations = Incarnations::build(&candidates, genesis_owner);
     let mut strata: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (idx, candidate) in candidates.iter().enumerate().skip(legacy_count) {
-        if let Some(depth) = incarnations.author_depth(candidate) {
-            strata.entry(depth).or_default().push(idx);
+        match incarnations.author_depth(candidate) {
+            Some(depth) => strata.entry(depth).or_default().push(idx),
+            // An operation whose cited incarnation resolves to no mint in this candidate set PARKS,
+            // exactly as v1 does. It must never simply leave the strata: an applied operation with
+            // no outcome reads as EFFECTIVE at `derive_pinned_projection`, so it would enter branch
+            // selection unjudged and could displace a sibling at its slot. The mint can be absent
+            // even though the executor authorized the operation — the elimination loop drops a v2
+            // entry that forked or contests a frozen slot, and those filters are per-entry, blind
+            // to the incarnation DAG, so a mint can go while a dependent citing it stays.
+            None => {
+                outcomes.insert(candidate.hash(), Outcome::Parked(ParkReason::UnknownOwnerRef));
+            },
         }
     }
     for idxs in strata.values() {
@@ -2431,11 +2459,59 @@ mod tests {
         );
     }
 
+    /// An applied operation whose cited incarnation resolves to NO mint parks; it must never leave
+    /// the composition without an outcome.
+    ///
+    /// `derive_pinned_projection` reads an absent outcome as effective (`is_none_or`), so such an
+    /// entry would enter branch selection unjudged and could displace a sibling at its slot — and
+    /// `forked` only ever grows, so that displacement is permanent. The mint can genuinely be
+    /// missing while the operation citing it is `Applied`: the executor authorizes against the
+    /// in-bundle mints, and the elimination loop drops entries that forked or contest a frozen
+    /// slot with per-entry filters that are blind to the incarnation DAG.
+    #[test]
+    fn an_applied_operation_citing_an_unresolvable_incarnation_parks() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let tip = founder_tip(&fixture);
+        let orphan = Dev::new(57);
+        // An incarnation id naming no entry in the frozen history or the bundle.
+        let absent_mint = OwnerId::from(AccountEntryHash::from_bytes([0x9e; 32]));
+        assert!(
+            frozen.history().outcome(&AccountEntryHash::from(absent_mint)).is_none(),
+            "the cited mint must be absent for this to exercise the unresolvable path",
+        );
+        let entry = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            absent_mint,
+            tip.seq + 1,
+            tip.hash,
+            &AccountOp::DeviceAdd {
+                device_fingerprint: orphan.fp,
+                ed25519_pubkey: orphan.ed,
+                x25519_pubkey: orphan.x,
+                role: DeviceRole::Member,
+                label: None,
+            },
+            v2_ops::CONTROL_VERSION,
+        );
+        let history = pinned_history(frozen, &[AppliedOperation { entry: &entry, registers: &[] }]);
+        assert_eq!(
+            history.outcome(&entry.hash()),
+            Some(Outcome::Parked(ParkReason::UnknownOwnerRef)),
+            "an unresolvable author parks rather than vanishing from the outcome map",
+        );
+        assert!(
+            !history.roster_facts().any(|(_, f)| f.authority.device_fingerprint == orphan.fp),
+            "and grants nothing",
+        );
+    }
+
     /// A cut the registers CONDEMNED removed nothing, so it must not tombstone the device it names.
     /// Tombstoning is I4 — never re-enroll — and nothing downstream undoes one, so applying it from
     /// an ineffective operation bars a device permanently on the strength of an op that took no
-    /// effect. Every cut is seeded `Effective` and only then overwritten by the condemnation pass,
-    /// so the tombstone loop is reading the result of that overwrite rather than a fresh judgement.
+    /// effect. Tombstones now come from the replayed `FoldState`: `apply_effect` records a removal
+    /// only for a cut the effect pass judged effective, so a condemned cut never reaches it.
     ///
     /// Two owners revoking each other concurrently, which is the case that produces this state. The
     /// SECOND owner cuts the founder's control chain at its tip; the founder's own removal sits one
@@ -2543,9 +2619,10 @@ mod tests {
             }),
             (RegisterKey::Device { account, log: SECRETS_LOG, device: founder_fp }, Cut::Empty),
         ];
-        // Scopes nothing, since `barred` has authored no entry — but it is what puts the victim in
-        // `cuts`, which `pinned_history` filters on `!registers.is_empty()` before the tombstone
-        // loop. An op dropped there would pass this test while pinning nothing.
+        // Scopes nothing, since `barred` has authored no entry. It no longer decides whether the
+        // victim is PROJECTED — every applied operation is, bar `CutExtend` — but it still decides
+        // whether the victim contributes a register to the composition, which is what this case is
+        // about. Kept so the op carries exactly the registers `cut_op_registers` derives from it.
         let victim_registers = [
             (RegisterKey::Device { account, log: CONTROL_LOG, device: barred.fp }, Cut::Empty),
             (RegisterKey::Device { account, log: SECRETS_LOG, device: barred.fp }, Cut::Empty),
