@@ -96,7 +96,7 @@ pub fn sign_local_node_binding(
     now_ms: i64,
 ) -> anyhow::Result<Result<Vec<u8>, NodeAuthError>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let Some(local) = identity::load_local_device(conn)? else {
         return Ok(Err(NodeAuthError::NoLocalDevice));
     };
@@ -159,7 +159,7 @@ pub fn verify_node_binding(
     now_ms: i64,
 ) -> anyhow::Result<Result<DeviceRole, NodeAuthError>> {
     let _snapshot = super::control_policy::read_snapshot(conn)?;
-    super::control_policy::require_supported_account_control(conn, account_id)?;
+    super::control_policy::require_foldable_account_control(conn, account_id)?;
     let b = match decode(binding_bytes) {
         Ok(b) => b,
         Err(e) => return Ok(Err(e)),
