@@ -54,6 +54,20 @@ const CANDIDATE_BYTES_GLOBAL_MAX: usize = 64 * 1024 * 1024;
 /// condition no per-account arithmetic can rescue.
 const VIEW_MANIFEST_FLOOR_ENTRIES: usize = 64;
 const VIEW_MANIFEST_FLOOR_BYTES: usize = 1024 * 1024;
+/// The share of the manifest floor ONE device fingerprint may hold.
+///
+/// The floor is a raised CEILING, not a pool with recorded membership, and the citation gate asks
+/// only whether SOME stored row cites this payload — so one admitted device can mint many manifests
+/// encoding the SAME view and have a single stored cut satisfy every one of them. Without a share,
+/// that device takes the whole floor and every other device's evidence is refused, which is the
+/// terminal state the floor exists to prevent, reached from inside the roster (#1393).
+///
+/// A quarter of each floor leaves three other devices' worth standing. Both dimensions are capped
+/// because bytes bind first: a manifest naming `control_v2::views::MAX_VIEW_ENTRIES` identities
+/// signs to roughly 63 KiB, so an entry-only share would still let one signer take half the byte
+/// floor.
+const VIEW_MANIFEST_SIGNER_ENTRIES: usize = VIEW_MANIFEST_FLOOR_ENTRIES / 4;
+const VIEW_MANIFEST_SIGNER_BYTES: usize = VIEW_MANIFEST_FLOOR_BYTES / 4;
 /// The per-account caps an ORDINARY candidate may reach — everything above the manifest floor.
 pub(super) const ORDINARY_CANDIDATES_PER_ACCOUNT_MAX: usize =
     CANDIDATES_PER_ACCOUNT_MAX - VIEW_MANIFEST_FLOOR_ENTRIES;
@@ -2786,8 +2800,9 @@ pub(super) fn insert_candidate(
     // Manifest-first stays legitimate; it is simply not widened. Replication orders entries
     // `log_id, seq, entry_hash`, and control is log 0 to the annex's log 3, so cut-before-manifest
     // is the DEFAULT arrival order and the citation is already stored when the manifest is charged.
-    let cited_manifest =
-        is_view_manifest(h) && a_stored_cut_cites(tx, h.account_id, &verified.payload)?;
+    let cited_manifest = is_view_manifest(h)
+        && a_stored_cut_cites(tx, h.account_id, &verified.payload)?
+        && signer_is_under_its_manifest_share(tx, h, signed_bytes.len())?;
     let (account_entries_max, account_bytes_max) = if cited_manifest {
         (CANDIDATES_PER_ACCOUNT_MAX, CANDIDATE_BYTES_PER_ACCOUNT_MAX)
     } else {
@@ -3626,6 +3641,39 @@ fn cited_view_digest(header: &AccountEntryHeader, payload: &[u8]) -> Option<[u8;
 ///
 /// The digest is `sha256` of exactly the payload bytes — the value a cut signs and the planner keys
 /// manifests by — NOT the entry hash, which covers the header and signature too.
+/// Whether this entry's SIGNER still has room inside its share of the view-manifest floor.
+///
+/// Counted over EVERY manifest row this fingerprint holds, cited or not. A device that parked
+/// manifests as ordinary traffic can therefore be refused the raised ceiling later, which is the
+/// intended reading: the share bounds how much manifest material one signer holds, however it was
+/// admitted, and being refused the ceiling is not being refused — the entry competes as ordinary
+/// traffic.
+///
+/// Counted from `log_id` + `entry_type` alone, which is broader than [`is_view_manifest`]: the
+/// header's `crypto_suite` and `op_version` are not stored columns, so an odd-suite annex entry
+/// wearing the manifest tag counts here too. That errs toward withholding the raised ceiling and
+/// never toward granting it, and an entry refused the ceiling is not refused — it competes as
+/// ordinary traffic, exactly like a manifest no cut cites.
+fn signer_is_under_its_manifest_share(
+    tx: &Transaction<'_>,
+    header: &AccountEntryHeader,
+    incoming_bytes: usize,
+) -> rusqlite::Result<bool> {
+    let (entries, bytes): (i64, i64) = tx.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(length(signed_bytes)), 0) FROM account_entries
+          WHERE account_id = ?1 AND log_id = ?2 AND entry_type = ?3 AND device_fingerprint = ?4",
+        params![
+            header.account_id.to_bytes().as_slice(),
+            fold::ANNEX_LOG,
+            annex::ops::entry_type::VIEW_MANIFEST,
+            header.device_fingerprint.to_bytes().as_slice(),
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(entries < VIEW_MANIFEST_SIGNER_ENTRIES as i64
+        && bytes.saturating_add(incoming_bytes as i64) <= VIEW_MANIFEST_SIGNER_BYTES as i64)
+}
+
 fn a_stored_cut_cites(
     tx: &Transaction<'_>,
     account_id: AccountId,

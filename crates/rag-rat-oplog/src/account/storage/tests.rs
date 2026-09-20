@@ -2923,6 +2923,7 @@ fn view_manifest_entry(
     account_id: AccountId,
     signer: &Dev,
     seq: u64,
+    prev: Option<[u8; 32]>,
 ) -> envelope::SignedAccountEntry {
     let view = fixture_view();
     let header = AccountEntryHeader {
@@ -2930,7 +2931,7 @@ fn view_manifest_entry(
         log_id: fold::ANNEX_LOG,
         device_fingerprint: signer.fp,
         seq,
-        prev_hash: None,
+        prev_hash: prev.map(Into::into),
         parent_ref: None,
         entry_type: annex::ops::entry_type::VIEW_MANIFEST,
         op_version: fold::SUPPORTED_OP_VERSION,
@@ -3018,7 +3019,7 @@ fn ordinary_and_manifest_against_a_full_ordinary_budget(
         &device_add(&member, DeviceRole::Member),
     );
     let ordinary = account_ingest(&conn, &add_bytes, NOW + 1).unwrap();
-    let manifest = view_manifest_entry(account_id, &founder, 0);
+    let manifest = view_manifest_entry(account_id, &founder, 0, None);
     let charged = account_ingest(&conn, &manifest.signed_bytes, NOW + 2).unwrap();
     (ordinary, charged)
 }
@@ -3059,6 +3060,176 @@ fn a_view_manifest_a_stored_cut_cites_reaches_capacity_an_ordinary_candidate_can
         ingest_branch(&charged),
         "ingested",
         "a manifest a stored cut cites reaches the reserved bytes",
+    );
+}
+
+/// One admitted device must not be able to take the whole view-manifest reserve (#1393).
+///
+/// The reserve is a raised CEILING, not a pool with recorded membership, and the citation gate asks
+/// only whether SOME stored row cites this payload. Every manifest below encodes the same view, so
+/// ONE stored cut satisfies all of them: the burst costs its author one cut plus ordinary slots,
+/// not one cut per manifest.
+///
+/// The second device is certified BEFORE the budget is filled. `stored_device_pubkeys` reads a
+/// STORED genesis/`DeviceAdd` (it does not require acceptance), so a `DeviceAdd` arriving after the
+/// fill would itself hit capacity and the honest manifest would then park for a reason that has
+/// nothing to do with the reserve.
+#[test]
+fn one_device_cannot_take_the_whole_view_manifest_reserve() {
+    let conn = db();
+    crate::local_device(&conn, NOW).unwrap();
+    let founder = Dev::new(0x97);
+    let member = Dev::new(0x98);
+    let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+    account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+    let (add_bytes, _) = op(
+        account_id,
+        &founder,
+        1,
+        Some(genesis_hash),
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_add(&member, DeviceRole::Member),
+    );
+    assert_eq!(
+        ingest_branch(&account_ingest(&conn, &add_bytes, NOW + 1).unwrap()),
+        "ingested",
+        "the second device is certified while ordinary headroom remains",
+    );
+
+    let cited = fixture_view().digest().unwrap();
+    let cut = citing_cut_entry(
+        account_id,
+        &founder,
+        2,
+        genesis_hash,
+        OwnerId::from_bytes(genesis_hash),
+        cited,
+    );
+    assert_eq!(
+        ingest_branch(&account_ingest(&conn, &cut.signed_bytes, NOW + 2).unwrap()),
+        "ingested",
+        "one stored cut is all the burst needs",
+    );
+
+    // Every ordinary slot is spoken for; the genesis, the DeviceAdd and the cut are three of them.
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+        &tx,
+        account_id,
+        [0x7e; 32],
+        (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX - 3) as u64,
+        0,
+        0,
+        i64::MAX,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    // The chain is the author's own: the nullity rule only requires `prev_hash` to be non-null
+    // above seq 0, never that the predecessor exists, and an annex entry is never accepted — so no
+    // accepted-slot index bounds how far one device extends its own annex chain.
+    let mut taken = 0;
+    let mut prev: Option<[u8; 32]> = None;
+    for seq in 0..VIEW_MANIFEST_FLOOR_ENTRIES as u64 {
+        let burst = view_manifest_entry(account_id, &founder, seq, prev);
+        prev = Some(burst.entry_hash.into());
+        if ingest_branch(&account_ingest(&conn, &burst.signed_bytes, NOW + 3).unwrap())
+            == "ingested"
+        {
+            taken += 1;
+        }
+    }
+    assert_eq!(
+        taken, VIEW_MANIFEST_SIGNER_ENTRIES,
+        "the burst is bounded by the signer's share, not by the floor",
+    );
+
+    let honest = view_manifest_entry(account_id, &member, 0, None);
+    assert_eq!(
+        ingest_branch(&account_ingest(&conn, &honest.signed_bytes, NOW + 4).unwrap()),
+        "ingested",
+        "another admitted device's cited manifest stays admissible after the burst (burst took \
+         {taken} slots)",
+    );
+}
+
+/// The signer's share binds on BYTES as well as entries (#1393).
+///
+/// A manifest naming the maximum identities signs to roughly 63 KiB, so a handful of the largest
+/// reach the byte share while most of the sixteen entry slots are still free. An entry-only share
+/// would let one signer hold half the byte floor.
+///
+/// Rows are seeded directly and the predicate is probed: what is under test is the arithmetic over
+/// stored lengths, and driving it through ingest would need 63 KiB fixtures to say the same thing.
+#[test]
+fn a_signers_manifest_share_binds_on_bytes_before_entries() {
+    let conn = db();
+    let founder = Dev::new(0x99);
+    let (account_id, genesis_bytes, _) = genesis(&founder);
+    account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+
+    let probe = AccountEntryHeader {
+        account_id,
+        log_id: fold::ANNEX_LOG,
+        device_fingerprint: founder.fp,
+        seq: 0,
+        prev_hash: None,
+        parent_ref: None,
+        entry_type: annex::ops::entry_type::VIEW_MANIFEST,
+        op_version: fold::SUPPORTED_OP_VERSION,
+        crypto_suite: 0,
+        auth_len: 0,
+        key_id: None,
+        authority_ref: None,
+    };
+
+    {
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        assert!(
+            signer_is_under_its_manifest_share(&tx, &probe, 1).unwrap(),
+            "a signer holding no manifest is under its share",
+        );
+    }
+
+    // Four rows, each a quarter of the byte share: the byte dimension is now spent while twelve of
+    // the sixteen entry slots remain free.
+    for seq in 0..4u64 {
+        conn.execute(
+            "INSERT INTO account_entries(entry_hash, account_id, log_id, device_fingerprint, seq,
+                 entry_type, accepted, signed_bytes, received_at_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+            params![
+                [seq as u8; 32].as_slice(),
+                account_id.to_bytes().as_slice(),
+                fold::ANNEX_LOG,
+                founder.fp.to_bytes().as_slice(),
+                seq as i64,
+                annex::ops::entry_type::VIEW_MANIFEST,
+                vec![0u8; VIEW_MANIFEST_SIGNER_BYTES / 4],
+                NOW,
+            ],
+        )
+        .unwrap();
+    }
+
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    let stored: i64 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM account_entries
+              WHERE account_id = ?1 AND log_id = ?2 AND entry_type = ?3",
+            params![
+                account_id.to_bytes().as_slice(),
+                fold::ANNEX_LOG,
+                annex::ops::entry_type::VIEW_MANIFEST
+            ],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 4, "entry slots are nowhere near the share");
+    assert!(
+        !signer_is_under_its_manifest_share(&tx, &probe, 1).unwrap(),
+        "the byte share binds while twelve entry slots remain",
     );
 }
 
@@ -3154,7 +3325,7 @@ fn a_view_manifest_from_an_uncertified_device_is_only_parked() {
     let (account_id, genesis_bytes, _) = genesis(&founder);
     account_ingest(&conn, &genesis_bytes, NOW).unwrap();
 
-    let manifest = view_manifest_entry(account_id, &Dev::new(0x96), 0);
+    let manifest = view_manifest_entry(account_id, &Dev::new(0x96), 0, None);
     assert_eq!(
         account_ingest(&conn, &manifest.signed_bytes, NOW + 1).unwrap(),
         IngestOutcome::PreVerify
