@@ -517,14 +517,24 @@ pub(in crate::account) fn pinned_history(
     frozen: &FrozenLegacy,
     applied: &[AppliedOperation<'_>],
 ) -> AccountAuthHistory {
+    // EVERY applied operation projects, not only the register-installing ones, and each is judged
+    // by the v1 effect pass rather than admitted unjudged (#1311 slice F). A `CutExtend` is the one
+    // exclusion: `cut_op_registers` yields nothing for it and this composition never calls
+    // `cut_extend_register`, so its §11.4 re-blessing is dropped — running it through
+    // `classify_effect`, which calls a Ctrl/Secrets extend effective BECAUSE the register pass
+    // admitted it, would consume an epoch on a premise that is false here.
+    let projected: Vec<&AppliedOperation<'_>> =
+        applied.iter().filter(|op| !matches!(op.entry.op, AccountOp::CutExtend { .. })).collect();
     let mut cuts: Vec<&AppliedOperation<'_>> =
-        applied.iter().filter(|op| !op.registers.is_empty()).collect();
-    // Total and deterministic, and causal within one device's chain — the only order that matters,
-    // since a cut's effect never depends on a cut authored on someone else's chain.
+        projected.iter().copied().filter(|op| !op.registers.is_empty()).collect();
+    // Total and deterministic. Only the register COMPOSITION reads this order, and `⊔` is a join,
+    // so the composed boundary is a function of the multiset; the effect pass below imposes its own
+    // causal order by depth.
     cuts.sort_by_key(|op| (op.entry.header().seq, op.entry.hash()));
 
+    let legacy_count = frozen.foldable().len();
     let mut candidates = frozen.foldable();
-    candidates.extend(cuts.iter().map(|op| op.entry.clone()));
+    candidates.extend(projected.iter().map(|op| op.entry.clone()));
     let headers: HashMap<AccountEntryHash, &AccountEntryHeader> = frozen
         .entries()
         .iter()
@@ -580,37 +590,106 @@ pub(in crate::account) fn pinned_history(
     }
 
     let mut outcomes = frozen.history.outcomes.clone();
-    // The frozen epochs are normalized to `0..effective_count`, so the cuts take the slots above
-    // them and `derive_authority_facts` replays the whole legacy epoch before any of them.
-    for (offset, op) in cuts.iter().enumerate() {
-        outcomes.insert(op.entry.hash(), Outcome::Effective {
-            auth_epoch: frozen.history.effective_count + offset as u64,
-        });
-    }
-    // A v2 cut may condemn what the legacy epoch left standing. This only ever downgrades, so it
-    // can revive no branch loser, and the genesis is exempt for the reason `rederive_condemnation`
-    // exempts it: a self-removal on the founder's chain would otherwise leave the account with no
-    // effective root.
+    // Sweep the COMPOSED registers over every candidate, legacy included. A v2 cut may condemn what
+    // the legacy epoch left standing; this only ever downgrades, so it revives no branch loser, and
+    // the genesis is exempt for the reason `rederive_condemnation` exempts it — a self-removal on
+    // the founder's chain would otherwise leave the account with no effective root.
+    //
+    // `Parked` is carried too, and for legacy entries as well as v2 ones. A cut whose watermark is
+    // not held still installs, so an entry under it is undecided rather than clear; preferring its
+    // frozen outcome would silently accept what v1 parks (I11). The same map is what
+    // `authority_status` reads to park a DEPENDENT of a parked mint instead of stale-rejecting it.
+    let mut verdicts = FoldVerdicts::default();
     for candidate in &candidates {
         if Some(candidate.hash()) == frozen.history.genesis_hash {
             continue;
         }
-        if let RegisterVerdict::Condemned(reason) = register_verdict(candidate, &registers, &view) {
-            outcomes.insert(candidate.hash(), Outcome::Condemned(reason));
+        match register_verdict(candidate, &registers, &view) {
+            RegisterVerdict::Condemned(reason) => {
+                verdicts.condemned.insert(candidate.hash(), reason);
+                outcomes.insert(candidate.hash(), Outcome::Condemned(reason));
+            },
+            RegisterVerdict::Parked(reason) => {
+                verdicts.parked.insert(candidate.hash(), reason);
+                outcomes.insert(candidate.hash(), Outcome::Parked(reason));
+            },
+            RegisterVerdict::Clear => {},
         }
     }
-    let effective_count = normalize_auth_epochs(&mut outcomes);
 
-    let mut tombstoned = frozen.history.tombstoned.clone();
-    for op in &cuts {
-        // An effective removal tombstones the device (I4: never re-enroll), as `apply_effect` does
-        // for v1. A cut its own registers condemned removed nothing.
-        if let AccountOp::DeviceRemove { device_fingerprint, .. } = &op.entry.op
-            && outcomes.get(&op.entry.hash()).is_some_and(Outcome::is_effective)
-        {
-            tombstoned.insert(*device_fingerprint);
+    // Condemnation must reach DEPENDENTS before anything seeds the effect pass. A v2 cut condemns
+    // the remover's targets by register, but an entry authored UNDER a condemned mint is not
+    // register-scoped — the keys name the removed device, not its dependents — so it survives the
+    // sweep above. Seeding from that set would put a live incarnation in `state` for a device whose
+    // own enrolment the composed history condemns, and the next v2 operation it authored would
+    // classify `Live` and enrol another device. Rejection failing to propagate through the
+    // authority-dependency graph is a known production defect in comparable systems.
+    settle_authority_dependencies(&candidates, &mut outcomes);
+
+    // Seed the effect state from the COMMITTED effective set, after the overlay — never from a
+    // terminal `FoldState` captured at checkpoint time. That state is not what the certificate
+    // commits to (outcomes keep changing after it is produced) and it predates every v2 register.
+    // Replaying `apply_effect` over the surviving legacy operations in epoch order re-classifies
+    // nothing: it is the state projection of an already-decided set, the same replay
+    // `derive_authority_facts` performs in its own vocabulary.
+    // No genesis in the frozen epoch means no incarnation for anything to cite: `author_depth`
+    // resolves for no candidate, so no v2 operation would stratify and there is nothing to seed.
+    // The register sweep and dependency settle above still stand — neither needs a genesis — so
+    // fall through to the frozen projection rather than inventing an owner id that names nothing.
+    let genesis_owner = match frozen.history.genesis_hash() {
+        Some(genesis) => OwnerId::from(genesis),
+        None => {
+            let effective_count = normalize_auth_epochs(&mut outcomes);
+            let facts = derive_authority_facts(&candidates, &outcomes, &registers);
+            return AccountAuthHistory {
+                outcomes,
+                classification: frozen.history.classification,
+                contested_successor: frozen.history.contested_successor,
+                effective_count,
+                roster_refs: facts.roster_refs,
+                owner_incarnations: facts.owner_incarnations,
+                stream_ownership: facts.stream_ownership,
+                grants: facts.grants,
+                grant_cuts: facts.grant_cuts,
+                tombstoned: frozen.history.tombstoned.clone(),
+                genesis_hash: frozen.history.genesis_hash,
+            };
+        },
+    };
+    let mut state = FoldState::seeded(genesis_owner);
+    let mut surviving: Vec<(&Candidate, u64)> = candidates[..legacy_count]
+        .iter()
+        .filter_map(|candidate| match outcomes.get(&candidate.hash()) {
+            Some(Outcome::Effective { auth_epoch }) => Some((candidate, *auth_epoch)),
+            _ => None,
+        })
+        .collect();
+    surviving.sort_by_key(|(candidate, epoch)| (*epoch, candidate.hash()));
+    for (candidate, _) in surviving {
+        apply_effect(candidate, &mut state);
+    }
+    state.next_auth_epoch = frozen.history.effective_count;
+
+    // Stratify the v2 operations by author depth and run the pass PER DEPTH. `effect_pass` orders
+    // within a stratum by `(device_fingerprint, seq, hash)` and has no depth awareness, so one flat
+    // call would reject a dependent with `StaleAuthority` whenever its author's fingerprint sorts
+    // before its mint's — half of all pairs, on every refold.
+    let mut incarnations = Incarnations::build(&candidates, genesis_owner);
+    let mut strata: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (idx, candidate) in candidates.iter().enumerate().skip(legacy_count) {
+        if let Some(depth) = incarnations.author_depth(candidate) {
+            strata.entry(depth).or_default().push(idx);
         }
     }
+    for idxs in strata.values() {
+        effect_pass(&candidates, idxs, &incarnations, &verdicts, &mut state, &mut outcomes);
+    }
+
+    let effective_count = normalize_auth_epochs(&mut outcomes);
+    // Tombstones come from the replayed state: `apply_effect` records an effective `DeviceRemove`
+    // exactly as v1 does, so a legacy removal a v2 cut condemned correctly drops out instead of
+    // being carried forward from the frozen set.
+    let tombstoned = state.tombstoned.clone();
 
     let facts = derive_authority_facts(&candidates, &outcomes, &registers);
     AccountAuthHistory {
@@ -2123,26 +2202,85 @@ mod tests {
         );
     }
 
-    /// An operation that installs NO register is deliberately not projected. Execution evaluates no
-    /// state preconditions, so projecting a v2 enrolment unjudged would put a device on the roster
-    /// this account's own history never admitted — a tombstoned one included. Omitting it can only
-    /// under-GRANT, which the operational gates cover; what it can never do is under-revoke.
+    /// An operation installing NO register IS projected, but only through the v1 effect pass — the
+    /// state preconditions are what make that safe. Execution evaluates none of them, so admitting
+    /// an applied enrolment unjudged would put a device on the roster this account's own history
+    /// never admitted, a tombstoned one included. Routing it through `classify_effect` is what lets
+    /// a pinned account enrol at all without granting authority it was never conferred (#1311).
+    ///
+    /// The projection therefore CHANGES for a clean enrolment — that is the point of the slice —
+    /// so this asserts the directed outcomes rather than that the projection is untouched.
     #[test]
-    fn a_v2_operation_that_installs_no_register_grants_no_authority() {
+    fn a_v2_enrolment_projects_only_when_the_state_preconditions_hold() {
         let fixture = demoted_owner();
         let frozen = fixture.checkpoint.frozen_legacy();
         let (_, nominated) = v2_cut(&fixture, true);
         let enrolment = &nominated[0];
         let outcome = applied(frozen, &[], enrolment);
         assert!(outcome.registers.is_empty(), "an enrolment installs no register");
+
         let history = pinned_history(frozen, &[AppliedOperation {
             entry: enrolment,
             registers: &outcome.registers,
         }]);
-        assert_eq!(
+
+        // A clean enrolment of a device the frozen roster does not hold is EFFECTIVE, and shows up
+        // as a roster fact — the authority a pinned account could not previously gain.
+        let AccountOp::DeviceAdd { device_fingerprint, .. } = &enrolment.op else {
+            panic!("the nominated operation is an enrolment");
+        };
+        assert!(
+            matches!(history.outcome(&enrolment.hash()), Some(Outcome::Effective { .. })),
+            "a precondition-passing v2 enrolment takes effect",
+        );
+        assert!(
+            history
+                .roster_facts()
+                .any(|(_, fact)| fact.authority.device_fingerprint == *device_fingerprint),
+            "and lands a roster fact for the device it enrolled",
+        );
+        assert_ne!(
             projection_hash(&history),
             projection_hash(frozen.history()),
-            "a v2 enrolment leaves the frozen projection untouched",
+            "so the composed projection differs from the frozen one",
+        );
+    }
+
+    /// The other half of the same contract: an enrolment whose STATE precondition fails is rejected
+    /// with the v1 reason, not admitted. Re-adding a device the frozen roster already holds is a
+    /// duplicate; `classify_effect` owns that rule and this composition calls it rather than
+    /// restating it.
+    #[test]
+    fn a_v2_enrolment_of_an_already_enrolled_device_is_rejected() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let tip = founder_tip(&fixture);
+        // Dev::new(12) is the `accepted_victim`'s subject — on the frozen roster by construction.
+        let duplicate = Dev::new(12);
+        let entry = author_on_founder_chain(
+            &fixture.checkpoint,
+            &fixture.founder,
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &AccountOp::DeviceAdd {
+                device_fingerprint: duplicate.fp,
+                ed25519_pubkey: duplicate.ed,
+                x25519_pubkey: duplicate.x,
+                role: DeviceRole::Member,
+                label: None,
+            },
+            v2_ops::CONTROL_VERSION,
+        );
+        let outcome = applied(frozen, &[], &entry);
+        let history = pinned_history(frozen, &[AppliedOperation {
+            entry: &entry,
+            registers: &outcome.registers,
+        }]);
+        assert_eq!(
+            history.outcome(&entry.hash()),
+            Some(Outcome::Rejected(RejectReason::DuplicateAdd)),
+            "the v1 duplicate-add rule decides it, unchanged",
         );
     }
 
@@ -2223,7 +2361,14 @@ mod tests {
         let fixture = demoted_owner();
         let frozen = fixture.checkpoint.frozen_legacy();
         let tip = founder_tip(&fixture);
-        let cut_at = |seq: u64, prev: AccountEntryHash, reason: &str| {
+        // Two DISTINCT enrolled subjects. The composed fold now runs the v1 effect pass over every
+        // applied operation, so a second cut of a device the first already removed is
+        // `Rejected(Ineffective)` and takes no epoch at all — which would make the ordering this
+        // test exists to check unobservable. Seeds 11 and 12 are the frozen roster's two Members;
+        // the founder and seed 41 are its only Owners, and cutting an owner risks the I2
+        // last-owner rejection instead.
+        let subjects = [fixture.subject.fp, Dev::new(12).fp];
+        let cut_at = |seq: u64, prev: AccountEntryHash, subject: usize, reason: &str| {
             author_on_founder_chain(
                 &fixture.checkpoint,
                 &fixture.founder,
@@ -2231,7 +2376,7 @@ mod tests {
                 seq,
                 prev,
                 &AccountOp::DeviceRemove {
-                    device_fingerprint: fixture.subject.fp,
+                    device_fingerprint: subjects[subject],
                     control_cut: Cut::Empty,
                     secrets_cut: Cut::Empty,
                     content_cuts: vec![],
@@ -2246,8 +2391,8 @@ mod tests {
         // winner about half the time, and dropping seq from the key survives on those runs.
         let (first, second) = (0..64)
             .find_map(|nonce| {
-                let first = cut_at(tip.seq + 1, tip.hash, &format!("first {nonce}"));
-                let second = cut_at(tip.seq + 2, first.hash(), &format!("second {nonce}"));
+                let first = cut_at(tip.seq + 1, tip.hash, 0, &format!("first {nonce}"));
+                let second = cut_at(tip.seq + 2, first.hash(), 1, &format!("second {nonce}"));
                 (first.hash() > second.hash()).then_some((first, second))
             })
             .expect("a pair whose hash order opposes its seq order");
@@ -2256,14 +2401,15 @@ mod tests {
             "the fixture must oppose hash order to seq order or the sort's seq component is masked",
         );
 
-        let key = RegisterKey::Device {
+        let key_for = |device| RegisterKey::Device {
             account: fixture.checkpoint.pin().account_id,
             log: CONTROL_LOG,
-            device: fixture.subject.fp,
+            device,
         };
-        let admits_accepted = [(key.clone(), Cut::At { seq: 0, hash: fixture.accepted_victim })];
+        let admits_accepted =
+            [(key_for(subjects[0]), Cut::At { seq: 0, hash: fixture.accepted_victim })];
         let extends_to_condemned =
-            [(key.clone(), Cut::At { seq: 1, hash: fixture.condemned_victim })];
+            [(key_for(subjects[1]), Cut::At { seq: 1, hash: fixture.condemned_victim })];
         let base = frozen.history.effective_count();
         let history = pinned_history(frozen, &[
             AppliedOperation { entry: &first, registers: &admits_accepted },
