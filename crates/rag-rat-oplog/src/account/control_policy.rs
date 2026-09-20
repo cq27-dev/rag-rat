@@ -932,6 +932,65 @@ mod tests {
         assert_eq!(storage::account_effective_count(&conn, account).unwrap(), 2);
     }
 
+    /// A v2 revocation's content cut reaches the projection a content refold reads.
+    ///
+    /// The executor decides a revocation on its REGISTERS alone and never inspects `content_cuts`,
+    /// so the cut rides through as part of the `AccountOp` and is derived into `content_boundaries`
+    /// by the fact derivation the pinned composition shares with v1. Nothing else in the v2 path
+    /// carries it, which makes that shared derivation the only thing standing between a v2
+    /// revocation and a content boundary.
+    ///
+    /// The negative control is exact: with no boundary row a CLOSED roster fact answers `Closed`,
+    /// and this revocation closes the subject's seat — so a `Cut` here cannot be a default leaking
+    /// through.
+    #[test]
+    fn a_v2_revocation_bounds_content_on_the_stream_its_cut_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let (account, device, genesis, enrolled) = account_with_one_enrolment(&conn);
+        let digest = install_pin(&conn, account).checkpoint_digest;
+        let subject = test_support::Dev::new(7).fp;
+        let (stream, _) = test_support::stream_own(account);
+        let cut_hash = super::id::AccountEntryHash::from_bytes([0x5c; 32]);
+
+        let view = control_v2::views::ViewManifest { checkpoint: digest, entries: Vec::new() };
+        let remove = device_remove_entry(
+            account,
+            &device,
+            enrolled,
+            2,
+            genesis,
+            digest,
+            view.digest().unwrap(),
+            subject,
+            0,
+            vec![ops::ContentCut { stream_id: stream, seq: 9, hash: cut_hash }],
+        );
+        storage::account_ingest(&conn, &remove.signed_bytes, 3).unwrap();
+        {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            annex::author::author_view_manifest_in_tx(&tx, &device, account, &view, 4).unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(accepted_flag(&conn, remove.entry_hash), 1, "the revocation applied");
+        assert!(!seat_open(&conn, subject), "and closed the subject's seat");
+
+        let roster_ref: super::id::RosterRef = enrolled.into();
+        let answer =
+            storage::roster_content_authority(&conn, account, roster_ref, subject, stream).unwrap();
+        let fold::AuthorityQuery::Effective(authority) = answer else {
+            // No interpolation: the query's value is taint-traced from the authority gate, and
+            // formatting it into the panic reads as writing authority state to a log.
+            panic!("roster content authority did not resolve effective under the pin");
+        };
+        assert_eq!(
+            authority.boundary,
+            fold::AuthorityBoundary::Cut { seq: 9, hash: cut_hash },
+            "the v2 cut's content boundary reached the projection",
+        );
+    }
+
     /// The retraction path is reached only by a pin naming a version this binary cannot execute,
     /// and V130's `CHECK(required_version=2)` means no stored row can name one yet. Drive it
     /// directly so the forward-compat branch still works when a later schema admits one.
@@ -972,12 +1031,13 @@ mod tests {
         pre_cut_view: [u8; 32],
         subject: crate::op::DeviceFingerprint,
         distinguisher: u32,
+        content_cuts: Vec<ops::ContentCut>,
     ) -> envelope::SignedAccountEntry {
         let op = ops::AccountOp::DeviceRemove {
             device_fingerprint: subject,
             control_cut: crate::account::cut::Cut::Empty,
             secrets_cut: crate::account::cut::Cut::Empty,
-            content_cuts: vec![],
+            content_cuts,
             // Inert, and 0 keeps the bytes this fixture emitted before the parameter existed. It is
             // not a nonce and nothing derives a key from it. The SUBJECT stays the caller's: which
             // device a revocation names is what these tests assert about, so it can never be the
@@ -1049,6 +1109,7 @@ mod tests {
             view.digest().unwrap(),
             subject,
             0,
+            vec![],
         );
         storage::account_ingest(&conn, &remove.signed_bytes, 3).unwrap();
 
@@ -1118,6 +1179,7 @@ mod tests {
                 manifest,
                 subject,
                 distinguisher,
+                vec![],
             )
         };
         let member = test_support::Dev::new(7).fp;
