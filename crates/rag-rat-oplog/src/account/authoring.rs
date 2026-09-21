@@ -1396,6 +1396,60 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// The same exclusion applies on the SECRETS log, where it is a knowing over-revocation.
+    ///
+    /// A non-evaluable log-1 entry is prefix-transparent — slot-eligible, and acceptable to a NEWER
+    /// binary — so cutting past it may condemn something a newer peer accepted. That is chosen
+    /// deliberately: including it would let the subject of a cut plant one unfoldable secrets entry
+    /// and make itself permanently unremovable. The control-log argument (a retained entry
+    /// quarantines the rest of that chain everywhere) does NOT carry here, which is why this axis
+    /// is pinned separately rather than left to the log-0 case.
+    #[test]
+    fn a_retained_secrets_entry_on_the_subjects_chain_does_not_block_its_removal() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x7f);
+        let secret = DeviceSecret::from_seed(&[0x7f; 32]);
+
+        let retained = sign_account_entry(
+            &secret,
+            &AccountEntryHeader {
+                account_id: account,
+                log_id: fold::SECRETS_LOG,
+                device_fingerprint: subject,
+                seq: 0,
+                prev_hash: None,
+                parent_ref: None,
+                entry_type: 0,
+                // A future version on log 1 is retained and slot-eligible, never accepted here.
+                op_version: 99,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: None,
+            },
+            &[0x81, 0x01],
+        )
+        .unwrap();
+        storage::account_ingest(&conn, &retained.signed_bytes, NOW).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM account_entry_status WHERE entry_hash = ?1",
+                params![retained.entry_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "retained_unfolded",
+            "the fixture must actually be retained-not-accepted, or this proves nothing",
+        );
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW)
+            .expect("a retained secrets entry cannot veto its subject's removal");
+        tx.commit().unwrap();
+    }
+
     /// A subject with UNDECIDED entries above its accepted tail cannot be cut.
     ///
     /// A parked entry can still become effective once this store catches up, so peers may already
@@ -1474,7 +1528,7 @@ mod tests {
     /// cut takes the last ordinary slot and the manifest can only come from the reserve. Authored
     /// the other way round the manifest would consume that slot and the cut would hit capacity.
     #[test]
-    fn a_pinned_removal_seats_its_manifest_in_the_reserve_when_the_ordinary_budget_is_full() {
+    fn a_pinned_removal_seats_its_manifest_in_the_reserve_not_the_ordinary_budget() {
         let conn = db();
         let (account, _) = account_owning_a_public_stream(&conn);
         let subject = enrol(&conn, 0x7d);
