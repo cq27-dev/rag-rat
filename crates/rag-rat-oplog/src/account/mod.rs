@@ -62,11 +62,12 @@ mod test_support;
 pub use annex::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use authoring::{
     EnrollingDevice, RevokeReason, StreamRevocation, author_device_add_in_tx,
-    author_enrollment_device_add_in_tx, author_stream_grant_in_tx, author_stream_revoke_in_tx,
-    enrollment_authoring_fits, enrollment_authoring_requirements, ensure_owned_stream_v2_in_tx,
-    ensure_owned_stream_v2_with_mode_in_tx, established_owned_stream_v2,
-    established_owned_stream_v2_with_mode, owned_stream_v2_id, owned_stream_v2_id_with_mode,
-    owner_stream_v2_id_for_account, retry_enrollment_pre_verify, validate_device_add_label,
+    author_device_remove_in_tx, author_enrollment_device_add_in_tx, author_stream_grant_in_tx,
+    author_stream_revoke_in_tx, enrollment_authoring_fits, enrollment_authoring_requirements,
+    ensure_owned_stream_v2_in_tx, ensure_owned_stream_v2_with_mode_in_tx,
+    established_owned_stream_v2, established_owned_stream_v2_with_mode, owned_stream_v2_id,
+    owned_stream_v2_id_with_mode, owner_stream_v2_id_for_account, retry_enrollment_pre_verify,
+    validate_device_add_label,
 };
 pub use bootstrap::{
     AuthoredDurability, ENROLLMENT_HELD_ENTRY_HASHES_MAX, EnrollmentBootstrap, EnrollmentBudget,

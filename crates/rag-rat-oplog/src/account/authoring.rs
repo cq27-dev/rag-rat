@@ -21,7 +21,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 
 use super::bootstrap::{self, LocalAccountRef};
 use super::control_policy::{AccountControlPolicy, UnsupportedAccountControlVersion};
-use super::control_v2::ops as v2_ops;
+use super::control_v2::{ops as v2_ops, views};
 use super::envelope::{
     AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, signed_entry_len,
 };
@@ -96,7 +96,7 @@ pub fn ensure_owned_stream_v2_with_mode_in_tx(
         stream_id,
         stream_spec_bytes: stream::canonical_spec_v2_bytes(&spec)?,
     };
-    author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+    author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, None, now_ms)?;
 
     // Verify the FACT, never the authored entry's status. Under a race two ensures could each reach
     // here and the loser's `StreamOwn` folds `Rejected(Ineffective)` — but ownership holds either
@@ -201,6 +201,7 @@ fn author_account_op_in_tx(
     account_id: AccountId,
     genesis_hash: AccountEntryHash,
     op: &AccountOp,
+    pre_cut_view: Option<[u8; 32]>,
     now_ms: i64,
 ) -> anyhow::Result<AccountEntryHash> {
     // The account's control version decides what this seam SIGNS, not merely whether it may sign.
@@ -249,24 +250,34 @@ fn author_account_op_in_tx(
     let auth_len = storage::account_effective_count(tx, account_id)?;
 
     let (op_version, payload) = match &pin {
-        None => (
-            1,
-            ops::encode(op)
-                .map_err(|err| anyhow::anyhow!("encoding the account op failed: {err}"))?,
-        ),
+        None => {
+            // v1 has no notion of a nominated view, so a caller that built one and reached here
+            // would be committing to evidence these bytes never name. Refuse rather than sign a
+            // payload that silently drops it.
+            anyhow::ensure!(
+                pre_cut_view.is_none(),
+                "a pre-cut view was supplied for an account that is not pinned; v1 control bytes \
+                 carry no view and would silently discard it",
+            );
+            (
+                1,
+                ops::encode(op)
+                    .map_err(|err| anyhow::anyhow!("encoding the account op failed: {err}"))?,
+            )
+        },
         Some(pin) => (
             v2_ops::CONTROL_VERSION,
             v2_ops::ControlOp {
                 checkpoint: pin.checkpoint_digest,
-                // `ControlOp::encode` requires a pre-cut view for exactly `DeviceRemove` and
-                // `OwnerDemote`, and no caller of this seam authors either, so `None` is always
-                // legal here and a future caller that breaks that gets a loud encode failure.
+                // `ControlOp::encode` requires a view for exactly `DeviceRemove` and `OwnerDemote`
+                // and refuses it for everything else, so a caller that supplies the wrong one fails
+                // loudly here rather than authoring a revocation that credits nothing.
                 //
-                // `StreamRevoke` is the one revocation-SHAPED op that reaches this seam, and it is
-                // deliberately not in the encoder's set: its cuts travel in the op, not in a
-                // nominated view. It never arrives pinned regardless — the revoke seam gates
-                // itself, because under a pin its cut plan would come back empty.
-                pre_cut_view: None,
+                // `StreamRevoke` is revocation-SHAPED but deliberately not in the encoder's set:
+                // its cuts travel in the op, not in a nominated view. It never arrives pinned
+                // regardless — the revoke seam gates itself, because under a pin its cut plan would
+                // come back empty.
+                pre_cut_view,
                 op: op.clone(),
             }
             .encode()?,
@@ -519,7 +530,8 @@ fn author_device_add_with_promotion_in_tx(
         role,
         label: joiner.label,
     };
-    let entry_hash = author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+    let entry_hash =
+        author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, None, now_ms)?;
     if promotion == DeviceAddPromotion::Retry {
         storage::promote_after_local_device_add_in_tx(tx, account_id, now_ms)?;
     }
@@ -544,6 +556,174 @@ fn author_device_add_with_promotion_in_tx(
              enrollment won the fold",
         ),
     }
+    Ok(entry_hash)
+}
+
+/// Author a `DeviceRemove` closing `subject`'s roster seat on the local (owner) account's control
+/// log, then VERIFY THE FACT — the seat is closed — never the authored entry's status.
+///
+/// Owner-only: a `DeviceRemove` from a device without effective owner authority folds `Rejected`,
+/// leaving the seat open, so the fact check errors. The subject must be roster-effective NOW, since
+/// removing a device that was never enrolled folds `Rejected(Ineffective)` rather than tombstoning
+/// a fingerprint no enrollment ever added.
+///
+/// Under a control-v2 pin this authors the cut's detached view manifest FIRST: `ControlOp::encode`
+/// refuses a revocation naming no view, and the executor applies the cut only once the manifest is
+/// a stored row it can read. The view nominates nothing, and that is deliberate — nomination widens
+/// a cut's freshness CREDIT and never decides who is condemned, because the register sweep runs
+/// over every applied v2 operation regardless. An empty view is conservative, not a gap.
+///
+/// Does NOT rotate stream keys. Rotation on removal is lazy and fires from the seal path when a
+/// removed device still holds the current key: local policy, deliberately not a chained authority
+/// act. `reason` is carried verbatim for operators and peers; nothing in the fold reads it.
+pub fn author_device_remove_in_tx(
+    tx: &Transaction<'_>,
+    subject: DeviceFingerprint,
+    reason: &str,
+    now_ms: i64,
+) -> anyhow::Result<AccountEntryHash> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+        "cannot author a device removal before the store's local account is minted (call \
+         local_account first)",
+    )?;
+    let device = local_device(tx, now_ms)?;
+    anyhow::ensure!(
+        storage::effective_owner_incarnation_for_device(tx, account_id, device.fingerprint())?
+            .is_some(),
+        "the local device holds no effective owner incarnation on this account, so it cannot \
+         remove a device",
+    );
+    // A self-removal is structurally dead, not merely unwise: the op is authored at this device's
+    // own chain tail + 1, so it sits BEYOND any watermark it could name on that chain and its own
+    // register condemns it. The fold pins that as spec. Refusing here names the real reason —
+    // without it the post-check fires instead and blames missing owner authority, which is false.
+    anyhow::ensure!(
+        subject != device.fingerprint(),
+        "a device cannot remove itself: the removal would sit beyond the watermark it names on \
+         its own chain and self-condemn. Another owner device has to author it",
+    );
+    // Load-bearing, not defensive: the post-check below reads `None` for a device that was never
+    // enrolled just as it does for one this removal closed, so WITHOUT this the seam reports
+    // success for an entry that folds `Rejected(Ineffective)` — tombstoning a fingerprint no
+    // enrollment added, which permanently bars a legitimate future `DeviceAdd` for it.
+    anyhow::ensure!(
+        storage::effective_roster_entry_in_snapshot(tx, account_id, subject)?.is_some(),
+        "that device is not roster-effective on this account; removing one that was never \
+         enrolled folds ineffective and would tombstone a fingerprint no enrollment added",
+    );
+
+    // Bound the subject's own chains at what THIS store accepted. `Cut::Empty` is NOT the safe
+    // default: it means nothing on the chain is valid, retroactively invalidating entries the
+    // account's own history may already rest on. It is correct only where there is nothing to keep.
+    let cut_at_accepted_tail = |log: u8| -> anyhow::Result<super::cut::Cut> {
+        let accepted = account_accepted_chain_tail(tx, account_id, subject, log)?;
+        // A cut names the accepted tail, so entries above it are condemned. That is only a hazard
+        // where peers may hold work this store has not DECIDED on yet — and `accepted` is not the
+        // complement of "undecided". A `Rejected`, `Condemned` or `Forked` entry is decided and can
+        // never be accepted, so refusing on any unaccepted row would make a device whose chain tail
+        // merely lost a race permanently unremovable: candidate storage is grow-only and the
+        // verdict is deterministic, so nothing could ever clear it. A second device racing
+        // `ensure_owned_stream_v2_in_tx` produces exactly that shape, and it is not an error.
+        //
+        // Only a PARKED entry can still become effective later, so only a parked row above the
+        // accepted tail means a peer may already hold what this cut would condemn.
+        //
+        // `retained_unfolded` is deliberately excluded, and the reason DIFFERS BY LOG — this
+        // closure runs for both, so do not carry the control-log argument across.
+        //
+        // On the control log it costs nothing: that tag set is closed, so a retained entry
+        // truncates its author's accepted chain on every binary, and nothing above it is accepted
+        // anywhere.
+        //
+        // The secrets log is the deliberate opposite. A non-evaluable log-1 entry is slot-eligible
+        // and PREFIX-TRANSPARENT, precisely so a newer binary can accept it — so excluding it here
+        // is a knowing OVER-revocation: this cut may condemn an entry a newer peer accepted, and
+        // `Cut::Empty` (a subject that has accepted nothing) is the maximal form of that.
+        //
+        // It is chosen anyway. The alternative hands the SUBJECT of a cut a veto over its own
+        // removal: plant one entry at an unknown `op_version` and become permanently unremovable.
+        // An availability failure on the one operation aimed at a device outweighs a convergence
+        // cost on that device's forward-compatibility entries.
+        let parked_above: bool = tx.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM account_entries e
+                   JOIN account_entry_status s ON s.entry_hash = e.entry_hash
+                  WHERE e.account_id = ?1 AND e.log_id = ?2 AND e.device_fingerprint = ?3
+                    AND e.seq > ?4 AND s.status = ?5)",
+            params![
+                account_id.to_bytes().as_slice(),
+                log,
+                subject.to_bytes().as_slice(),
+                accepted.map_or(-1i64, |(seq, _)| seq as i64),
+                fold::EntryStatus::Parked.as_db_str(),
+            ],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !parked_above,
+            "this store holds undecided entries on the subject's log-{log} chain above the last \
+             one it accepted, so a cut naming that tail could condemn work its peers have already \
+             accepted; catch this store up before removing that device",
+        );
+        Ok(match accepted {
+            Some((seq, hash)) => super::cut::Cut::At { seq, hash },
+            None => super::cut::Cut::Empty,
+        })
+    };
+    let op = AccountOp::DeviceRemove {
+        device_fingerprint: subject,
+        control_cut: cut_at_accepted_tail(fold::CONTROL_LOG)?,
+        secrets_cut: cut_at_accepted_tail(fold::SECRETS_LOG)?,
+        // An absent per-stream boundary answers `Closed` against a CLOSED roster fact, which is
+        // exactly what removing the whole device means. Naming cuts here would NARROW that to a
+        // per-stream prefix, not widen it.
+        content_cuts: Vec::new(),
+        reason: reason.to_string(),
+    };
+
+    // Build the view but author NOTHING yet. Its digest is a pure function of its contents, so the
+    // cut can name it before it is stored — which is the order this has to happen in (below).
+    let view = match super::control_policy::account_control_policy(tx, account_id)? {
+        AccountControlPolicy::LegacyV1 => None,
+        AccountControlPolicy::ControlV2(pin) =>
+            Some(views::ViewManifest { checkpoint: pin.checkpoint_digest, entries: Vec::new() }),
+        AccountControlPolicy::UnsupportedVersion(pin) =>
+            return Err(UnsupportedAccountControlVersion { pin }.into()),
+    };
+    // The cut names its evidence by the digest of the manifest PAYLOAD — never by the annex entry
+    // hash that authoring returns. They are different 32-byte values, and naming the wrong one
+    // parks the cut forever waiting on a manifest that will never be found.
+    let pre_cut_view = view.as_ref().map(views::ViewManifest::digest).transpose()?;
+
+    let entry_hash =
+        author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, pre_cut_view, now_ms)?;
+
+    // The manifest goes SECOND, and the order is load-bearing. `insert_candidate` grants a view
+    // manifest the raised ceiling only when some STORED cut already cites it, and that citation is
+    // recorded when the control row lands. Authoring the manifest first charges it the ordinary
+    // per-account budget, so an account whose ordinary budget is full could never author a
+    // revocation at all — the exact starvation the reserve exists to prevent, reached by the one
+    // party whose revocation must always be authorable. Until the manifest is stored the cut simply
+    // parks for want of it, and storing it here is what applies it.
+    //
+    // Signed by the CUT'S OWN device: an unknown signer parks in the pre-verify queue, which evicts
+    // oldest-first, so the cut's evidence could be dropped out from under it.
+    if let Some(view) = view {
+        super::annex::author::author_view_manifest_in_tx(tx, &device, account_id, &view, now_ms)?;
+    }
+
+    // The FACT, not the entry status: `None` means no OPEN roster row survives for the subject.
+    // That direction is robust where its complement is not — one fingerprint can hold several open
+    // roster rows, so asserting presence would be nondeterministic, while absence is unambiguous.
+    //
+    // It is only a SUCCESS check because the precondition above established the subject held a seat
+    // to begin with. On its own `None` is satisfied by a device that was never enrolled, so the two
+    // checks have to be read as a pair.
+    anyhow::ensure!(
+        storage::effective_roster_entry_in_snapshot(tx, account_id, subject)?.is_none(),
+        "the DeviceRemove did not close the subject's roster seat — the local device lacks \
+         effective owner authority, or a concurrent operation won the fold",
+    );
     Ok(entry_hash)
 }
 
@@ -574,7 +754,8 @@ pub fn author_stream_grant_in_tx(
     )?;
     let device = local_device(tx, now_ms)?;
     let op = AccountOp::StreamGrant { stream_id, grantee_account_id, grant_role: role };
-    let grant_id = author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, now_ms)?;
+    let grant_id =
+        author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, None, now_ms)?;
     match storage::grant_effective_in_snapshot(
         tx,
         account_id,
@@ -717,6 +898,7 @@ pub fn author_stream_revoke_in_tx(
             account_id,
             genesis_hash,
             &op,
+            None,
             now_ms,
         )?);
     }
@@ -968,6 +1150,407 @@ mod tests {
     /// the cut plan would come back empty — the byte-identical shape a HARD revocation authors.
     /// `departed` promises prior work stays valid as far as it vouches; silently quarantining all
     /// of it instead is worse than refusing, and nothing else on this path errors.
+    /// Enrol `subject` on the account's roster BEFORE any pin — enrollment states its own strict
+    /// gate, so a device cannot be added once the account is pinned.
+    fn enrol(conn: &Connection, seed: u8) -> DeviceFingerprint {
+        let joiner = DeviceSecret::from_seed(&[seed; 32]);
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[seed.wrapping_add(1); 32])
+                    .public()
+                    .to_bytes(),
+                label: None,
+            },
+            ops::DeviceRole::Member,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        joiner.public().fingerprint()
+    }
+
+    /// Every annex-log payload this account holds.
+    fn annex_payloads(conn: &Connection, account: AccountId) -> Vec<Vec<u8>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT signed_bytes FROM account_entries
+                 WHERE account_id = ?1 AND log_id = ?2 ORDER BY seq",
+            )
+            .unwrap();
+        let rows: Vec<Vec<u8>> = stmt
+            .query_map(params![account.to_bytes().as_slice(), fold::ANNEX_LOG], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        rows.iter()
+            .map(|bytes| {
+                crate::account::envelope::decode_account_signed(bytes).unwrap().payload.to_vec()
+            })
+            .collect()
+    }
+
+    /// A pinned removal names its manifest by the digest of the manifest's PAYLOAD, and that
+    /// manifest is a stored row.
+    ///
+    /// This is the binding the whole cut rests on, and the two candidate values are easy to
+    /// confuse: authoring the manifest returns the annex ENTRY hash, while the cut must name
+    /// `sha256(payload)`. Naming the entry hash would park the cut forever, waiting on evidence no
+    /// executor can match. Hashing the stored payload here — rather than re-encoding the view this
+    /// test believes was authored — is what makes it a test of the binding instead of of my
+    /// arithmetic.
+    #[test]
+    fn a_pinned_removal_names_its_manifest_by_the_stored_payload_digest() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x71);
+        crate::account::test_support::install_real_pin(&conn, account, NOW);
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW).expect("a pinned owner removes");
+        tx.commit().unwrap();
+
+        assert_eq!(
+            control_tail_op_version(&conn, account),
+            v2_ops::CONTROL_VERSION,
+            "the removal is signed at the account's control version",
+        );
+        let payloads = annex_payloads(&conn, account);
+        assert_eq!(payloads.len(), 1, "exactly one manifest was authored");
+
+        let cut_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT signed_bytes FROM account_entries
+                 WHERE account_id = ?1 AND log_id = 0 ORDER BY seq DESC LIMIT 1",
+                params![account.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let cut = crate::account::envelope::decode_account_signed(&cut_bytes).unwrap();
+        let named = v2_ops::decode(cut.header.entry_type, &cut.payload)
+            .unwrap()
+            .pre_cut_view
+            .expect("a revocation names a pre-cut view");
+        assert_eq!(
+            named,
+            crate::cbor::sha256(&payloads[0]),
+            "the cut names sha256 of the stored manifest payload, not the annex entry hash",
+        );
+    }
+
+    /// The cut bounds the subject's chain at its ACCEPTED tail, not at `Cut::Empty`.
+    ///
+    /// The distinction is the whole point of computing a watermark: `Cut::Empty` means nothing on
+    /// the chain is valid, retroactively invalidating every entry that device ever authored —
+    /// including ones the account's own history rests on. A subject enrolled as a Member has
+    /// authored nothing, so its cuts are legitimately `Empty` and could not tell a real watermark
+    /// from a hardcoded one; the founder is the cheapest subject that actually has accepted
+    /// entries to preserve.
+    #[test]
+    fn a_removal_cuts_at_the_subjects_accepted_tail_rather_than_closing_the_chain() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+
+        // The subject must have accepted entries of its OWN, or its cut is legitimately `Empty`
+        // and the assertion below could not tell a real watermark from a hardcoded one. Enrolling
+        // as `Owner` mints an incarnation whose id is the DeviceAdd's entry hash, which is what
+        // the subject's own control op then cites as its authority.
+        let dev = crate::account::test_support::Dev::new(0x77);
+        let incarnation = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let hash = author_device_add_in_tx(
+                &tx,
+                EnrollingDevice { ed25519_pubkey: dev.ed, x25519_pubkey: dev.x, label: None },
+                ops::DeviceRole::Owner,
+                NOW,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            hash
+        };
+        let (_, own) = crate::account::test_support::stream_own_mode(
+            account,
+            crate::stream::AccessMode::PublicRead,
+            "repo-b",
+        );
+        let (bytes, authored) = crate::account::test_support::control_op(
+            account,
+            &dev,
+            0,
+            None,
+            Some(incarnation.into()),
+            &own,
+        );
+        storage::account_ingest(&conn, &bytes, NOW).unwrap();
+        let accepted: i64 = conn
+            .query_row(
+                "SELECT accepted FROM account_entries WHERE entry_hash = ?1",
+                params![authored.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(accepted, 1, "the subject's own control entry is accepted");
+
+        let tail = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let tail =
+                account_accepted_chain_tail(&tx, account, dev.fp, fold::CONTROL_LOG).unwrap();
+            tx.commit().unwrap();
+            tail.expect("the subject has an accepted control entry")
+        };
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, dev.fp, "left", NOW).expect("the owner removes a device");
+        tx.commit().unwrap();
+
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT signed_bytes FROM account_entries
+                 WHERE account_id = ?1 AND log_id = 0 ORDER BY seq DESC LIMIT 1",
+                params![account.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored = crate::account::envelope::decode_account_signed(&bytes).unwrap();
+        let op = match ops::decode(stored.header.entry_type, &stored.payload).unwrap() {
+            ops::DecodedAccountOp::Known(op) => op,
+            _ => panic!("the authored removal decodes"),
+        };
+        let AccountOp::DeviceRemove { control_cut, .. } = op else {
+            panic!("the authored op is a DeviceRemove");
+        };
+        assert_eq!(
+            control_cut,
+            crate::account::cut::Cut::At { seq: tail.0, hash: tail.1 },
+            "the cut names the subject's accepted tail, so its prior work stays valid",
+        );
+    }
+
+    /// A device cannot remove itself, and the refusal names the real reason.
+    ///
+    /// The removal would be authored at this device's own chain tail + 1, so it sits beyond any
+    /// watermark it can name on that chain and its own register condemns it. Without the explicit
+    /// precondition the seam still fails — but at the post-check, reporting missing owner
+    /// authority, which is not what happened.
+    #[test]
+    fn a_device_cannot_remove_itself() {
+        let conn = db();
+        let (_account, _) = account_owning_a_public_stream(&conn);
+        let own = local_device(&conn, NOW).unwrap().fingerprint();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_device_remove_in_tx(&tx, own, "left", NOW)
+            .expect_err("a device cannot remove itself");
+        assert!(
+            err.to_string().contains("cannot remove itself"),
+            "expected the self-removal refusal, got: {err}",
+        );
+    }
+
+    /// A DECIDED-but-unaccepted entry on the subject's chain must not block its removal.
+    ///
+    /// An entry at an `op_version` no binary folds is retained, never accepted — and it can never
+    /// become accepted here. Refusing on it would let the subject of a cut author one and make
+    /// ITSELF unremovable, which is an availability attack on the one operation aimed at it. The
+    /// same reasoning covers rejected, condemned and forked entries, which is the commoner case: a
+    /// second device racing an ownership ensure legitimately folds `Rejected(Ineffective)`.
+    #[test]
+    fn a_retained_entry_on_the_subjects_chain_does_not_block_its_removal() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x79);
+        let secret = DeviceSecret::from_seed(&[0x79; 32]);
+
+        let (_, op) = crate::account::test_support::stream_own_mode(
+            account,
+            crate::stream::AccessMode::PublicRead,
+            "repo-c",
+        );
+        let retained = sign_account_entry(
+            &secret,
+            &AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: subject,
+                seq: 0,
+                prev_hash: None,
+                parent_ref: None,
+                entry_type: ops::entry_type_of(&op),
+                // No binary folds this, so it is retained and never accepted.
+                op_version: 99,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: None,
+            },
+            &ops::encode(&op).unwrap(),
+        )
+        .unwrap();
+        storage::account_ingest(&conn, &retained.signed_bytes, NOW).unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW)
+            .expect("a retained entry the subject authored cannot veto its own removal");
+        tx.commit().unwrap();
+    }
+
+    /// A subject with UNDECIDED entries above its accepted tail cannot be cut.
+    ///
+    /// A parked entry can still become effective once this store catches up, so peers may already
+    /// hold work a cut at the accepted tail would condemn — and the §11.4 repair has no authoring
+    /// seam and is dropped outright under a pin, so the too-low cut would stand. `AuthLenAhead` is
+    /// the reachable shape: an entry citing a fold length this store has not reached, which the
+    /// fold documents as recoverable by syncing.
+    #[test]
+    fn a_subject_with_parked_entries_above_its_accepted_tail_refuses() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let dev = crate::account::test_support::Dev::new(0x7b);
+        // Enrolled as Owner so its own control op resolves an incarnation and parks on freshness
+        // rather than being rejected for want of authority.
+        let incarnation = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let hash = author_device_add_in_tx(
+                &tx,
+                EnrollingDevice { ed25519_pubkey: dev.ed, x25519_pubkey: dev.x, label: None },
+                ops::DeviceRole::Owner,
+                NOW,
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            hash
+        };
+        let (_, op) = crate::account::test_support::stream_own_mode(
+            account,
+            crate::stream::AccessMode::PublicRead,
+            "repo-d",
+        );
+        let ahead = sign_account_entry(
+            &dev.secret,
+            &AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: dev.fp,
+                seq: 0,
+                prev_hash: None,
+                parent_ref: None,
+                entry_type: ops::entry_type_of(&op),
+                op_version: 1,
+                crypto_suite: 0,
+                // Far beyond this store's effective count, so the fold parks it as recoverable.
+                auth_len: 9_999,
+                key_id: None,
+                authority_ref: Some(incarnation.into()),
+            },
+            &ops::encode(&op).unwrap(),
+        )
+        .unwrap();
+        storage::account_ingest(&conn, &ahead.signed_bytes, NOW).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM account_entry_status WHERE entry_hash = ?1",
+                params![ahead.entry_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "parked", "the fixture must actually park, or this proves nothing");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_device_remove_in_tx(&tx, dev.fp, "left", NOW)
+            .expect_err("a subject this store has not caught up on cannot be cut");
+        assert!(
+            err.to_string().contains("undecided entries"),
+            "expected the catch-up refusal, got: {err}",
+        );
+    }
+
+    /// The manifest lands in the view-manifest reserve, not the ordinary budget.
+    ///
+    /// `insert_candidate` grants a manifest the raised ceiling only when a STORED cut already
+    /// cites it, and that citation is written when the control row lands — so the cut has to be
+    /// authored first. Reserving all but ONE ordinary slot discriminates the order exactly: the
+    /// cut takes the last ordinary slot and the manifest can only come from the reserve. Authored
+    /// the other way round the manifest would consume that slot and the cut would hit capacity.
+    #[test]
+    fn a_pinned_removal_seats_its_manifest_in_the_reserve_when_the_ordinary_budget_is_full() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x7d);
+        crate::account::test_support::install_real_pin(&conn, account, NOW);
+
+        let held: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1",
+                params![account.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // Leave exactly one ordinary slot. Expiry is judged against the WALL CLOCK, never the
+        // caller's `now_ms`, so a fold coordinate here would reserve nothing.
+        let spare = storage::ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as i64 - held - 1;
+        conn.execute(
+            "INSERT INTO account_candidate_reservations(
+                 reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms)
+             VALUES(?1, ?2, ?3, 0, ?4)",
+            params![
+                [0x9c_u8; 32].as_slice(),
+                account.to_bytes().as_slice(),
+                spare,
+                rag_rat_base::time::now_ms() + 600_000,
+            ],
+        )
+        .unwrap();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW)
+            .expect("the cut takes the last ordinary slot and the manifest comes from the reserve");
+        tx.commit().unwrap();
+        assert_eq!(annex_payloads(&conn, account).len(), 1, "the manifest was stored");
+    }
+
+    /// An unpinned account removes a device the v1 way: no view exists to name, so authoring one
+    /// would be committing to evidence the signed bytes never reference.
+    #[test]
+    fn an_unpinned_removal_stays_v1_and_authors_no_manifest() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x73);
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW).expect("an unpinned owner removes");
+        tx.commit().unwrap();
+
+        assert_eq!(control_tail_op_version(&conn, account), 1, "v1 bytes for a legacy account");
+        assert!(annex_payloads(&conn, account).is_empty(), "and no manifest was authored");
+    }
+
+    /// Removing a device that is not roster-effective would fold `Rejected(Ineffective)` and
+    /// tombstone a fingerprint no enrollment ever added, so the seam refuses before authoring.
+    #[test]
+    fn removing_a_device_that_was_never_enrolled_authors_nothing() {
+        let conn = db();
+        let (_account, _) = account_owning_a_public_stream(&conn);
+        let stranger = DeviceSecret::from_seed(&[0x75; 32]).public().fingerprint();
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        // Both counts are read INSIDE the transaction: two post-rollback reads agree whether or
+        // not anything was inserted, so that assertion could never fail.
+        let before: i64 =
+            tx.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap();
+        let err = author_device_remove_in_tx(&tx, stranger, "left", NOW)
+            .expect_err("a device that was never enrolled cannot be removed");
+        let after: i64 =
+            tx.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap();
+        drop(tx);
+        assert!(
+            err.to_string().contains("not roster-effective"),
+            "expected the roster precondition, got: {err}",
+        );
+        assert_eq!(before, after, "the refusal authored nothing");
+    }
+
     #[test]
     fn revocation_still_refuses_under_a_pin() {
         let conn = db();
