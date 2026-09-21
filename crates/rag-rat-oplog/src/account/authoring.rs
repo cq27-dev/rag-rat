@@ -20,6 +20,8 @@ use anyhow::Context;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::bootstrap::{self, LocalAccountRef};
+use super::control_policy::{AccountControlPolicy, UnsupportedAccountControlVersion};
+use super::control_v2::ops as v2_ops;
 use super::envelope::{
     AccountEntryHeader, VerifiedAccountEntry, sign_account_entry, signed_entry_len,
 };
@@ -201,7 +203,16 @@ fn author_account_op_in_tx(
     op: &AccountOp,
     now_ms: i64,
 ) -> anyhow::Result<AccountEntryHash> {
-    super::control_policy::require_supported_account_control(tx, account_id)?;
+    // The account's control version decides what this seam SIGNS, not merely whether it may sign.
+    // A pinned account that still signed v1 bytes would author an entry its own fold can never make
+    // effective, while unpinned peers folded the same bytes as a real operation — so the version is
+    // chosen here, at the one seam every control op passes through, rather than by a relaxed gate.
+    let pin = match super::control_policy::account_control_policy(tx, account_id)? {
+        AccountControlPolicy::LegacyV1 => None,
+        AccountControlPolicy::ControlV2(pin) => Some(pin),
+        AccountControlPolicy::UnsupportedVersion(pin) =>
+            return Err(UnsupportedAccountControlVersion { pin }.into()),
+    };
     let fingerprint = device.fingerprint();
     // Chain from the control-log tail. Post-genesis the tail is never empty (the genesis is seq 0);
     // an empty chain here means the caller skipped the mint, which is a programming error.
@@ -210,6 +221,22 @@ fn author_account_op_in_tx(
             "cannot author a non-genesis account op on an empty control chain (mint the genesis \
              first)",
         )?;
+    if pin.is_some() {
+        // Under a pin the raw tail is a trap. A v2 entry's ancestry is walked back to its first
+        // non-v2 ancestor, which must be one the checkpoint accepted; a retained row above the
+        // accepted tail (for example a v1 op authored between proposing and installing the pin)
+        // makes that walk fail, and because the frozen epoch never grows the park is PERMANENT —
+        // taking every later entry on this device's chain with it. Chaining from the accepted tail
+        // instead would put two entries in one slot and decide our own op by a hash tiebreak, so
+        // refuse while nothing has been authored.
+        let accepted = account_accepted_chain_tail(tx, account_id, fingerprint, fold::CONTROL_LOG)?;
+        anyhow::ensure!(
+            accepted.is_some_and(|(seq, hash)| seq == tail_seq && hash == tail_hash),
+            "this device's control chain ends in an entry the checkpoint did not accept, so a \
+             control v2 entry chained onto it could never fold; catch this device up (or re-pin \
+             over the current history) before authoring",
+        );
+    }
     let seq = tail_seq
         .checked_add(1)
         .context("account control chain tail is at u64::MAX seq; cannot extend")?;
@@ -220,6 +247,31 @@ fn author_account_op_in_tx(
     // fold — a revoking cut included, since the fold credits it the entries it condemns. Mirrors
     // the `/3` content seam's freshness citation.
     let auth_len = storage::account_effective_count(tx, account_id)?;
+
+    let (op_version, payload) = match &pin {
+        None => (
+            1,
+            ops::encode(op)
+                .map_err(|err| anyhow::anyhow!("encoding the account op failed: {err}"))?,
+        ),
+        Some(pin) => (
+            v2_ops::CONTROL_VERSION,
+            v2_ops::ControlOp {
+                checkpoint: pin.checkpoint_digest,
+                // `ControlOp::encode` requires a pre-cut view for exactly `DeviceRemove` and
+                // `OwnerDemote`, and no caller of this seam authors either, so `None` is always
+                // legal here and a future caller that breaks that gets a loud encode failure.
+                //
+                // `StreamRevoke` is the one revocation-SHAPED op that reaches this seam, and it is
+                // deliberately not in the encoder's set: its cuts travel in the op, not in a
+                // nominated view. It never arrives pinned regardless — the revoke seam gates
+                // itself, because under a pin its cut plan would come back empty.
+                pre_cut_view: None,
+                op: op.clone(),
+            }
+            .encode()?,
+        ),
+    };
 
     let header = AccountEntryHeader {
         account_id,
@@ -236,7 +288,7 @@ fn author_account_op_in_tx(
         // peer could reject it.
         parent_ref: Some(genesis_hash),
         entry_type: ops::entry_type_of(op),
-        op_version: 1,
+        op_version,
         crypto_suite: 0,
         auth_len,
         key_id: None,
@@ -244,8 +296,6 @@ fn author_account_op_in_tx(
         // genesis, whose incarnation id is its own entry hash.
         authority_ref: Some(genesis_hash.into()),
     };
-    let payload =
-        ops::encode(op).map_err(|err| anyhow::anyhow!("encoding the account op failed: {err}"))?;
     let signed = sign_account_entry(device.secret(), &header, &payload)?;
     let verified = VerifiedAccountEntry {
         header: signed.header,
@@ -439,6 +489,11 @@ fn author_device_add_with_promotion_in_tx(
         "cannot enroll a device before the store's local account is minted (call local_account \
          first)",
     )?;
+    // Enrollment states its own control gate instead of inheriting one. The shared op seam now
+    // SIGNS under a pin rather than refusing, so a path that must stay v1-only has to say so here;
+    // opening enrollment under a pin needs the invite ticket to carry the checkpoint digest, which
+    // is a separate change.
+    super::control_policy::require_supported_account_control(tx, account_id)?;
     let device = local_device(tx, now_ms)?;
     // The fingerprint is derived, not trusted from the caller — the op's canonicalization derives
     // it the same way, so this keeps the roster checks below honest.
@@ -612,6 +667,13 @@ pub fn author_stream_revoke_in_tx(
         "cannot author a stream revoke before the store's local account is minted (call \
          local_account first)",
     )?;
+    // Revocation states its own control gate, and must, because its CUT PLAN is derived from
+    // accepted content. A pin retracts content acceptance for the account and its streams, so under
+    // a pin `accepted_chain_tails` answers empty and a SOFT reason would author
+    // `StreamRevoke { device_cuts: [] }` — byte-identical to the hard shape, silently quarantining
+    // all of the grantee's prior work instead of keeping it valid as far as it vouches. Refuse
+    // until content is evaluable under a pin; nothing here errors on its own.
+    super::control_policy::require_supported_account_control(tx, account_id)?;
     let device = local_device(tx, now_ms)?;
     let grant_ids = storage::open_writer_grants(tx, account_id, stream_id, grantee_account_id)?;
     anyhow::ensure!(
@@ -694,11 +756,57 @@ pub(super) fn account_chain_tail(
     device_fingerprint: DeviceFingerprint,
     log_id: u8,
 ) -> anyhow::Result<Option<(u64, AccountEntryHash)>> {
-    let row: Option<(i64, Vec<u8>)> = tx
-        .query_row(
+    chain_tail(tx, account_id, device_fingerprint, log_id, TailScope::Held)
+}
+
+/// The device's highest-seq entry on `log_id` that the fold ACCEPTED, which is a different question
+/// from [`account_chain_tail`]: the candidate DAG is grow-only and holds retained and forked rows
+/// above the accepted frontier. Authoring reads both and refuses when they disagree.
+fn account_accepted_chain_tail(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    log_id: u8,
+) -> anyhow::Result<Option<(u64, AccountEntryHash)>> {
+    chain_tail(tx, account_id, device_fingerprint, log_id, TailScope::Accepted)
+}
+
+/// Which rows a tail read considers. `Accepted` adds the `accepted = 1` predicate the partial
+/// unique index `account_accepted_slot` keys on, so it yields at most one row per slot.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum TailScope {
+    Held,
+    Accepted,
+}
+
+/// Shared so the two tails cannot parse `seq` differently. `account_entries.seq` is a plain numeric
+/// INTEGER — `ORDER BY seq DESC` is a numeric compare and the value reads back as i64 — NOT the
+/// fixed-width big-endian blob `content_entries.seq` uses. Mixing the two silently misorders
+/// chains.
+fn chain_tail(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+    log_id: u8,
+    scope: TailScope,
+) -> anyhow::Result<Option<(u64, AccountEntryHash)>> {
+    // `entry_hash` breaks the tie deterministically. `Accepted` cannot equivocate — the partial
+    // unique index admits one accepted row per slot — but `Held` can, and without a tiebreak
+    // SQLite may return either row, so the same stored state could permit or refuse authoring from
+    // one call to the next.
+    let sql = match scope {
+        TailScope::Held =>
             "SELECT seq, entry_hash FROM account_entries
              WHERE account_id = ?1 AND log_id = ?2 AND device_fingerprint = ?3
-             ORDER BY seq DESC LIMIT 1",
+             ORDER BY seq DESC, entry_hash LIMIT 1",
+        TailScope::Accepted =>
+            "SELECT seq, entry_hash FROM account_entries
+             WHERE account_id = ?1 AND log_id = ?2 AND device_fingerprint = ?3 AND accepted = 1
+             ORDER BY seq DESC, entry_hash LIMIT 1",
+    };
+    let row: Option<(i64, Vec<u8>)> = tx
+        .query_row(
+            sql,
             params![
                 account_id.to_bytes().as_slice(),
                 log_id,
@@ -737,6 +845,177 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn
+    }
+
+    /// Mint the account and own one `PublicRead` `/2` stream, BEFORE any pin: an ensure is
+    /// authoring intent and refuses under every pin, so the ownership a grant needs cannot be
+    /// established afterwards.
+    fn account_owning_a_public_stream(conn: &Connection) -> (AccountId, crate::stream::StreamId) {
+        let account = bootstrap::local_account(conn, NOW).unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let stream = ensure_owned_stream_v2_with_mode_in_tx(
+            &tx,
+            "repo-a",
+            crate::stream::AccessMode::PublicRead,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        (account, stream)
+    }
+
+    /// The control version of this account's newest control-log entry. The version is a header
+    /// field inside the signed envelope, not a column, so the row has to be decoded to read it.
+    fn control_tail_op_version(conn: &Connection, account: AccountId) -> u32 {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT signed_bytes FROM account_entries
+                 WHERE account_id = ?1 AND log_id = 0 ORDER BY seq DESC LIMIT 1",
+                params![account.to_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::account::envelope::decode_account_signed(&bytes).unwrap().header.op_version
+    }
+
+    /// The version a control op is signed at follows the ACCOUNT's control version, not the
+    /// caller's. Authoring a grant under an executable pin signs control v2 — and
+    /// `author_stream_grant_in_tx` verifies the FACT before returning, so an `Ok` here is itself
+    /// the proof the v2 grant folded effective rather than being authored and ignored.
+    #[test]
+    fn a_pinned_account_signs_its_grant_as_control_v2() {
+        let conn = db();
+        let (account, stream) = account_owning_a_public_stream(&conn);
+        assert_eq!(control_tail_op_version(&conn, account), 1, "unpinned authoring stays v1");
+
+        crate::account::test_support::install_real_pin(&conn, account, NOW);
+
+        let grantee = AccountId::from_bytes([0x5a; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Writer, NOW)
+            .expect("a pinned owner authors an effective v2 grant");
+        tx.commit().unwrap();
+
+        assert_eq!(
+            control_tail_op_version(&conn, account),
+            v2_ops::CONTROL_VERSION,
+            "the stored grant is signed at the account's control version, not v1",
+        );
+    }
+
+    /// A row above the device's ACCEPTED tail makes the next v2 entry unfoldable forever, so the
+    /// seam refuses while nothing has been authored. An entry at an `op_version` no binary folds is
+    /// retained-but-never-accepted, which is exactly the shape a v1 op authored between proposing
+    /// and installing a pin leaves behind.
+    #[test]
+    fn an_unaccepted_tail_refuses_the_grant_before_any_entry_exists() {
+        let conn = db();
+        let (account, stream) = account_owning_a_public_stream(&conn);
+        crate::account::test_support::install_real_pin(&conn, account, NOW);
+
+        let device = local_device(&conn, NOW).unwrap();
+        let (tail_seq, tail_hash) = {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+            let tail =
+                account_chain_tail(&tx, account, device.fingerprint(), fold::CONTROL_LOG).unwrap();
+            tx.commit().unwrap();
+            tail.unwrap()
+        };
+        let (_, stream_own) = crate::account::test_support::stream_own_public(account);
+        let unfoldable = sign_account_entry(
+            device.secret(),
+            &AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: device.fingerprint(),
+                seq: tail_seq + 1,
+                prev_hash: Some(tail_hash),
+                parent_ref: Some(tail_hash),
+                entry_type: ops::entry_type_of(&stream_own),
+                // No binary folds this, so it is retained and never accepted.
+                op_version: 99,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(tail_hash.into()),
+            },
+            &ops::encode(&stream_own).unwrap(),
+        )
+        .unwrap();
+        storage::account_ingest(&conn, &unfoldable.signed_bytes, NOW).unwrap();
+
+        let grantee = AccountId::from_bytes([0x5b; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        // Both counts are read INSIDE the transaction. Reading them outside would compare two
+        // post-rollback states, which match whether or not the seam inserted a candidate — an
+        // assertion that cannot fail.
+        let before: i64 =
+            tx.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap();
+        let err = author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Writer, NOW)
+            .expect_err("a chain ending above the accepted tail must refuse");
+        let after: i64 =
+            tx.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap();
+        drop(tx);
+        assert!(
+            err.to_string().contains("did not accept"),
+            "expected the accepted-tail refusal, got: {err}",
+        );
+        assert_eq!(before, after, "the refusal authored nothing");
+    }
+
+    /// A revocation must not quietly change meaning under a pin. A SOFT reason takes its cuts from
+    /// accepted content, and a pin retracts content acceptance for the account and its streams, so
+    /// the cut plan would come back empty — the byte-identical shape a HARD revocation authors.
+    /// `departed` promises prior work stays valid as far as it vouches; silently quarantining all
+    /// of it instead is worse than refusing, and nothing else on this path errors.
+    #[test]
+    fn revocation_still_refuses_under_a_pin() {
+        let conn = db();
+        let (account, stream) = account_owning_a_public_stream(&conn);
+        let grantee = AccountId::from_bytes([0x5c; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_stream_grant_in_tx(&tx, stream, grantee, ops::GrantRole::Writer, NOW)
+            .expect("an unpinned owner grants normally");
+        tx.commit().unwrap();
+
+        crate::account::test_support::install_real_pin(&conn, account, NOW);
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err =
+            author_stream_revoke_in_tx(&tx, stream, grantee, RevokeReason::Departed, None, NOW)
+                .expect_err("a pinned account must not author a stream revoke");
+        assert!(
+            err.downcast_ref::<UnsupportedAccountControlVersion>().is_some(),
+            "expected the typed pin refusal, got: {err}",
+        );
+    }
+
+    /// Enrollment carries its OWN gate rather than inheriting the shared seam's, which now signs
+    /// under a pin instead of refusing. Opening enrollment needs the invite ticket to carry the
+    /// checkpoint digest, so until then a pinned account enrolls nothing.
+    #[test]
+    fn enrollment_still_refuses_under_a_pin() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        crate::account::test_support::install_real_pin(&conn, account, NOW);
+
+        let joiner = DeviceSecret::from_seed(&[0x61; 32]);
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        let err = author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[0x62; 32]).public().to_bytes(),
+                label: None,
+            },
+            ops::DeviceRole::Member,
+            NOW,
+        )
+        .expect_err("a pinned account must not enrol a device");
+        assert!(
+            err.downcast_ref::<UnsupportedAccountControlVersion>().is_some(),
+            "expected the typed pin refusal, got: {err}",
+        );
     }
 
     /// The unsent-work guard's "ever a writer" fact must survive the roster projection being
