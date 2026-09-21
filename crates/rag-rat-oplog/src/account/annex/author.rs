@@ -289,10 +289,6 @@ pub(in crate::account) fn author_annex_entry_in_tx(
 /// deliberate rather than an omission: a manifest's integrity is the digest the cut signed, so
 /// nothing reads either field — and carrying one would invite a later reader to gate on it, which
 /// would make a revoked author's manifest vanish and re-park a cut that had already applied.
-#[allow(
-    dead_code,
-    reason = "no production path authors a v2 cut yet — pin install is test-only (#1311)"
-)]
 pub(in crate::account) fn author_view_manifest_in_tx(
     tx: &Transaction<'_>,
     device: &LocalDevice,
