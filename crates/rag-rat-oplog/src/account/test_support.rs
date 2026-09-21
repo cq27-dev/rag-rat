@@ -88,3 +88,33 @@ pub(in crate::account) fn stream_own_mode(
     let stream_spec_bytes = stream::canonical_spec_v2_bytes(&spec).unwrap();
     (stream_id, AccountOp::StreamOwn { stream_id, stream_spec_bytes })
 }
+
+/// Install a REAL, verifiable pin: propose a checkpoint over the account's own evidence, verify it,
+/// and store it through the pin seam. A raw `INSERT` into `account_control_pins` yields a
+/// `ControlV2` policy whose digest matches no stored bundle, so the very next refold fails
+/// verification — a test resting on that proves nothing about authoring.
+pub(in crate::account) fn install_real_pin(
+    conn: &rusqlite::Connection,
+    account: AccountId,
+    now_ms: i64,
+) {
+    use rusqlite::{Transaction, TransactionBehavior};
+
+    let device = crate::local_device(conn, now_ms).unwrap();
+    // Proposing is itself refused once pinned, so the proof must be built first.
+    let bundle = {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let bundle = super::checkpoint::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
+        tx.commit().unwrap();
+        bundle
+    };
+    let pin = super::checkpoint::TrustedCheckpointPin {
+        account_id: account,
+        checkpoint_digest: bundle.certificate_digest(),
+        required_control_version: 2,
+    };
+    let proof = super::checkpoint::verify_checkpoint(pin, &bundle).unwrap();
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+    super::control_policy::pin_checkpoint_in_tx(&tx, pin, &proof).unwrap();
+    tx.commit().unwrap();
+}
