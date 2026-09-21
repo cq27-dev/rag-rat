@@ -2290,12 +2290,13 @@ fn derive_authority_facts(
             },
             AccountOp::OwnerPromote { device_fingerprint } => {
                 let hash = candidate.hash();
-                // A promote of a device with no ACTIVE enrollment confers nothing. The v1 fold
-                // cannot reach this — `settle_authority_dependencies` rejects such a promote
-                // `Ineffective` — but `v2::pinned_history` composes a history without replaying the
-                // effect pass, and there a v2 cut can condemn the `DeviceAdd` that enrolled the
-                // subject while a promote authored on another chain stays effective. Total rather
-                // than an assertion, so that case grants nothing instead of panicking.
+                // A promote of a device with no ACTIVE enrollment confers nothing. Neither fold
+                // reaches this any more: `settle_authority_dependencies` rejects such a promote
+                // `Ineffective`, and `v2::pinned_history` now replays the same effect pass over the
+                // applied v2 operations, so a promote whose `DeviceAdd` a v2 cut condemned is
+                // classified `BadPromote` rather than left standing. Kept total rather than
+                // asserting, so a future composition that reaches it grants nothing instead of
+                // panicking.
                 let Some(roster_ref) = roster.get(device_fingerprint) else {
                     continue;
                 };

@@ -2322,9 +2322,16 @@ fn derive_pinned_projection(
             .collect();
         let history = fold::v2::pinned_history(frozen, &applied);
         // The checkpoint's accepted set plus the applied entries, MINUS whatever the composed
-        // history explicitly condemns. An entry the composition does not model at all — every
-        // applied operation that installs no register — keeps its acceptance; acceptance is a
-        // question about branch selection, and only a v2 REGISTER takes it away.
+        // history does not leave effective. The composition runs the v1 effect pass over every
+        // applied operation, not just the register-installing ones, and parks any whose cited
+        // incarnation resolves to no mint — so an applied entry always leaves with an outcome and
+        // a judged-ineffective one drops out exactly as it would in a v1 fold.
+        //
+        // `is_none_or` is kept as the TOTAL form deliberately. It is what makes this read safe if a
+        // future composition ever returns without judging something: absent would then mean
+        // effective, and an unjudged entry entering branch selection could displace a sibling at
+        // its slot. That is a real hazard, not a hypothetical — the composition omitted exactly
+        // this default once.
         let still_effective =
             |hash: &AccountEntryHash| history.outcome(hash).is_none_or(|o| o.is_effective());
         let mut effective: HashSet<AccountEntryHash> = accepted_at_checkpoint

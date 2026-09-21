@@ -1156,6 +1156,40 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
         let (account, device, genesis, enrolled) = account_with_one_enrolment(&conn);
+        // A second enrolment, BEFORE the pin: the checkpoint freezes the roster, so a device added
+        // afterwards is outside the frozen history and its revocation would be ineffective for that
+        // reason instead of forked. `device_add_entry` hardcodes seq 1, which is the slot the first
+        // enrolment already holds — chaining at seq 2 is what makes this an addition rather than an
+        // equivocating sibling.
+        let other_dev = test_support::Dev::new(20);
+        let second_op = ops::AccountOp::DeviceAdd {
+            device_fingerprint: other_dev.fp,
+            ed25519_pubkey: other_dev.ed,
+            x25519_pubkey: other_dev.x,
+            role: ops::DeviceRole::Member,
+            label: None,
+        };
+        let second = envelope::sign_account_entry(
+            device.secret(),
+            &envelope::AccountEntryHeader {
+                account_id: account,
+                log_id: fold::CONTROL_LOG,
+                device_fingerprint: device.fingerprint(),
+                seq: 2,
+                prev_hash: Some(enrolled),
+                parent_ref: Some(genesis),
+                entry_type: ops::entry_type_of(&second_op),
+                op_version: 1,
+                crypto_suite: 0,
+                auth_len: 1,
+                key_id: None,
+                authority_ref: Some(genesis.into()),
+            },
+            &ops::encode(&second_op).unwrap(),
+        )
+        .unwrap();
+        storage::account_ingest(&conn, &second.signed_bytes, 2).unwrap();
+        assert_eq!(accepted_flag(&conn, second.entry_hash), 1, "the second enrolment accepted");
         let digest = install_pin(&conn, account).checkpoint_digest;
         let view = control_v2::views::ViewManifest { checkpoint: digest, entries: Vec::new() };
         let manifest = view.digest().unwrap();
@@ -1168,12 +1202,16 @@ mod tests {
             tx.commit().unwrap();
         }
 
+        // Chained at seq 3 off the SECOND enrolment: the cuts must be siblings of each other, not
+        // of an enrolment. `device_remove_entry`'s slot moved when a second enrolment took seq 2,
+        // and two cuts losing selection to an unrelated entry fold nothing at all — which would
+        // leave the seat assertion below passing for a reason that has nothing to do with forking.
         let revoke = |subject, distinguisher| {
             device_remove_entry(
                 account,
                 &device,
-                enrolled,
-                2,
+                second.entry_hash,
+                3,
                 genesis,
                 digest,
                 manifest,
@@ -1184,11 +1222,21 @@ mod tests {
         };
         let member = test_support::Dev::new(7).fp;
         let loser = revoke(member, 0);
-        // The same slot, a DIFFERENT subject, and the smaller hash — the side the min-hash
-        // tiebreak keeps, which leaves the member's revocation forked. The subject is fixed and the
+        // The same slot, a DIFFERENT subject, and the smaller hash — the side the min-hash tiebreak
+        // keeps, which leaves the member's revocation forked. The subject is fixed and the
         // distinguisher varies: revoking a different device is what makes this a fork rather than a
         // duplicate, so it is not something the search may move.
+        //
+        // BOTH subjects must be enrolled. The composed fold now runs the v1 effect pass over every
+        // applied operation, so a cut of a device that was never on the roster is
+        // `Rejected(Ineffective)` (I4: it must not tombstone a fingerprint no `DeviceAdd` ever
+        // added) and could never hold the slot — the fork, not effectiveness, has to be what
+        // separates these two.
         let other = test_support::Dev::new(20).fp;
+        assert!(
+            seat_open(&conn, other),
+            "the second subject must be enrolled, or this tests ineffectiveness rather than a fork",
+        );
         let winner = smaller_than(loser.entry_hash, |distinguisher| revoke(other, distinguisher));
         storage::account_ingest(&conn, &loser.signed_bytes, 5).unwrap();
         storage::account_ingest(&conn, &winner.signed_bytes, 6).unwrap();
