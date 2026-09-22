@@ -19,6 +19,7 @@ use crate::op::DeviceFingerprint;
 const CHECKPOINT_DOMAIN: &str = "rag-rat/control-checkpoint/1";
 const SIGNED_DOMAIN: &str = "rag-rat/control-checkpoint-signed/1";
 const EVIDENCE_DOMAIN: &str = "rag-rat/control-checkpoint-evidence/1";
+const BUNDLE_DOMAIN: &str = "rag-rat/control-checkpoint-bundle/1";
 /// Protocol bounds, independent of the receiver's configurable ingestion budgets.
 pub const CHECKPOINT_EVIDENCE_MAX_ENTRIES: usize = 4096;
 pub const CHECKPOINT_EVIDENCE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -43,6 +44,119 @@ impl CheckpointBundle {
     /// Digest for operator review/export. Computing it does not establish trust in this bundle.
     pub fn certificate_digest(&self) -> [u8; 32] {
         cbor::sha256(&self.certificate)
+    }
+
+    /// The transport form: one canonical CBOR item a proposal is written to and an installing store
+    /// reads back.
+    ///
+    /// The envelope is NOT covered by [`Self::certificate_digest`], and must never become so. That
+    /// digest is `sha256(certificate)`, and it is the value an operator relays out of band and
+    /// types into `install` — so wrapping the certificate for transport cannot be allowed to change
+    /// it, or a bundle proposed by one release would not match the digest relayed for it.
+    ///
+    /// Evidence order is preserved rather than sorted. [`evidence_digest`] sorts internally, so the
+    /// commitment is already order-independent; imposing an order here would be a second, weaker
+    /// rule about bytes that nothing reads.
+    ///
+    /// Encoding enforces every payload bound [`Self::decode`] enforces. Decode additionally bounds
+    /// the total ENCODED length, which this does not check; the two agree only because that bound
+    /// is sized to cover the largest output this can produce, and
+    /// `the_maximum_shape_survives_a_round_trip` is what holds them to it.
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Self::check_bounds(
+            &self.certificate,
+            self.evidence.len(),
+            self.evidence.iter().map(Vec::len),
+        )?;
+        let mut bytes = Vec::new();
+        let mut e = Encoder::new(&mut bytes);
+        e.put_array(3);
+        e.put_str(BUNDLE_DOMAIN);
+        e.put_bytes(&self.certificate);
+        e.put_array(self.evidence.len() as u64);
+        for entry in &self.evidence {
+            e.put_bytes(entry);
+        }
+        Ok(bytes)
+    }
+
+    /// Decode a transport bundle. Duplicate evidence is NOT checked here: `decode_evidence` already
+    /// rejects it against `entry_hash`, and a second check over raw bytes would be a weaker copy of
+    /// a rule that has a home.
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        // Bound the input before recursively validating it or allocating its arrays.
+        //
+        // Sized FROM the constants, never a guessed slack: `check_bounds` limits payload lengths,
+        // while the envelope adds a bstr header (up to 5 bytes) per entry plus its own framing. A
+        // flat allowance below that lets `encode` emit a bundle this would refuse, which makes the
+        // round-trip promise false at the maximum shape — where no ordinary test reaches.
+        //
+        // The framing term is derived rather than guessed, so that renaming the domain cannot
+        // silently outgrow it: array(3) header, the domain string with its own header, then the
+        // certificate and evidence-array headers.
+        const FRAMING_MAX: usize = 1 + 2 + BUNDLE_DOMAIN.len() + 5 + 5;
+        const ENVELOPE_OVERHEAD_MAX: usize =
+            5 * CHECKPOINT_EVIDENCE_MAX_ENTRIES + CERTIFICATE_MAX_BYTES + FRAMING_MAX;
+        anyhow::ensure!(
+            bytes.len() <= CHECKPOINT_EVIDENCE_MAX_BYTES + ENVELOPE_OVERHEAD_MAX,
+            "checkpoint bundle exceeds protocol limits"
+        );
+        cbor::require_canonical_cbor(bytes)?;
+        let mut d = Decoder::new(bytes);
+        anyhow::ensure!(
+            d.array()? == Some(3) && d.str()? == BUNDLE_DOMAIN,
+            "checkpoint bundle grammar"
+        );
+        // Bound the certificate against its OWN limit before copying it. The pre-check above admits
+        // ~16 MiB because evidence may be that large, so a bundle is free to spend that entire
+        // budget on a certificate instead — and copying it first would let a remote sender cost the
+        // decoder thousands of times what the certificate limit permits, before anything refuses.
+        let certificate = d.bytes()?;
+        anyhow::ensure!(
+            certificate.len() <= CERTIFICATE_MAX_BYTES,
+            "checkpoint certificate exceeds protocol limit"
+        );
+        let certificate = certificate.to_vec();
+        let count = d.array()?.ok_or_else(|| anyhow::anyhow!("indefinite bundle evidence"))?;
+        anyhow::ensure!(
+            count <= CHECKPOINT_EVIDENCE_MAX_ENTRIES as u64,
+            "checkpoint evidence count exceeds protocol limit"
+        );
+        let mut evidence = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            evidence.push(d.bytes()?.to_vec());
+        }
+        Self::check_bounds(&certificate, evidence.len(), evidence.iter().map(Vec::len))?;
+        let bundle = Self { certificate, evidence };
+        // Re-encode and compare, so a stored bundle is byte-identical to what it decodes to and no
+        // alternative encoding of the same content is accepted.
+        anyhow::ensure!(
+            d.position() == bytes.len() && bundle.encode()? == bytes,
+            "noncanonical checkpoint bundle"
+        );
+        Ok(bundle)
+    }
+
+    /// The protocol bounds, shared by both directions so they cannot drift apart.
+    fn check_bounds(
+        certificate: &[u8],
+        count: usize,
+        mut lengths: impl Iterator<Item = usize>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            certificate.len() <= CERTIFICATE_MAX_BYTES,
+            "checkpoint certificate exceeds protocol limit"
+        );
+        anyhow::ensure!(
+            count <= CHECKPOINT_EVIDENCE_MAX_ENTRIES,
+            "checkpoint evidence count exceeds protocol limit"
+        );
+        let total = lengths.try_fold(0usize, |total, len| total.checked_add(len));
+        anyhow::ensure!(
+            total.is_some_and(|total| total <= CHECKPOINT_EVIDENCE_MAX_BYTES),
+            "checkpoint evidence bytes exceed protocol limit"
+        );
+        Ok(())
     }
 }
 
@@ -734,5 +848,184 @@ mod tests {
             verify_checkpoint(pin(account, &bundle), &stripped),
             Err(CheckpointError::MissingEvidence)
         ));
+    }
+
+    /// The transport bytes are frozen: a bundle written by one release must decode in the next.
+    #[test]
+    fn golden_checkpoint_bundle() {
+        let (founder, account, genesis, _) = fixture();
+        let bundle = prepare_checkpoint(account, &[genesis], &founder.secret).unwrap();
+        assert_eq!(
+            rag_rat_base::hash::hex_lower(&bundle.encode().unwrap()),
+            "8378237261672d7261742f636f6e74726f6c2d636865636b706f696e742d62756e646c652f315901568378237261672d7261742f636f6e74726f6c2d636865636b706f696e742d7369676e65642f3158ec88781c7261672d7261742f636f6e74726f6c2d636865636b706f696e742f31582034d26eede7b519569c485cac41338c03c3e61fd6bd50cd98263ae9057ddc6dc7025820a96cd5ba0219bfc8413c7cfdad50eb31cf49b9c77615158b47cd783a033b4d165820a8a828409eff856f24388d05f86df5f04083f157feea00d970caa9b4d868451458204e12a5b735749810791391f3c600fd98514becbb5736f182549c282a89b0fdc658208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c5820a96cd5ba0219bfc8413c7cfdad50eb31cf49b9c77615158b47cd783a033b4d1658408c97e9d96dbb1d0a09fa2539ec0b9f27959b706aacff762b1c84a5a662b15da0efbc565843acc6f6bf8ea722917b53deebb48d3124e9d1ce021c35a447feb50e815901238378187261672d7261742f6163636f756e742d7369676e65642f3158c48258678d777261672d7261742f6163636f756e742d656e7472792f31582034d26eede7b519569c485cac41338c03c3e61fd6bd50cd98263ae9057ddc6dc700582034750f98bd59fcfc946da45aaabe933be154a4b5094e1c4abf42866505f3c97e00f6f600010000f6f658588558208a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c582000f81ab0eb0e18ddb5e247d38f25c7a352c39fc77a74cb3f739d309f69ee4878500000000000000000000000000000000000f6584014029bc87a9022fb39d9f806cb349b515d8ad9369b84e6de857e5dcb7e6a7b153463f6a825e021a65862d65e5b9a37bda2ebdf55d9eb8ec4ab5f768544e7a20f",
+        );
+    }
+
+    /// Wrapping a certificate for transport must not change the digest an operator relays, or a
+    /// bundle proposed by one release would not match the digest circulated for it.
+    #[test]
+    fn the_envelope_does_not_disturb_the_relayed_digest() {
+        let (founder, account, genesis, _) = fixture();
+        let bundle = prepare_checkpoint(account, &[genesis], &founder.secret).unwrap();
+        let round_tripped = CheckpointBundle::decode(&bundle.encode().unwrap()).unwrap();
+        assert_eq!(round_tripped, bundle, "the round trip is lossless");
+        assert_eq!(
+            round_tripped.certificate_digest(),
+            bundle.certificate_digest(),
+            "the digest covers the certificate alone, not the envelope",
+        );
+    }
+
+    /// Evidence order is preserved, not sorted. `evidence_digest` sorts internally, so imposing an
+    /// order here would be a second rule about bytes nothing reads — and one that could silently
+    /// disagree with what a peer wrote.
+    #[test]
+    fn the_envelope_preserves_evidence_order() {
+        let (_founder, account, genesis, _) = fixture();
+        // A SECOND device at seq 0, not the founder at seq 1: the envelope enforces `prev_hash is
+        // null iff seq == 0`, and chaining would imply a relationship this test is not about. All
+        // it needs is two distinct blobs it can present in two orders.
+        let other = Dev::new(2);
+        let extra = envelope::sign_account_entry(
+            &other.secret,
+            &AccountEntryHeader {
+                account_id: account,
+                log_id: 0,
+                device_fingerprint: other.fp,
+                seq: 0,
+                prev_hash: None,
+                parent_ref: None,
+                entry_type: 99,
+                op_version: 1,
+                crypto_suite: 0,
+                auth_len: 0,
+                key_id: None,
+                authority_ref: None,
+            },
+            &[0x81, 0x01],
+        )
+        .unwrap();
+        let forward = CheckpointBundle {
+            certificate: vec![0x01, 0x02],
+            evidence: vec![genesis.clone(), extra.signed_bytes.clone()],
+        };
+        let reversed = CheckpointBundle {
+            certificate: vec![0x01, 0x02],
+            evidence: vec![extra.signed_bytes, genesis],
+        };
+        assert_ne!(forward.encode().unwrap(), reversed.encode().unwrap());
+        assert_eq!(CheckpointBundle::decode(&forward.encode().unwrap()).unwrap(), forward);
+        assert_eq!(CheckpointBundle::decode(&reversed.encode().unwrap()).unwrap(), reversed);
+    }
+
+    /// The MAXIMUM shape round-trips, which is the case a guessed decode allowance breaks.
+    ///
+    /// `check_bounds` limits payload lengths, but the envelope adds a bstr header per entry. At the
+    /// entry and byte ceilings together that overhead is ~20 KiB, so a pre-check with a flat 1 KiB
+    /// slack would refuse a bundle this store had just written — and every ordinary test sits far
+    /// below the ceiling, so nothing else would notice.
+    #[test]
+    fn the_maximum_shape_survives_a_round_trip() {
+        let entry = vec![0u8; CHECKPOINT_EVIDENCE_MAX_BYTES / CHECKPOINT_EVIDENCE_MAX_ENTRIES];
+        let bundle = CheckpointBundle {
+            certificate: vec![0u8; CERTIFICATE_MAX_BYTES],
+            evidence: vec![entry; CHECKPOINT_EVIDENCE_MAX_ENTRIES],
+        };
+        let encoded = bundle.encode().expect("the maximum shape encodes");
+        assert_eq!(
+            CheckpointBundle::decode(&encoded).expect("and decodes"),
+            bundle,
+            "a bundle this store can write is one it can read back",
+        );
+    }
+
+    /// Over-limit bundles built by ANOTHER host are refused by `decode` on its own terms.
+    ///
+    /// Every other malformed case reaches the decoder through `encode`, which refuses to produce
+    /// these at all — so without raw inputs the decoder's own bounds are never exercised by
+    /// anything, and the entry-count limit that runs before the evidence vector is allocated has no
+    /// test at all.
+    #[test]
+    fn a_decoder_refuses_over_limit_bundles_it_did_not_write() {
+        fn raw(certificate: &[u8], evidence: &[Vec<u8>]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            let mut e = Encoder::new(&mut bytes);
+            e.put_array(3);
+            e.put_str(BUNDLE_DOMAIN);
+            e.put_bytes(certificate);
+            e.put_array(evidence.len() as u64);
+            for entry in evidence {
+                e.put_bytes(entry);
+            }
+            bytes
+        }
+
+        assert!(
+            CheckpointBundle::decode(&raw(&vec![0; CERTIFICATE_MAX_BYTES + 1], &[])).is_err(),
+            "a certificate over its own limit, inside a bundle small enough to reach the parser",
+        );
+        assert!(
+            CheckpointBundle::decode(&raw(&[], &[vec![0; CHECKPOINT_EVIDENCE_MAX_BYTES + 1]]))
+                .is_err(),
+            "evidence over the byte limit",
+        );
+        assert!(
+            CheckpointBundle::decode(&raw(&[], &vec![
+                vec![0x01];
+                CHECKPOINT_EVIDENCE_MAX_ENTRIES + 1
+            ]))
+            .is_err(),
+            "evidence over the entry limit",
+        );
+        assert_eq!(
+            CheckpointBundle::decode(&raw(&[], &[])).unwrap(),
+            CheckpointBundle { certificate: vec![], evidence: vec![] },
+            "while the minimal shape still round-trips",
+        );
+    }
+
+    /// Every way a transport bundle can be malformed, refused before anything is allocated or
+    /// trusted. An accepted alternative encoding of the same content would mean two byte strings
+    /// name one checkpoint, which is what the re-encode comparison exists to prevent.
+    #[test]
+    fn a_malformed_transport_bundle_is_refused() {
+        let (founder, account, genesis, _) = fixture();
+        let bundle = prepare_checkpoint(account, &[genesis], &founder.secret).unwrap();
+        let good = bundle.encode().unwrap();
+
+        assert!(CheckpointBundle::decode(&good[..good.len() - 1]).is_err(), "truncated");
+        let mut trailing = good.clone();
+        trailing.push(0x00);
+        assert!(CheckpointBundle::decode(&trailing).is_err(), "trailing bytes");
+
+        // A different domain is a different format, not a newer one.
+        let mut wrong_domain = Vec::new();
+        {
+            let mut e = Encoder::new(&mut wrong_domain);
+            e.put_array(3);
+            e.put_str("rag-rat/control-checkpoint-bundle/2");
+            e.put_bytes(&bundle.certificate);
+            e.put_array(bundle.evidence.len() as u64);
+            for entry in &bundle.evidence {
+                e.put_bytes(entry);
+            }
+        }
+        assert!(CheckpointBundle::decode(&wrong_domain).is_err(), "wrong domain");
+
+        // Bounds are enforced by ENCODE too, so a bundle this store cannot read is one it also
+        // cannot write.
+        let oversize_cert =
+            CheckpointBundle { certificate: vec![0; CERTIFICATE_MAX_BYTES + 1], evidence: vec![] };
+        assert!(oversize_cert.encode().is_err(), "oversize certificate");
+        let too_many = CheckpointBundle {
+            certificate: bundle.certificate.clone(),
+            evidence: vec![vec![0x01]; CHECKPOINT_EVIDENCE_MAX_ENTRIES + 1],
+        };
+        assert!(too_many.encode().is_err(), "evidence count over limit");
+        let too_large = CheckpointBundle {
+            certificate: bundle.certificate,
+            evidence: vec![vec![0; CHECKPOINT_EVIDENCE_MAX_BYTES + 1]],
+        };
+        assert!(too_large.encode().is_err(), "evidence bytes over limit");
     }
 }
