@@ -186,11 +186,13 @@ pub fn require_foldable_account_control(
 /// No peer advertisement, sync receipt, or ordinary account ingestion calls this API.
 ///
 /// **The caller MUST roll back on `Err`.** An error before the pin row leaves a prefix of the
-/// evidence in `account_entries`, which has no delete path. An error AFTER it — the evidence-row
-/// loop, or the refold — is why this is a MUST rather than a SHOULD: committing then leaves a pin
-/// row the V130 triggers refuse to UPDATE or DELETE, with incomplete evidence, so
-/// `verified_checkpoint` fails on every later fold and the account is permanently unfoldable. This
-/// is the uniform rule of the `_in_tx` seams rather than a local savepoint.
+/// evidence in `account_entries`, which has no delete path. An error inside the EVIDENCE-ROW loop
+/// is why this is a MUST rather than a SHOULD: committing then leaves a pin row the V130 triggers
+/// refuse to UPDATE or DELETE with incomplete evidence, so `verify_checkpoint` fails in
+/// `verified_checkpoint` on every later fold and the account is permanently unfoldable. Errors
+/// after that loop — the stream-routing inserts, the refold — leave complete evidence and only a
+/// stale projection, which the next fold repairs. This is the uniform rule of the `_in_tx` seams
+/// rather than a local savepoint.
 pub fn pin_checkpoint_in_tx(
     tx: &Transaction<'_>,
     expected: TrustedCheckpointPin,
@@ -263,14 +265,19 @@ pub fn pin_checkpoint_in_tx(
 /// Store the checkpoint's evidence as ordinary candidates when `account` is this store's OWN
 /// account, returning how many rows were new.
 ///
-/// Load-bearing, not bookkeeping, and it does NOT fail closed. The pinned fold selects chains from
-/// STORED rows rooted at seq 0, so a store holding the pin without its evidence has a stored tail
-/// far below the checkpoint's tip. Authoring is not refused — the accepted tail equals the raw
-/// tail, so the guard passes — and the op is signed at a seq the checkpoint already froze. It lands
-/// in `contests_frozen_slot`, contributes nothing, and the revocation is silently discarded: the
-/// removed device keeps its roster seat. Storing the evidence restores the tip those ops continue
-/// from. `an_owner_that_installed_its_pin_without_the_history_can_author_under_it` fails exactly
-/// there when this is stubbed out.
+/// Load-bearing, not bookkeeping, and it does NOT fail closed. `frozen_slots` is keyed on
+/// `(log_id, DEVICE, seq)`, so the hazard is precise: when the AUTHORING device's own control chain
+/// is truncated below the tip the checkpoint froze FOR IT, its next op is signed at a seq the
+/// checkpoint already decided. Authoring is not refused — the accepted tail equals the raw tail, so
+/// the guard passes — and the op then lands in `contests_frozen_slot`, contributes nothing, and the
+/// revocation is silently discarded while the removed device keeps its roster seat.
+///
+/// That is a store restored without its own history, not a freshly enrolled second device: a device
+/// holding its own seq-0 entry authors at ITS tail+1, a slot the checkpoint never froze for it, and
+/// applies fine; one holding no rows at all is refused loudly on an empty control chain. Storing
+/// the evidence restores the tip. Stub this out and
+/// `an_owner_that_installed_its_pin_without_the_history_can_author_under_it` fails at the removal's
+/// post-check — `storage.rs`'s frozen-slot filter is the line that drops it.
 ///
 /// A FOREIGN pinned account stores nothing. The session layer already refuses a relayed pinned
 /// foreign account's entries — "the evidence is not wanted either — a fold of a pinned account only
@@ -278,6 +285,10 @@ pub fn pin_checkpoint_in_tx(
 /// a store that pinned a contributor start relaying that contributor's history.
 ///
 /// Capacity refuses rather than skipping: a skipped entry leaves precisely the missing root above.
+/// Note this charges the evidence against the grow-only ordinary budget, so a store already at its
+/// cap cannot install its own pin at all — not "retry later". The two preconditions nearly exclude
+/// each other, since that budget is mostly filled by the very history whose absence makes this
+/// necessary; an outstanding invite reservation is the realistic way both hold.
 fn store_own_account_evidence_in_tx(
     tx: &Transaction<'_>,
     account: AccountId,

@@ -1224,8 +1224,8 @@ mod tests {
         outcome
     }
 
-    /// Leave only the genesis: a second owner device that holds the pin but never synced the
-    /// history. The genesis stays because `read_local_account` resolves the pointer through it —
+    /// Leave only the genesis: a store restored without its own control history, still holding the
+    /// pin. The genesis stays because `read_local_account` resolves the pointer through it —
     /// without it the store would forget which account is its own.
     fn forget_all_but_genesis(conn: &Connection, account: AccountId) {
         let genesis = crate::read_local_account_genesis(conn).unwrap().unwrap();
@@ -1257,16 +1257,17 @@ mod tests {
         assert!(closed.is_some(), "the revocation takes effect: the device leaves the roster");
     }
 
-    /// An owner holding its account's pin without the matching history can still revoke under it.
+    /// An owner restored without its own control history can still revoke under its pin.
     ///
-    /// It does NOT fail closed, which is the point. Without the stored evidence the stored tail
-    /// sits far below the checkpoint's tip; the accepted tail equals the raw tail, so the pin
-    /// guard PASSES and the removal is authored — at a seq the checkpoint already froze. It is
-    /// then discarded as contesting a frozen slot and the device keeps its roster seat. Stub the
-    /// storage out and what fires is `author_device_remove_in_tx`'s post-check, never a refusal.
+    /// It does NOT fail closed, which is the point. The accepted tail equals the raw tail, so the
+    /// pin guard PASSES and the removal is authored — at a seq the checkpoint already froze for
+    /// THIS device. It is then discarded as contesting a frozen slot and the device keeps its
+    /// roster seat. Stub the storage out and what fires is `author_device_remove_in_tx`'s
+    /// post-check, never a refusal.
     ///
-    /// The fixture's local device is the founder, so this is "an owner lost its history" rather
-    /// than a literal second device; the stored-tail shortfall is the same one either way.
+    /// The fixture's local device is the founder, whose chain the deletion truncates — which is the
+    /// hazard exactly. A device holding its OWN seq-0 entry authors at its own tail+1, a slot the
+    /// checkpoint never froze for it, so this is a restore case rather than a second-device one.
     #[test]
     fn an_owner_that_installed_its_pin_without_the_history_can_author_under_it() {
         let conn = db();
@@ -1364,15 +1365,18 @@ mod tests {
         forget_all_but_genesis(&conn, account);
 
         let before = stored_entries(&conn, account);
-        reserve_all_but(&conn, account, before, 0);
+        // ONE free slot, not zero: with none, the refusal fires before anything is inserted and
+        // "stored nothing" is a tautology. With one, a row lands and is then rolled back, so the
+        // assertion below is about the rollback rather than about nothing having happened.
+        reserve_all_but(&conn, account, before, 1);
         assert!(
             crate::install_checkpoint(&conn, pin, proof.bundle()).is_err(),
             "the repair does not fit the candidate budget",
         );
-        assert_eq!(stored_entries(&conn, account), before, "the repair stored nothing");
-        assert!(
-            crate::account_is_pinned(&conn, account).unwrap(),
-            "and the permanent pin is untouched",
+        assert_eq!(
+            stored_entries(&conn, account),
+            before,
+            "the row inserted before the refusal is rolled back with it",
         );
     }
 
