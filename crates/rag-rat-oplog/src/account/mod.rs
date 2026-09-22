@@ -80,7 +80,7 @@ pub use branch::{AncestryRelation, CitedFreshness, UnknownAncestry};
 pub use checkpoint::{
     CHECKPOINT_EVIDENCE_MAX_BYTES, CHECKPOINT_EVIDENCE_MAX_ENTRIES, CheckpointBundle,
     CheckpointError, TrustedCheckpointPin, VerifiedCheckpoint, prepare_checkpoint_in_tx,
-    verify_checkpoint,
+    propose_checkpoint, verify_checkpoint,
 };
 #[allow(unused_imports, reason = "C2 contract is frozen before transport wiring lands")]
 pub use content::{
@@ -123,8 +123,9 @@ pub(crate) use content::{content_projected_tables_exist, open_sealed_payload};
 pub(in crate::account) use content::{seal_and_sign_content_entry, sign_sealed_content_entry};
 pub use control_policy::{
     AccountControlPolicy, PinInstallOutcome, UnsupportedAccountControlVersion,
-    account_control_policy, account_is_pinned, export_account_checkpoint, pin_checkpoint_in_tx,
-    require_supported_account_control, stream_control_pinned,
+    account_control_policy, account_is_pinned, export_account_checkpoint, install_checkpoint,
+    pin_checkpoint_in_tx, pinned_accounts, require_supported_account_control,
+    stream_control_pinned,
 };
 pub use fold::{
     AuthorityBoundary, AuthorityFreshness, AuthorityInvalidReason, AuthorityQuery, EntryStatus,

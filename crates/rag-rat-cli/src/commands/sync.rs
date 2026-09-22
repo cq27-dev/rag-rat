@@ -15,7 +15,7 @@ use rag_rat_sync::{
 use rusqlite::{Connection, params};
 use zeroize::Zeroizing;
 
-use crate::cli::{AccountIdInput, KeepUntil, SyncArgs, SyncCommand};
+use crate::cli::{AccountIdInput, CheckpointCommand, KeepUntil, SyncArgs, SyncCommand};
 use crate::open_index;
 use crate::render::print_output;
 
@@ -48,6 +48,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
             contribute_with_ticket(config, account),
         SyncCommand::Pull { account, peer } => pull(config, *account, peer.as_deref()),
         SyncCommand::Enable => with_repo_db(config, enable),
+        SyncCommand::Checkpoint { command } => checkpoint(config, command),
         SyncCommand::Publish { seed } => with_repo_db(config, |db| publish(db, seed.as_deref())),
         SyncCommand::CatchUp { target } => with_repo_db(config, |db| catch_up(db, *target)),
         SyncCommand::Whoami => with_repo_db(config, whoami),
@@ -77,6 +78,91 @@ fn with_repo_db(
     let _lock = crate::repo_write_lock(config)?;
     let db = open_index(config)?;
     run(&db)
+}
+
+/// `sync checkpoint …`.
+///
+/// `inspect` is the one arm that runs without the repo: it decodes a file and touches no database,
+/// so taking the write lock or demanding an index exist would refuse a question that needs neither.
+fn checkpoint(config: &Config, command: &CheckpointCommand) -> anyhow::Result<()> {
+    match command {
+        CheckpointCommand::Inspect { path } => checkpoint_inspect(path),
+        CheckpointCommand::Propose { out } =>
+            with_repo_db(config, |db| checkpoint_propose(db, out)),
+        CheckpointCommand::Export { out } => with_repo_db(config, |db| checkpoint_export(db, out)),
+        CheckpointCommand::Status => with_repo_db(config, checkpoint_status),
+    }
+}
+
+fn checkpoint_propose(db: &IndexDatabase, out: &Path) -> anyhow::Result<()> {
+    let proposal = db.checkpoint_propose()?;
+    crate::write_atomic(out, &proposal.bundle)?;
+    print_output(&serde_json::json!({
+        "written": out.display().to_string(),
+        "digest": hash::hex_lower(&proposal.digest),
+        "evidence_entries": proposal.evidence_entries,
+        "evidence_bytes": proposal.evidence_bytes,
+        "installed": false,
+        "note": "relay this digest to every peer over a channel the bundle did not travel on; a \
+                 bundle is only trustworthy against a digest obtained separately",
+    }))
+}
+
+fn checkpoint_export(db: &IndexDatabase, out: &Path) -> anyhow::Result<()> {
+    let Some(proposal) = db.checkpoint_export()? else {
+        return print_output(&serde_json::json!({
+            "pinned": false,
+            "written": serde_json::Value::Null,
+            "note": "this account holds no control pin, so there is no bundle to export",
+        }));
+    };
+    crate::write_atomic(out, &proposal.bundle)?;
+    print_output(&serde_json::json!({
+        "pinned": true,
+        "written": out.display().to_string(),
+        "digest": hash::hex_lower(&proposal.digest),
+        "evidence_entries": proposal.evidence_entries,
+        "evidence_bytes": proposal.evidence_bytes,
+    }))
+}
+
+fn checkpoint_inspect(path: &Path) -> anyhow::Result<()> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading checkpoint bundle {}", path.display()))?;
+    let bundle = rag_rat_oplog::CheckpointBundle::decode(&bytes)?;
+    print_output(&serde_json::json!({
+        "path": path.display().to_string(),
+        "account": hash::hex_lower(&bundle.certificate_account()?.to_bytes()),
+        "digest": hash::hex_lower(&bundle.certificate_digest()),
+        "evidence_entries": bundle.evidence.len(),
+        "evidence_bytes": bundle.evidence.iter().map(Vec::len).sum::<usize>(),
+        "verified": false,
+        "note": "nothing here is checked against a pin; compare this digest with the one you \
+                 received out of band before trusting the bundle",
+    }))
+}
+
+fn checkpoint_status(db: &IndexDatabase) -> anyhow::Result<()> {
+    let status = db.checkpoint_status()?;
+    let policy = match status.local_policy {
+        None => "no_local_account",
+        Some(rag_rat_oplog::AccountControlPolicy::LegacyV1) => "legacy_v1",
+        Some(rag_rat_oplog::AccountControlPolicy::ControlV2(_)) => "control_v2",
+        Some(rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(_)) => "unsupported_version",
+    };
+    print_output(&serde_json::json!({
+        "local_account": status.local_account.map(|id| hash::hex_lower(&id.to_bytes())),
+        "local_policy": policy,
+        "pinned": status
+            .pinned
+            .iter()
+            .map(|pin| serde_json::json!({
+                "account": hash::hex_lower(&pin.account_id.to_bytes()),
+                "digest": hash::hex_lower(&pin.checkpoint_digest),
+                "required_control_version": pin.required_control_version,
+            }))
+            .collect::<Vec<_>>(),
+    }))
 }
 
 fn enable(db: &IndexDatabase) -> anyhow::Result<()> {

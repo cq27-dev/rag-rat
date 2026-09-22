@@ -46,6 +46,17 @@ impl CheckpointBundle {
         cbor::sha256(&self.certificate)
     }
 
+    /// The account this bundle certifies, read from the certificate itself.
+    ///
+    /// For DISPLAY before an irreversible install — an operator inspecting a bundle needs to see
+    /// which account it is for, and the answer must come from the bundle rather than from whatever
+    /// account the inspecting store happens to hold. Reading it here establishes no trust: the
+    /// certificate is not checked against a pin, so a caller deciding anything on this value alone
+    /// is trusting the file's own claim about itself.
+    pub fn certificate_account(&self) -> anyhow::Result<AccountId> {
+        Ok(decode_certificate(&self.certificate)?.account)
+    }
+
     /// The transport form: one canonical CBOR item a proposal is written to and an installing store
     /// reads back.
     ///
@@ -493,6 +504,22 @@ pub fn prepare_checkpoint_in_tx(
         .map(|entry| entry.signed_bytes)
         .collect::<Vec<_>>();
     prepare_checkpoint(account, &evidence, signer.secret())
+}
+
+/// Build a proposal, owning the read transaction [`prepare_checkpoint_in_tx`] requires.
+///
+/// Proposing approves nothing and installs nothing. The bundle it returns is inert until some
+/// operator relays its digest out of band and another store is told to expect exactly that value.
+pub fn propose_checkpoint(
+    conn: &rusqlite::Connection,
+    account: AccountId,
+    signer: &LocalDevice,
+) -> anyhow::Result<CheckpointBundle> {
+    // Deferred: this path only reads. The transaction exists to give the evidence scan and the
+    // certificate it signs one consistent snapshot, not to write anything, so it is dropped
+    // (rolled back) rather than committed.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)?;
+    prepare_checkpoint_in_tx(&tx, account, signer)
 }
 
 fn prepare_checkpoint(

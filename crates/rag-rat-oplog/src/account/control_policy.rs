@@ -252,6 +252,65 @@ pub fn export_account_checkpoint(
     Ok(Some((pin, bundle)))
 }
 
+/// Install `expected` from a transport bundle, owning the IMMEDIATE transaction
+/// [`pin_checkpoint_in_tx`] requires.
+///
+/// Verification runs against the EXTERNALLY supplied digest, inside that transaction: a bundle that
+/// is not the one an operator was told to expect installs nothing at all. The digest is never taken
+/// from the bundle, which is the whole point of the pin — see [`verify_checkpoint`].
+///
+/// Permanent and irreversible on success: the V130 triggers refuse UPDATE and DELETE on the pin row
+/// and its evidence, and every operational seam refuses for a pinned account thereafter.
+pub fn install_checkpoint(
+    conn: &Connection,
+    expected: TrustedCheckpointPin,
+    bundle: &CheckpointBundle,
+) -> anyhow::Result<PinInstallOutcome> {
+    let tx = Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let proof = checkpoint::verify_checkpoint(expected, bundle)?;
+    let outcome = pin_checkpoint_in_tx(&tx, expected, &proof)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// Every account this store holds a pin for, ordered by id — not only the local one.
+///
+/// A store folds other accounts' logs, so "am I pinned?" is the wrong question: the one that
+/// matters is which of the accounts this store carries have become unfoldable, and a local-only
+/// report answers it wrongly by omission.
+///
+/// Reports nothing on a pre-V130 database rather than failing, exactly as
+/// [`account_control_policy`] does — an older store has no pins, which is a different thing from an
+/// error.
+pub fn pinned_accounts(conn: &Connection) -> anyhow::Result<Vec<TrustedCheckpointPin>> {
+    let _snapshot = read_snapshot(conn)?;
+    let mut stmt = match conn.prepare(
+        "SELECT account_id, checkpoint_digest, required_version FROM account_control_pins ORDER \
+         BY account_id",
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) if missing_table(&error, "account_control_pins") => {
+            require_pre_pin_schema(conn)?;
+            return Ok(Vec::new());
+        },
+        Err(error) => return Err(error.into()),
+    };
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, u32>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(account, digest, required_control_version)| {
+            Ok(TrustedCheckpointPin {
+                account_id: AccountId::from_bytes(id::fixed(&account)?),
+                checkpoint_digest: id::fixed(&digest)?,
+                required_control_version,
+            })
+        })
+        .collect()
+}
+
 /// The durable certificate and evidence rows behind `account`'s pin, exactly as installed.
 /// Deliberately unverified: both callers verify, and the caching one keys on the digest the
 /// certificate hashes to.
@@ -392,6 +451,136 @@ mod tests {
             &bundle,
         )
         .unwrap()
+    }
+
+    /// The wrapper's transaction is the unit of installation: a bundle that is not the one the
+    /// operator was told to expect leaves the store completely unpinned.
+    ///
+    /// The `_in_tx` tests cannot reach this. They own the transaction, so what a failure inside one
+    /// leaves behind is their caller's business — and the conn-level wrapper IS that caller.
+    #[test]
+    fn a_bundle_that_does_not_match_the_relayed_digest_installs_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 0).unwrap();
+        let proof = proof(&conn, account);
+        let wrong = TrustedCheckpointPin { checkpoint_digest: [0x5a; 32], ..proof.pin() };
+        assert!(
+            install_checkpoint(&conn, wrong, proof.bundle()).is_err(),
+            "the digest names a checkpoint this bundle is not",
+        );
+        assert_eq!(
+            account_control_policy(&conn, account).unwrap(),
+            AccountControlPolicy::LegacyV1,
+            "a refused install leaves no pin behind",
+        );
+        assert!(pinned_accounts(&conn).unwrap().is_empty());
+    }
+
+    /// Installing through the conn-level wrapper COMMITS, so a second call meets an already
+    /// committed pin in a fresh transaction — a different path from two calls inside one
+    /// transaction, which is all the `_in_tx` test can exercise.
+    #[test]
+    fn installing_twice_across_committed_transactions_reports_the_second_as_already_pinned() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 0).unwrap();
+        let proof = proof(&conn, account);
+        let pin = proof.pin();
+        assert_eq!(
+            install_checkpoint(&conn, pin, proof.bundle()).unwrap(),
+            PinInstallOutcome::Installed
+        );
+        assert_eq!(
+            install_checkpoint(&conn, pin, proof.bundle()).unwrap(),
+            PinInstallOutcome::AlreadyPinned
+        );
+        assert_eq!(
+            account_control_policy(&conn, account).unwrap(),
+            AccountControlPolicy::ControlV2(pin)
+        );
+    }
+
+    /// The enumeration answers "which accounts this store carries have become unfoldable", so an
+    /// unpinned store reports NOTHING rather than failing — no pins is an answer, not an error.
+    #[test]
+    fn pinned_accounts_reports_every_pin_and_an_unpinned_store_is_empty_not_an_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 0).unwrap();
+        assert!(pinned_accounts(&conn).unwrap().is_empty(), "no pins is not an error");
+        let proof = proof(&conn, account);
+        install_checkpoint(&conn, proof.pin(), proof.bundle()).unwrap();
+        assert_eq!(pinned_accounts(&conn).unwrap(), vec![proof.pin()]);
+    }
+
+    /// A bundle proposed on one store installs on ANOTHER, across the transport encoding — the
+    /// path "propose here, install there" actually takes.
+    ///
+    /// The installing store holds none of the proposing account's history. It does not need any:
+    /// the bundle carries its own evidence, and the pin is verified against the digest an operator
+    /// relayed rather than against anything already local.
+    #[test]
+    fn a_bundle_proposed_on_one_store_installs_on_another_through_its_transport_bytes() {
+        let proposer = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&proposer, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&proposer, 0).unwrap();
+        let device = crate::local_device(&proposer, 0).unwrap();
+        let bundle = checkpoint::propose_checkpoint(&proposer, account, &device).unwrap();
+        let digest = bundle.certificate_digest();
+        let wire = bundle.encode().unwrap();
+
+        let installer = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&installer, &crate::test_hooks()).unwrap();
+        let local = crate::local_account(&installer, 0).unwrap();
+        assert_ne!(local, account, "the installing store is a different account");
+        assert!(pinned_accounts(&installer).unwrap().is_empty());
+
+        let decoded = CheckpointBundle::decode(&wire).unwrap();
+        assert_eq!(decoded, bundle, "the transport bytes carry the bundle unchanged");
+        assert_eq!(
+            decoded.certificate_account().unwrap(),
+            account,
+            "the bundle names the account it was PROPOSED for, not the store reading it",
+        );
+        let pin = TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: digest,
+            required_control_version: 2,
+        };
+        assert_eq!(
+            install_checkpoint(&installer, pin, &decoded).unwrap(),
+            PinInstallOutcome::Installed
+        );
+        assert_eq!(
+            account_control_policy(&installer, account).unwrap(),
+            AccountControlPolicy::ControlV2(pin),
+        );
+        assert_eq!(pinned_accounts(&installer).unwrap(), vec![pin]);
+        assert_eq!(
+            account_control_policy(&installer, local).unwrap(),
+            AccountControlPolicy::LegacyV1,
+            "pinning a foreign account leaves this store's own account alone",
+        );
+    }
+
+    /// Proposing is refused once the account is pinned — a second proposal is meaningless, and the
+    /// gate that says so is inside `prepare_checkpoint_in_tx`, reached here through the wrapper.
+    #[test]
+    fn proposing_is_refused_once_the_account_is_pinned() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
+        checkpoint::propose_checkpoint(&conn, account, &device)
+            .expect("an unpinned account proposes");
+        let proof = proof(&conn, account);
+        install_checkpoint(&conn, proof.pin(), proof.bundle()).unwrap();
+        let error = checkpoint::propose_checkpoint(&conn, account, &device).unwrap_err();
+        assert!(
+            error.downcast_ref::<UnsupportedAccountControlVersion>().is_some(),
+            "the refusal is the control-version gate, not an incidental failure",
+        );
     }
 
     #[test]
@@ -586,6 +775,12 @@ mod tests {
         rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
         conn.execute_batch("DROP TABLE account_control_pins").unwrap();
         assert!(account_control_policy(&conn, AccountId::from_bytes([1; 32])).is_err());
+        // `pinned_accounts` carries its OWN copy of this arm, so asserting it here is what makes
+        // that copy provable — the policy read passing says nothing about the enumeration.
+        assert!(
+            pinned_accounts(&conn).is_err(),
+            "a current schema missing the table is corruption"
+        );
         // Every row at or beyond V130, not just V130's own. `require_pre_pin_schema` asks whether
         // the ladder reached the pin schema AT ALL, so a later migration's row answers yes on its
         // own — and a ledger carrying one of those while missing V130's is a state the ordered
@@ -598,6 +793,10 @@ mod tests {
         assert_eq!(
             account_control_policy(&conn, AccountId::from_bytes([1; 32])).unwrap(),
             AccountControlPolicy::LegacyV1
+        );
+        assert!(
+            pinned_accounts(&conn).unwrap().is_empty(),
+            "a pre-pin store holds no pins, which is an answer rather than a failure",
         );
     }
 

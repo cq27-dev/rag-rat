@@ -62,7 +62,7 @@ pub use lens::{
     LensStatus, LensSymbol, LensSymbolHop, LensTreemap, LensTreemapFile, LensVersion,
 };
 pub use search::SearchRequest;
-pub use sync::{PublishSeedReport, SyncCatchUpReport};
+pub use sync::{CheckpointProposal, CheckpointStatus, PublishSeedReport, SyncCatchUpReport};
 
 /// Volume cap on the memories `read_chunk` attaches as drive-by context. The binding is
 /// structural, so every hit is relevant; the cap is purely about how much of a reader's attention
