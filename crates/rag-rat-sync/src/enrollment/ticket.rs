@@ -18,12 +18,12 @@ use super::wire::{decode, ensure_consumed, fixed32};
 // content-addressed by nothing, is TTL'd and single-use, so no ticket outlives a release. And for a
 // SECURITY field silent compatibility is the wrong default — an old binary that ignored the digest
 // would enrol into a pinned account without installing its pin. Legible rejection is correct.
-const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/3";
+pub(super) const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/3";
 /// Shared by every revision of the domain, so a ticket from another release is told apart from
 /// arbitrary bytes that merely decoded as a string in that position.
-const TICKET_DOMAIN_STEM: &str = "rag-rat/invite-ticket/";
+pub(super) const TICKET_DOMAIN_STEM: &str = "rag-rat/invite-ticket/";
 /// This binary's revision of the ticket format.
-const TICKET_VERSION: u32 = 3;
+pub(super) const TICKET_VERSION: u32 = 3;
 
 /// Which way the version skews, so the operator is told the action that can actually work.
 ///
@@ -36,11 +36,17 @@ fn version_skew(domain: &str) -> InviteError {
     else {
         return InviteError::Malformed("ticket domain mismatch".into());
     };
-    InviteError::TicketVersionSkew(if revision < TICKET_VERSION {
-        "this ticket was minted by an older rag-rat — ask the owner to re-mint it"
-    } else {
-        "this ticket was minted by a newer rag-rat — upgrade rag-rat on this machine"
-    })
+    match revision.cmp(&TICKET_VERSION) {
+        std::cmp::Ordering::Less => InviteError::TicketVersionSkew(
+            "this ticket was minted by an older rag-rat — ask the owner to re-mint it",
+        ),
+        std::cmp::Ordering::Greater => InviteError::TicketVersionSkew(
+            "this ticket was minted by a newer rag-rat — upgrade rag-rat on this machine",
+        ),
+        // `03`, `+3`: this revision, spelled in a way nothing mints. Corrupt, not skewed — and
+        // blaming a release the operator cannot change sends them nowhere.
+        std::cmp::Ordering::Equal => InviteError::Malformed("ticket domain mismatch".into()),
+    }
 }
 
 const MAX_RELAY_URL_BYTES: usize = 2048;
@@ -182,6 +188,10 @@ impl InviteTicket {
             Err(iroh_tickets::ParseError::Kind { .. }) => Err(InviteError::Malformed(format!(
                 "an invite ticket starts with `{TICKET_KIND_PREFIX}`"
             ))),
+            // Unwrap the verification message rather than nesting it: the actionable sentence was
+            // arriving four prefixes deep by the time the CLI printed it.
+            Err(iroh_tickets::ParseError::Verify { message, .. }) =>
+                Err(InviteError::Malformed(message.to_string())),
             Err(error) => Err(InviteError::Malformed(format!("invalid invite ticket: {error}"))),
         }
     }

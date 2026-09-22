@@ -169,11 +169,10 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         // and a joiner would enrol without installing its pin — the exact failure the domain bump
         // exists to prevent, only silent. Unreachable today, since both pinned states are refused
         // above; it is here so opening that gate has to decide this rather than inherit it.
-        rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(_) =>
-            return Err(InviteError::Storage(anyhow::anyhow!(
-                "cannot mint an invite for an account pinned at a control version this binary \
-                 cannot execute"
-            ))),
+        rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(pin) =>
+            return Err(InviteError::Storage(
+                rag_rat_oplog::UnsupportedAccountControlVersion { pin }.into(),
+            )),
     };
     tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     Ok(InviteTicket {

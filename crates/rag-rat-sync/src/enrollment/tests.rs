@@ -180,52 +180,58 @@ fn ticket_bytes(
 /// this green — the assertions pin the OUTCOME, not any one guard.
 #[test]
 fn the_optional_digest_admits_no_other_spelling() {
-    for (name, bytes) in [
+    let v3 = "rag-rat/invite-ticket/3";
+    // Each case names the reason it must be refused FOR. The three classes are genuinely distinct —
+    // a wrong datatype never reaches the length check — so one blanket substring would be asserting
+    // something the decoder does not do, and an `||` chain over all three is barely stronger than
+    // `is_err()`.
+    for (name, expected, bytes) in [
         (
             "undefined",
-            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+            "expected bytes",
+            ticket_bytes(v3, 8, |e| {
                 e.undefined().unwrap();
             }),
         ),
         (
             "a bool",
-            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+            "expected bytes",
+            ticket_bytes(v3, 8, |e| {
                 e.bool(false).unwrap();
             }),
         ),
         (
             "an integer",
-            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+            "expected bytes",
+            ticket_bytes(v3, 8, |e| {
                 e.u8(0).unwrap();
             }),
         ),
         (
             "a text string",
-            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+            "expected bytes",
+            ticket_bytes(v3, 8, |e| {
                 e.str("no").unwrap();
             }),
         ),
         (
             "a short digest",
-            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+            "digest",
+            ticket_bytes(v3, 8, |e| {
                 e.bytes(&[0; 31]).unwrap();
             }),
         ),
         (
             "a long digest",
-            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+            "digest",
+            ticket_bytes(v3, 8, |e| {
                 e.bytes(&[0; 33]).unwrap();
             }),
         ),
-        ("the field omitted", ticket_bytes("rag-rat/invite-ticket/3", 7, |_| {})),
+        ("the field omitted", "arity", ticket_bytes(v3, 7, |_| {})),
     ] {
-        // Assert the digest is what refused it, not merely that something did: every shape here
-        // would also be caught by the canonical re-encode, so `is_err()` alone cannot tell which.
         let err = InviteTicket::decode(&bytes).unwrap_err().to_string();
-        assert!(
-            err.contains("digest") || err.contains("bytes") || err.contains("arity"),
-            "{name} must be refused with a reason naming the field: {err}",
-        );
+        assert!(err.contains(expected), "{name} must be refused naming `{expected}`: {err}");
     }
     assert_eq!(
         InviteTicket::decode(&ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
@@ -234,6 +240,17 @@ fn the_optional_digest_admits_no_other_spelling() {
         .unwrap(),
         sample_ticket(),
         "`null` is the one spelling of `None` that survives",
+    );
+}
+
+/// The domain and the version constant are one fact spelled twice. A bump that edits the domain
+/// and forgets the version inverts the message for the MOST common skew at any bump — the previous
+/// release's ticket — telling that operator to upgrade a machine that is already current.
+#[test]
+fn the_ticket_domain_and_version_constant_agree() {
+    assert_eq!(
+        super::ticket::TICKET_DOMAIN,
+        format!("{}{}", super::ticket::TICKET_DOMAIN_STEM, super::ticket::TICKET_VERSION),
     );
 }
 
@@ -266,6 +283,16 @@ fn version_skew_names_the_action_that_can_work() {
     });
     let err = InviteTicket::decode(&junk).unwrap_err().to_string();
     assert!(!err.contains("rag-rat —"), "arbitrary bytes are not a version skew: {err}");
+
+    // `03` parses as this very revision. Corrupt, not skewed: sending the operator to upgrade or
+    // to ask for a re-mint would both be wrong, since neither release is at fault.
+    for spelling in ["rag-rat/invite-ticket/03", "rag-rat/invite-ticket/+3"] {
+        let bytes = ticket_bytes(spelling, 8, |e| {
+            e.null().unwrap();
+        });
+        let err = InviteTicket::decode(&bytes).unwrap_err().to_string();
+        assert!(!err.contains("rag-rat —"), "{spelling} is not a skew: {err}");
+    }
 }
 
 /// The `/3` bytes are frozen in BOTH directions: a ticket minted by one release must decode in the
