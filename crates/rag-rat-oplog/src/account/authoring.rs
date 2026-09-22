@@ -1293,6 +1293,59 @@ mod tests {
         remove_and_assert_revoked(&conn, account, subject);
     }
 
+    /// A capacity refusal part-way through storing the evidence leaves NOTHING behind through the
+    /// production seam: no pin, and not the prefix of evidence already inserted.
+    ///
+    /// Evidence is stored one candidate at a time, so the refusal lands with some rows already in
+    /// the transaction. `account_entries` has no delete path, so a caller that committed past the
+    /// error would keep that partial history for an account that never pinned. The reservation
+    /// below leaves exactly one slot, so at least one insert succeeds before the refusal.
+    #[test]
+    fn a_capacity_refused_install_leaves_neither_a_pin_nor_partial_evidence() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        enrol(&conn, 0x74);
+        let (pin, proof) = proposed_pin(&conn, account);
+        assert!(proof.bundle().evidence.len() >= 3, "room for one insert, then a refusal");
+        forget_all_but_genesis(&conn, account);
+        let before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM account_entries WHERE account_id = ?1",
+                [account.to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let slots_left = 1;
+        conn.execute(
+            "INSERT INTO account_candidate_reservations
+                 (reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            rusqlite::params![
+                [0xee_u8; 32].as_slice(),
+                account.to_bytes().as_slice(),
+                crate::account::storage::ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as i64
+                    - before
+                    - slots_left,
+                i64::MAX / 2,
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            crate::install_checkpoint(&conn, pin, proof.bundle()).is_err(),
+            "the evidence does not fit",
+        );
+        let after: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM account_entries WHERE account_id = ?1",
+                [account.to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, before, "no prefix of the evidence survives the refusal");
+        assert!(!crate::account_is_pinned(&conn, account).unwrap(), "and nothing was pinned");
+    }
+
     /// A pinned removal names its manifest by the digest of the manifest's PAYLOAD, and that
     /// manifest is a stored row.
     ///

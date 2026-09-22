@@ -184,6 +184,11 @@ pub fn require_foldable_account_control(
 
 /// Persist independent trust and complete proof atomically. Caller owns the IMMEDIATE transaction.
 /// No peer advertisement, sync receipt, or ordinary account ingestion calls this API.
+///
+/// **The caller MUST roll back on `Err`.** Evidence is stored one candidate at a time, so an error
+/// part-way through leaves a prefix of it in the caller's transaction, and `account_entries` has no
+/// delete path: committing past the error would keep that partial history for an account that was
+/// never pinned. This is the uniform rule of the `_in_tx` seams rather than a local savepoint.
 pub fn pin_checkpoint_in_tx(
     tx: &Transaction<'_>,
     expected: TrustedCheckpointPin,
@@ -198,12 +203,13 @@ pub fn pin_checkpoint_in_tx(
         None => false,
     };
     let bundle = proof.bundle();
-    // BEFORE any permanent row: a capacity refusal must leave nothing behind for a caller that
-    // commits after handling the error, and the pin rows below can never be removed.
+    // Before any pin row: those rows can never be removed, so every refusal this can raise lands
+    // while nothing irreversible has been written yet.
     let stored = store_own_account_evidence_in_tx(tx, expected.account_id, bundle)?;
     if already_pinned {
         // Re-installing the same pin is the repair path for a store whose evidence is missing —
         // one pinned before this storage existed. Only a store that actually gained rows refolds.
+        // The repair can itself be refused for capacity; the pin is untouched either way.
         if stored > 0 {
             super::storage::refold_after_pin_install_in_tx(tx, expected.account_id)?;
         }
@@ -797,7 +803,8 @@ mod tests {
         assert_eq!(
             roster_rows(&installer, account),
             before_roster,
-            "the checkpoint's own evidence arriving as candidates is inert, not disruptive",
+            "the checkpoint's own evidence arriving as candidates does not contest the frozen \
+             projection",
         );
         assert_eq!(
             account_control_policy(&installer, account).unwrap(),
