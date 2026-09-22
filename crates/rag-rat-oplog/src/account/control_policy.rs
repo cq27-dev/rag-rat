@@ -185,10 +185,12 @@ pub fn require_foldable_account_control(
 /// Persist independent trust and complete proof atomically. Caller owns the IMMEDIATE transaction.
 /// No peer advertisement, sync receipt, or ordinary account ingestion calls this API.
 ///
-/// **The caller MUST roll back on `Err`.** Evidence is stored one candidate at a time, so an error
-/// part-way through leaves a prefix of it in the caller's transaction, and `account_entries` has no
-/// delete path: committing past the error would keep that partial history for an account that was
-/// never pinned. This is the uniform rule of the `_in_tx` seams rather than a local savepoint.
+/// **The caller MUST roll back on `Err`.** An error before the pin row leaves a prefix of the
+/// evidence in `account_entries`, which has no delete path. An error AFTER it — the evidence-row
+/// loop, or the refold — is why this is a MUST rather than a SHOULD: committing then leaves a pin
+/// row the V130 triggers refuse to UPDATE or DELETE, with incomplete evidence, so
+/// `verified_checkpoint` fails on every later fold and the account is permanently unfoldable. This
+/// is the uniform rule of the `_in_tx` seams rather than a local savepoint.
 pub fn pin_checkpoint_in_tx(
     tx: &Transaction<'_>,
     expected: TrustedCheckpointPin,
@@ -203,8 +205,8 @@ pub fn pin_checkpoint_in_tx(
         None => false,
     };
     let bundle = proof.bundle();
-    // Before any pin row: those rows can never be removed, so every refusal this can raise lands
-    // while nothing irreversible has been written yet.
+    // Before any pin row: those rows can never be removed, so a refusal here leaves no PIN behind.
+    // It can still leave a prefix of the evidence, which is why the caller must roll back.
     let stored = store_own_account_evidence_in_tx(tx, expected.account_id, bundle)?;
     if already_pinned {
         // Re-installing the same pin is the repair path for a store whose evidence is missing —
@@ -261,12 +263,14 @@ pub fn pin_checkpoint_in_tx(
 /// Store the checkpoint's evidence as ordinary candidates when `account` is this store's OWN
 /// account, returning how many rows were new.
 ///
-/// Load-bearing, not bookkeeping. The pinned fold selects chains from STORED rows, rooted at seq 0,
-/// and a v2 operation continues from the checkpoint's tip. On a store that INSTALLED a pin it never
-/// proposed — a second owner device — that tip exists only in `account_control_pin_evidence`, so
-/// every v2 continuation has no stored root: it forks, drops out of the applied set, and a v2
-/// revocation never takes effect. The empty accepted tail also refuses v2 authoring on that device.
-/// Storing the evidence gives those chains their roots.
+/// Load-bearing, not bookkeeping, and it does NOT fail closed. The pinned fold selects chains from
+/// STORED rows rooted at seq 0, so a store holding the pin without its evidence has a stored tail
+/// far below the checkpoint's tip. Authoring is not refused — the accepted tail equals the raw
+/// tail, so the guard passes — and the op is signed at a seq the checkpoint already froze. It lands
+/// in `contests_frozen_slot`, contributes nothing, and the revocation is silently discarded: the
+/// removed device keeps its roster seat. Storing the evidence restores the tip those ops continue
+/// from. `an_owner_that_installed_its_pin_without_the_history_can_author_under_it` fails exactly
+/// there when this is stubbed out.
 ///
 /// A FOREIGN pinned account stores nothing. The session layer already refuses a relayed pinned
 /// foreign account's entries — "the evidence is not wanted either — a fold of a pinned account only
@@ -855,11 +859,24 @@ mod tests {
         tx.commit().unwrap();
         // Each refusal in its own transaction, DROPPED rather than committed: the caller must roll
         // back on `Err`, and a test that committed past one would model exactly the misuse.
-        let other = TrustedCheckpointPin { checkpoint_digest: [3; 32], ..expected };
-        for (pin, proof) in [(first.pin(), &first), (other, &proof)] {
+        {
             let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
-            assert!(pin_checkpoint_in_tx(&tx, pin, proof).is_err(), "a conflicting pin refuses");
+            assert!(
+                pin_checkpoint_in_tx(&tx, first.pin(), &first).is_err(),
+                "a second, different digest for this account is a conflicting pin",
+            );
+        }
+        // A DIFFERENT guard, and the only one this pair can reach: a `VerifiedCheckpoint` whose
+        // `pin()` is `other` is unconstructible, so this never gets as far as the conflict check.
+        {
+            let other = TrustedCheckpointPin { checkpoint_digest: [3; 32], ..expected };
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                pin_checkpoint_in_tx(&tx, other, &proof).is_err(),
+                "the proof does not vouch for the pin it is offered against",
+            );
         }
         assert!(conn.execute("DELETE FROM account_control_pins", []).is_err());
         assert!(conn.execute("DELETE FROM account_control_pin_evidence", []).is_err());

@@ -1201,10 +1201,10 @@ mod tests {
         crate::account::checkpoint::VerifiedCheckpoint,
     ) {
         let device = crate::local_device(conn, NOW).unwrap();
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        // The public seam: a DEFERRED read, dropped. Re-rolling it here took a write lock and
+        // committed an empty transaction for nothing.
         let bundle =
-            crate::account::checkpoint::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
-        tx.commit().unwrap();
+            crate::account::checkpoint::propose_checkpoint(conn, account, &device).unwrap();
         let pin = crate::account::checkpoint::TrustedCheckpointPin {
             account_id: account,
             checkpoint_digest: bundle.certificate_digest(),
@@ -1257,14 +1257,16 @@ mod tests {
         assert!(closed.is_some(), "the revocation takes effect: the device leaves the roster");
     }
 
-    /// An owner device that INSTALLED its account's pin — never proposed it, never synced the
-    /// history — can still revoke under it.
+    /// An owner holding its account's pin without the matching history can still revoke under it.
     ///
-    /// The pinned fold selects chains from STORED rows rooted at seq 0, and a v2 operation
-    /// continues from the checkpoint's tip. Unless install stores the evidence, that tip lives
-    /// only in `account_control_pin_evidence`, the accepted control tail is empty, and v2
-    /// authoring refuses; a v2 revocation arriving from elsewhere would fork for want of a
-    /// root.
+    /// It does NOT fail closed, which is the point. Without the stored evidence the stored tail
+    /// sits far below the checkpoint's tip; the accepted tail equals the raw tail, so the pin
+    /// guard PASSES and the removal is authored — at a seq the checkpoint already froze. It is
+    /// then discarded as contesting a frozen slot and the device keeps its roster seat. Stub the
+    /// storage out and what fires is `author_device_remove_in_tx`'s post-check, never a refusal.
+    ///
+    /// The fixture's local device is the founder, so this is "an owner lost its history" rather
+    /// than a literal second device; the stored-tail shortfall is the same one either way.
     #[test]
     fn an_owner_that_installed_its_pin_without_the_history_can_author_under_it() {
         let conn = db();
@@ -1308,14 +1310,32 @@ mod tests {
         let (pin, proof) = proposed_pin(&conn, account);
         assert!(proof.bundle().evidence.len() >= 3, "room for one insert, then a refusal");
         forget_all_but_genesis(&conn, account);
-        let before: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM account_entries WHERE account_id = ?1",
-                [account.to_bytes().as_slice()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        let slots_left = 1;
+        let before = stored_entries(&conn, account);
+        reserve_all_but(&conn, account, before, 1);
+
+        assert!(
+            crate::install_checkpoint(&conn, pin, proof.bundle()).is_err(),
+            "the evidence does not fit",
+        );
+        assert_eq!(
+            stored_entries(&conn, account),
+            before,
+            "no prefix of the evidence survives the refusal",
+        );
+        assert!(!crate::account_is_pinned(&conn, account).unwrap(), "and nothing was pinned");
+    }
+
+    fn stored_entries(conn: &Connection, account: AccountId) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM account_entries WHERE account_id = ?1",
+            [account.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Reserve the account's ordinary candidate budget down to `slots_left` free entries.
+    fn reserve_all_but(conn: &Connection, account: AccountId, held: i64, slots_left: i64) {
         conn.execute(
             "INSERT INTO account_candidate_reservations
                  (reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms)
@@ -1324,26 +1344,36 @@ mod tests {
                 [0xee_u8; 32].as_slice(),
                 account.to_bytes().as_slice(),
                 crate::account::storage::ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as i64
-                    - before
+                    - held
                     - slots_left,
                 i64::MAX / 2,
             ],
         )
         .unwrap();
+    }
 
+    /// The repair path can itself be refused for capacity, and then leaves the pin untouched —
+    /// the case where "untouched either way" is load-bearing, since the pin is already permanent.
+    #[test]
+    fn a_capacity_refused_repair_leaves_the_pin_and_stores_nothing() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        enrol(&conn, 0x75);
+        let (pin, proof) = proposed_pin(&conn, account);
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::Installed);
+        forget_all_but_genesis(&conn, account);
+
+        let before = stored_entries(&conn, account);
+        reserve_all_but(&conn, account, before, 0);
         assert!(
             crate::install_checkpoint(&conn, pin, proof.bundle()).is_err(),
-            "the evidence does not fit",
+            "the repair does not fit the candidate budget",
         );
-        let after: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM account_entries WHERE account_id = ?1",
-                [account.to_bytes().as_slice()],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(after, before, "no prefix of the evidence survives the refusal");
-        assert!(!crate::account_is_pinned(&conn, account).unwrap(), "and nothing was pinned");
+        assert_eq!(stored_entries(&conn, account), before, "the repair stored nothing");
+        assert!(
+            crate::account_is_pinned(&conn, account).unwrap(),
+            "and the permanent pin is untouched",
+        );
     }
 
     /// A pinned removal names its manifest by the digest of the manifest's PAYLOAD, and that
