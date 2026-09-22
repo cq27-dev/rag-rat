@@ -1192,6 +1192,194 @@ mod tests {
             .collect()
     }
 
+    /// A verifiable pin over the account's own evidence, proposed but NOT installed.
+    fn proposed_pin(
+        conn: &Connection,
+        account: AccountId,
+    ) -> (
+        crate::account::checkpoint::TrustedCheckpointPin,
+        crate::account::checkpoint::VerifiedCheckpoint,
+    ) {
+        let device = crate::local_device(conn, NOW).unwrap();
+        // The public seam: a DEFERRED read, dropped. Re-rolling it here took a write lock and
+        // committed an empty transaction for nothing.
+        let bundle =
+            crate::account::checkpoint::propose_checkpoint(conn, account, &device).unwrap();
+        let pin = crate::account::checkpoint::TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: bundle.certificate_digest(),
+            required_control_version: 2,
+        };
+        (pin, crate::account::checkpoint::verify_checkpoint(pin, &bundle).unwrap())
+    }
+
+    fn install_pin(
+        conn: &Connection,
+        pin: crate::account::checkpoint::TrustedCheckpointPin,
+        proof: &crate::account::checkpoint::VerifiedCheckpoint,
+    ) -> crate::PinInstallOutcome {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let outcome = crate::pin_checkpoint_in_tx(&tx, pin, proof).unwrap();
+        tx.commit().unwrap();
+        outcome
+    }
+
+    /// Leave only the genesis: a store restored without its own control history, still holding the
+    /// pin. The genesis stays because `read_local_account` resolves the pointer through it —
+    /// without it the store would forget which account is its own.
+    fn forget_all_but_genesis(conn: &Connection, account: AccountId) {
+        let genesis = crate::read_local_account_genesis(conn).unwrap().unwrap();
+        conn.execute(
+            "DELETE FROM account_entries WHERE account_id = ?1 AND entry_hash != ?2",
+            rusqlite::params![account.to_bytes().as_slice(), genesis.as_slice()],
+        )
+        .unwrap();
+    }
+
+    /// Author a v2 removal of `subject` and assert it actually took effect.
+    fn remove_and_assert_revoked(
+        conn: &Connection,
+        account: AccountId,
+        subject: DeviceFingerprint,
+    ) {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW)
+            .expect("an owner holding the pin authors a v2 removal under it");
+        tx.commit().unwrap();
+        let closed: Option<i64> = conn
+            .query_row(
+                "SELECT closed_at FROM account_roster_history
+                  WHERE account_id = ?1 AND device_fingerprint = ?2",
+                rusqlite::params![account.to_bytes().as_slice(), subject.to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(closed.is_some(), "the revocation takes effect: the device leaves the roster");
+    }
+
+    /// An owner restored without its own control history can still revoke under its pin.
+    ///
+    /// It does NOT fail closed, which is the point. The accepted tail equals the raw tail, so the
+    /// pin guard PASSES and the removal is authored — at a seq the checkpoint already froze for
+    /// THIS device. It is then discarded as contesting a frozen slot and the device keeps its
+    /// roster seat. Stub the storage out and what fires is `author_device_remove_in_tx`'s
+    /// post-check, never a refusal.
+    ///
+    /// The fixture's local device is the founder, whose chain the deletion truncates — which is the
+    /// hazard exactly. A device holding its OWN seq-0 entry authors at its own tail+1, a slot the
+    /// checkpoint never froze for it, so this is a restore case rather than a second-device one.
+    #[test]
+    fn an_owner_that_installed_its_pin_without_the_history_can_author_under_it() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x72);
+        let (pin, proof) = proposed_pin(&conn, account);
+        forget_all_but_genesis(&conn, account);
+
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::Installed);
+        remove_and_assert_revoked(&conn, account, subject);
+    }
+
+    /// Re-installing the SAME pin repairs a store that holds the pin but lacks its evidence — the
+    /// state of any store pinned before install began storing it. `AlreadyPinned` must not short
+    /// out before the evidence is stored.
+    #[test]
+    fn reinstalling_a_pin_restores_the_evidence_it_was_installed_without() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x73);
+        let (pin, proof) = proposed_pin(&conn, account);
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::Installed);
+        forget_all_but_genesis(&conn, account);
+
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::AlreadyPinned);
+        remove_and_assert_revoked(&conn, account, subject);
+    }
+
+    /// A capacity refusal part-way through storing the evidence leaves NOTHING behind through the
+    /// production seam: no pin, and not the prefix of evidence already inserted.
+    ///
+    /// Evidence is stored one candidate at a time, so the refusal lands with some rows already in
+    /// the transaction. `account_entries` has no delete path, so a caller that committed past the
+    /// error would keep that partial history for an account that never pinned. The reservation
+    /// below leaves exactly one slot, so at least one insert succeeds before the refusal.
+    #[test]
+    fn a_capacity_refused_install_leaves_neither_a_pin_nor_partial_evidence() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        enrol(&conn, 0x74);
+        let (pin, proof) = proposed_pin(&conn, account);
+        assert!(proof.bundle().evidence.len() >= 3, "room for one insert, then a refusal");
+        forget_all_but_genesis(&conn, account);
+        let before = stored_entries(&conn, account);
+        reserve_all_but(&conn, account, before, 1);
+
+        assert!(
+            crate::install_checkpoint(&conn, pin, proof.bundle()).is_err(),
+            "the evidence does not fit",
+        );
+        assert_eq!(
+            stored_entries(&conn, account),
+            before,
+            "no prefix of the evidence survives the refusal",
+        );
+        assert!(!crate::account_is_pinned(&conn, account).unwrap(), "and nothing was pinned");
+    }
+
+    fn stored_entries(conn: &Connection, account: AccountId) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM account_entries WHERE account_id = ?1",
+            [account.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Reserve the account's ordinary candidate budget down to `slots_left` free entries.
+    fn reserve_all_but(conn: &Connection, account: AccountId, held: i64, slots_left: i64) {
+        conn.execute(
+            "INSERT INTO account_candidate_reservations
+                 (reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            rusqlite::params![
+                [0xee_u8; 32].as_slice(),
+                account.to_bytes().as_slice(),
+                crate::account::storage::ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as i64
+                    - held
+                    - slots_left,
+                i64::MAX / 2,
+            ],
+        )
+        .unwrap();
+    }
+
+    /// The repair path can itself be refused for capacity, and then leaves the pin untouched —
+    /// the case where "untouched either way" is load-bearing, since the pin is already permanent.
+    #[test]
+    fn a_capacity_refused_repair_leaves_the_pin_and_stores_nothing() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        enrol(&conn, 0x75);
+        let (pin, proof) = proposed_pin(&conn, account);
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::Installed);
+        forget_all_but_genesis(&conn, account);
+
+        let before = stored_entries(&conn, account);
+        // ONE free slot, not zero: with none, the refusal fires before anything is inserted and
+        // "stored nothing" is a tautology. With one, a row lands and is then rolled back, so the
+        // assertion below is about the rollback rather than about nothing having happened.
+        reserve_all_but(&conn, account, before, 1);
+        assert!(
+            crate::install_checkpoint(&conn, pin, proof.bundle()).is_err(),
+            "the repair does not fit the candidate budget",
+        );
+        assert_eq!(
+            stored_entries(&conn, account),
+            before,
+            "the row inserted before the refusal is rolled back with it",
+        );
+    }
+
     /// A pinned removal names its manifest by the digest of the manifest's PAYLOAD, and that
     /// manifest is a stored row.
     ///

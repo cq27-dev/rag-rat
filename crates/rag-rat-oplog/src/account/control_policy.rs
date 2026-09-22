@@ -184,17 +184,41 @@ pub fn require_foldable_account_control(
 
 /// Persist independent trust and complete proof atomically. Caller owns the IMMEDIATE transaction.
 /// No peer advertisement, sync receipt, or ordinary account ingestion calls this API.
+///
+/// **The caller MUST roll back on `Err`.** An error before the pin row leaves a prefix of the
+/// evidence in `account_entries`, which has no delete path. An error inside the EVIDENCE-ROW loop
+/// is why this is a MUST rather than a SHOULD: committing then leaves a pin row the V130 triggers
+/// refuse to UPDATE or DELETE with incomplete evidence, so `verify_checkpoint` fails in
+/// `verified_checkpoint` on every later fold and the account is permanently unfoldable. Errors
+/// after that loop — the stream-routing inserts, the refold — leave complete evidence and only a
+/// stale projection, which the next fold repairs. This is the uniform rule of the `_in_tx` seams
+/// rather than a local savepoint.
 pub fn pin_checkpoint_in_tx(
     tx: &Transaction<'_>,
     expected: TrustedCheckpointPin,
     proof: &VerifiedCheckpoint,
 ) -> anyhow::Result<PinInstallOutcome> {
     anyhow::ensure!(expected == proof.pin(), "checkpoint proof differs from expected pin");
-    if let Some(existing) = account_control_policy(tx, expected.account_id)?.pin() {
-        anyhow::ensure!(existing == expected, "conflicting permanent account control pin");
+    let already_pinned = match account_control_policy(tx, expected.account_id)?.pin() {
+        Some(existing) => {
+            anyhow::ensure!(existing == expected, "conflicting permanent account control pin");
+            true
+        },
+        None => false,
+    };
+    let bundle = proof.bundle();
+    // Before any pin row: those rows can never be removed, so a refusal here leaves no PIN behind.
+    // It can still leave a prefix of the evidence, which is why the caller must roll back.
+    let stored = store_own_account_evidence_in_tx(tx, expected.account_id, bundle)?;
+    if already_pinned {
+        // Re-installing the same pin is the repair path for a store whose evidence is missing —
+        // one pinned before this storage existed. Only a store that actually gained rows refolds.
+        // The repair can itself be refused for capacity; the pin is untouched either way.
+        if stored > 0 {
+            super::storage::refold_after_pin_install_in_tx(tx, expected.account_id)?;
+        }
         return Ok(PinInstallOutcome::AlreadyPinned);
     }
-    let bundle = proof.bundle();
     tx.execute("INSERT INTO account_control_pins VALUES (?1,?2,?3,?4)", params![
         expected.account_id.to_bytes().as_slice(),
         expected.checkpoint_digest.as_slice(),
@@ -236,6 +260,65 @@ pub fn pin_checkpoint_in_tx(
     // verdicts come from the dispatch a later fold takes, so install and refold can never disagree.
     super::storage::refold_after_pin_install_in_tx(tx, expected.account_id)?;
     Ok(PinInstallOutcome::Installed)
+}
+
+/// Store the checkpoint's evidence as ordinary candidates when `account` is this store's OWN
+/// account, returning how many rows were new.
+///
+/// Load-bearing, not bookkeeping, and it does NOT fail closed. `frozen_slots` is keyed on
+/// `(log_id, DEVICE, seq)`, so the hazard is precise: when the AUTHORING device's own control chain
+/// is truncated below the tip the checkpoint froze FOR IT, its next op is signed at a seq the
+/// checkpoint already decided. Authoring is not refused — the accepted tail equals the raw tail, so
+/// the guard passes — and the op then lands in `contests_frozen_slot`, contributes nothing, and the
+/// revocation is silently discarded while the removed device keeps its roster seat.
+///
+/// That is a store restored without its own history, not a freshly enrolled second device: a device
+/// holding its own seq-0 entry authors at ITS tail+1, a slot the checkpoint never froze for it, and
+/// applies fine; one holding no rows at all is refused loudly on an empty control chain. Only the
+/// truncated-chain case has a test — the two second-device outcomes follow from the per-device slot
+/// key and would need a two-store fixture to pin directly. Storing
+/// the evidence restores the tip. Stub this out and
+/// `an_owner_that_installed_its_pin_without_the_history_can_author_under_it` fails at the removal's
+/// post-check — `storage.rs`'s frozen-slot filter is the line that drops it.
+///
+/// A FOREIGN pinned account stores nothing. The session layer already refuses a relayed pinned
+/// foreign account's entries — "the evidence is not wanted either — a fold of a pinned account only
+/// retracts" — and `account_entries_for_sync` feeds the serve path, so storing them here would make
+/// a store that pinned a contributor start relaying that contributor's history.
+///
+/// Capacity refuses rather than skipping: a skipped entry leaves precisely the missing root above.
+/// Note this charges the evidence against the grow-only ordinary budget, so a store already at its
+/// cap cannot install its own pin at all — not "retry later". The two preconditions nearly exclude
+/// each other, since that budget is mostly filled by the very history whose absence makes this
+/// necessary; an outstanding invite reservation is the realistic way both hold.
+fn store_own_account_evidence_in_tx(
+    tx: &Transaction<'_>,
+    account: AccountId,
+    bundle: &CheckpointBundle,
+) -> anyhow::Result<usize> {
+    if crate::read_local_account(tx)? != Some(account) {
+        return Ok(0);
+    }
+    // The arrival stamp. `insert_candidate` judges reservation expiry against the wall clock
+    // itself, so this only records when the rows landed here.
+    let now_ms = rag_rat_base::time::now_ms();
+    let mut stored = 0;
+    for bytes in &bundle.evidence {
+        let entry = super::envelope::decode_account_signed(bytes)?;
+        let verified = super::envelope::VerifiedAccountEntry {
+            header: entry.header,
+            payload: entry.payload,
+            entry_hash: entry.entry_hash,
+        };
+        match super::storage::insert_candidate(tx, &verified, bytes, now_ms)? {
+            super::storage::CandidateInsert::Inserted => stored += 1,
+            super::storage::CandidateInsert::AlreadyPresent => {},
+            super::storage::CandidateInsert::AtCapacity(scope) => anyhow::bail!(
+                "checkpoint evidence does not fit this store's candidate budget ({scope:?})"
+            ),
+        }
+    }
+    Ok(stored)
 }
 
 /// Export from a single read snapshot; reverify durable proof before handing it to recovery.
@@ -583,6 +666,170 @@ mod tests {
         );
     }
 
+    fn roster_rows(conn: &Connection, account: AccountId) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM account_roster_history WHERE account_id = ?1",
+            [account.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn held_entries(conn: &Connection, account: AccountId) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM account_entries WHERE account_id = ?1",
+            [account.to_bytes().as_slice()],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Installing this store's OWN pin stores the checkpoint's evidence as candidates.
+    ///
+    /// The row count is the mechanism;
+    /// `an_owner_that_installed_its_pin_without_the_history_can_author_under_it` proves the
+    /// effect. The state it needs — own account, evidence absent — is the second-owner-device case:
+    /// a device that INSTALLED the pin holds the bundle only in `account_control_pin_evidence`.
+    /// The deletion below builds that state directly, since a proposing store necessarily
+    /// already holds every entry its evidence was drawn from.
+    ///
+    /// The genesis is deliberately kept: `read_local_account` resolves the pointer THROUGH the
+    /// candidate DAG, so deleting it would make the store forget which account is its own and the
+    /// own-account branch would be skipped for the wrong reason.
+    #[test]
+    fn installing_this_stores_own_pin_stores_its_evidence_as_candidates() {
+        let conn = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&conn, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&conn, 0).unwrap();
+        let device = crate::local_device(&conn, 0).unwrap();
+        // A second entry, so the deletion below has something to remove.
+        {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            crate::ensure_owned_stream_v2_in_tx(&tx, "evidence-restore-test", 1).unwrap();
+            tx.commit().unwrap();
+        }
+        let bundle = checkpoint::propose_checkpoint(&conn, account, &device).unwrap();
+        let pin = TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: bundle.certificate_digest(),
+            required_control_version: 2,
+        };
+
+        let before = held_entries(&conn, account);
+        let genesis = crate::read_local_account_genesis(&conn).unwrap().unwrap();
+        conn.execute(
+            "DELETE FROM account_entries WHERE account_id = ?1 AND entry_hash != ?2",
+            params![account.to_bytes().as_slice(), genesis.as_slice()],
+        )
+        .unwrap();
+        let after_delete = held_entries(&conn, account);
+        assert!(
+            after_delete < before,
+            "the deletion must actually remove evidence ({before} -> {after_delete}), or the \
+             restoration below proves nothing",
+        );
+        assert_eq!(
+            crate::read_local_account(&conn).unwrap(),
+            Some(account),
+            "the store still knows its own account, so the own-account branch is reached",
+        );
+
+        install_checkpoint(&conn, pin, &bundle).unwrap();
+
+        assert_eq!(
+            held_entries(&conn, account) as usize,
+            bundle.evidence.len(),
+            "installing restored every evidence entry as a candidate",
+        );
+    }
+
+    /// Installing a FOREIGN account's pin stores none of its evidence as candidates.
+    ///
+    /// The session layer already decided this where it drops relayed entries — "the evidence is
+    /// not wanted either — a fold of a pinned account only retracts" — and
+    /// `account_entries_for_sync` feeds the serve path, so storing it here would make a store
+    /// that pinned a contributor begin relaying that contributor's history to peers.
+    #[test]
+    fn installing_a_foreign_accounts_pin_stores_none_of_its_evidence() {
+        let proposer = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&proposer, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&proposer, 0).unwrap();
+        let device = crate::local_device(&proposer, 0).unwrap();
+        let bundle = checkpoint::propose_checkpoint(&proposer, account, &device).unwrap();
+        assert!(!bundle.evidence.is_empty(), "the bundle carries evidence to be excluded");
+        let pin = TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: bundle.certificate_digest(),
+            required_control_version: 2,
+        };
+
+        let receiver = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&receiver, &crate::test_hooks()).unwrap();
+        let local = crate::local_account(&receiver, 0).unwrap();
+        assert_ne!(local, account, "the pinned account is foreign to this store");
+
+        install_checkpoint(&receiver, pin, &bundle).unwrap();
+        assert_eq!(
+            held_entries(&receiver, account),
+            0,
+            "a foreign pinned account's evidence must not become servable candidates",
+        );
+    }
+
+    /// The evidence arriving LATER, by ordinary ingest, must not disturb what the pin froze.
+    ///
+    /// Account ingest is deliberately not pin-gated, so a pinned store keeps receiving control-log
+    /// v1 rows — including, once account-log sync opens, the checkpoint's own evidence. Those rows
+    /// enter `load_candidates`, so they reach `select_coherent_branches` and the frozen-slot
+    /// filter. Landing the exact entries the checkpoint accepted must not contest what it froze:
+    /// no fork, the roster intact, the pin still governing. (They are not inert in general — they
+    /// are the roots a v2 continuation chains from; this fixture authors no v2 operation.)
+    #[test]
+    fn evidence_arriving_by_ingest_after_a_pin_does_not_disturb_the_frozen_projection() {
+        let proposer = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&proposer, &crate::test_hooks()).unwrap();
+        let account = crate::local_account(&proposer, 0).unwrap();
+        let device = crate::local_device(&proposer, 0).unwrap();
+        let bundle = checkpoint::propose_checkpoint(&proposer, account, &device).unwrap();
+        let pin = TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: bundle.certificate_digest(),
+            required_control_version: 2,
+        };
+
+        let installer = Connection::open_in_memory().unwrap();
+        rag_rat_db::schema::apply(&installer, &crate::test_hooks()).unwrap();
+        crate::local_account(&installer, 0).unwrap();
+        install_checkpoint(&installer, pin, &bundle).unwrap();
+        super::super::storage::refold_account(&installer, account).unwrap();
+        let before_roster = roster_rows(&installer, account);
+        assert!(before_roster > 0, "the pin folds a real roster before any ingest");
+
+        // Exactly the entries the checkpoint committed to, by the ordinary (ungated) path.
+        for bytes in &bundle.evidence {
+            crate::account_ingest(&installer, bytes, 0).unwrap();
+        }
+        assert_eq!(
+            held_entries(&installer, account) as usize,
+            bundle.evidence.len(),
+            "every evidence entry is now a stored candidate",
+        );
+        super::super::storage::refold_account(&installer, account).unwrap();
+
+        assert_eq!(
+            roster_rows(&installer, account),
+            before_roster,
+            "the checkpoint's own evidence arriving as candidates does not contest the frozen \
+             projection",
+        );
+        assert_eq!(
+            account_control_policy(&installer, account).unwrap(),
+            AccountControlPolicy::ControlV2(pin),
+            "and the pin still governs",
+        );
+    }
+
     #[test]
     fn pin_is_atomic_permanent_idempotent_and_survives_reopen_and_refold() {
         let dir = tempfile::tempdir().unwrap();
@@ -617,15 +864,33 @@ mod tests {
             pin_checkpoint_in_tx(&tx, expected, &proof).unwrap(),
             PinInstallOutcome::AlreadyPinned
         );
-        assert!(pin_checkpoint_in_tx(&tx, first.pin(), &first).is_err());
         assert_eq!(
             account_control_policy(&tx, account).unwrap(),
             AccountControlPolicy::ControlV2(expected),
             "the schema admits only version 2, so every installed pin is one this binary executes",
         );
-        let other = TrustedCheckpointPin { checkpoint_digest: [3; 32], ..expected };
-        assert!(pin_checkpoint_in_tx(&tx, other, &proof).is_err());
         tx.commit().unwrap();
+        // Each refusal in its own transaction, DROPPED rather than committed: the caller must roll
+        // back on `Err`, and a test that committed past one would model exactly the misuse.
+        {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                pin_checkpoint_in_tx(&tx, first.pin(), &first).is_err(),
+                "a second, different digest for this account is a conflicting pin",
+            );
+        }
+        // A DIFFERENT guard, and the only one this pair can reach: a `VerifiedCheckpoint` whose
+        // `pin()` is `other` is unconstructible, so this never gets as far as the conflict check.
+        {
+            let other = TrustedCheckpointPin { checkpoint_digest: [3; 32], ..expected };
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                pin_checkpoint_in_tx(&tx, other, &proof).is_err(),
+                "the proof does not vouch for the pin it is offered against",
+            );
+        }
         assert!(conn.execute("DELETE FROM account_control_pins", []).is_err());
         assert!(conn.execute("DELETE FROM account_control_pin_evidence", []).is_err());
         rag_rat_db::schema::purge_repo_rows(&conn, "pin-retention-test").unwrap();
