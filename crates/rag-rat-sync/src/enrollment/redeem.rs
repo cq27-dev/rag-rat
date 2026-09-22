@@ -162,10 +162,12 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
     let checkpoint_digest = match rag_rat_oplog::account_control_policy(&tx, account_id)
         .map_err(InviteError::Storage)?
     {
-        rag_rat_oplog::AccountControlPolicy::LegacyV1 => None,
-        rag_rat_oplog::AccountControlPolicy::ControlV2(pin)
-        | rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(pin) =>
-            Some(pin.checkpoint_digest),
+        rag_rat_oplog::AccountControlPolicy::ControlV2(pin) => Some(pin.checkpoint_digest),
+        // Deliberately stamps nothing for a version this binary cannot execute: both pinned states
+        // are refused above today, so when the gate opens that must be a decision someone makes,
+        // not one inherited from an arm written while the path was unreachable.
+        rag_rat_oplog::AccountControlPolicy::LegacyV1
+        | rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(_) => None,
     };
     tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     Ok(InviteTicket {

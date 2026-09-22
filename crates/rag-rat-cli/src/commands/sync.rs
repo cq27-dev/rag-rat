@@ -43,8 +43,12 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
             invite_writer(config, Duration::from_secs(*ttl_secs)),
         // A pasted TICKET routes contribution through the network redemption; the bare owner-id
         // form stays the local configure-only path below.
-        SyncCommand::Contribute { account }
-            if rag_rat_sync::InviteTicket::from_ticket_string(account).is_ok() =>
+        // Dispatch on the PREFIX, never on whether the ticket parses. A fallible parse as the
+        // discriminator was total over real tickets only while every released version's tickets
+        // decoded; after a domain bump an older peer's ticket falls through to the account-id
+        // branch and the operator is told their ACCOUNT ID is malformed. `contribute_with_ticket`
+        // reports the real reason.
+        SyncCommand::Contribute { account } if account.trim().starts_with("ragratinvite") =>
             contribute_with_ticket(config, account),
         SyncCommand::Pull { account, peer } => pull(config, *account, peer.as_deref()),
         SyncCommand::Enable => with_repo_db(config, enable),

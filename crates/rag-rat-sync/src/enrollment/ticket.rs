@@ -7,7 +7,7 @@ use minicbor::{Decoder, Encoder};
 use rag_rat_oplog::AccountId;
 
 use super::error::InviteError;
-use super::wire::{decode, ensure_consumed, exact_array, exact_str, fixed32};
+use super::wire::{decode, ensure_consumed, exact_array, fixed32};
 
 // `/2` added the kind discriminator (arity 6 -> 7) when the pairing ticket and the writer
 // invite merged into one struct; a `/1` binary rejects the new domain legibly. `/3` appends the
@@ -19,6 +19,9 @@ use super::wire::{decode, ensure_consumed, exact_array, exact_str, fixed32};
 // SECURITY field silent compatibility is the wrong default — an old binary that ignored the digest
 // would enrol into a pinned account without installing its pin. Legible rejection is correct.
 const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/3";
+/// Shared by every version of the domain, so a ticket from another release is told apart from
+/// arbitrary bytes that merely decoded as a string in that position.
+const TICKET_DOMAIN_STEM: &str = "rag-rat/invite-ticket/";
 
 const MAX_RELAY_URL_BYTES: usize = 2048;
 
@@ -68,9 +71,11 @@ pub struct InviteTicket {
     /// between machines by hand, so the digest travels here while the proof travels over the
     /// enrollment connection, and the joiner verifies one against the other.
     ///
-    /// Always `None` on a [`InviteTicketKind::Writer`] ticket — a writer grant is cross-account
-    /// and pins nothing — and decode refuses a writer ticket that carries one, so the field
-    /// can never read as authority it does not have.
+    /// Always `None` on a [`InviteTicketKind::Writer`] ticket: a writer grant is cross-account and
+    /// pins nothing. Enforced at decode AND in [`Self::expect_kind`], which every writer consumer
+    /// passes through — the fields are public, so an in-process caller can build a writer ticket
+    /// carrying a digest without ever round-tripping through decode. This is not a type-level
+    /// guarantee; making it unrepresentable means moving the field into the `Pairing` variant.
     pub checkpoint_digest: Option<[u8; 32]>,
 }
 
@@ -96,7 +101,17 @@ impl InviteTicket {
     pub fn decode(bytes: &[u8]) -> Result<Self, InviteError> {
         let mut dec = Decoder::new(bytes);
         exact_array(&mut dec, 8, "ticket")?;
-        exact_str(&mut dec, TICKET_DOMAIN, "ticket domain")?;
+        let domain = dec.str().map_err(decode)?;
+        if domain != TICKET_DOMAIN {
+            // An older ticket and a corrupt paste are different problems, and the operator can act
+            // on one of them. Saying which is the whole point of bumping the domain rather than
+            // letting an old binary silently ignore a field it does not understand.
+            return Err(InviteError::Malformed(if domain.starts_with(TICKET_DOMAIN_STEM) {
+                "this ticket was minted by an older rag-rat — ask the owner to re-mint it".into()
+            } else {
+                "ticket domain mismatch".into()
+            }));
+        }
         let kind = InviteTicketKind::from_wire_tag(dec.u8().map_err(decode)?)?;
         let account_id = AccountId::from_bytes(fixed32(dec.bytes().map_err(decode)?, "account")?);
         let inviter_node_id = fixed32(dec.bytes().map_err(decode)?, "node id")?;
@@ -153,6 +168,13 @@ impl InviteTicket {
 
     /// Redeem-side kind check: the wrong paste names the command that accepts it.
     pub fn expect_kind(&self, expected: InviteTicketKind) -> Result<(), InviteError> {
+        // A self-invalid ticket never reaches a redemption path: decode refuses this shape, and an
+        // in-process caller that skipped decode is refused here, at the seam every consumer uses.
+        if self.kind == InviteTicketKind::Writer && self.checkpoint_digest.is_some() {
+            return Err(InviteError::Malformed(
+                "a writer invite pins no checkpoint and must not carry a digest".into(),
+            ));
+        }
         if self.kind == expected {
             return Ok(());
         }
@@ -177,9 +199,18 @@ impl iroh_tickets::Ticket for InviteTicket {
     }
 
     fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
-        Self::decode(bytes).map_err(|_| {
+        // Carry the reason through. Flattening every decode failure into one string made "this is
+        // from an older release" and "you pasted junk" byte-identical where operators stand.
+        // `ParseError::Verify` only carries a `&'static str`, so the reason cannot be threaded
+        // through verbatim — but the one case an operator can ACT on is worth telling apart from
+        // "you pasted junk", which is the whole value of bumping the domain.
+        Self::decode(bytes).map_err(|error| {
             iroh_tickets::ParseError::verification_failed(
-                "ticket bytes are not a canonical rag-rat invite",
+                if error.to_string().contains("older rag-rat") {
+                    "this ticket was minted by an older rag-rat — ask the owner to re-mint it"
+                } else {
+                    "ticket bytes are not a canonical rag-rat invite"
+                },
             )
         })
     }

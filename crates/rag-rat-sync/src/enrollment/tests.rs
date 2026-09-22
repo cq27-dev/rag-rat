@@ -110,7 +110,7 @@ fn a_ticket_carries_the_checkpoint_digest_and_a_writer_ticket_may_not() {
     assert_eq!(InviteTicket::from_ticket_string(&s).unwrap(), pinned, "the digest round-trips");
     assert_ne!(s, sample_ticket().to_ticket_string(), "and it is carried in the bytes");
 
-    // Unpinned stays `None` rather than some zero digest, so "no pin" is not spelled like a pin.
+    // Unpinned stays `None` rather than a zero digest, so "no pin" is not spelled like a pin.
     assert_eq!(
         InviteTicket::from_ticket_string(&sample_ticket().to_ticket_string())
             .unwrap()
@@ -118,16 +118,122 @@ fn a_ticket_carries_the_checkpoint_digest_and_a_writer_ticket_may_not() {
         None,
     );
 
+    // Through `decode`, asserting the WRITER rule's own words: `from_ticket_string` collapses
+    // decode failures into one wrapper string, so asserting on that would pass equally for an
+    // arity, domain or route failure.
     let writer = InviteTicket {
         kind: InviteTicketKind::Writer,
         checkpoint_digest: Some([0x5a; 32]),
         ..sample_ticket()
     };
-    let err = InviteTicket::from_ticket_string(&writer.to_ticket_string()).unwrap_err().to_string();
-    assert!(
-        err.contains("invalid invite ticket"),
-        "a writer ticket with a digest is refused: {err}"
+    let err = InviteTicket::decode(&writer.encode()).unwrap_err().to_string();
+    assert!(err.contains("must not carry a digest"), "{err}");
+    // And at the seam every writer consumer passes through, since the fields are public and an
+    // in-process caller can skip decode entirely.
+    let err = writer.expect_kind(InviteTicketKind::Writer).unwrap_err().to_string();
+    assert!(err.contains("must not carry a digest"), "{err}");
+}
+
+fn ticket_bytes(
+    domain: &str,
+    arity: u64,
+    digest: impl Fn(&mut minicbor::Encoder<&mut Vec<u8>>),
+) -> Vec<u8> {
+    let t = sample_ticket();
+    let mut out = Vec::new();
+    let mut enc = minicbor::Encoder::new(&mut out);
+    enc.array(arity).unwrap();
+    enc.str(domain).unwrap();
+    enc.u8(0).unwrap();
+    enc.bytes(&t.account_id.to_bytes()).unwrap();
+    enc.bytes(&t.inviter_node_id).unwrap();
+    enc.str(&t.relay_url).unwrap();
+    enc.bytes(&t.nonce).unwrap();
+    enc.i64(t.expires_at_ms).unwrap();
+    digest(&mut enc);
+    out
+}
+
+/// The optional digest is exactly one byte string or exactly `null`; nothing else decodes.
+///
+/// The wrong-length cases are defended twice over: by `fixed32`, and by the canonical re-encode
+/// comparison, which no padded or truncated digest can survive. So deleting `fixed32` alone leaves
+/// this green — the assertions pin the OUTCOME, not any one guard.
+#[test]
+fn the_optional_digest_admits_no_other_spelling() {
+    for (name, bytes) in [
+        (
+            "undefined",
+            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+                e.undefined().unwrap();
+            }),
+        ),
+        (
+            "a bool",
+            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+                e.bool(false).unwrap();
+            }),
+        ),
+        (
+            "an integer",
+            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+                e.u8(0).unwrap();
+            }),
+        ),
+        (
+            "a text string",
+            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+                e.str("no").unwrap();
+            }),
+        ),
+        (
+            "a short digest",
+            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+                e.bytes(&[0; 31]).unwrap();
+            }),
+        ),
+        (
+            "a long digest",
+            ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+                e.bytes(&[0; 33]).unwrap();
+            }),
+        ),
+        ("the field omitted", ticket_bytes("rag-rat/invite-ticket/3", 7, |_| {})),
+    ] {
+        assert!(InviteTicket::decode(&bytes).is_err(), "{name} must not decode as the digest");
+    }
+    assert_eq!(
+        InviteTicket::decode(&ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+            e.null().unwrap();
+        }))
+        .unwrap(),
+        sample_ticket(),
+        "`null` is the one spelling of `None` that survives",
     );
+}
+
+/// A ticket from an older release is told apart from a corrupt paste — the whole reason the domain
+/// was bumped rather than the field appended by omission.
+#[test]
+fn an_older_releases_ticket_says_so() {
+    let older = ticket_bytes("rag-rat/invite-ticket/2", 8, |e| {
+        e.null().unwrap();
+    });
+    let err = InviteTicket::decode(&older).unwrap_err().to_string();
+    assert!(err.contains("older rag-rat"), "{err}");
+    let junk = ticket_bytes("rag-rat/not-a-ticket/1", 8, |e| {
+        e.null().unwrap();
+    });
+    let err = InviteTicket::decode(&junk).unwrap_err().to_string();
+    assert!(!err.contains("older rag-rat"), "arbitrary bytes are not blamed on a release: {err}");
+}
+
+/// The `/3` bytes are frozen: a ticket minted by one release must decode in the next.
+#[test]
+fn golden_invite_ticket_v3() {
+    let pinned = InviteTicket { checkpoint_digest: Some([0x5a; 32]), ..sample_ticket() };
+    assert_eq!(rag_rat_base::hash::hex_lower(&pinned.encode()), "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687b58205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a");
+    assert_eq!(rag_rat_base::hash::hex_lower(&sample_ticket().encode()), "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687bf6");
 }
 
 #[test]
