@@ -48,7 +48,8 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         // decoded; after a domain bump an older peer's ticket falls through to the account-id
         // branch and the operator is told their ACCOUNT ID is malformed. `contribute_with_ticket`
         // reports the real reason.
-        SyncCommand::Contribute { account } if account.trim().starts_with("ragratinvite") =>
+        SyncCommand::Contribute { account }
+            if account.trim().starts_with(rag_rat_sync::TICKET_KIND_PREFIX) =>
             contribute_with_ticket(config, account),
         SyncCommand::Pull { account, peer } => pull(config, *account, peer.as_deref()),
         SyncCommand::Enable => with_repo_db(config, enable),

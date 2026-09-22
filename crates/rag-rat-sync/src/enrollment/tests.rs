@@ -134,6 +134,25 @@ fn a_ticket_carries_the_checkpoint_digest_and_a_writer_ticket_may_not() {
     assert!(err.contains("must not carry a digest"), "{err}");
 }
 
+/// The pasteable form of arbitrary ticket bytes, so a test can drive the path an operator does
+/// (`from_ticket_string`) rather than only `decode`. Encoded by the SAME implementation production
+/// uses, so the test cannot pass on a spelling the real parser would never see.
+fn ticket_string(bytes: &[u8]) -> String {
+    struct Raw(Vec<u8>);
+    impl iroh_tickets::Ticket for Raw {
+        const KIND: &'static str = super::ticket::TICKET_KIND_PREFIX;
+
+        fn encode_bytes(&self) -> Vec<u8> {
+            self.0.clone()
+        }
+
+        fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
+            Ok(Self(bytes.to_vec()))
+        }
+    }
+    iroh_tickets::Ticket::encode_string(&Raw(bytes.to_vec()))
+}
+
 fn ticket_bytes(
     domain: &str,
     arity: u64,
@@ -200,7 +219,13 @@ fn the_optional_digest_admits_no_other_spelling() {
         ),
         ("the field omitted", ticket_bytes("rag-rat/invite-ticket/3", 7, |_| {})),
     ] {
-        assert!(InviteTicket::decode(&bytes).is_err(), "{name} must not decode as the digest");
+        // Assert the digest is what refused it, not merely that something did: every shape here
+        // would also be caught by the canonical re-encode, so `is_err()` alone cannot tell which.
+        let err = InviteTicket::decode(&bytes).unwrap_err().to_string();
+        assert!(
+            err.contains("digest") || err.contains("bytes") || err.contains("arity"),
+            "{name} must be refused with a reason naming the field: {err}",
+        );
     }
     assert_eq!(
         InviteTicket::decode(&ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
@@ -212,28 +237,56 @@ fn the_optional_digest_admits_no_other_spelling() {
     );
 }
 
-/// A ticket from an older release is told apart from a corrupt paste — the whole reason the domain
-/// was bumped rather than the field appended by omission.
+/// Version skew is diagnosed on the path an OPERATOR takes, at the shapes releases actually mint.
+///
+/// `/1` was a 6-element array, `/2` a 7-element one, `/3` is 8. Asserting arity before reading the
+/// domain would make every one of these die on arity and never reach the message written for it —
+/// and a fixture that spells an old domain at the CURRENT arity would not notice, because that
+/// shape has never been minted by anything.
 #[test]
-fn an_older_releases_ticket_says_so() {
-    let older = ticket_bytes("rag-rat/invite-ticket/2", 8, |e| {
+fn version_skew_names_the_action_that_can_work() {
+    // Exactly what the `/2` release emitted: seven elements, no digest field.
+    let older = ticket_bytes("rag-rat/invite-ticket/2", 7, |_| {});
+    let err = InviteTicket::from_ticket_string(&ticket_string(&older)).unwrap_err().to_string();
+    assert!(err.contains("older rag-rat"), "{err}");
+    assert!(err.contains("re-mint"), "and names the owner's action: {err}");
+
+    // The common direction: the owner runs `sync init`, so the MINTING side upgrades first.
+    // "Ask for a re-mint" is the one action that cannot help here.
+    let newer = ticket_bytes("rag-rat/invite-ticket/4", 8, |e| {
         e.null().unwrap();
     });
-    let err = InviteTicket::decode(&older).unwrap_err().to_string();
-    assert!(err.contains("older rag-rat"), "{err}");
+    let err = InviteTicket::from_ticket_string(&ticket_string(&newer)).unwrap_err().to_string();
+    assert!(err.contains("newer rag-rat"), "{err}");
+    assert!(err.contains("upgrade"), "and names THIS machine's action: {err}");
+
+    // A domain the format never had is not blamed on anybody's release.
     let junk = ticket_bytes("rag-rat/not-a-ticket/1", 8, |e| {
         e.null().unwrap();
     });
     let err = InviteTicket::decode(&junk).unwrap_err().to_string();
-    assert!(!err.contains("older rag-rat"), "arbitrary bytes are not blamed on a release: {err}");
+    assert!(!err.contains("rag-rat —"), "arbitrary bytes are not a version skew: {err}");
 }
 
-/// The `/3` bytes are frozen: a ticket minted by one release must decode in the next.
+/// The `/3` bytes are frozen in BOTH directions: a ticket minted by one release must decode in the
+/// next. Asserting only `encode` would let a future stricter `decode` reject the frozen bytes while
+/// the round-trip stayed green, since a round trip moves with whatever `encode` emits.
 #[test]
 fn golden_invite_ticket_v3() {
     let pinned = InviteTicket { checkpoint_digest: Some([0x5a; 32]), ..sample_ticket() };
-    assert_eq!(rag_rat_base::hash::hex_lower(&pinned.encode()), "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687b58205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a");
-    assert_eq!(rag_rat_base::hash::hex_lower(&sample_ticket().encode()), "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687bf6");
+    let pinned_hex = "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687b58205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    let unpinned_hex = "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687bf6";
+    assert_eq!(rag_rat_base::hash::hex_lower(&pinned.encode()), pinned_hex);
+    assert_eq!(rag_rat_base::hash::hex_lower(&sample_ticket().encode()), unpinned_hex);
+    assert_eq!(
+        InviteTicket::decode(&rag_rat_base::hash::hex_decode(pinned_hex).unwrap()).unwrap(),
+        pinned,
+        "the frozen bytes still decode",
+    );
+    assert_eq!(
+        InviteTicket::decode(&rag_rat_base::hash::hex_decode(unpinned_hex).unwrap()).unwrap(),
+        sample_ticket(),
+    );
 }
 
 #[test]

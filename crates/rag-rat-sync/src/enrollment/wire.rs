@@ -392,7 +392,11 @@ pub(super) fn refusal_code(error: &InviteError) -> Option<RefusalCode> {
         InviteError::HeldStateConflict => Some(RefusalCode::HeldStateConflict),
         // A transport failure never reached a redemption and has never produced a wire
         // refusal; it is named here rather than left to a wildcard so it cannot start to.
+        // Version skew is decided reading a ticket string, before any connection exists, so it
+        // has no wire refusal either — named rather than left to a wildcard so it cannot acquire
+        // one by accident.
         InviteError::Malformed(_)
+        | InviteError::TicketVersionSkew(_)
         | InviteError::Storage(_)
         | InviteError::Io(_)
         | InviteError::Transport(_) => None,

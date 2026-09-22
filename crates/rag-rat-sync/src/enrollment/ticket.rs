@@ -7,7 +7,7 @@ use minicbor::{Decoder, Encoder};
 use rag_rat_oplog::AccountId;
 
 use super::error::InviteError;
-use super::wire::{decode, ensure_consumed, exact_array, fixed32};
+use super::wire::{decode, ensure_consumed, fixed32};
 
 // `/2` added the kind discriminator (arity 6 -> 7) when the pairing ticket and the writer
 // invite merged into one struct; a `/1` binary rejects the new domain legibly. `/3` appends the
@@ -19,9 +19,29 @@ use super::wire::{decode, ensure_consumed, exact_array, fixed32};
 // SECURITY field silent compatibility is the wrong default — an old binary that ignored the digest
 // would enrol into a pinned account without installing its pin. Legible rejection is correct.
 const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/3";
-/// Shared by every version of the domain, so a ticket from another release is told apart from
+/// Shared by every revision of the domain, so a ticket from another release is told apart from
 /// arbitrary bytes that merely decoded as a string in that position.
 const TICKET_DOMAIN_STEM: &str = "rag-rat/invite-ticket/";
+/// This binary's revision of the ticket format.
+const TICKET_VERSION: u32 = 3;
+
+/// Which way the version skews, so the operator is told the action that can actually work.
+///
+/// Direction matters and the common case is NEWER, not older: the owner runs `sync init`, so the
+/// minting side upgrades first. Telling that operator to ask for a re-mint sends them after the one
+/// thing that cannot help — the owner would re-mint the same unreadable revision forever.
+fn version_skew(domain: &str) -> InviteError {
+    let Some(revision) =
+        domain.strip_prefix(TICKET_DOMAIN_STEM).and_then(|v| v.parse::<u32>().ok())
+    else {
+        return InviteError::Malformed("ticket domain mismatch".into());
+    };
+    InviteError::TicketVersionSkew(if revision < TICKET_VERSION {
+        "this ticket was minted by an older rag-rat — ask the owner to re-mint it"
+    } else {
+        "this ticket was minted by a newer rag-rat — upgrade rag-rat on this machine"
+    })
+}
 
 const MAX_RELAY_URL_BYTES: usize = 2048;
 
@@ -100,17 +120,17 @@ impl InviteTicket {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, InviteError> {
         let mut dec = Decoder::new(bytes);
-        exact_array(&mut dec, 8, "ticket")?;
+        // Read the array header WITHOUT asserting its length, and diagnose the domain first: every
+        // revision of this format has its own arity (`/1` was 6, `/2` was 7, `/3` is 8), so
+        // asserting arity up front means a genuinely older ticket dies on arity and never reaches
+        // the message written for it. Which is the only input that message exists to serve.
+        let arity = dec.array().map_err(decode)?;
         let domain = dec.str().map_err(decode)?;
         if domain != TICKET_DOMAIN {
-            // An older ticket and a corrupt paste are different problems, and the operator can act
-            // on one of them. Saying which is the whole point of bumping the domain rather than
-            // letting an old binary silently ignore a field it does not understand.
-            return Err(InviteError::Malformed(if domain.starts_with(TICKET_DOMAIN_STEM) {
-                "this ticket was minted by an older rag-rat — ask the owner to re-mint it".into()
-            } else {
-                "ticket domain mismatch".into()
-            }));
+            return Err(version_skew(domain));
+        }
+        if arity != Some(8) {
+            return Err(InviteError::Malformed("ticket arity".into()));
         }
         let kind = InviteTicketKind::from_wire_tag(dec.u8().map_err(decode)?)?;
         let account_id = AccountId::from_bytes(fixed32(dec.bytes().map_err(decode)?, "account")?);
@@ -189,7 +209,7 @@ impl InviteTicket {
 
 /// The [`iroh_tickets::Ticket`] string prefix. One prefix for both kinds on purpose: the kind is
 /// in the payload, so a wrong-kind paste decodes far enough to say which command wants it.
-const TICKET_KIND_PREFIX: &str = "ragratinvite";
+pub const TICKET_KIND_PREFIX: &str = "ragratinvite";
 
 impl iroh_tickets::Ticket for InviteTicket {
     const KIND: &'static str = TICKET_KIND_PREFIX;
@@ -201,17 +221,15 @@ impl iroh_tickets::Ticket for InviteTicket {
     fn decode_bytes(bytes: &[u8]) -> Result<Self, iroh_tickets::ParseError> {
         // Carry the reason through. Flattening every decode failure into one string made "this is
         // from an older release" and "you pasted junk" byte-identical where operators stand.
-        // `ParseError::Verify` only carries a `&'static str`, so the reason cannot be threaded
-        // through verbatim — but the one case an operator can ACT on is worth telling apart from
-        // "you pasted junk", which is the whole value of bumping the domain.
+        // `ParseError::Verify` carries only a `&'static str`, so the reason cannot be threaded
+        // through verbatim — but the cases an operator can ACT on are worth telling apart from
+        // "you pasted junk", which is the whole value of bumping the domain. Selected by MATCHING
+        // the variant: keying it off formatted text reverts silently when the text is reworded.
         Self::decode(bytes).map_err(|error| {
-            iroh_tickets::ParseError::verification_failed(
-                if error.to_string().contains("older rag-rat") {
-                    "this ticket was minted by an older rag-rat — ask the owner to re-mint it"
-                } else {
-                    "ticket bytes are not a canonical rag-rat invite"
-                },
-            )
+            iroh_tickets::ParseError::verification_failed(match error {
+                InviteError::TicketVersionSkew(message) => message,
+                _ => "ticket bytes are not a canonical rag-rat invite",
+            })
         })
     }
 }

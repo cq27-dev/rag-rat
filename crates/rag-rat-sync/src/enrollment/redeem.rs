@@ -162,12 +162,18 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
     let checkpoint_digest = match rag_rat_oplog::account_control_policy(&tx, account_id)
         .map_err(InviteError::Storage)?
     {
+        rag_rat_oplog::AccountControlPolicy::LegacyV1 => None,
         rag_rat_oplog::AccountControlPolicy::ControlV2(pin) => Some(pin.checkpoint_digest),
-        // Deliberately stamps nothing for a version this binary cannot execute: both pinned states
-        // are refused above today, so when the gate opens that must be a decision someone makes,
-        // not one inherited from an arm written while the path was unreachable.
-        rag_rat_oplog::AccountControlPolicy::LegacyV1
-        | rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(_) => None,
+        // Fail CLOSED for a version this binary cannot execute. `None` would be the fail-OPEN
+        // spelling of "I don't know": the ticket would assert that a pinned account is unpinned,
+        // and a joiner would enrol without installing its pin — the exact failure the domain bump
+        // exists to prevent, only silent. Unreachable today, since both pinned states are refused
+        // above; it is here so opening that gate has to decide this rather than inherit it.
+        rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(_) =>
+            return Err(InviteError::Storage(anyhow::anyhow!(
+                "cannot mint an invite for an account pinned at a control version this binary \
+                 cannot execute"
+            ))),
     };
     tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     Ok(InviteTicket {

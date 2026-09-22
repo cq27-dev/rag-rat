@@ -54,8 +54,9 @@ pub use endpoint::{
 };
 pub use enrollment::{
     ENROLL_ALPN, EnrollmentReceipt, EnrollmentRequest, InviteError, InviteSpec, InviteTicket,
-    InviteTicketKind, WriterGrantReceipt, WriterInviteSpec, mint_invite, mint_writer_invite,
-    redeem_invite, run_enrollment_acceptor, run_enrollment_dialer, run_writer_grant_dialer,
+    InviteTicketKind, TICKET_KIND_PREFIX, WriterGrantReceipt, WriterInviteSpec, mint_invite,
+    mint_writer_invite, redeem_invite, run_enrollment_acceptor, run_enrollment_dialer,
+    run_writer_grant_dialer,
 };
 /// The dialable address type every peer-facing helper here hands back.
 ///
