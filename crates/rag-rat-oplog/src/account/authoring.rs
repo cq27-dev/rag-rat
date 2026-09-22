@@ -1192,6 +1192,107 @@ mod tests {
             .collect()
     }
 
+    /// A verifiable pin over the account's own evidence, proposed but NOT installed.
+    fn proposed_pin(
+        conn: &Connection,
+        account: AccountId,
+    ) -> (
+        crate::account::checkpoint::TrustedCheckpointPin,
+        crate::account::checkpoint::VerifiedCheckpoint,
+    ) {
+        let device = crate::local_device(conn, NOW).unwrap();
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let bundle =
+            crate::account::checkpoint::prepare_checkpoint_in_tx(&tx, account, &device).unwrap();
+        tx.commit().unwrap();
+        let pin = crate::account::checkpoint::TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: bundle.certificate_digest(),
+            required_control_version: 2,
+        };
+        (pin, crate::account::checkpoint::verify_checkpoint(pin, &bundle).unwrap())
+    }
+
+    fn install_pin(
+        conn: &Connection,
+        pin: crate::account::checkpoint::TrustedCheckpointPin,
+        proof: &crate::account::checkpoint::VerifiedCheckpoint,
+    ) -> crate::PinInstallOutcome {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let outcome = crate::pin_checkpoint_in_tx(&tx, pin, proof).unwrap();
+        tx.commit().unwrap();
+        outcome
+    }
+
+    /// Leave only the genesis: a second owner device that holds the pin but never synced the
+    /// history. The genesis stays because `read_local_account` resolves the pointer through it —
+    /// without it the store would forget which account is its own.
+    fn forget_all_but_genesis(conn: &Connection, account: AccountId) {
+        let genesis = crate::read_local_account_genesis(conn).unwrap().unwrap();
+        conn.execute(
+            "DELETE FROM account_entries WHERE account_id = ?1 AND entry_hash != ?2",
+            rusqlite::params![account.to_bytes().as_slice(), genesis.as_slice()],
+        )
+        .unwrap();
+    }
+
+    /// Author a v2 removal of `subject` and assert it actually took effect.
+    fn remove_and_assert_revoked(
+        conn: &Connection,
+        account: AccountId,
+        subject: DeviceFingerprint,
+    ) {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW)
+            .expect("an owner holding the pin authors a v2 removal under it");
+        tx.commit().unwrap();
+        let closed: Option<i64> = conn
+            .query_row(
+                "SELECT closed_at FROM account_roster_history
+                  WHERE account_id = ?1 AND device_fingerprint = ?2",
+                rusqlite::params![account.to_bytes().as_slice(), subject.to_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(closed.is_some(), "the revocation takes effect: the device leaves the roster");
+    }
+
+    /// An owner device that INSTALLED its account's pin — never proposed it, never synced the
+    /// history — can still revoke under it.
+    ///
+    /// The pinned fold selects chains from STORED rows rooted at seq 0, and a v2 operation
+    /// continues from the checkpoint's tip. Unless install stores the evidence, that tip lives
+    /// only in `account_control_pin_evidence`, the accepted control tail is empty, and v2
+    /// authoring refuses; a v2 revocation arriving from elsewhere would fork for want of a
+    /// root.
+    #[test]
+    fn an_owner_that_installed_its_pin_without_the_history_can_author_under_it() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x72);
+        let (pin, proof) = proposed_pin(&conn, account);
+        forget_all_but_genesis(&conn, account);
+
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::Installed);
+        remove_and_assert_revoked(&conn, account, subject);
+    }
+
+    /// Re-installing the SAME pin repairs a store that holds the pin but lacks its evidence — the
+    /// state of any store pinned before install began storing it. `AlreadyPinned` must not short
+    /// out before the evidence is stored.
+    #[test]
+    fn reinstalling_a_pin_restores_the_evidence_it_was_installed_without() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x73);
+        let (pin, proof) = proposed_pin(&conn, account);
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::Installed);
+        forget_all_but_genesis(&conn, account);
+
+        assert_eq!(install_pin(&conn, pin, &proof), crate::PinInstallOutcome::AlreadyPinned);
+        remove_and_assert_revoked(&conn, account, subject);
+    }
+
     /// A pinned removal names its manifest by the digest of the manifest's PAYLOAD, and that
     /// manifest is a stored row.
     ///

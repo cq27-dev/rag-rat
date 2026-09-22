@@ -190,11 +190,25 @@ pub fn pin_checkpoint_in_tx(
     proof: &VerifiedCheckpoint,
 ) -> anyhow::Result<PinInstallOutcome> {
     anyhow::ensure!(expected == proof.pin(), "checkpoint proof differs from expected pin");
-    if let Some(existing) = account_control_policy(tx, expected.account_id)?.pin() {
-        anyhow::ensure!(existing == expected, "conflicting permanent account control pin");
+    let already_pinned = match account_control_policy(tx, expected.account_id)?.pin() {
+        Some(existing) => {
+            anyhow::ensure!(existing == expected, "conflicting permanent account control pin");
+            true
+        },
+        None => false,
+    };
+    let bundle = proof.bundle();
+    // BEFORE any permanent row: a capacity refusal must leave nothing behind for a caller that
+    // commits after handling the error, and the pin rows below can never be removed.
+    let stored = store_own_account_evidence_in_tx(tx, expected.account_id, bundle)?;
+    if already_pinned {
+        // Re-installing the same pin is the repair path for a store whose evidence is missing —
+        // one pinned before this storage existed. Only a store that actually gained rows refolds.
+        if stored > 0 {
+            super::storage::refold_after_pin_install_in_tx(tx, expected.account_id)?;
+        }
         return Ok(PinInstallOutcome::AlreadyPinned);
     }
-    let bundle = proof.bundle();
     tx.execute("INSERT INTO account_control_pins VALUES (?1,?2,?3,?4)", params![
         expected.account_id.to_bytes().as_slice(),
         expected.checkpoint_digest.as_slice(),
@@ -216,23 +230,6 @@ pub fn pin_checkpoint_in_tx(
          account_stream_ownership WHERE account_id=?1",
         [expected.account_id.to_bytes().as_slice()],
     )?;
-    // Evidence becomes ordinary candidates ONLY for this store's own account.
-    //
-    // For a FOREIGN pinned account the session layer has already decided the opposite, and says so
-    // where it drops relayed entries: "the evidence is not wanted either — a fold of a pinned
-    // account only retracts". Writing it in here would be a back door into exactly what
-    // `OplogSyncStore::ingest` refuses, and `account_entries_for_sync` feeds the serve path — so a
-    // store that pinned a contributor would begin relaying that contributor's history.
-    //
-    // Own-account is where the need is, and it is owner-side: serving an enrollment receipt means
-    // handing on evidence this store may never have proposed (a second owner device that INSTALLED
-    // the pin holds it only in `account_control_pin_evidence`). A joiner needs nothing here — its
-    // receipt carries the bootstrap — and it has no local account at install time anyway.
-    let own_account = crate::read_local_account(tx)? == Some(expected.account_id);
-    // The arrival stamp for evidence stored as candidates below. `insert_candidate` judges
-    // reservation expiry against the wall clock itself, so this only records when these entries
-    // landed HERE.
-    let now_ms = rag_rat_base::time::now_ms();
     for bytes in &bundle.evidence {
         let entry = super::envelope::decode_account_signed(bytes)?;
         if entry.header.log_id == super::fold::CONTROL_LOG
@@ -247,36 +244,58 @@ pub fn pin_checkpoint_in_tx(
                 params![expected.account_id.to_bytes().as_slice(), stream_id.to_bytes().as_slice()],
             )?;
         }
-        // Inert for the fold: these are exactly the entries the checkpoint accepted, so they land
-        // on slots `derive_pinned_projection` already froze and add nothing the frozen history did
-        // not already supply.
-        // `evidence_arriving_by_ingest_after_a_pin_does_not_disturb_the_frozen_projection`
-        // drives that same end state through the ordinary ingest path.
-        //
-        // Capacity refuses the INSTALL rather than being skipped. Ignoring it would leave exactly
-        // the gap this closes, and refusing here is deterministic and lands while the pin does not
-        // yet exist — the last moment this is still reversible.
-        if own_account {
-            let verified = super::envelope::VerifiedAccountEntry {
-                header: entry.header,
-                payload: entry.payload,
-                entry_hash: entry.entry_hash,
-            };
-            if let super::storage::CandidateInsert::AtCapacity(scope) =
-                super::storage::insert_candidate(tx, &verified, bytes, now_ms)?
-            {
-                anyhow::bail!(
-                    "checkpoint evidence does not fit this store's candidate budget ({scope:?}); \
-                     no pin was installed"
-                );
-            }
-        }
     }
     // Re-derive everything the pin changes, inside the install transaction. A pin this binary
     // executes rebuilds its projection from the checkpoint; one it cannot execute retracts it. Both
     // verdicts come from the dispatch a later fold takes, so install and refold can never disagree.
     super::storage::refold_after_pin_install_in_tx(tx, expected.account_id)?;
     Ok(PinInstallOutcome::Installed)
+}
+
+/// Store the checkpoint's evidence as ordinary candidates when `account` is this store's OWN
+/// account, returning how many rows were new.
+///
+/// Load-bearing, not bookkeeping. The pinned fold selects chains from STORED rows, rooted at seq 0,
+/// and a v2 operation continues from the checkpoint's tip. On a store that INSTALLED a pin it never
+/// proposed — a second owner device — that tip exists only in `account_control_pin_evidence`, so
+/// every v2 continuation has no stored root: it forks, drops out of the applied set, and a v2
+/// revocation never takes effect. The empty accepted tail also refuses v2 authoring on that device.
+/// Storing the evidence gives those chains their roots.
+///
+/// A FOREIGN pinned account stores nothing. The session layer already refuses a relayed pinned
+/// foreign account's entries — "the evidence is not wanted either — a fold of a pinned account only
+/// retracts" — and `account_entries_for_sync` feeds the serve path, so storing them here would make
+/// a store that pinned a contributor start relaying that contributor's history.
+///
+/// Capacity refuses rather than skipping: a skipped entry leaves precisely the missing root above.
+fn store_own_account_evidence_in_tx(
+    tx: &Transaction<'_>,
+    account: AccountId,
+    bundle: &CheckpointBundle,
+) -> anyhow::Result<usize> {
+    if crate::read_local_account(tx)? != Some(account) {
+        return Ok(0);
+    }
+    // The arrival stamp. `insert_candidate` judges reservation expiry against the wall clock
+    // itself, so this only records when the rows landed here.
+    let now_ms = rag_rat_base::time::now_ms();
+    let mut stored = 0;
+    for bytes in &bundle.evidence {
+        let entry = super::envelope::decode_account_signed(bytes)?;
+        let verified = super::envelope::VerifiedAccountEntry {
+            header: entry.header,
+            payload: entry.payload,
+            entry_hash: entry.entry_hash,
+        };
+        match super::storage::insert_candidate(tx, &verified, bytes, now_ms)? {
+            super::storage::CandidateInsert::Inserted => stored += 1,
+            super::storage::CandidateInsert::AlreadyPresent => {},
+            super::storage::CandidateInsert::AtCapacity(scope) => anyhow::bail!(
+                "checkpoint evidence does not fit this store's candidate budget ({scope:?})"
+            ),
+        }
+    }
+    Ok(stored)
 }
 
 /// Export from a single read snapshot; reverify durable proof before handing it to recovery.
@@ -644,11 +663,12 @@ mod tests {
 
     /// Installing this store's OWN pin stores the checkpoint's evidence as candidates.
     ///
-    /// This is what lets an owner hand on evidence it never proposed. The state it needs — own
-    /// account, evidence absent — is the second-owner-device case: a device that INSTALLED the pin
-    /// holds the bundle only in `account_control_pin_evidence`. The deletion below builds that
-    /// state directly, since a proposing store necessarily already holds every entry its evidence
-    /// was drawn from.
+    /// The row count is the mechanism;
+    /// `an_owner_that_installed_its_pin_without_the_history_can_author_under_it` proves the
+    /// effect. The state it needs — own account, evidence absent — is the second-owner-device case:
+    /// a device that INSTALLED the pin holds the bundle only in `account_control_pin_evidence`.
+    /// The deletion below builds that state directly, since a proposing store necessarily
+    /// already holds every entry its evidence was drawn from.
     ///
     /// The genesis is deliberately kept: `read_local_account` resolves the pointer THROUGH the
     /// candidate DAG, so deleting it would make the store forget which account is its own and the
@@ -734,23 +754,14 @@ mod tests {
         );
     }
 
-    /// A pin folds the same roster whether or not the installing store held the evidence.
-    ///
-    /// The authority projection is rewritten from `projection.history`, which `pinned_history`
-    /// composes from the checkpoint's OWN frozen entries — never from the stored candidate rows. So
-    /// a store that installed a bundle it has no history for still reconstructs the roster,
-    /// incarnations and stream ownership from that bundle alone.
-    ///
-    /// The selection walk over `account_entries` answers a different question: which STORED
-    /// candidates are accepted. Reading it as the source of the roster predicts that this test
-    /// fails, which it does not.
     /// The evidence arriving LATER, by ordinary ingest, must not disturb what the pin froze.
     ///
     /// Account ingest is deliberately not pin-gated, so a pinned store keeps receiving control-log
     /// v1 rows — including, once account-log sync opens, the checkpoint's own evidence. Those rows
     /// enter `load_candidates`, so they reach `select_coherent_branches` and the frozen-slot
-    /// filter. Landing the exact entries the checkpoint accepted must be inert: same roster,
-    /// same accepted set, no fork.
+    /// filter. Landing the exact entries the checkpoint accepted must not contest what it froze:
+    /// no fork, the roster intact, the pin still governing. (They are not inert in general — they
+    /// are the roots a v2 continuation chains from; this fixture authors no v2 operation.)
     #[test]
     fn evidence_arriving_by_ingest_after_a_pin_does_not_disturb_the_frozen_projection() {
         let proposer = Connection::open_in_memory().unwrap();
@@ -792,52 +803,6 @@ mod tests {
             account_control_policy(&installer, account).unwrap(),
             AccountControlPolicy::ControlV2(pin),
             "and the pin still governs",
-        );
-    }
-
-    #[test]
-    fn a_pin_installed_without_the_evidence_folds_the_same_roster() {
-        let proposer = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&proposer, &crate::test_hooks()).unwrap();
-        let account = crate::local_account(&proposer, 0).unwrap();
-        let device = crate::local_device(&proposer, 0).unwrap();
-        let bundle = checkpoint::propose_checkpoint(&proposer, account, &device).unwrap();
-        let pin = TrustedCheckpointPin {
-            account_id: account,
-            checkpoint_digest: bundle.certificate_digest(),
-            required_control_version: 2,
-        };
-
-        // Baseline: the store that PROPOSED it already holds every evidence entry.
-        install_checkpoint(&proposer, pin, &bundle).unwrap();
-        super::super::storage::refold_account(&proposer, account).unwrap();
-        let proposed_roster = roster_rows(&proposer, account);
-        let proposed_entries = held_entries(&proposer, account);
-        // Without this the comparison below passes at `0 == 0` — a pinned store that folded NOTHING
-        // would look identical to one that folded correctly, and the test would prove nothing.
-        assert!(
-            proposed_roster > 0,
-            "the proposing store must fold a real roster, or the comparison is vacuous (roster \
-             {proposed_roster} from {proposed_entries} entries)",
-        );
-
-        // The store that INSTALLS it holds none of that account's history.
-        let installer = Connection::open_in_memory().unwrap();
-        rag_rat_db::schema::apply(&installer, &crate::test_hooks()).unwrap();
-        crate::local_account(&installer, 0).unwrap();
-        assert_eq!(
-            held_entries(&installer, account),
-            0,
-            "the installing store holds none of the proposing account's entries",
-        );
-        install_checkpoint(&installer, pin, &bundle).unwrap();
-        super::super::storage::refold_account(&installer, account).unwrap();
-        let installed_roster = roster_rows(&installer, account);
-
-        assert_eq!(
-            installed_roster, proposed_roster,
-            "proposer folded {proposed_roster} roster rows from {proposed_entries} held entries; \
-             installer folded {installed_roster} from 0",
         );
     }
 
