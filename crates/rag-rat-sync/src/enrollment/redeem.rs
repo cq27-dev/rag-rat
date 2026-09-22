@@ -155,6 +155,18 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         ],
     )
     .map_err(|error| InviteError::Storage(error.into()))?;
+    // Stamp the pin the account ACTUALLY carries, read in the mint transaction — never a caller
+    // argument, so a caller can neither forget it nor forge one. `None` while the account is
+    // unpinned, which is every ticket today: minting is still refused under a pin until the
+    // enrollment gates open.
+    let checkpoint_digest = match rag_rat_oplog::account_control_policy(&tx, account_id)
+        .map_err(InviteError::Storage)?
+    {
+        rag_rat_oplog::AccountControlPolicy::LegacyV1 => None,
+        rag_rat_oplog::AccountControlPolicy::ControlV2(pin)
+        | rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(pin) =>
+            Some(pin.checkpoint_digest),
+    };
     tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     Ok(InviteTicket {
         kind: InviteTicketKind::Pairing,
@@ -163,6 +175,7 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         relay_url,
         nonce,
         expires_at_ms,
+        checkpoint_digest,
     })
 }
 
@@ -280,6 +293,9 @@ pub fn mint_writer_invite(
         relay_url,
         nonce,
         expires_at_ms,
+        // A writer grant is cross-account and pins nothing; decode refuses one that carries a
+        // digest, so this is the only value it may take.
+        checkpoint_digest: None,
     })
 }
 

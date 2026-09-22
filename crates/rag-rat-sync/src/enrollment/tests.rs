@@ -98,7 +98,36 @@ fn sample_ticket() -> InviteTicket {
         relay_url: "https://relay.example".into(),
         nonce: [3u8; 32],
         expires_at_ms: 1_700_000_000_123,
+        checkpoint_digest: None,
     }
+}
+
+/// The `/3` wire: the digest round-trips, and a writer ticket may never carry one.
+#[test]
+fn a_ticket_carries_the_checkpoint_digest_and_a_writer_ticket_may_not() {
+    let pinned = InviteTicket { checkpoint_digest: Some([0x5a; 32]), ..sample_ticket() };
+    let s = pinned.to_ticket_string();
+    assert_eq!(InviteTicket::from_ticket_string(&s).unwrap(), pinned, "the digest round-trips");
+    assert_ne!(s, sample_ticket().to_ticket_string(), "and it is carried in the bytes");
+
+    // Unpinned stays `None` rather than some zero digest, so "no pin" is not spelled like a pin.
+    assert_eq!(
+        InviteTicket::from_ticket_string(&sample_ticket().to_ticket_string())
+            .unwrap()
+            .checkpoint_digest,
+        None,
+    );
+
+    let writer = InviteTicket {
+        kind: InviteTicketKind::Writer,
+        checkpoint_digest: Some([0x5a; 32]),
+        ..sample_ticket()
+    };
+    let err = InviteTicket::from_ticket_string(&writer.to_ticket_string()).unwrap_err().to_string();
+    assert!(
+        err.contains("invalid invite ticket"),
+        "a writer ticket with a digest is refused: {err}"
+    );
 }
 
 #[test]

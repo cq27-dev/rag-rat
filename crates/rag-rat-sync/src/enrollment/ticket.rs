@@ -10,8 +10,15 @@ use super::error::InviteError;
 use super::wire::{decode, ensure_consumed, exact_array, exact_str, fixed32};
 
 // `/2` added the kind discriminator (arity 6 -> 7) when the pairing ticket and the writer
-// invite merged into one struct; a `/1` binary rejects the new domain legibly.
-const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/2";
+// invite merged into one struct; a `/1` binary rejects the new domain legibly. `/3` appends the
+// checkpoint digest (arity 8).
+//
+// A domain bump rather than the additive-by-omission trick `StreamSpecV2` uses: that exists there
+// because `stream_id = sha256(spec)` and changing bytes would move identities, while a ticket is
+// content-addressed by nothing, is TTL'd and single-use, so no ticket outlives a release. And for a
+// SECURITY field silent compatibility is the wrong default — an old binary that ignored the digest
+// would enrol into a pinned account without installing its pin. Legible rejection is correct.
+const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/3";
 
 const MAX_RELAY_URL_BYTES: usize = 2048;
 
@@ -56,13 +63,22 @@ pub struct InviteTicket {
     pub relay_url: String,
     pub nonce: [u8; 32],
     pub expires_at_ms: i64,
+    /// The digest of the control checkpoint the inviting account is pinned to, or `None` when it
+    /// is unpinned. This is the pin's trusted channel: the ticket is what an operator carries
+    /// between machines by hand, so the digest travels here while the proof travels over the
+    /// enrollment connection, and the joiner verifies one against the other.
+    ///
+    /// Always `None` on a [`InviteTicketKind::Writer`] ticket — a writer grant is cross-account
+    /// and pins nothing — and decode refuses a writer ticket that carries one, so the field
+    /// can never read as authority it does not have.
+    pub checkpoint_digest: Option<[u8; 32]>,
 }
 
 impl InviteTicket {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut enc = Encoder::new(&mut out);
-        enc.array(7).expect("owned Vec");
+        enc.array(8).expect("owned Vec");
         enc.str(TICKET_DOMAIN).expect("owned Vec");
         enc.u8(self.kind.wire_tag()).expect("owned Vec");
         enc.bytes(&self.account_id.to_bytes()).expect("owned Vec");
@@ -70,12 +86,16 @@ impl InviteTicket {
         enc.str(&self.relay_url).expect("owned Vec");
         enc.bytes(&self.nonce).expect("owned Vec");
         enc.i64(self.expires_at_ms).expect("owned Vec");
+        match self.checkpoint_digest {
+            Some(digest) => enc.bytes(&digest).expect("owned Vec"),
+            None => enc.null().expect("owned Vec"),
+        };
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, InviteError> {
         let mut dec = Decoder::new(bytes);
-        exact_array(&mut dec, 7, "ticket")?;
+        exact_array(&mut dec, 8, "ticket")?;
         exact_str(&mut dec, TICKET_DOMAIN, "ticket domain")?;
         let kind = InviteTicketKind::from_wire_tag(dec.u8().map_err(decode)?)?;
         let account_id = AccountId::from_bytes(fixed32(dec.bytes().map_err(decode)?, "account")?);
@@ -84,8 +104,28 @@ impl InviteTicket {
         validate_enrollment_route(&inviter_node_id, &relay_url)?;
         let nonce = fixed32(dec.bytes().map_err(decode)?, "nonce")?;
         let expires_at_ms = dec.i64().map_err(decode)?;
+        let checkpoint_digest = match dec.datatype().map_err(decode)? {
+            minicbor::data::Type::Null => {
+                dec.null().map_err(decode)?;
+                None
+            },
+            _ => Some(fixed32(dec.bytes().map_err(decode)?, "checkpoint digest")?),
+        };
+        if kind == InviteTicketKind::Writer && checkpoint_digest.is_some() {
+            return Err(InviteError::Malformed(
+                "a writer invite pins no checkpoint and must not carry a digest".into(),
+            ));
+        }
         ensure_consumed(&dec, bytes)?;
-        let ticket = Self { kind, account_id, inviter_node_id, relay_url, nonce, expires_at_ms };
+        let ticket = Self {
+            kind,
+            account_id,
+            inviter_node_id,
+            relay_url,
+            nonce,
+            expires_at_ms,
+            checkpoint_digest,
+        };
         if ticket.encode() != bytes {
             return Err(InviteError::Malformed("ticket is not canonical CBOR".into()));
         }
