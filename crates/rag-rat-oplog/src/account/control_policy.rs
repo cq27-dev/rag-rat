@@ -274,7 +274,9 @@ pub fn pin_checkpoint_in_tx(
 ///
 /// That is a store restored without its own history, not a freshly enrolled second device: a device
 /// holding its own seq-0 entry authors at ITS tail+1, a slot the checkpoint never froze for it, and
-/// applies fine; one holding no rows at all is refused loudly on an empty control chain. Storing
+/// applies fine; one holding no rows at all is refused loudly on an empty control chain. Only the
+/// truncated-chain case has a test — the two second-device outcomes follow from the per-device slot
+/// key and would need a two-store fixture to pin directly. Storing
 /// the evidence restores the tip. Stub this out and
 /// `an_owner_that_installed_its_pin_without_the_history_can_author_under_it` fails at the removal's
 /// post-check — `storage.rs`'s frozen-slot filter is the line that drops it.
