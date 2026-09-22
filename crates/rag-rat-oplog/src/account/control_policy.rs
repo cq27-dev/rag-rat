@@ -847,15 +847,20 @@ mod tests {
             pin_checkpoint_in_tx(&tx, expected, &proof).unwrap(),
             PinInstallOutcome::AlreadyPinned
         );
-        assert!(pin_checkpoint_in_tx(&tx, first.pin(), &first).is_err());
         assert_eq!(
             account_control_policy(&tx, account).unwrap(),
             AccountControlPolicy::ControlV2(expected),
             "the schema admits only version 2, so every installed pin is one this binary executes",
         );
-        let other = TrustedCheckpointPin { checkpoint_digest: [3; 32], ..expected };
-        assert!(pin_checkpoint_in_tx(&tx, other, &proof).is_err());
         tx.commit().unwrap();
+        // Each refusal in its own transaction, DROPPED rather than committed: the caller must roll
+        // back on `Err`, and a test that committed past one would model exactly the misuse.
+        let other = TrustedCheckpointPin { checkpoint_digest: [3; 32], ..expected };
+        for (pin, proof) in [(first.pin(), &first), (other, &proof)] {
+            let tx = Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(pin_checkpoint_in_tx(&tx, pin, proof).is_err(), "a conflicting pin refuses");
+        }
         assert!(conn.execute("DELETE FROM account_control_pins", []).is_err());
         assert!(conn.execute("DELETE FROM account_control_pin_evidence", []).is_err());
         rag_rat_db::schema::purge_repo_rows(&conn, "pin-retention-test").unwrap();
