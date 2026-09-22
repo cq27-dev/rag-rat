@@ -256,10 +256,59 @@ pub(crate) struct SyncArgs {
     pub command: SyncCommand,
 }
 
+/// Control-checkpoint proposal, review and reporting.
+///
+/// Installing a pin is deliberately absent. Every operational seam refuses for a pinned account
+/// today — authoring, sync and enrollment alike — and the pin is permanent, so an
+/// operator-reachable `install` would end a store's working life with no way back. The capability
+/// exists at the library level and opens here once account sync, content evaluation and the
+/// enrollment ticket all carry a pinned account (#1311).
+#[derive(Debug, Subcommand)]
+pub(crate) enum CheckpointCommand {
+    /// Build a control-checkpoint proposal for this account and write it to a file.
+    #[command(long_about = "Writes the proposal bundle and prints its digest. That digest is \
+                            what every peer must receive through a channel the bundle did not \
+                            travel over: a bundle that vouched for itself would turn a \
+                            trusted-channel upgrade into trusting whatever file you were handed. \
+                            Proposing installs nothing and approves nothing. Requires an open \
+                            owner incarnation on this device, and refuses once the account is \
+                            pinned.")]
+    Propose {
+        /// File to write the proposal bundle to.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+    /// Write out the bundle behind this account's existing pin.
+    #[command(long_about = "Once an account is pinned, `propose` refuses — so this is the only \
+                            way to obtain its bundle for a peer that still needs one.")]
+    Export {
+        /// File to write the stored bundle to.
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
+    /// Report what a bundle file claims, without touching this store.
+    #[command(long_about = "Decodes the bundle and prints the account it certifies, its digest \
+                            and its evidence counts. Reads no database and establishes no trust \
+                            — compare the printed digest against the one you were given out of \
+                            band, because the file's own account of itself proves nothing.")]
+    Inspect {
+        /// Bundle file to read.
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    },
+    /// Report control-pin status for every account this store carries.
+    Status,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum SyncCommand {
     /// Permanently enable sealed authoring for subsequent local memory changes.
     Enable,
+    /// Propose, review and report control checkpoints.
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
     /// Permanently publish this repo's account as a public knowledge base (anonymous read-only).
     #[command(long_about = "Marks this repo's account as public in its entirety: subsequent \
                             memory authoring uses a public_read stream and the account becomes \
@@ -1849,5 +1898,33 @@ mod sync_validation_tests {
         };
         assert_eq!(account.original, original);
         assert_eq!(account.id, rag_rat_oplog::AccountId::from_hex(&original).unwrap());
+    }
+
+    #[test]
+    fn checkpoint_subcommands_parse_and_install_is_not_reachable() {
+        let cli =
+            Cli::try_parse_from(["rag-rat", "sync", "checkpoint", "propose", "--out", "b.cbor"])
+                .unwrap();
+        let Command::Sync(SyncArgs {
+            command: SyncCommand::Checkpoint { command: CheckpointCommand::Propose { out } },
+        }) = cli.command
+        else {
+            panic!("expected checkpoint propose");
+        };
+        assert_eq!(out, PathBuf::from("b.cbor"));
+
+        assert!(Cli::try_parse_from(["rag-rat", "sync", "checkpoint", "status"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["rag-rat", "sync", "checkpoint", "inspect", "b.cbor"]).is_ok()
+        );
+        // `propose` and `export` write a file, so the destination is required, never defaulted.
+        assert!(Cli::try_parse_from(["rag-rat", "sync", "checkpoint", "propose"]).is_err());
+        assert!(Cli::try_parse_from(["rag-rat", "sync", "checkpoint", "export"]).is_err());
+        // Installing a pin ends a store's working life and cannot be undone, so it is deliberately
+        // not an operator-reachable command. Adding one has to break this test on purpose.
+        assert!(
+            Cli::try_parse_from(["rag-rat", "sync", "checkpoint", "install", "b.cbor"]).is_err(),
+            "install must not be reachable from the CLI while a pinned store cannot operate",
+        );
     }
 }

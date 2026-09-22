@@ -21,6 +21,33 @@ pub struct PublishSeedReport {
     pub imported_memories: u64,
 }
 
+/// A control-checkpoint bundle ready to leave this host: the transport bytes, plus the digest an
+/// operator relays over a channel those bytes did not travel on. Holding this installs nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointProposal {
+    pub bundle: Vec<u8>,
+    pub digest: [u8; 32],
+    pub evidence_entries: u64,
+    pub evidence_bytes: u64,
+}
+
+/// Which accounts this store holds control pins for, and what the local account's policy is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointStatus {
+    pub local_account: Option<rag_rat_oplog::AccountId>,
+    pub local_policy: Option<rag_rat_oplog::AccountControlPolicy>,
+    pub pinned: Vec<rag_rat_oplog::TrustedCheckpointPin>,
+}
+
+fn proposal(bundle: &rag_rat_oplog::CheckpointBundle) -> anyhow::Result<CheckpointProposal> {
+    Ok(CheckpointProposal {
+        digest: bundle.certificate_digest(),
+        evidence_entries: bundle.evidence.len() as u64,
+        evidence_bytes: bundle.evidence.iter().map(|entry| entry.len() as u64).sum(),
+        bundle: bundle.encode()?,
+    })
+}
+
 impl IndexDatabase {
     /// Last observed table-sync row failures for this checkout's active repository. This report
     /// reads local observations; it does not mint an account, trigger authoring or scan tables.
@@ -282,5 +309,83 @@ impl IndexDatabase {
             rag_rat_base::time::now_ms(),
         )?;
         Ok(())
+    }
+
+    /// Build a control-checkpoint proposal for this store's account.
+    ///
+    /// Proposing approves nothing and installs nothing. The returned digest has to reach every peer
+    /// out of band before anything can be pinned to it; that separation is the whole trust model.
+    /// Refuses once the account is already pinned, and on a device holding no open owner
+    /// incarnation.
+    pub fn checkpoint_propose(&self) -> anyhow::Result<CheckpointProposal> {
+        let conn = self.storage.connection();
+        let account = rag_rat_oplog::read_local_account(conn)?
+            .context("checkpoint proposal requires a local account")?;
+        let device = rag_rat_oplog::load_local_device(conn)?
+            .context("checkpoint proposal requires a local device identity")?;
+        proposal(&rag_rat_oplog::propose_checkpoint(conn, account, &device)?)
+    }
+
+    /// Install `account`'s control pin from transport bytes plus the digest relayed out of band.
+    ///
+    /// `digest` is required and is never read from the bundle — a bundle that vouched for itself
+    /// would turn a trusted-channel upgrade into "trust whatever file you were handed". `account`
+    /// is explicit for a related reason: `verify_checkpoint` refuses a bundle whose certificate
+    /// names a different account, and deriving it from this store instead would quietly make every
+    /// account but the local one unpinnable.
+    ///
+    /// **Permanent.** A pinned account refuses every operational seam afterwards, and the V130
+    /// triggers refuse UPDATE and DELETE on the row. There is no uninstall.
+    pub fn checkpoint_install(
+        &self,
+        account: rag_rat_oplog::AccountId,
+        bundle: &[u8],
+        digest: [u8; 32],
+    ) -> anyhow::Result<rag_rat_oplog::PinInstallOutcome> {
+        let bundle = rag_rat_oplog::CheckpointBundle::decode(bundle)?;
+        rag_rat_oplog::install_checkpoint(
+            self.storage.connection(),
+            rag_rat_oplog::TrustedCheckpointPin {
+                account_id: account,
+                checkpoint_digest: digest,
+                required_control_version: 2,
+            },
+            &bundle,
+        )
+    }
+
+    /// The local account's control policy, plus EVERY account this store holds a pin for.
+    ///
+    /// A store folds other accounts' logs, so "am I pinned?" is the wrong question — the one that
+    /// matters is which of the accounts carried here have become unfoldable, and a local-only
+    /// report answers it wrongly by omission.
+    pub fn checkpoint_status(&self) -> anyhow::Result<CheckpointStatus> {
+        let conn = self.storage.connection();
+        let local_account = rag_rat_oplog::read_local_account(conn)?;
+        let local_policy = match local_account {
+            Some(account) => Some(rag_rat_oplog::account_control_policy(conn, account)?),
+            None => None,
+        };
+        Ok(CheckpointStatus {
+            local_account,
+            local_policy,
+            pinned: rag_rat_oplog::pinned_accounts(conn)?,
+        })
+    }
+
+    /// The bundle behind this store's own pin, re-verified against the durable proof.
+    ///
+    /// Load-bearing rather than a convenience: [`Self::checkpoint_propose`] refuses once an account
+    /// is pinned, so after installation this is the only way to obtain the bundle for a peer that
+    /// still needs it.
+    pub fn checkpoint_export(&self) -> anyhow::Result<Option<CheckpointProposal>> {
+        let conn = self.storage.connection();
+        let Some(account) = rag_rat_oplog::read_local_account(conn)? else {
+            return Ok(None);
+        };
+        match rag_rat_oplog::export_account_checkpoint(conn, account)? {
+            Some((_pin, bundle)) => proposal(&bundle).map(Some),
+            None => Ok(None),
+        }
     }
 }
