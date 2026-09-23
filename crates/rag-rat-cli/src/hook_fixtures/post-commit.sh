@@ -17,9 +17,12 @@ cd "$repo_root" || exit 0
 unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_PREFIX GIT_NAMESPACE \
   GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
-RAG_RAT_HOOK_DISABLE=1 \
-  rag-rat maintenance \
-    --trigger post-commit \
-    --max-seconds 30 >"${TMPDIR:-/tmp}/rag-rat-post-commit.log" 2>&1 &
+# Exported, not a command prefix: a prefix would cover only the first of the two attempts.
+RAG_RAT_HOOK_DISABLE=1
+export RAG_RAT_HOOK_DISABLE
+{
+  npx -y @rag-rat/bin@@VERSION@ maintenance --trigger post-commit --max-seconds 30 ||
+  rag-rat maintenance --trigger post-commit --max-seconds 30
+} >"${TMPDIR:-/tmp}/rag-rat-post-commit.log" 2>&1 &
 
 exit 0

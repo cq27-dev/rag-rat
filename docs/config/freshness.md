@@ -43,8 +43,15 @@ NFS and WSL2 `drvfs`/`9p` (`/mnt/...`) mounts — keep the repo on a native file
 ## Git hooks (`rag-rat hooks install`)
 
 `rag-rat hooks install` writes generated `post-checkout`, `post-merge`, `post-rewrite`, and
-`post-commit` hooks to the current worktree's Git hooks directory. Those hooks call `rag-rat
-maintenance --max-seconds 30` in the background so branch switches, merges, rebases, and commits
+`post-commit` hooks to the current worktree's Git hooks directory. Those hooks run
+`npx -y @rag-rat/bin@<version> maintenance --max-seconds 30` in the background, pinned to the
+installing version, and fall back to `rag-rat maintenance` on PATH when npx is missing or that run
+fails (for `cargo install` and the source-only platforms), so branch switches, merges, rebases, and commits
 refresh the current worktree index and advance changed-first embedding reconciliation without
 blocking normal Git operations. Each maintenance pass also runs a worktree-safe `gc` that prunes
 index rows for commits no longer held by any live worktree (run `rag-rat gc` to prune on demand).
+
+The pin follows upgrades on its own: when `rag-rat mcp` starts — including after the agent plugin
+updates itself — it rewrites any installed rag-rat hook pinned to an older version. It never
+downgrades a hook and never installs one that is not there. `rag-rat hooks status` reports each
+hook's `current` flag, and `rag-rat hooks install` rewrites them on demand.

@@ -62,8 +62,9 @@ sequenceDiagram
 ## Quickstart
 
 For Claude Code, Codex, and opencode, install the plugin. It registers the MCP server, adds the
-hooks, and installs a version-matched `rag-rat` binary on first run (the Claude Code and Codex
-bundles also add the skills; on opencode add them with `npx @rag-rat/skills`):
+hooks, and fetches a version-matched `rag-rat` binary into its own cache on first run — not onto
+your `PATH`; see [Running the CLI](#running-the-cli) (the Claude Code and Codex bundles also add the
+skills; on opencode add them with `npx @rag-rat/skills`):
 
 ```bash
 # Claude Code
@@ -516,6 +517,23 @@ feature of the index, query, or MCP surface is affected:
   index, which works the same but without cross-call dedupe.
 
 ## Commands
+
+### Running the CLI
+
+Commands in this README and in `docs/` are written as `rag-rat <command>`. That works as written when
+`rag-rat` is on your `PATH` — `npm install -g @rag-rat/bin` or `cargo install rag-rat` puts it
+there. The plugin alone does not: it keeps its binary in a private, per-version cache. Without a
+`PATH` install, run the same command through npx:
+
+```bash
+npx -y @rag-rat/bin <command>               # e.g. npx -y @rag-rat/bin hooks install
+```
+
+That runs the latest release, which is what a self-updating plugin runs too. If the CLI and the
+MCP server ever disagree about the index — the server refuses an index "created by a newer
+rag-rat" — pin the CLI to the server's version (the `version` field of the `index_status` tool):
+`npx -y @rag-rat/bin@<version> <command>`. Git hooks pin themselves this way and follow plugin
+updates on their own.
 
 ```bash
 rag-rat init                       # guided first-run setup
