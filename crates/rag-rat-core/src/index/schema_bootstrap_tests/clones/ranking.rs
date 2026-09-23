@@ -54,6 +54,7 @@ fn find_clones_ranks_a_clean_clone_class_with_metrics() {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

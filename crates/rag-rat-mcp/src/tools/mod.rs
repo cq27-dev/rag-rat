@@ -6,10 +6,10 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-pub use catalog::{TOOL_NAMES, description, list_tools, schema};
+pub use catalog::{TOOL_NAMES, description, is_listed, list_tools, schema, toolset};
 pub(crate) use defaults::*;
 pub(crate) use handlers::*;
-use rag_rat_base::config::{Config, MemorySurface};
+use rag_rat_base::config::{Config, McpToolset, MemorySurface};
 use rag_rat_base::language::Language;
 use rag_rat_core::IndexDatabase;
 use rag_rat_core::query::clusters::RepoClustersOptions;
@@ -79,6 +79,32 @@ fn is_read_only_tool(name: &str) -> bool {
 /// (`mcp_stdio_every_advertised_tool_is_routable`), so this is the same "is this a real tool" test
 /// the active `call_tool_for_config` applies — used by the dormant server to reject an
 /// unknown/misspelled name instead of masking it as `no_index`.
+/// The optional toolsets this server lists: the repo's `[mcp] toolsets`, plus any named in the
+/// comma-separated `RAG_RAT_TOOLSETS` — which is how a plugin launch, or a dormant server with no
+/// config, turns one on. An unknown name in the variable is skipped with a warning (config names
+/// are validated at load).
+pub fn enabled_toolsets(config: Option<&rag_rat_base::config::Config>) -> Vec<McpToolset> {
+    let from_env = std::env::var("RAG_RAT_TOOLSETS").unwrap_or_default();
+    merge_toolsets(
+        config.map(|config| config.mcp.toolsets.as_slice()).unwrap_or_default(),
+        &from_env,
+    )
+}
+
+/// The configured toolsets plus those named in a `RAG_RAT_TOOLSETS` value, sorted and deduped.
+fn merge_toolsets(configured: &[McpToolset], from_env: &str) -> Vec<McpToolset> {
+    let mut enabled = configured.to_vec();
+    for name in from_env.split(',').map(str::trim).filter(|name| !name.is_empty()) {
+        match McpToolset::from_config_str(name) {
+            Some(set) => enabled.push(set),
+            None => tracing::warn!(toolset = name, "RAG_RAT_TOOLSETS names an unknown toolset"),
+        }
+    }
+    enabled.sort_unstable();
+    enabled.dedup();
+    enabled
+}
+
 pub(crate) fn is_known_tool(name: &str) -> bool {
     TOOL_NAMES.contains(&name)
 }

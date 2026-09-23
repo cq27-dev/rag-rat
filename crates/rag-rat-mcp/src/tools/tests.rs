@@ -412,7 +412,7 @@ const SCHEMA_ROWS: &[SchemaRow] = &[
     row("llm_status", &[], &[]),
     row("heal_index", &[], &["limit"]),
     row("papertrail_sync_status", &[], &[]),
-    row("index_status", &[], &[]),
+    SchemaRow { include: Some(&["embeddings"]), ..row("index_status", &[], &["include"]) },
     // `bind` is OPTIONAL (#463): omitting it creates an unanchored Concept/Task node.
     SchemaRow {
         enums: &[
@@ -1270,6 +1270,7 @@ fn mixed_config() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),
@@ -1304,6 +1305,7 @@ fn markdown_config(text: &str) -> (rag_rat_base::test_scratch::ScratchDir, Confi
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),
@@ -1335,6 +1337,7 @@ fn rust_config(root: PathBuf) -> Config {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),
@@ -1717,4 +1720,40 @@ fn busy_retry_rides_out_a_short_writer_but_is_bounded() {
     });
     assert!(rag_rat_db::storage::is_busy(&exhausted.unwrap_err()));
     assert_eq!(calls.get(), 3, "bounded to MAX_ATTEMPTS");
+}
+
+/// The default list is the coding surface: maintenance, diagnostics and the memory task graph come
+/// off it, and each comes back when its toolset is enabled. Listing only — every tool stays
+/// routable (`mcp_stdio_every_advertised_tool_is_routable` covers `TOOL_NAMES`).
+#[test]
+fn toolsets_decide_what_is_listed_and_nothing_else() {
+    use rag_rat_base::config::McpToolset::{Admin, Graph};
+    let listed = |enabled: &[rag_rat_base::config::McpToolset]| {
+        TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| super::is_listed(name, enabled))
+            .collect::<Vec<_>>()
+    };
+    let default = listed(&[]);
+    for name in ["semantic_search", "impact_surface", "memory_search", "index_status"] {
+        assert!(default.contains(&name), "{name} is on the default list");
+    }
+    for name in ["heal_index", "dream", "llm_status", "memory_edges", "ffi_surface"] {
+        assert!(!default.contains(&name), "{name} is off the default list");
+    }
+    assert!(
+        listed(&[Admin]).contains(&"heal_index") && !listed(&[Admin]).contains(&"memory_edges")
+    );
+    assert!(
+        listed(&[Graph]).contains(&"memory_edges") && !listed(&[Graph]).contains(&"heal_index")
+    );
+    assert_eq!(listed(&[Admin, Graph]), TOOL_NAMES.to_vec(), "both toolsets list everything");
+}
+
+#[test]
+fn toolsets_merge_config_with_the_environment_and_skip_unknown_names() {
+    use rag_rat_base::config::McpToolset::{Admin, Graph};
+    assert_eq!(super::merge_toolsets(&[], ""), vec![]);
+    assert_eq!(super::merge_toolsets(&[Graph], " admin , nope ,graph"), vec![Admin, Graph]);
 }

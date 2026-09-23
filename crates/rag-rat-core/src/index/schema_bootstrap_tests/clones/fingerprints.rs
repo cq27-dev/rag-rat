@@ -514,6 +514,7 @@ fn multi_language_clone_integration_finds_within_language_no_cross() {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

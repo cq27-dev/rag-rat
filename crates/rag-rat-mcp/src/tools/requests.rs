@@ -782,6 +782,21 @@ pub struct HealIndexArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Default)]
 pub struct EmptyArgs {}
 
+/// `index_status` `include` flags, off by default: freshness is what a thin result usually needs,
+/// embedding coverage the next question. (The tracker cache is always in the report.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexStatusInclude {
+    Embeddings,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Default)]
+pub struct IndexStatusArgs {
+    /// Also report `embeddings`: model, install state, embedded / missing / skipped chunks.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<IndexStatusInclude>>,
+}
+
 impl MemoryCreateArgs {
     pub(super) fn core(self) -> RepoMemoryCreate {
         RepoMemoryCreate {

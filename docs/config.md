@@ -43,6 +43,9 @@ Each topic below has its own in-depth page under [`docs/config/`](config/):
   (`[oracle]`) with quiet-period and min-interval gates.
 - **[Version check](config/version-check.md)** — the cached, fail-open crates.io update check
   (`[version_check]`).
+- **MCP toolsets** — `[mcp] toolsets = ["admin", "graph"]` lists the optional maintenance and
+  memory-graph tools alongside the default coding surface; every tool stays callable either way
+  (see [`docs/mcp-tools.md`](mcp-tools.md)). Unknown names fail config load.
 - **[Dream memory maintenance](config/dream.md)** — the opt-in verify/compaction model
   (`[llm.dream]`), ephemeral GPU serving, nightly scheduling, and reviewing findings.
 - **[Issue distillation model](config/distill.md)** — the opt-in LLM pass that fills distilled

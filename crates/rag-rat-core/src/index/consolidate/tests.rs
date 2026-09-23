@@ -708,6 +708,7 @@ fn import_rekeys_call_path_identity_for_the_destination_repo() {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

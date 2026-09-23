@@ -40,8 +40,10 @@ impl ServerHandler for RagRatService {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
+        let enabled = crate::tools::enabled_toolsets(self.config.as_ref());
         let tools = crate::tools::TOOL_NAMES
             .iter()
+            .filter(|name| crate::tools::is_listed(name, &enabled))
             .map(|name| {
                 let input_schema = match crate::tools::schema(name) {
                     Value::Object(map) => map,
@@ -130,6 +132,20 @@ mod tests {
             (Some(0), Some(CacheScope::Public)),
             "2026-07-28 peers must receive the required cache hints"
         );
+    }
+
+    /// `tools/list` advertises the default surface, not the maintenance toolsets.
+    #[tokio::test]
+    async fn tools_list_advertises_only_the_default_surface() {
+        let names = list_tools_at(ProtocolVersion::V_2025_06_18)
+            .await
+            .tools
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "impact_surface"));
+        assert!(!names.iter().any(|name| name == "heal_index"), "admin tools are not listed");
+        assert!(!names.iter().any(|name| name == "memory_edges"), "graph tools are not listed");
     }
 
     /// Peers on older protocol versions keep the pre-SEP-2549 wire shape: strict legacy clients

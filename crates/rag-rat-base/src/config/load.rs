@@ -5,8 +5,8 @@ use std::str::FromStr;
 
 use super::raw::RawIndex;
 use super::{
-    self as config, Config, ConfigError, LlmConfig, LogConfig, MemoryConfig, PapertrailConfig,
-    RawConfig, RawTarget, ResolvedTarget, TargetKind, TrackerConfig,
+    self as config, Config, ConfigError, LlmConfig, LogConfig, McpConfig, MemoryConfig,
+    PapertrailConfig, RawConfig, RawTarget, ResolvedTarget, TargetKind, TrackerConfig,
 };
 use crate::language::Language;
 
@@ -147,6 +147,7 @@ impl Config {
         resolve_cookbook_in_place(&mut llm.distill.remote.cookbook, &config_dir);
         let watch = raw.watch.into();
         let version_check = raw.version_check.into();
+        let mcp = McpConfig::try_from(raw.mcp)?;
         let oracle = raw.oracle.into();
         let search = raw.search.into();
         let sync = raw.sync.into();
@@ -165,6 +166,7 @@ impl Config {
             llm,
             watch,
             version_check,
+            mcp,
             oracle,
             search,
             memory,

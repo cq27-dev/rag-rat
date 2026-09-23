@@ -97,6 +97,7 @@ pub(crate) fn whole_root_config(root: &Path, target_dirs: &[PathBuf]) -> (Config
         llm: LlmConfig::default(),
         watch: WatchConfig::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

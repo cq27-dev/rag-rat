@@ -197,19 +197,14 @@ pub(crate) fn call_tool_with_db(
             }
             value
         },
-        "llm_status" => {
-            let mut value = json!(db.llm_status()?);
-            // `fastembed` re-states the same counts as `embedding` plus backend diagnostics; keep
-            // the canonical `embedding` capability/state block and the `artifacts` coverage block.
-            remove_object_key(&mut value, "fastembed");
-            value
-        },
+        "llm_status" => llm_status_value(db)?,
         "heal_index" => {
             let args: HealIndexArgs = serde_json::from_value(arguments)?;
             json!(db.heal_index(args.limit)?)
         },
         "papertrail_sync_status" => json!(db.papertrail_sync_status()?),
         "index_status" => {
+            let args: IndexStatusArgs = serde_json::from_value(arguments)?;
             let mut value = json!(db.status(db.database_path())?);
             // The full migration ledger is static detail (use the CLI `doctor`/`migrate` for it),
             // and the embedded llm block duplicates the `llm_status` tool.
@@ -217,6 +212,12 @@ pub(crate) fn call_tool_with_db(
                 remove_object_key(schema, "migrations");
             }
             remove_object_key(&mut value, "llm");
+            // Embedding coverage is the next question after freshness; folded in on request rather
+            // than kept as a separate tool on the default list. The report already carries the
+            // papertrail cache block `papertrail_sync_status` returns.
+            if included(&args.include, IndexStatusInclude::Embeddings, false) {
+                value["embeddings"] = llm_status_value(db)?;
+            }
             value
         },
         "memory_create" => {
@@ -464,6 +465,15 @@ pub(crate) fn graph_tool(
         },
         SymbolAnswer::Done(answer) => Ok(answer),
     }
+}
+
+/// The embedding status report, shared by `llm_status` and `index_status {include: [embeddings]}`.
+fn llm_status_value(db: &IndexDatabase) -> anyhow::Result<Value> {
+    let mut value = json!(db.llm_status()?);
+    // `fastembed` re-states the same counts as `embedding` plus backend diagnostics; keep the
+    // canonical `embedding` capability/state block and the `artifacts` coverage block.
+    remove_object_key(&mut value, "fastembed");
+    Ok(value)
 }
 
 pub(crate) fn docs_for_symbol_tool(

@@ -150,6 +150,8 @@ pub enum ConfigError {
          `jira`)"
     )]
     TrackerProviderMissing,
+    #[error("[mcp] `toolsets` entries must be `admin` or `graph` (got `{0}`)")]
+    McpToolsetUnknown(String),
     #[error(
         "[[tracker]] `provider` must be one of `github`, `gitlab`, `bitbucket`, or `jira` (got \
          `{0}`)"

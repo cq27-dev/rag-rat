@@ -35,6 +35,7 @@ fn config_over_temp_repo() -> (rag_rat_base::test_scratch::ScratchDir, Config) {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),
@@ -468,4 +469,16 @@ fn memory_show_expands_a_memory_to_its_full_body_by_id() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `index_status` folds in embedding coverage, only on request.
+#[test]
+fn index_status_includes_embeddings_on_request() {
+    let (_root, svc) = service_over_temp_repo();
+    let text = |args| {
+        let result = svc.call("index_status", args).unwrap();
+        serde_json::to_string(&result.content).unwrap()
+    };
+    assert!(!text(json!({})).contains("embeddings:"), "absent by default");
+    assert!(text(json!({"include": ["embeddings"]})).contains("embeddings:"), "present on request");
 }

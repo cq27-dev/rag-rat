@@ -625,6 +625,7 @@ fn test_config(root: PathBuf) -> Config {
         watch: Default::default(),
         log: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

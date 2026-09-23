@@ -27,6 +27,7 @@ fn rebuild_bootstraps_sqlite_schema_for_empty_target_root() {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),
