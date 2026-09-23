@@ -18,9 +18,42 @@ pub(super) const MAX_ENROLL_RESPONSE_FRAME: u32 = crate::codec::MAX_FRAME_BYTES;
 
 pub(super) const MAX_ENROLL_BOOTSTRAP_ENTRIES: u64 = 4_096;
 
+/// An invite's one-time nonce: a bearer secret. Whoever holds it can redeem the invite — enroll a
+/// device into the account, or be granted a stream. Its `Debug` is redacted, so the ticket and the
+/// requests that carry it can keep deriving `Debug` and be formatted in an error path, a `dbg!` or
+/// a tracing field without writing the secret into a log. Reading it is always explicit.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InviteNonce([u8; 32]);
+
+impl InviteNonce {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for InviteNonce {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for InviteNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InviteNonce(<redacted>)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnrollmentRequest {
-    pub nonce: [u8; 32],
+    pub nonce: InviteNonce,
     /// Account the joiner intends to adopt. The acceptor compares this with the nonce's persisted
     /// account before authoring or consuming the one-time invite.
     pub expected_account: AccountId,
@@ -42,7 +75,7 @@ impl EnrollmentRequest {
         let mut enc = Encoder::new(&mut out);
         enc.array(8).expect("owned Vec");
         enc.str(REQUEST_DOMAIN).expect("owned Vec");
-        enc.bytes(&self.nonce).expect("owned Vec");
+        enc.bytes(self.nonce.as_slice()).expect("owned Vec");
         enc.bytes(&self.expected_account.to_bytes()).expect("owned Vec");
         enc.bytes(&self.ed25519_pubkey).expect("owned Vec");
         enc.bytes(&self.x25519_pubkey).expect("owned Vec");
@@ -66,7 +99,7 @@ impl EnrollmentRequest {
         let budget_u64 =
             |dec: &mut Decoder<'_>| -> Result<u64, InviteError> { dec.u64().map_err(decode) };
         let request = Self {
-            nonce: fixed32(dec.bytes().map_err(decode)?, "nonce")?,
+            nonce: InviteNonce::from_bytes(fixed32(dec.bytes().map_err(decode)?, "nonce")?),
             expected_account: AccountId::from_bytes(fixed32(
                 dec.bytes().map_err(decode)?,
                 "expected account",
@@ -280,7 +313,7 @@ const GRANT_RESPONSE_DOMAIN: &str = "rag-rat/grant-response/1";
 /// owner-ward by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterGrantRequest {
-    pub nonce: [u8; 32],
+    pub nonce: InviteNonce,
     /// The owner account the ticket names; compared against the nonce's persisted account.
     pub expected_account: AccountId,
     pub contributor_account: AccountId,
@@ -292,7 +325,7 @@ impl WriterGrantRequest {
         let mut enc = Encoder::new(&mut out);
         enc.array(4).expect("owned Vec");
         enc.str(GRANT_REQUEST_DOMAIN).expect("owned Vec");
-        enc.bytes(&self.nonce).expect("owned Vec");
+        enc.bytes(self.nonce.as_slice()).expect("owned Vec");
         enc.bytes(&self.expected_account.to_bytes()).expect("owned Vec");
         enc.bytes(&self.contributor_account.to_bytes()).expect("owned Vec");
         out
@@ -303,7 +336,7 @@ impl WriterGrantRequest {
         exact_array(&mut dec, 4, "grant request")?;
         exact_str(&mut dec, GRANT_REQUEST_DOMAIN, "grant request domain")?;
         let request = Self {
-            nonce: fixed32(dec.bytes().map_err(decode)?, "nonce")?,
+            nonce: InviteNonce::from_bytes(fixed32(dec.bytes().map_err(decode)?, "nonce")?),
             expected_account: AccountId::from_bytes(fixed32(
                 dec.bytes().map_err(decode)?,
                 "expected account",

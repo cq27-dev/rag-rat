@@ -96,7 +96,7 @@ fn sample_ticket() -> InviteTicket {
         account_id: AccountId::from_bytes([9u8; 32]),
         inviter_node_id: crate::endpoint::node_id_from_secret([7u8; 32]),
         relay_url: "https://relay.example".into(),
-        nonce: [3u8; 32],
+        nonce: [3u8; 32].into(),
         expires_at_ms: 1_700_000_000_123,
         checkpoint_digest: None,
     }
@@ -167,7 +167,7 @@ fn ticket_bytes(
     enc.bytes(&t.account_id.to_bytes()).unwrap();
     enc.bytes(&t.inviter_node_id).unwrap();
     enc.str(&t.relay_url).unwrap();
-    enc.bytes(&t.nonce).unwrap();
+    enc.bytes(t.nonce.as_slice()).unwrap();
     enc.i64(t.expires_at_ms).unwrap();
     digest(&mut enc);
     out
@@ -414,7 +414,7 @@ fn generous_budget() -> EnrollmentBudget {
 fn request_is_canonical_and_exactly_bound() {
     let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
     let request = EnrollmentRequest {
-        nonce: [7; 32],
+        nonce: [7; 32].into(),
         expected_account: AccountId::from_bytes([8; 32]),
         ed25519_pubkey,
         x25519_pubkey,
@@ -990,7 +990,7 @@ fn new_mandatory_key_targets_grow_an_outstanding_invites_reservation() {
         )
         .unwrap()
     };
-    let (entries0, bytes0) = reservation_of(ticket.nonce);
+    let (entries0, bytes0) = reservation_of(*ticket.nonce.as_bytes());
     assert_eq!(entries0, 1, "no live keys yet: only the DeviceAdd is reserved");
 
     // Authoring a new live key target grows the outstanding invite's reservation in the same
@@ -1000,7 +1000,7 @@ fn new_mandatory_key_targets_grow_an_outstanding_invites_reservation() {
     let stream = rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, "repo-a", NOW + 1).unwrap();
     rag_rat_oplog::mint_and_author_stream_key_wrap_in_tx(&tx, stream, NOW + 1).unwrap();
     tx.commit().unwrap();
-    let (entries1, bytes1) = reservation_of(ticket.nonce);
+    let (entries1, bytes1) = reservation_of(*ticket.nonce.as_bytes());
     assert_eq!(entries1, entries0 + 1, "one new live key target is one reserved wrap");
     assert!(bytes1 > bytes0, "the reserved wrap carries its byte cost");
 
@@ -2070,7 +2070,7 @@ async fn duplex_exchange_returns_the_authored_device_add() {
 async fn a_slow_but_progressing_response_completes() {
     let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
     let request = EnrollmentRequest {
-        nonce: [42; 32],
+        nonce: [42; 32].into(),
         expected_account: AccountId::from_bytes([1; 32]),
         ed25519_pubkey,
         x25519_pubkey,
@@ -2111,7 +2111,7 @@ async fn a_slow_but_progressing_response_completes() {
 async fn a_stalled_response_times_out_within_one_window() {
     let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
     let request = EnrollmentRequest {
-        nonce: [42; 32],
+        nonce: [42; 32].into(),
         expected_account: AccountId::from_bytes([1; 32]),
         ed25519_pubkey,
         x25519_pubkey,
@@ -2172,7 +2172,7 @@ async fn dialer_acks_the_response_once_decoded() {
     let conn = db();
     let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
     let request = EnrollmentRequest {
-        nonce: [42; 32],
+        nonce: [42; 32].into(),
         expected_account: AccountId::from_bytes([1; 32]),
         ed25519_pubkey,
         x25519_pubkey,
@@ -2202,7 +2202,7 @@ async fn dialer_acks_the_response_once_decoded() {
 async fn a_stalled_response_ack_is_bounded_and_best_effort() {
     let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
     let request = EnrollmentRequest {
-        nonce: [42; 32],
+        nonce: [42; 32].into(),
         expected_account: AccountId::from_bytes([1; 32]),
         ed25519_pubkey,
         x25519_pubkey,
@@ -2235,7 +2235,7 @@ async fn duplex_exchange_returns_a_semantic_refusal() {
     let conn = db();
     let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
     let request = EnrollmentRequest {
-        nonce: [42; 32],
+        nonce: [42; 32].into(),
         expected_account: AccountId::from_bytes([1; 32]),
         ed25519_pubkey,
         x25519_pubkey,
@@ -2509,7 +2509,7 @@ fn an_invite_whose_pin_moved_is_refused_before_its_nonce_is_consumed() {
         budget: generous_budget(),
         held_entry_hashes: Vec::new(),
     };
-    disagree_with_the_accounts_pin(&conn, ticket.nonce);
+    disagree_with_the_accounts_pin(&conn, *ticket.nonce.as_bytes());
 
     assert!(
         matches!(
@@ -2549,7 +2549,7 @@ fn a_pin_that_moved_after_consumption_still_replays_the_acknowledged_receipt() {
     };
     let (receipt, _) = redeem_invite(&conn, request.clone(), [9; 32], &|| NOW + 1).unwrap();
 
-    disagree_with_the_accounts_pin(&conn, ticket.nonce);
+    disagree_with_the_accounts_pin(&conn, *ticket.nonce.as_bytes());
 
     let (replayed, _) = redeem_invite(&conn, request, [9; 32], &|| NOW + 2)
         .expect("a lost response must still be answerable after the pin moves");
@@ -2756,4 +2756,45 @@ async fn a_second_owner_mints_and_redeems_a_writer_invite() {
         Some(Into::into(receipt.grant_id)),
         "the grant a second owner authored folds effective",
     );
+}
+
+/// The invite nonce is a bearer secret: whoever holds it can redeem the invite. Formatting a ticket
+/// or either request with `{:?}` — in an error path, a `dbg!`, a tracing field, a failing test's
+/// message — must not print it, in either Debug form. The redaction lives on the nonce's own type,
+/// so a field added to any of these later cannot bring the leak back.
+#[test]
+fn debug_formatting_never_prints_the_invite_nonce() {
+    let secret = [0xab; 32];
+    let nonce: InviteNonce = secret.into();
+    // The run of element values a derived Debug prints for the bytes, whitespace removed. Comparing
+    // whole renderings misses the pretty form: a nested one is indented differently, and a pretty
+    // array ends `171,]` where a compact one ends `171]`. The bare run appears in both.
+    let squash = |text: &str| text.split_whitespace().collect::<String>();
+    let leak = squash(&format!("{secret:?}")).trim_matches(|c| c == '[' || c == ']').to_owned();
+    let ticket = InviteTicket { nonce, ..sample_ticket() };
+    let enrollment = EnrollmentRequest {
+        nonce,
+        expected_account: AccountId::from_bytes([1; 32]),
+        ed25519_pubkey: [2; 32],
+        x25519_pubkey: [3; 32],
+        transport_node_id: [4; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    let writer = WriterGrantRequest {
+        nonce,
+        expected_account: AccountId::from_bytes([1; 32]),
+        contributor_account: AccountId::from_bytes([5; 32]),
+    };
+    for (name, rendered) in [
+        ("ticket", format!("{ticket:?}")),
+        ("ticket, pretty", format!("{ticket:#?}")),
+        ("enrollment request", format!("{enrollment:?}")),
+        ("enrollment request, pretty", format!("{enrollment:#?}")),
+        ("writer request", format!("{writer:?}")),
+        ("writer request, pretty", format!("{writer:#?}")),
+    ] {
+        assert!(!squash(&rendered).contains(&leak), "{name} prints the nonce: {rendered}");
+        assert!(rendered.contains("<redacted>"), "{name} names the field as redacted: {rendered}");
+    }
 }

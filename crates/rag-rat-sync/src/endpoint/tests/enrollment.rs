@@ -6,7 +6,7 @@ use super::*;
 fn local_request(database: &Connection) -> EnrollmentRequest {
     let local = rag_rat_oplog::local_device(database, NOW).unwrap();
     EnrollmentRequest {
-        nonce: [1; 32],
+        nonce: [1; 32].into(),
         expected_account: AccountId::from_bytes([5; 32]),
         ed25519_pubkey: local.ed25519_public_key(),
         x25519_pubkey: local.x25519_public_key(),
@@ -175,7 +175,7 @@ async fn enrollment_refusal_and_wrong_alpn_close_over_loopback() {
     // An unknown nonce redeems nothing: the acceptor answers a semantic refusal and closes
     // without the enrolled wait.
     let request = EnrollmentRequest {
-        nonce: [0x99; 32],
+        nonce: [0x99; 32].into(),
         expected_account: rag_rat_oplog::read_local_account(&owner_db).unwrap().unwrap(),
         ed25519_pubkey: local.ed25519_public_key(),
         x25519_pubkey: local.x25519_public_key(),
