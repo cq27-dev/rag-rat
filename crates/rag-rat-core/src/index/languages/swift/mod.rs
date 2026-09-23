@@ -218,7 +218,7 @@ fn symbol_node(node: Node<'_>) -> Option<SymbolMatch<'_>> {
 fn operator_name(node: Node<'_>) -> Option<Node<'_>> {
     let mut saw_operator_keyword = false;
     (0..node.child_count()).find_map(|index| {
-        let child = node.child(u32::try_from(index).ok()?)?;
+        let child = node.child(index)?;
         if !saw_operator_keyword {
             saw_operator_keyword = child.kind() == "operator";
             return None;
@@ -259,10 +259,7 @@ fn property_names(pattern: Node<'_>) -> Vec<Node<'_>> {
 }
 
 fn direct_child_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    (0..node.child_count()).find_map(|index| {
-        let index = u32::try_from(index).ok()?;
-        node.child(index).filter(|child| child.kind() == kind)
-    })
+    (0..node.child_count()).find_map(|index| node.child(index).filter(|child| child.kind() == kind))
 }
 
 pub(super) const RESOLVER_POLICY: ResolutionPolicy = ResolutionPolicy {

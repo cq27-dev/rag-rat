@@ -50,7 +50,7 @@ jobs:
     if: ${{ !startsWith(github.head_ref, 'release-plz-') && !github.event.pull_request.head.repo.fork }}
     runs-on: bigmem
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       # The runner is persistent: the iai runner stays installed in its cargo home, and the bench
       # corpus in the directory its `RAG_RAT_BENCH_CORPUS` names, so neither needs a cache step.
@@ -68,7 +68,7 @@ jobs:
         run: cp "$GITHUB_EVENT_PATH" event.json
 
       - name: Upload results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark_results
           path: |

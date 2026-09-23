@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use rag_rat_base::language::Language;
 use tree_sitter::Node;
@@ -180,7 +181,7 @@ pub(crate) fn annotation_type_span(spans: &[NodeSpan], lo: usize) -> Option<&Nod
 pub struct NodeSpan {
     pub start_byte: usize,
     pub end_byte: usize,
-    /// `node.kind()` returns a `&'static str` from the grammar — stored directly, no allocation.
+    /// The node kind, interned through [`static_kind`] so a span can outlive its parse tree.
     pub kind: &'static str,
     /// `true` iff `node.child_count() == 0`.
     pub is_leaf: bool,
@@ -212,6 +213,21 @@ pub(crate) fn normalize_baseline(node: Node<'_>, text: &str, lang: Language) -> 
     normalize_baseline_spanned(node, text, lang).0
 }
 
+/// A `&'static` copy of a tree-sitter node kind. `Node::kind` borrows from the tree, but a
+/// `NodeSpan` outlives it (refine members keep their spans after the tree is dropped). Kinds are a
+/// closed per-grammar set, so each distinct kind is leaked once and the total stays bounded.
+fn static_kind(kind: &str) -> &'static str {
+    static KINDS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut kinds =
+        KINDS.get_or_init(Default::default).lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(&interned) = kinds.get(kind) {
+        return interned;
+    }
+    let interned: &'static str = Box::leak(kind.into());
+    kinds.insert(interned);
+    interned
+}
+
 fn walk_spanned(
     node: Node<'_>,
     src: &[u8],
@@ -220,7 +236,7 @@ fn walk_spanned(
     tokens: &mut Vec<String>,
     spans: &mut Vec<NodeSpan>,
 ) {
-    let kind = node.kind();
+    let kind = static_kind(node.kind());
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
 

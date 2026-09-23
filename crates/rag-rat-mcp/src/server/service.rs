@@ -1,6 +1,6 @@
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListToolsResult,
-    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler};
@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 use super::RagRatService;
 
 impl ServerHandler for RagRatService {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("rag-rat", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Read-only-source repo intelligence. Index and auto-heal writes are confined to \
@@ -72,7 +72,7 @@ impl ServerHandler for RagRatService {
 
 #[cfg(test)]
 mod tests {
-    use rmcp::model::ClientInfo;
+    use rmcp::model::ClientConfig;
     use rmcp::service::serve_directly;
     use rmcp::{ClientHandler, RoleClient};
 
@@ -84,8 +84,8 @@ mod tests {
     }
 
     impl ClientHandler for VersionedClient {
-        fn get_info(&self) -> ClientInfo {
-            let mut info = ClientInfo::default();
+        fn get_info(&self) -> ClientConfig {
+            let mut info = ClientConfig::default();
             info.protocol_version = self.protocol_version.clone();
             info
         }
@@ -98,7 +98,7 @@ mod tests {
         let (server_transport, client_transport) = tokio::io::duplex(1 << 20);
         let service = RagRatService::new_dormant(rag_rat_core::OutputFormat::Json);
         let client_handler = VersionedClient { protocol_version: protocol_version.clone() };
-        let mut server_peer_info = ServerInfo::default();
+        let mut server_peer_info = ServerConfig::default();
         server_peer_info.protocol_version = protocol_version;
         let server = serve_directly::<RoleServer, _, _, _, _>(
             service,

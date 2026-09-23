@@ -66,9 +66,6 @@ fn modifiers_have_test_annotation(modifiers: &str) -> bool {
 
 fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
     for index in 0..node.child_count() {
-        let Some(index) = u32::try_from(index).ok() else {
-            continue;
-        };
         if let Some(child) = node.child(index)
             && child.kind() == "companion"
         {

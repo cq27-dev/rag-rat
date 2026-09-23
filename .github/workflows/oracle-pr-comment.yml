@@ -22,7 +22,7 @@ jobs:
     runs-on: ubicloud-standard-2
     steps:
       - name: Download the rendered report (from the oracle run)
-        uses: dawidd6/action-download-artifact@v6
+        uses: dawidd6/action-download-artifact@v24
         with:
           name: oracle-report-md
           run_id: ${{ github.event.workflow_run.id }}
@@ -30,7 +30,7 @@ jobs:
 
       - name: Upsert the sticky PR comment
         if: hashFiles('oracle-report.md') != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

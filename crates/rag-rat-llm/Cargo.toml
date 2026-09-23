@@ -21,7 +21,7 @@ eval = []
 [dependencies]
 anyhow.workspace = true
 fastembed = { workspace = true, optional = true }
-model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
+model2vec-rs = { version = "0.3.0", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
 rag-rat-base.workspace = true
 rag-rat-db.workspace = true
 reqwest.workspace = true

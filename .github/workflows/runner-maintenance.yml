@@ -26,7 +26,7 @@ jobs:
     runs-on: ci
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Cap every runner's cargo target dir
         run: |
           set -euo pipefail

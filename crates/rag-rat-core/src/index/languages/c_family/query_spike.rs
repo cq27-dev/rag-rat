@@ -69,7 +69,7 @@ fn query_edges_from_root(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, text.as_bytes());
     while let Some(query_match) = matches.next() {
-        for capture in query_match.captures {
+        for capture in query_match.captures() {
             c_like_edges(
                 EdgeVisit { text, node: capture.node, symbols, path, locator: &locator },
                 &mut emit,

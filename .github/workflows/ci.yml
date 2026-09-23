@@ -42,7 +42,7 @@ jobs:
     name: rustfmt
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # rustfmt.toml uses nightly-only options (struct_lit_style, imports_granularity, …),
       # so the format check must run on nightly.
       - uses: dtolnay/rust-toolchain@nightly
@@ -60,7 +60,7 @@ jobs:
     name: clippy
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -79,7 +79,7 @@ jobs:
     name: clippy (all features)
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -101,7 +101,7 @@ jobs:
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         if: ${{ !startsWith(runner.name, 'hetzner-') }}
@@ -133,7 +133,7 @@ jobs:
     name: build (fastembed + model2vec)
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         if: ${{ !startsWith(runner.name, 'hetzner-') }}
@@ -157,7 +157,7 @@ jobs:
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -183,7 +183,7 @@ jobs:
           fi
           cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: lcov.info
           # Tokenless upload works for public repos; CODECOV_TOKEN is used if the secret is set.
@@ -198,8 +198,8 @@ jobs:
     name: vscode lens extension
     runs-on: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && 'ci' || 'ubicloud-standard-4' }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
