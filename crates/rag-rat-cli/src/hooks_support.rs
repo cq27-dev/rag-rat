@@ -153,7 +153,7 @@ pub(crate) fn hook_is_current(path: &Path, hook: ManagedHook) -> bool {
 }
 
 /// A release version as comparable numbers. `None` for anything that is not plain `X.Y.Z`.
-fn release_version(version: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn release_version(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
     let version = (parts.next()??, parts.next()??, parts.next()??);
     parts.next().is_none().then_some(version)

@@ -39,6 +39,13 @@ pub(crate) fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> 
         }
         spawn_detached_oracle_auto_run(config);
     }
+    // Expose the plugin-cached binary on PATH (#1427). Runs for a dormant server too: that is the
+    // first launch in a repo not set up yet, which is exactly when the user needs the CLI.
+    match crate::path_shim::refresh_path_shim() {
+        Ok(Some(shim)) => tracing::info!(shim = %shim.display(), "exposed rag-rat on PATH"),
+        Ok(None) => {},
+        Err(error) => tracing::warn!(%error, "could not update the rag-rat PATH shim"),
+    }
     // Small worker pool: the stdio JSON-RPC loop is mostly serial and CPU-heavy indexing is rayon,
     // not tokio; stay multi_thread so a blocking tool handler can't stall the serve/upgrade tasks
     // (issue #63, facet 3).

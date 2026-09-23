@@ -1,4 +1,4 @@
-# rag-rat plugin (prototype)
+# rag-rat plugin
 
 A coding-agent plugin for **Claude Code, Codex, Cursor, VS Code, and opencode** that bundles
 rag-rat's MCP server, skills, and hooks, and **installs a
@@ -51,12 +51,14 @@ Claude/Codex.) Node, not `.sh`, so it works on native Windows too. Resolution or
    lockfile-serialized. **Skipped under `--no-install`** — until the MCP server's first `npx` run has
    installed the binary, a hook is a harmless no-op.
 
-When the binary resolves from the managed cache (2, 5) or the npx cache (3), the launcher also keeps
-a `rag-rat` shim in `~/.local/bin` pointing at it — a symlink, or `rag-rat.cmd` on Windows — so the
-CLI runs from a shell. It never edits shell profiles or PATH (`rag-rat doctor` reports when
-`~/.local/bin` is not on PATH), never replaces a `rag-rat` there it did not create, and only moves
-the shim to a newer version, so two plugins on different versions do not fight over it.
-`RAG_RAT_NO_PATH_SHIM=1` disables it; `RAG_RAT_SHIM_DIR` relocates it.
+**PATH.** The binary exposes itself: when `rag-rat mcp` starts from one of the plugin caches (the
+managed cache or npx's `@rag-rat/bin`), it keeps a `rag-rat` shim in `~/.local/bin` pointing at
+itself — a symlink, or `rag-rat.cmd` on Windows — so the CLI runs from a shell for every harness,
+from the first session. It never edits shell profiles or PATH (`rag-rat doctor` reports when
+`~/.local/bin` is not on PATH), never replaces a `rag-rat` there it did not create, never links a dev
+build or a `cargo install` binary, and only moves the shim to a newer release, so plugins for two
+agents on different versions do not fight over it. `RAG_RAT_NO_PATH_SHIM=1` disables it;
+`RAG_RAT_SHIM_DIR` relocates it.
 
 Version comes from `plugin.json`. Intel Mac has no prebuilt → the launcher prints the source path
 (`cargo install rag-rat --no-default-features --features model2vec`).
@@ -83,7 +85,8 @@ unconfigured, unindexed, unavailable, or not yet present in the launcher's cache
 
 **Claude** (`hooks/hooks.json`, auto-discovered):
 - `SessionStart` (`startup|clear|compact`, 5s) → repo orientation digest.
-- `PreToolUse` on `Grep`/`Bash` (10s) → grep-augmentation.
+- `PreToolUse` on `Grep`/`Read`/`Bash` (10s) → grep- and read-augmentation (repo memories and
+  symbols attached to what the agent is about to search or read).
 - `PreToolUse` on `Write`/`Edit`/`MultiEdit` (10s) → write-time clone check.
 - `PostToolUse` on successful edits → detached, watcher-aware scoped reindex.
 - The manifest has one dispatcher per lifecycle event, with combined matchers preventing unrelated
