@@ -35,7 +35,21 @@ fn find_on_path(path_var: &OsStr) -> Option<PathBuf> {
     std::env::split_paths(path_var)
         .filter(|dir| !is_npm_injected(dir))
         .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_runnable(candidate))
+}
+
+/// A file the shell would run: on Unix it needs an execute bit, or the shell skips it for a later
+/// PATH entry. (Windows runs these by extension.)
+fn is_runnable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata().is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// The `cli` section of `doctor`, computed from `path_var` and the launcher's shim directory.
@@ -98,6 +112,19 @@ mod tests {
         std::env::join_paths(dirs).unwrap()
     }
 
+    /// An executable stub `rag-rat` in `dir`, named the way this platform looks it up.
+    fn install_stub(dir: &Path) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let stub = dir.join(if cfg!(windows) { "rag-rat.cmd" } else { "rag-rat" });
+        fs::write(&stub, "stub").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        stub
+    }
+
     /// The case the section exists for: the launcher made the shim, but its directory is not on
     /// PATH, so a shell still cannot run `rag-rat` — say where it is and how to fix PATH.
     #[test]
@@ -105,9 +132,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shims = dir.path().join("shims");
         let elsewhere = dir.path().join("elsewhere");
-        fs::create_dir_all(&shims).unwrap();
         fs::create_dir_all(&elsewhere).unwrap();
-        fs::write(shims.join(SHIM_NAME), "stub").unwrap();
+        install_stub(&shims);
 
         let report = status(&path_of(&[&elsewhere]), Some(&shims));
         assert_eq!(report["on_path"], serde_json::Value::Null);
@@ -132,14 +158,28 @@ mod tests {
         let npm_bin = dir.path().join("_npx/abc/node_modules/.bin");
         let global_bin = dir.path().join("prefix/bin");
         for bin in [&npm_bin, &global_bin] {
-            fs::create_dir_all(bin).unwrap();
-            fs::write(bin.join(if cfg!(windows) { "rag-rat.cmd" } else { "rag-rat" }), "stub")
-                .unwrap();
+            install_stub(bin);
         }
         let none = dir.path().join("none");
         assert_eq!(status(&path_of(&[&npm_bin]), Some(&none))["on_path"], serde_json::Value::Null);
         let report = status(&path_of(&[&npm_bin, &global_bin]), Some(&none));
         assert!(report["on_path"].as_str().is_some_and(|p| p.contains("prefix")), "{report}");
+    }
+
+    /// A `rag-rat` without an execute bit is not something the shell can run; the search moves on.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_rag_rat_is_skipped_for_a_later_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let broken = install_stub(&dir.path().join("broken"));
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o644)).unwrap();
+        let working = install_stub(&dir.path().join("working"));
+        let report = status(
+            &path_of(&[&dir.path().join("broken"), &dir.path().join("working")]),
+            Some(&dir.path().join("none")),
+        );
+        assert_eq!(report["on_path"], serde_json::json!(working));
     }
 
     #[test]
