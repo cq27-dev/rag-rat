@@ -3018,9 +3018,9 @@ mod tests {
         promote(&conn, laptop).unwrap();
 
         let roster = crate::local_account_roster(&conn).unwrap();
-        assert_eq!(roster.len(), 3, "{roster:?}");
+        assert_eq!(roster.len(), 3);
         let founder = &roster[0];
-        assert!(founder.this_device && founder.owner, "the founder is listed first: {founder:?}");
+        assert!(founder.this_device && founder.owner, "the founder is listed first");
         let listed_laptop = roster.iter().find(|d| d.fingerprint == laptop).unwrap();
         assert_eq!(listed_laptop.label.as_deref(), Some("laptop"));
         assert!(listed_laptop.owner && !listed_laptop.this_device);

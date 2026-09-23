@@ -1309,7 +1309,7 @@ fn promoting_a_member_reports_it_as_an_owner() {
     let promoted =
         super::super::grants::promote_account_device(&conn, &fingerprint[..12], 2_000).unwrap();
     assert_eq!(promoted.fingerprint, member.fingerprint());
-    assert!(promoted.owner, "the result reflects the promotion: {promoted:?}");
+    assert!(promoted.owner, "the result reflects the promotion");
 }
 
 #[test]
