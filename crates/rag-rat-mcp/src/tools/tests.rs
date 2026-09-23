@@ -382,7 +382,15 @@ const SCHEMA_ROWS: &[SchemaRow] = &[
         ..row("repo_clusters", &[], &["include", "limit", "min_cluster_size"])
     },
     row("important_symbols", &[], &["limit", "personalize"]),
-    row("find_clones", &[], &["limit", "min_copies", "min_similarity"]),
+    row("find_clones", &[], &[
+        "id",
+        "limit",
+        "line",
+        "min_copies",
+        "min_similarity",
+        "path",
+        "ref",
+    ]),
     row("clones_for_symbol", &[], &["id", "line", "path", "ref"]),
     row("ffi_surface", &[], &["limit"]),
     SchemaRow {
@@ -460,6 +468,7 @@ const SCHEMA_ROWS: &[SchemaRow] = &[
             ("status", &["active", "stale", "obsolete", "rejected"]),
         ],
         ..row("memory_update", &["memory_id"], &[
+            "bind",
             "body",
             "confidence",
             "kind",
@@ -471,6 +480,16 @@ const SCHEMA_ROWS: &[SchemaRow] = &[
         ])
     },
     row("memory_search", &["query"], QUERY_ARGS),
+    row("memory_get", &[], &[
+        "allow_ambiguous",
+        "edge_sequence_hash",
+        "id",
+        "limit",
+        "memory_id",
+        "path",
+        "ref",
+        "symbol",
+    ]),
     row("memory_for_symbol", &[], &["allow_ambiguous", "id", "limit", "ref", "symbol"]),
     row("memory_for_path", &["path"], PATH_ARGS),
     row("memory_for_call_path", &["edge_sequence_hash"], &["edge_sequence_hash", "limit"]),

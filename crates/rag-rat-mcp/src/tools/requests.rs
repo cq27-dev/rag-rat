@@ -667,6 +667,37 @@ pub struct MemoryUpdateArgs {
     /// Set the node's structured payload (#465). Omit to leave the stored payload unchanged; a
     /// JSON object replaces it.
     pub payload: Option<serde_json::Value>,
+    /// Re-anchor the memory to a new binding (same shape as `memory_create`'s `bind`). Applied
+    /// after any field changes, as its own authored write.
+    pub bind: Option<MemoryBindArgs>,
+}
+
+impl MemoryUpdateArgs {
+    /// Whether the call changes any field (as opposed to only re-anchoring).
+    pub(super) fn changes_fields(&self) -> bool {
+        self.kind.is_some()
+            || self.title.is_some()
+            || self.body.is_some()
+            || self.confidence.is_some()
+            || self.status.is_some()
+            || self.tags.is_some()
+            || self.payload.is_some()
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct MemoryGetArgs {
+    /// A memory id: that memory, in full.
+    pub memory_id: Option<String>,
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
+    /// The memories bound to a file or directory path.
+    pub path: Option<String>,
+    /// The memories bound to a call path (`edge_sequence_hash` from `find_callers` /
+    /// `trace_callees`).
+    pub edge_sequence_hash: Option<String>,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
 }
 
 // A bare keyword query: the whole surface of the full-text search tools that honor nothing beyond
@@ -1063,6 +1094,24 @@ pub struct FindClonesArgs {
     /// capped at the refine budget (currently 50): `limit: N` returns at most 50 classes, all
     /// refined. Omit (null) to retrieve all classes (only the top 50 refined, the rest unrefined).
     pub limit: Option<usize>,
+    /// With a symbol (`id` / `ref`, or `path` + `line`), return that symbol's clone class instead
+    /// of the repo-wide list; the other parameters then do not apply.
+    #[serde(rename = "id", default)]
+    pub logical_symbol_id: Option<SymHandle>,
+    #[serde(rename = "ref")]
+    pub symbol_path: Option<String>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+}
+
+impl FindClonesArgs {
+    /// Whether the caller named one symbol, which makes this the per-symbol form.
+    pub(super) fn names_a_symbol(&self) -> bool {
+        self.logical_symbol_id.is_some()
+            || self.symbol_path.is_some()
+            || self.path.is_some()
+            || self.line.is_some()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]

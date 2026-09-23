@@ -76,7 +76,8 @@ advice, and the quote is what spares the reader from trusting a summary of a sum
 **Revise before you create.** A memory that has drifted actively misleads, while a missing one merely
 fails to help — so correcting or retiring a wrong record is the highest-value write available.
 `memory_search` first: if something already covers the ground, `memory_update` it; reach for
-`memory_create` only when nothing does, and `memory_mark_obsolete` when nothing actionable survives.
+`memory_create` only when nothing does, and retire it (`memory_update` with `status: "obsolete"`)
+when nothing actionable survives.
 
 **Terseness is a staleness strategy, not a style preference.** Every extra detail is one more thing a
 later change can falsify, and a record that contradicts the source on one line gets distrusted on all

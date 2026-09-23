@@ -46,11 +46,11 @@ you're actually asking (full schemas: `docs/mcp-tools.md`):
 | Read a chunk's exact current text | `read_chunk` |
 | Orient in an unfamiliar repo | `repo_brief` (spine / churn / god_modules / refactor_candidates), `repo_clusters` |
 | Find the load-bearing symbols | `important_symbols` |
-| Check if code duplicates what's already here | `find_clones`; the clone class of one symbol → `clones_for_symbol` |
+| Check if code duplicates what's already here | `find_clones` (repo-wide), or `find_clones` with a symbol (`id` / `ref`, or `path` + `line`) for its clone class |
 | Understand **why** code exists, or **when/why** it changed | **`history_for`** a symbol (`symbol`/`ref`/`id`), `path`, `chunk_id` or `commit` — commits, blame, and the tracker issues / reviews that reference it |
 | Search history by keyword | `history_search` with `source`: `commits`, `changes` (commits + the files they touched), `issues`, `rationale` |
 | Read docs / doc-comments for a symbol | `docs_for_symbol` |
-| Recall prior notes | `memory_search`, `memory_for_symbol` / `memory_for_path` / `memory_for_call_path` |
+| Recall prior notes | `memory_search` (keywords), `memory_get` (by `memory_id`, symbol, `path`, or call path) |
 | Check index / embedding / tracker-cache health | `index_status` (`include: ["embeddings"]` for embedding coverage) |
 
 **Optional toolsets.** Maintenance and diagnostics are off the default tool list; if you need one and
@@ -121,7 +121,7 @@ so it must say **what is true now and what to do about it**. "This was fixed in 
 used to fail open", "stage 2 landed the split" are unactionable, and history goes stale the moment
 the next change lands. The same applies when you update one: if the thing a memory warned about has
 been fixed, rewrite the body to state the rule that now holds rather than appending a status section,
-and `memory_mark_obsolete` it if nothing actionable survives.
+and retire it (`memory_update` with `status: "obsolete"`) if nothing actionable survives.
 
 Keep: invariants, the reasoning behind a decision, traps and their failure modes, what to reach for,
 what is still unresolved. Drop: PR/stage narration, "used to be", anything whose only value is that
@@ -140,8 +140,8 @@ Do it well:
   titles nobody can act on: they name the work, so the reader must open the body to learn whether it
   concerns them. Name the constraint or the trap instead, and leave an issue number as a trailing
   pointer only when it earns its place. Max 160 characters.
-- **After a large refactor**, `memory_doctor` flags `gone` anchors and `memory_rebind` re-anchors
-  them.
+- **After a large refactor**, `memory_doctor` (admin toolset) flags `gone` anchors and
+  `memory_update` with `bind` re-anchors them.
 
 The memory layer is kept honest by **`dream`** — a maintenance worklist of load-bearing code with no
 memory (coverage gaps) and memories that have drifted from the source. The **dream-review** skill is

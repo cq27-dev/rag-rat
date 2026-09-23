@@ -246,8 +246,53 @@ pub(crate) fn call_tool_with_db(
             json!(db.memory_rebind(&args.memory_id, args.bind.into())?)
         },
         "memory_update" => {
-            let args: MemoryUpdateArgs = serde_json::from_value(arguments)?;
-            json!(db.memory_update(args.core())?)
+            let mut args: MemoryUpdateArgs = serde_json::from_value(arguments)?;
+            let bind = args.bind.take();
+            let changes_fields = args.changes_fields();
+            anyhow::ensure!(
+                changes_fields || bind.is_some(),
+                "nothing to update: name a field to change (`status: \"obsolete\"` retires it), \
+                 or `bind` to re-anchor it"
+            );
+            let memory_id = args.memory_id.clone();
+            let mut memory =
+                if changes_fields { Some(db.memory_update(args.core())?) } else { None };
+            if let Some(bind) = bind {
+                memory = Some(db.memory_rebind(&memory_id, bind.into())?);
+            }
+            json!(memory)
+        },
+        "memory_get" => {
+            let args: MemoryGetArgs = serde_json::from_value(arguments.clone())?;
+            let pick = |keys: &[&str]| {
+                let mut sub = serde_json::Map::new();
+                for key in keys {
+                    if let Some(value) = arguments.get(*key) {
+                        sub.insert((*key).to_string(), value.clone());
+                    }
+                }
+                Value::Object(sub)
+            };
+            let tool = match (
+                args.memory_id.is_some(),
+                args.selector.names_a_symbol(),
+                args.path.is_some(),
+                args.edge_sequence_hash.is_some(),
+            ) {
+                (true, false, false, false) => ("memory_show", pick(&["memory_id"])),
+                (false, true, false, false) => (
+                    "memory_for_symbol",
+                    pick(&["symbol", "ref", "id", "allow_ambiguous", "limit"]),
+                ),
+                (false, false, true, false) => ("memory_for_path", pick(&["path", "limit"])),
+                (false, false, false, true) =>
+                    ("memory_for_call_path", pick(&["edge_sequence_hash", "limit"])),
+                _ => anyhow::bail!(
+                    "name exactly one of: `memory_id`, a symbol (`symbol` / `ref` / `id`), a \
+                     `path`, or an `edge_sequence_hash`"
+                ),
+            };
+            call_tool_with_db(db, tool.0, tool.1, graded_history, memory_surface)?
         },
         "memory_edge_add" => {
             let args: MemoryEdgeAddArgs = serde_json::from_value(arguments)?;
@@ -331,8 +376,13 @@ pub(crate) fn call_tool_with_db(
             )?)
         },
         "find_clones" => {
-            let args: FindClonesArgs = serde_json::from_value(arguments)?;
-            find_clones_tool(db, args)?
+            let args: FindClonesArgs = serde_json::from_value(arguments.clone())?;
+            if args.names_a_symbol() {
+                let args: ClonesForSymbolArgs = serde_json::from_value(arguments)?;
+                clones_for_symbol_tool(db, args)?
+            } else {
+                find_clones_tool(db, args)?
+            }
         },
         "clones_for_symbol" => {
             let args: ClonesForSymbolArgs = serde_json::from_value(arguments)?;

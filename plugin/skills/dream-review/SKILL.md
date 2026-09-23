@@ -69,28 +69,28 @@ A load-bearing symbol (many callers) with no memory binding.
 
 ### `stale_reference` — `subject = <memory id>`, `evidence` lists the unresolved path(s)
 A memory body references a `.rs` path that no longer resolves against the index.
-- Read the memory: `memory_show` with its id. Locate where the path went: `semantic_search` /
+- Read the memory: `memory_get` with its `memory_id`. Locate where the path went: `semantic_search` /
   `symbol_lookup` on the moved code.
-- **Root fix:** if the code moved, `memory_update` the body to the new path, and/or `memory_rebind`
+- **Root fix:** if the code moved, `memory_update` the body to the new path, and/or re-anchor it with `memory_update` + `bind`
   to re-anchor. The finding resolves once the reference is valid again. If the memory is genuinely
-  stale, `memory_mark_obsolete`.
+  stale, `memory_update` with `status: "obsolete"`.
 - **Dismiss** only for a true false positive (e.g. a deliberate historical reference the regex can't
   tell apart): `dream_review` with `verdict: "dismiss"`.
 
 ### `memory_unverifiable` — `subject = <memory id>`
 Decided deterministically: the memory's bindings are all gone/absent **and** none of its identifiers
 resolve anywhere in the whole-tree index.
-- Read it (`memory_show`). Does the code it describes still exist under a new name?
-- **Root fix:** re-anchor with `memory_rebind`; or if it's obsolete, `memory_mark_obsolete`.
+- Read it (`memory_get`). Does the code it describes still exist under a new name?
+- **Root fix:** re-anchor with `memory_update` + `bind`; or if it's obsolete, `memory_update` with `status: "obsolete"`.
 - **Dismiss** if it's still-true prose that simply isn't code-anchorable (accept it as-is):
   `dream_review` with `verdict: "dismiss"`.
 
 ### `memory_divergence` — `subject = <memory id>`, `evidence` = the model's cited pack lines
 The model judged the memory to have drifted from current code. **The model is ~71–76% accurate —
 verify before acting.**
-- Read the memory and the cited lines yourself (`memory_show`, `impact_surface`, `read_chunk`). Is
+- Read the memory and the cited lines yourself (`memory_get`, `impact_surface`, `read_chunk`). Is
   the note actually wrong about current code?
-- **Root fix:** if genuinely stale, `memory_update` to correct it (or `memory_mark_obsolete`). The
+- **Root fix:** if genuinely stale, `memory_update` to correct it (or retire it with `status: "obsolete"`). The
   divergence finding drops once the stored verdict flips `current` on a re-check, or the body edit
   self-invalidates the old verdict.
 - **Accept** if the divergence is real but intentional — the note is deliberately *ahead* of unmerged

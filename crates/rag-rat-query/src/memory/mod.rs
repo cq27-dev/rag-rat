@@ -766,7 +766,7 @@ pub fn apply_memory_surface(
 /// lossy rewrite. `rag-rat memory get <id>` is the CLI equivalent; naming one path keeps the marker
 /// cheap, since it is paid per memory on every attachment under the default surface.
 fn body_elision_marker(memory_id: &str) -> String {
-    format!("{BODY_ELISION_PREFIX} — full text: memory_show {memory_id}]")
+    format!("{BODY_ELISION_PREFIX} — full text: memory_get {{memory_id: {memory_id}}}]")
 }
 
 /// The opening of every [`body_elision_marker`].

@@ -604,3 +604,75 @@ fn a_deprecated_tool_still_answers_and_names_its_replacement() {
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("history_for {path"), "{}", notes[0]);
 }
+
+fn create_memory(svc: &RagRatService, path: &str, title: &str) -> String {
+    let created = payload(
+        svc,
+        "memory_create",
+        json!({
+            "kind": "Invariant",
+            "title": title,
+            "body": "Every connection goes through open_database.",
+            "confidence": "high",
+            "bind": {"path": path},
+        }),
+    );
+    created["memory"]["memory_id"].as_str().expect("memory_id").to_string()
+}
+
+/// `memory_get` answers each selector exactly as the tool it replaces, and refuses two at once.
+#[test]
+fn memory_get_answers_each_selector_as_the_tool_it_replaces() {
+    let (_root, svc) = json_service();
+    let id = create_memory(&svc, "src/lib.rs", "open_database is the only opener");
+    // Bound elsewhere: a path lookup must leave it out, which a keyword search would not.
+    let elsewhere = create_memory(&svc, "Cargo.toml", "open question about the manifest");
+    let by_path = payload(&svc, "memory_get", json!({"path": "src/lib.rs"})).to_string();
+    assert!(by_path.contains(&id) && !by_path.contains(&elsewhere), "{by_path}");
+    assert_eq!(
+        payload(&svc, "memory_get", json!({"memory_id": id})),
+        payload(&svc, "memory_show", json!({"memory_id": id}))
+    );
+    assert_eq!(
+        payload(&svc, "memory_get", json!({"path": "src/lib.rs"})),
+        payload(&svc, "memory_for_path", json!({"path": "src/lib.rs"}))
+    );
+    assert_eq!(
+        payload(&svc, "memory_get", json!({"symbol": "open_database"})),
+        payload(&svc, "memory_for_symbol", json!({"symbol": "open_database"}))
+    );
+    let err = format!(
+        "{:?}",
+        svc.call("memory_get", json!({"memory_id": id, "path": "src"})).unwrap_err()
+    );
+    assert!(err.contains("exactly one of"), "{err}");
+}
+
+/// `memory_update` covers retiring (what `memory_mark_obsolete` did) and re-anchoring (what
+/// `memory_rebind` did), and refuses a call that changes nothing.
+#[test]
+fn memory_update_retires_and_reanchors() {
+    let (_root, svc) = json_service();
+    let id = create_memory(&svc, "src/lib.rs", "to retire");
+    let retired = payload(&svc, "memory_update", json!({"memory_id": id, "status": "obsolete"}));
+    assert_eq!(retired["status"], "obsolete", "{retired}");
+
+    let other = create_memory(&svc, "src/lib.rs", "to re-anchor");
+    let rebound =
+        payload(&svc, "memory_update", json!({"memory_id": other, "bind": {"path": "src"}}));
+    assert!(rebound.to_string().contains("\"src\""), "re-anchored to the directory: {rebound}");
+
+    let err = format!("{:?}", svc.call("memory_update", json!({"memory_id": other})).unwrap_err());
+    assert!(err.contains("nothing to update"), "{err}");
+}
+
+#[test]
+fn find_clones_with_a_symbol_answers_as_clones_for_symbol() {
+    let (_root, svc) = json_service();
+    let by_ref = json!({"ref": "src/lib.rs::open_database"});
+    assert_eq!(
+        payload(&svc, "find_clones", by_ref.clone()),
+        payload(&svc, "clones_for_symbol", by_ref)
+    );
+    assert!(payload(&svc, "find_clones", json!({})).is_object(), "without one, the repo-wide list");
+}

@@ -578,7 +578,7 @@ fn apply_memory_surface_summary_defers_the_body_and_hydrates_summary_and_verdict
         "the deferred body is replaced by the elision marker, not blanked silently"
     );
     assert!(
-        memories[0].body.contains("memory_show m1"),
+        memories[0].body.contains("memory_get {memory_id: m1}"),
         "the marker names the expand path: {}",
         memories[0].body
     );
