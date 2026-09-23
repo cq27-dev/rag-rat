@@ -53,6 +53,9 @@ struct StoredInvite {
     /// Legacy full-receipt copy (pre-V092). Never written anymore; retained so invites consumed
     /// before V092 keep replaying through their 24h window. The manifest form is preferred.
     receipt_bytes: Option<Vec<u8>>,
+    /// The account's control-log pin as it stood when this invite was minted; `None` for an
+    /// invite minted while unpinned, which is every row written before V132.
+    checkpoint_digest: Option<Vec<u8>>,
 }
 
 impl StoredInvite {
@@ -60,6 +63,22 @@ impl StoredInvite {
     /// a writer screen keeps refusing it `Unknown`.
     fn kind(&self) -> anyhow::Result<StoredInviteKind> {
         self.kind.as_ref().copied().map_err(|message| anyhow::anyhow!("{message}"))
+    }
+
+    /// The stored pin as a fixed digest. A column that is present but not 32 bytes is corruption,
+    /// not an unpinned invite, so it must not read back as `None` — that spelling would silently
+    /// admit the very mismatch this column exists to refuse.
+    fn checkpoint_digest(&self) -> Result<Option<[u8; 32]>, InviteError> {
+        self.checkpoint_digest
+            .as_deref()
+            .map(|bytes| {
+                <[u8; 32]>::try_from(bytes).map_err(|_| {
+                    InviteError::Storage(anyhow::anyhow!(
+                        "sync_invites checkpoint_digest is not 32 bytes"
+                    ))
+                })
+            })
+            .transpose()
     }
 }
 
@@ -141,10 +160,16 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         expires_at_ms,
     )?;
     prune_expired_invites_in_tx(&tx, now_ms)?;
+    // Stamp the pin the account ACTUALLY carries, read in the mint transaction — never a caller
+    // argument, so a caller can neither forget it nor forge one. `None` while the account is
+    // unpinned, which is every ticket today: minting is still refused under a pin until the
+    // enrollment gates open.
+    let checkpoint_digest = mint_time_pin(&tx, account_id)?;
     tx.execute(
         "INSERT INTO sync_invites(
-             nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             nonce, account_id, role, label, expires_at_ms, created_at_ms, used_at_ms,
+             checkpoint_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
         params![
             nonce.as_slice(),
             account_id.to_bytes().as_slice(),
@@ -152,28 +177,10 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
             label,
             expires_at_ms,
             now_ms,
+            checkpoint_digest.map(|digest| digest.to_vec()),
         ],
     )
     .map_err(|error| InviteError::Storage(error.into()))?;
-    // Stamp the pin the account ACTUALLY carries, read in the mint transaction — never a caller
-    // argument, so a caller can neither forget it nor forge one. `None` while the account is
-    // unpinned, which is every ticket today: minting is still refused under a pin until the
-    // enrollment gates open.
-    let checkpoint_digest = match rag_rat_oplog::account_control_policy(&tx, account_id)
-        .map_err(InviteError::Storage)?
-    {
-        rag_rat_oplog::AccountControlPolicy::LegacyV1 => None,
-        rag_rat_oplog::AccountControlPolicy::ControlV2(pin) => Some(pin.checkpoint_digest),
-        // Fail CLOSED for a version this binary cannot execute. `None` would be the fail-OPEN
-        // spelling of "I don't know": the ticket would assert that a pinned account is unpinned,
-        // and a joiner would enrol without installing its pin — the exact failure the domain bump
-        // exists to prevent, only silent. Unreachable today, since both pinned states are refused
-        // above; it is here so opening that gate has to decide this rather than inherit it.
-        rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(pin) =>
-            return Err(InviteError::Storage(
-                rag_rat_oplog::UnsupportedAccountControlVersion { pin }.into(),
-            )),
-    };
     tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     Ok(InviteTicket {
         kind: InviteTicketKind::Pairing,
@@ -184,6 +191,63 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         expires_at_ms,
         checkpoint_digest,
     })
+}
+
+/// The pin the account carries right now, as an invite records it: `None` while unpinned.
+///
+/// Fails CLOSED for a control version this binary cannot execute. `None` would be the fail-OPEN
+/// spelling of "I don't know": a ticket would assert that a pinned account is unpinned, and a
+/// joiner would enrol without installing its pin — the exact failure the ticket's digest exists to
+/// prevent, only silent. Unreachable while the callers sit behind
+/// `require_supported_account_control`, which refuses both pinned states outright; it is here so
+/// that opening those gates has to decide this case rather than inherit it.
+pub(super) fn mint_time_pin(
+    conn: &Connection,
+    account_id: AccountId,
+) -> Result<Option<[u8; 32]>, InviteError> {
+    match rag_rat_oplog::account_control_policy(conn, account_id).map_err(InviteError::Storage)? {
+        rag_rat_oplog::AccountControlPolicy::LegacyV1 => Ok(None),
+        rag_rat_oplog::AccountControlPolicy::ControlV2(pin) => Ok(Some(pin.checkpoint_digest)),
+        rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(pin) => Err(InviteError::Storage(
+            rag_rat_oplog::UnsupportedAccountControlVersion { pin }.into(),
+        )),
+    }
+}
+
+/// Refuse an invite the account's control-log pin has moved out from under, BEFORE the one-time
+/// nonce is consumed.
+///
+/// The ticket commits the joiner to one pin state: a digest to install, or none. The owner can
+/// change that state between mint and redemption — installing a pin is exactly the operation this
+/// work adds — and the ticket cannot be recalled. Redeeming anyway would author the pairing op and
+/// spend the nonce, and only then would the joiner find it holds a certificate with no digest to
+/// check it against. That is terminal at both ends: the nonce is spent and the pin is permanent.
+///
+/// The comparison is equality because equality is what "unchanged" means; it needs no argument
+/// beyond that, and it is fail-closed on states the schema currently forbids. The one difference
+/// that can actually arise is `NULL` against an installed pin, and a pre-V132 row — necessarily
+/// minted while unpinned, since minting has always sat behind a gate that refuses a pinned
+/// account — is refused by that same comparison without having to be told apart from a fresh one.
+///
+/// NOT REACHED TODAY. `require_supported_account_control` refuses a pinned account at the top of
+/// every screen, and the same gate on the mint keeps the stored column `NULL`, so both sides are
+/// `None` on every input a shipped binary can produce. This is the refusal the enrollment gates
+/// need in place BEFORE they narrow to `require_foldable_account_control`; until then it is inert.
+///
+/// That also bounds what the tests can drive through redemption. They reach this comparison by
+/// writing a digest onto the ROW of an unpinned account — the inverse of the direction that will
+/// fire once the gates open, which needs a pinned account the screen refuses earlier. The two are
+/// one `!=` over `Option<[u8; 32]>`, and the reading each side is built from is covered
+/// separately, but the live direction gets its end-to-end test from the slice that opens the gate.
+fn require_mint_time_pin_unchanged(
+    conn: &Connection,
+    invite: &StoredInvite,
+) -> Result<(), InviteError> {
+    let minted_under = invite.checkpoint_digest()?;
+    if minted_under != mint_time_pin(conn, stored_invite_account(invite)?)? {
+        return Err(InviteError::CheckpointPinMoved);
+    }
+    Ok(())
 }
 
 fn require_founder_enrollment_authority(
@@ -278,10 +342,17 @@ pub fn mint_writer_invite(
         .ok_or_else(|| InviteError::Malformed("invite expiry overflows i64".into()))?;
     require_founder_enrollment_authority(&tx, account_id)?;
     prune_expired_invites_in_tx(&tx, now_ms)?;
+    // Stamped on a writer row too, though no writer screen compares it and the writer TICKET
+    // carries no digest. The column's meaning has to be one thing across the table: leaving it
+    // unset here would make `NULL` mean "minted while unpinned" on a pairing row and "never
+    // recorded" on a writer row — a distinction nothing in the schema expresses — the moment the
+    // enrollment gates open and a pinned account can mint at all.
+    let checkpoint_digest = mint_time_pin(&tx, account_id)?;
     tx.execute(
         "INSERT INTO sync_invites(
-             nonce, account_id, role, stream_id, expires_at_ms, created_at_ms, used_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+             nonce, account_id, role, stream_id, expires_at_ms, created_at_ms, used_at_ms,
+             checkpoint_digest
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
         params![
             nonce.as_slice(),
             account_id.to_bytes().as_slice(),
@@ -289,6 +360,7 @@ pub fn mint_writer_invite(
             stream_id.as_slice(),
             expires_at_ms,
             now_ms,
+            checkpoint_digest.map(|digest| digest.to_vec()),
         ],
     )
     .map_err(|error| InviteError::Storage(error.into()))?;
@@ -724,6 +796,11 @@ fn screen_invite(
     if at_ms >= invite.expires_at_ms {
         return Err(InviteError::Expired);
     }
+    // AFTER the replay branch. What this guards is the consume, and a replay consumes nothing: it
+    // answers an enrollment the owner already authored, from a receipt whose every field predates
+    // the pin. Refusing it would stand a joiner the owner's own log counts as enrolled in front of
+    // a terminal error, for the one reason the replay window exists to cover — a lost response.
+    require_mint_time_pin_unchanged(conn, &invite)?;
     Ok(Screened::Proceed(Box::new(invite)))
 }
 
@@ -753,7 +830,8 @@ fn stored_invite(conn: &Connection, nonce: [u8; 32]) -> Result<Option<StoredInvi
     conn.query_row(
         "SELECT account_id, role, stream_id, label, expires_at_ms, used_at_ms,
                 used_transport_node, used_ed25519_pubkey, used_x25519_pubkey,
-                receipt_hash, receipt_signed, receipt_entries, receipt_bytes
+                receipt_hash, receipt_signed, receipt_entries, receipt_bytes,
+                checkpoint_digest
            FROM sync_invites WHERE nonce = ?1",
         [nonce.as_slice()],
         |row| {
@@ -773,6 +851,7 @@ fn stored_invite(conn: &Connection, nonce: [u8; 32]) -> Result<Option<StoredInvi
                 receipt_signed: row.get(10)?,
                 receipt_entries: row.get(11)?,
                 receipt_bytes: row.get(12)?,
+                checkpoint_digest: row.get(13)?,
             })
         },
     )

@@ -1811,7 +1811,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 131, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 132, "move this pin with the next schema migration");
 
     let conn = fresh_conn();
     conn.execute_batch(
@@ -2590,4 +2590,44 @@ fn migration_130_replays_real_authority_hooks_before_pin_tables_exist() {
     assert!(conn_table_exists(&conn, "account_control_pins"));
     rag_rat_oplog::require_supported_account_control(&conn, account).unwrap();
     schema::apply(&conn, &crate::index::migration_hooks()).unwrap();
+}
+
+/// V132 (#1311): `sync_invites` records the control-log pin its invite was minted under.
+///
+/// Driven on a bare connection so the ALTER actually runs. A `fresh_conn` store is provisioned
+/// from the generated end state, which arrives at the column through `CREATE TABLE` and would
+/// leave this step unexecuted — asserting a constraint the test never caused to be applied.
+///
+/// The CHECK is asserted rather than assumed because it is added by `ALTER TABLE ADD COLUMN`: one
+/// that silently did not take would admit a value the enrollment screen compares against a 32-byte
+/// pin and could never equal, refusing every redemption for an account behaving correctly.
+#[test]
+fn migration_132_invite_checkpoint_digest() {
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::migrations::apply_sync_invites(&bare).unwrap();
+    schema::migrations::apply_invite_checkpoint_digest(&bare).unwrap();
+    schema::migrations::apply_invite_checkpoint_digest(&bare).expect("replay is a no-op");
+
+    bare.execute_batch(
+        "INSERT INTO sync_invites(nonce, account_id, role, expires_at_ms, created_at_ms)
+             VALUES (randomblob(32), randomblob(32), 'member', 0, 0);",
+    )
+    .unwrap();
+    let minted_under: Option<Vec<u8>> =
+        bare.query_row("SELECT checkpoint_digest FROM sync_invites", [], |row| row.get(0)).unwrap();
+    assert_eq!(minted_under, None, "an invite minted while unpinned records no pin");
+
+    for (name, digest) in
+        [("a short digest", vec![0; 31]), ("an oversized digest", vec![0; 33]), ("empty", vec![])]
+    {
+        let error = bare
+            .execute("UPDATE sync_invites SET checkpoint_digest = ?1", [digest])
+            .expect_err(&format!("{name} must be refused"));
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "{name} must fail the length CHECK, not something else: {error}",
+        );
+    }
+    bare.execute("UPDATE sync_invites SET checkpoint_digest = ?1", [vec![7u8; 32]])
+        .expect("a 32-byte pin is what the screen compares against");
 }

@@ -2352,3 +2352,170 @@ fn writer_redemption_refuses_a_pinned_contributor_before_fresh_or_replay() {
         assert_eq!(before, after);
     }
 }
+
+/// A refusal the owner can emit and the joiner cannot read is a silent enrollment hang: the
+/// joiner reports `unknown enrollment refusal <token>` instead of the reason it was refused for.
+/// Ranging over the enum rather than a hand-listed set is what makes this hold for codes added
+/// later.
+///
+/// The expected token is restated here rather than read from `as_str`, because a round trip is
+/// blind to a RENAME: change the token in both directions and the enum still survives its own
+/// encoding while the bytes on the wire move under every peer running an older build. This second
+/// copy is the golden vector, and the match is exhaustive so a new code cannot skip it.
+///
+/// It reads the token out of the frame and compares it whole. A substring search over the encoded
+/// bytes looks equivalent and is not: every refusal frame carries the literal `refused`, whose
+/// tail IS the `used` token, so that spelling would assert nothing at all for `Used` — and for the
+/// rest it would pass any rename that keeps the old token as a substring.
+#[test]
+fn every_refusal_code_survives_the_wire_and_names_its_error() {
+    use strum::IntoEnumIterator;
+
+    for code in RefusalCode::iter() {
+        let expected_token = match code {
+            RefusalCode::Expired => "expired",
+            RefusalCode::Used => "used",
+            RefusalCode::Unknown => "unknown",
+            RefusalCode::WrongNode => "wrong_node",
+            RefusalCode::AccountMismatch => "account_mismatch",
+            RefusalCode::Revoked => "revoked",
+            RefusalCode::JoinerCapacity => "joiner_capacity",
+            RefusalCode::HeldStateConflict => "held_state_conflict",
+            RefusalCode::CheckpointPinMoved => "checkpoint_pin_moved",
+        };
+        let bytes = EnrollmentResponse::Refused(code).encode();
+        let mut frame = minicbor::Decoder::new(&bytes);
+        frame.array().unwrap();
+        frame.str().unwrap();
+        assert_eq!(frame.str().unwrap(), "refused", "a refusal frame names itself");
+        assert_eq!(
+            frame.str().unwrap(),
+            expected_token,
+            "{code:?} must go on the wire as `{expected_token}`",
+        );
+
+        let decoded = EnrollmentResponse::decode(&bytes)
+            .unwrap_or_else(|error| panic!("{code:?} must decode: {error}"));
+        let EnrollmentResponse::Refused(round_tripped) = decoded else {
+            panic!("{code:?} must decode as a refusal");
+        };
+        assert_eq!(round_tripped, code, "{code:?} must survive the wire unchanged");
+        // The acceptor picks the token from the error and the joiner turns it back into one, so
+        // the two directions have to agree or a refusal changes meaning in transit.
+        assert_eq!(
+            super::wire::refusal_code(&code.into_error()),
+            Some(code),
+            "{code:?} must map back to itself through its error",
+        );
+    }
+}
+
+/// The stamp an invite records is read from the account's real control policy, so a genuinely
+/// pinned account must produce the pin's digest and an unpinned one must produce nothing. The
+/// comparison built on it is exercised through redemption below; this is the reading underneath.
+#[test]
+fn the_mint_stamp_is_the_pin_the_account_actually_carries() {
+    let conn = db();
+    let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
+    assert_eq!(
+        super::redeem::mint_time_pin(&conn, account).unwrap(),
+        None,
+        "an unpinned account records no pin",
+    );
+
+    let device = rag_rat_oplog::load_local_device(&conn).unwrap().unwrap();
+    let bundle = rag_rat_oplog::propose_checkpoint(&conn, account, &device).unwrap();
+    let digest = bundle.certificate_digest();
+    rag_rat_oplog::install_checkpoint(
+        &conn,
+        rag_rat_oplog::TrustedCheckpointPin {
+            account_id: account,
+            checkpoint_digest: digest,
+            required_control_version: 2,
+        },
+        &bundle,
+    )
+    .unwrap();
+
+    assert_eq!(
+        super::redeem::mint_time_pin(&conn, account).unwrap(),
+        Some(digest),
+        "a pinned account records the digest its pin names",
+    );
+}
+
+/// The state the comparison refuses does not require a PINNED ACCOUNT — only a row whose recorded
+/// pin disagrees with the account's. Writing that disagreement onto the row instead of into the
+/// account reaches the refusal through the real redemption entry point, which a pinned account
+/// cannot do while `require_supported_account_control` refuses it at the top of the screen.
+fn disagree_with_the_accounts_pin(conn: &Connection, nonce: [u8; 32]) {
+    let updated = conn
+        .execute("UPDATE sync_invites SET checkpoint_digest = ?2 WHERE nonce = ?1", params![
+            nonce.as_slice(),
+            vec![7u8; 32]
+        ])
+        .unwrap();
+    assert_eq!(updated, 1, "the invite under test must exist");
+}
+
+#[test]
+fn an_invite_whose_pin_moved_is_refused_before_its_nonce_is_consumed() {
+    let conn = db();
+    let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
+    let ticket = ticket(&conn, account, DeviceRole::Member);
+    let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+    let request = EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    disagree_with_the_accounts_pin(&conn, ticket.nonce);
+
+    assert!(
+        matches!(
+            redeem_invite(&conn, request, [9; 32], &|| NOW + 1),
+            Err(InviteError::CheckpointPinMoved)
+        ),
+        "a redemption the owner cannot honour must refuse",
+    );
+    let used: Option<i64> = conn
+        .query_row(
+            "SELECT used_at_ms FROM sync_invites WHERE nonce = ?1",
+            [ticket.nonce.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(used, None, "the refusal must land before the one-time nonce is spent");
+}
+
+/// A replay consumes nothing and answers from a receipt whose every field predates the pin, so the
+/// mismatch must not preempt it. The case is exactly the one the replay window exists for — the
+/// owner authored the enrollment and the response was lost — and refusing it would strand a joiner
+/// the owner's own log counts as enrolled.
+#[test]
+fn a_pin_that_moved_after_consumption_still_replays_the_acknowledged_receipt() {
+    let conn = db();
+    let account = rag_rat_oplog::local_account(&conn, NOW).unwrap();
+    let ticket = ticket(&conn, account, DeviceRole::Member);
+    let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+    let request = EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    let (receipt, _) = redeem_invite(&conn, request.clone(), [9; 32], &|| NOW + 1).unwrap();
+
+    disagree_with_the_accounts_pin(&conn, ticket.nonce);
+
+    let (replayed, _) = redeem_invite(&conn, request, [9; 32], &|| NOW + 2)
+        .expect("a lost response must still be answerable after the pin moves");
+    assert_eq!(replayed, receipt, "the replay must be the receipt already acknowledged");
+}

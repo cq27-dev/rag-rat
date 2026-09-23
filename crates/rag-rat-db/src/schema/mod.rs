@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 131;
+pub const LATEST_SCHEMA_VERSION: u32 = 132;
 
 /// The `files.kind` token of a deletion tombstone — the row `mark_file_deleted` /
 /// `write_tombstone_in_scope` leave for a path the checkout no longer serves. It is outside
@@ -1175,6 +1175,12 @@ additive_migrations! {
          (#1367)",
     ) => MigrationFn::WithHooks(migrations::apply_account_view_citations),
         ledger_atomic;
+    MIGRATION_132_ID, MIGRATION_132_CHECKSUM, MIGRATION_132_DESCRIPTION = (
+        "132_invite_checkpoint_digest",
+        "sha256:rag-rat-invite-checkpoint-digest-v132",
+        "Record which control-log pin an invite was minted under, so a pin installed between mint \
+         and redemption is refused before the one-time nonce is consumed rather than after (#1311)",
+    ) => MigrationFn::Plain(migrations::apply_invite_checkpoint_digest);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

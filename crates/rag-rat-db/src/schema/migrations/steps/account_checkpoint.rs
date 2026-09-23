@@ -68,3 +68,26 @@ pub fn apply_account_view_citations(
     )?;
     (hooks.backfill_cited_view_digests)(conn)
 }
+
+/// V132 (#1311): remember which control-log pin an invite was minted under.
+///
+/// A ticket minted while the account was unpinned carries no digest. If the owner pins the account
+/// before that ticket is redeemed, the joiner has nothing to check the receipt's certificate
+/// against — and without this column the owner cannot tell, so it authors the pairing op and
+/// consumes the one-time nonce first, leaving the joiner a spent ticket it can never complete.
+/// Enrollment's rule is that every deterministic failure gates the irreversible boundary, so the
+/// owner has to be able to ask, before the consume, whether the pin state still matches the one it
+/// measured the ticket against.
+///
+/// NULL means minted while unpinned, on a fresh row and on every row written before this
+/// migration alike, so there is nothing to backfill: minting has always run behind a gate that
+/// refuses a pinned account outright, so no shipped binary could write a row that belongs under a
+/// pin. `BLOB` is a valid STRICT type, and `add_column_if_missing` makes a torn replay reconverge.
+pub fn apply_invite_checkpoint_digest(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(
+        conn,
+        "sync_invites",
+        "checkpoint_digest",
+        "BLOB CHECK(checkpoint_digest IS NULL OR length(checkpoint_digest)=32)",
+    )
+}
