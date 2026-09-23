@@ -6,7 +6,9 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-pub use catalog::{TOOL_NAMES, description, is_listed, list_tools, schema, toolset};
+pub use catalog::{
+    TOOL_NAMES, deprecation_note, description, is_listed, list_tools, replacement, schema, toolset,
+};
 pub(crate) use defaults::*;
 pub(crate) use handlers::*;
 use rag_rat_base::config::{Config, McpToolset, MemorySurface};

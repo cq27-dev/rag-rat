@@ -19,6 +19,8 @@ pub const TOOL_NAMES: &[&str] = &[
     "ffi_surface",
     "docs_for_symbol",
     "read_chunk",
+    "history_for",
+    "history_search",
     "commit_search",
     "git_history_for_path",
     "git_history_for_symbol",
@@ -77,10 +79,41 @@ pub fn toolset(name: &str) -> Option<McpToolset> {
     }
 }
 
+/// The tool that replaced a deprecated name, as a call an agent can copy. Deprecated names stay
+/// callable for one release, are never listed, and carry a note naming the replacement in every
+/// result, so an agent or skill still using one learns the new call from the answer itself.
+pub fn replacement(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "git_history_for_path" => "history_for {path, include: [\"commits\"]}",
+        "papertrail_refs_for_path" => "history_for {path, include: [\"tracker\"]}",
+        "git_history_for_symbol" => "history_for {symbol | ref | id, include: [\"commits\"]}",
+        "papertrail_for_symbol" => "history_for {symbol | ref | id, include: [\"tracker\"]}",
+        "git_blame_chunk" => "history_for {chunk_id, include: [\"blame\"]}",
+        "papertrail_for_chunk" => "history_for {chunk_id, include: [\"tracker\"]}",
+        "papertrail_for_commit" => "history_for {commit}",
+        "commit_search" => "history_search {query, source: \"commits\"}",
+        "commits_touching_query" => "history_search {query, source: \"changes\"}",
+        "papertrail_issue_search" => "history_search {query, source: \"issues\"}",
+        "rationale_search" => "history_search {query, source: \"rationale\"}",
+        _ => return None,
+    })
+}
+
+/// The note a deprecated tool's result carries, as a separate content block so the payload an older
+/// caller parses is unchanged.
+pub fn deprecation_note(name: &str) -> Option<String> {
+    replacement(name).map(|call| {
+        format!(
+            "note: `{name}` is deprecated and will be removed in a later release; call `{call}` \
+             instead."
+        )
+    })
+}
+
 /// Whether a server with `enabled` toolsets lists `name`. Listing only: every tool in
-/// [`TOOL_NAMES`] stays callable either way.
+/// [`TOOL_NAMES`] stays callable either way. A deprecated name is never listed.
 pub fn is_listed(name: &str, enabled: &[McpToolset]) -> bool {
-    toolset(name).is_none_or(|set| enabled.contains(&set))
+    replacement(name).is_none() && toolset(name).is_none_or(|set| enabled.contains(&set))
 }
 
 pub fn list_tools() -> Value {
@@ -191,6 +224,16 @@ pub fn description(name: &str) -> &'static str {
              read exact text after a search returns a chunk_id. When the chunk's symbol has \
              distilled decision records they attach as `distilled_records` (labeled unreviewed, \
              capped at 2).",
+        "history_for" =>
+            "History of one target — a symbol (`symbol` / `ref` / `id`), a `path`, a `chunk_id` or \
+             a `commit`: the commits that touched it, git blame for a chunk, and the cached \
+             tracker issues, change requests and review discussion that reference it. The \"why is \
+             this code like this?\" tool. `include` narrows to `commits`, `blame` or `tracker`.",
+        "history_search" =>
+            "Keyword search over history. `source`: `commits` (commit messages), `changes` (commit \
+             messages plus the files they changed — \"what work relates to X?\"), `issues` \
+             (tracker titles and bodies), `rationale` (review comments and discussion). Tracker \
+             hits carry the thread's distilled decision `record` when one exists.",
         "commit_search" =>
             "Full-text search over historical commit subjects and bodies — find when/why something \
              changed by keyword.",
@@ -370,6 +413,8 @@ fn arg_schema(name: &str) -> Option<Value> {
         "clones_for_symbol" => schema_for::<ClonesForSymbolArgs>(),
         "ffi_surface" => schema_for::<LimitArgs>(),
         "read_chunk" => schema_for::<ReadChunkArgs>(),
+        "history_for" => schema_for::<HistoryForArgs>(),
+        "history_search" => schema_for::<HistorySearchArgs>(),
         "git_history_for_path" | "papertrail_refs_for_path" => schema_for::<PathHistoryArgs>(),
         "git_blame_chunk" => schema_for::<BlameChunkArgs>(),
         "papertrail_for_chunk" => schema_for::<PapertrailChunkArgs>(),

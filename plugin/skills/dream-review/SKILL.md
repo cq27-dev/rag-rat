@@ -17,7 +17,7 @@ MCP tools, then resolve it — preferring a **root fix** (repair the memory / cl
 so the finding resolves on its own next run) over a bare verdict.
 
 Drive the whole loop through the **rag-rat MCP tools** — `dream` and `dream_review` for the worklist,
-and `semantic_search` / `symbol_lookup` / `impact_surface` / `find_callers` / `git_history_for_symbol`
+and `semantic_search` / `symbol_lookup` / `impact_surface` / `find_callers` / `history_for`
 / `memory_search` / `read_chunk` to investigate — not `grep`, and not the `rag-rat` CLI (an agent has
 the MCP but may not have the binary on PATH). It is a batch chore meant to run a few times a day, not
 continuously.
@@ -58,7 +58,7 @@ verdicts go through **`dream_review`** with `{ "finding": "<id>", "verdict": "ac
 ### `coverage_gap` — `subject = "path::symbol"`
 A load-bearing symbol (many callers) with no memory binding.
 - Investigate: `impact_surface` / `important_symbols` (personalize on the symbol) /
-  `git_history_for_symbol` — is there a durable, non-obvious invariant, decision, or footgun here?
+  `history_for` — is there a durable, non-obvious invariant, decision, or footgun here?
 - **Root fix:** if yes, `memory_create` an `Invariant`/`Decision`/`Risk` **bound to that symbol**
   (`bind.id` = its `sym_…` handle, or `bind.path`). The gap closes automatically on the next `dream`
   call (the binding now exists) — no verdict needed.

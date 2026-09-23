@@ -334,11 +334,13 @@ stay unchanged. The ones you'll reach for most:
 - **`memory_create`** — record a source-anchored repo memory; **`dream`** surfaces the maintenance
   worklist that keeps them honest ([below](#self-maintaining-memories)).
 
-Beyond these: repo orientation (`repo_brief`, `repo_clusters`), git/GitHub rationale
-(`commit_search`, `git_history_for_*`, `papertrail_for_*`, `rationale_search`), the full memory
-graph (`memory_search`, `memory_edges`, `memory_rebind`, `memory_doctor`, …), graph-vs-compiler
-audit (`compare_graph_to_scip`), and index diagnostics (`index_status`, `llm_status`, `heal_index`)
-— all documented in [`docs/mcp-tools.md`](docs/mcp-tools.md).
+Beyond these: repo orientation (`repo_brief`, `repo_clusters`), history and rationale
+(`history_for` a symbol, path, chunk or commit; `history_search` over commits, issues and review
+discussion), memory recall (`memory_search`, `memory_for_*`) and index health (`index_status`).
+Maintenance and diagnostics — `dream`, `heal_index`, `memory_doctor`, graph-vs-compiler audits,
+the memory task graph — are in the opt-in `admin` and `graph` toolsets (`[mcp] toolsets`), so they
+stay out of every agent's tool list until wanted. All documented in
+[`docs/mcp-tools.md`](docs/mcp-tools.md).
 
 ## Repo memories
 

@@ -42,6 +42,13 @@ impl RagRatService {
         // (the format is chosen once at launch; MCP has no per-call flag).
         let text = rag_rat_core::render(&value, self.output_format);
         let mut content = vec![ContentBlock::text(text)];
+        // Prose, so TOON only — like the stale-memory nudge: a `--json` client may join the text
+        // blocks before parsing, and the note would break the JSON it expects.
+        if self.output_format != rag_rat_core::OutputFormat::Json
+            && let Some(note) = crate::tools::deprecation_note(name)
+        {
+            content.push(ContentBlock::text(note));
+        }
         if let Some(nudge) = self.stale_memory_nudge(name) {
             content.push(ContentBlock::text(nudge));
         }

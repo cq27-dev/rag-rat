@@ -124,7 +124,7 @@ Records ride the surfaces agents already use — there is **no new vector lane**
 the record payload beats every no-LLM baseline while embeddings don't beat the existing FTS on
 ranking):
 
-- **Retrieval payload** — a `rationale_search` / `papertrail_issue_search` hit that has a distilled
+- **Retrieval payload** — a `history_search` hit (`source: "rationale"` or `"issues"`) that has a distilled
   record returns the record (root issue/cause, decision incl. rejected alternatives, outcome status +
   fixing commits, provenance facets) instead of only raw item/comment matches. Coalesced issue↔PR
   pairs answer as one result.
