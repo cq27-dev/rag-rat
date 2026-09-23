@@ -250,6 +250,13 @@ fn require_mint_time_pin_unchanged(
     Ok(())
 }
 
+/// Founder-only on purpose, although any owner can author a `DeviceAdd`: what this gate admits must
+/// match exactly what the JOINER accepts, and the joiner's `verify_enrollment_device_add` accepts
+/// only a DeviceAdd that cites the genesis and carries the founder's signature. Redemption consumes
+/// the nonce and stores the receipt before the joiner ever checks it, so an invite this gate
+/// admitted and the joiner then refused would fail after the irreversible boundary — identically on
+/// every replay. That covers a founder that was demoted and re-promoted, too: its DeviceAdd cites
+/// the promotion's incarnation, not the genesis. Widen this and that verifier together (#1416).
 fn require_founder_enrollment_authority(
     conn: &Connection,
     account_id: AccountId,
