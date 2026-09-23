@@ -1537,6 +1537,20 @@ pub(in crate::account) fn effective_owner_incarnation_for_device(
     owner_id.map(|bytes| id::fixed(&bytes).map(OwnerId::from_bytes)).transpose()
 }
 
+/// The LOCAL device's currently-live owner incarnation on `account_id`, or `None` when the store
+/// has no device identity yet or its device holds no open owner incarnation there. The one owner
+/// lookup offered outside the account layer: callers there only ever ask about the device they run
+/// on, and the per-device reader stays internal.
+pub fn local_owner_incarnation(
+    conn: &Connection,
+    account_id: AccountId,
+) -> anyhow::Result<Option<OwnerId>> {
+    let Some(device) = crate::load_local_device(conn)? else {
+        return Ok(None);
+    };
+    effective_owner_incarnation_for_device(conn, account_id, device.fingerprint())
+}
+
 fn missing_reference<T>(
     conn: &Connection,
     account_id: AccountId,
@@ -2560,10 +2574,20 @@ pub fn account_entry_ref(signed_bytes: &[u8]) -> anyhow::Result<(AccountId, Acco
     Ok((signed.header.account_id, signed.entry_hash))
 }
 
-/// Verify that an enrollment bootstrap contains a founder-signed `DeviceAdd` for the exact
-/// account, entry hash, and joiner keys the caller requested. This is deliberately independent of
-/// transport identity: the inviter's QUIC key routes the exchange, while the account founder key
-/// carried by the self-certifying genesis authorizes enrollment.
+/// Verify that an enrollment bootstrap is bound to the expected account and carries an
+/// authentically signed `DeviceAdd` for the exact entry hash and joiner keys the caller requested.
+/// Deliberately independent of transport identity: the inviter's QUIC key only routes the exchange.
+///
+/// This is STRUCTURAL, not the authorization boundary. It does not decide whether the DeviceAdd's
+/// signer was entitled to enroll anyone — any owner may, and whether this one was is exactly what
+/// the account fold decides for every entry, by the rule every peer applies.
+/// `adopt_enrollment_bootstrap` runs that fold in the same transaction that would commit the local
+/// account pointer, and requires the acknowledged DeviceAdd to be roster-effective or rolls back.
+/// Restating an authority rule here would be a second, narrower copy of the fold's — which drifts.
+/// What this checks is that the bootstrap is the expected account's (every genesis the fold could
+/// select, or whose key could be collected, self-hashes to it) and that the receipt's DeviceAdd is
+/// the enrollment the joiner asked for, authentically signed. Adoption would refuse most of what
+/// this refuses; refusing it here tells the joiner why, before anything is staged.
 pub fn verify_enrollment_device_add(
     account_entries: &[Vec<u8>],
     expected_account: AccountId,
@@ -2580,6 +2604,14 @@ pub fn verify_enrollment_device_add(
             signed.header.account_id == expected_account,
             "enrollment bootstrap contains an entry for another account"
         );
+        // The same per-entry validation adoption applies first. A header's account id is
+        // attacker-controlled, but a current plaintext control genesis must also carry a payload
+        // that self-hashes to it — so an impostor genesis carried beside the real one is refused
+        // here, before its key could be collected below. A genesis-tagged entry at another version,
+        // on another log or sealed is tolerated rather than refused: the fold never selects it, and
+        // no key is collected from it. The selection below re-checks the binding itself.
+        validate_storable_header_payload(&signed.header, &signed.payload)
+            .map_err(anyhow::Error::msg)?;
         if signed.entry_hash == expected_hash {
             anyhow::ensure!(
                 bytes.as_slice() == expected_signed,
@@ -2607,17 +2639,9 @@ pub fn verify_enrollment_device_add(
         .genesis_hash()
         .ok_or_else(|| anyhow::anyhow!("enrollment bootstrap has no accepted account genesis"))?;
     let genesis = entries
-        .into_iter()
+        .iter()
         .find(|signed| signed.entry_hash == genesis_hash)
         .expect("the fold's genesis hash names an entry in its input");
-    // The per-entry check above compares ATTACKER-CONTROLLED header bytes; bind the genesis to
-    // the expected account the way ingest does (§4): its payload must self-hash to
-    // `expected_account`, or an impostor's own founder-signed genesis + DeviceAdd (stamped with
-    // the victim's account_id in their headers) would pass every signature check below.
-    anyhow::ensure!(
-        id::account_id_from_genesis_payload(&genesis.payload) == expected_account,
-        "enrollment genesis payload does not hash to the expected account"
-    );
     let DecodedAccountOp::Known(AccountOp::AccountGenesis { ed25519_pubkey: founder_key, .. }) =
         ops::decode(genesis.header.entry_type, &genesis.payload)?
     else {
@@ -2627,12 +2651,28 @@ pub fn verify_enrollment_device_add(
 
     let device_add = device_add
         .ok_or_else(|| anyhow::anyhow!("enrollment bootstrap has no acknowledged DeviceAdd"))?;
+    // A DeviceAdd-shaped payload on another log, at another version or sealed is not an enrollment:
+    // the fold would never make it roster-effective. Refuse it here rather than let the joiner's
+    // request be answered by something that only looks like one.
     anyhow::ensure!(
-        device_add.header.authority_ref == Some(genesis.entry_hash.into()),
-        "enrollment DeviceAdd does not cite the founder incarnation"
+        is_current_control_plaintext(&device_add.header),
+        "enrollment DeviceAdd is not a current plaintext control-log entry"
     );
+    // The DeviceAdd verifies under the key its signer's fingerprint resolves to — whoever signed
+    // it, founder or not. Every entry's certified key is collected, not only those whose own
+    // signatures chain back here: a key is bound to its fingerprint by `sha256(pubkey) ==
+    // fingerprint`, so where it came from does not affect whom a valid signature proves. Only
+    // this one signer must resolve; adoption enforces its causal fixpoint over the whole
+    // snapshot, and an honest snapshot can carry entries whose signers never do.
+    let mut certified = HashMap::new();
+    for signed in &entries {
+        add_self_pubkey(&mut certified, &signed.header, &signed.payload);
+    }
+    let signer_key = certified.get(&device_add.header.device_fingerprint).ok_or_else(|| {
+        anyhow::anyhow!("enrollment DeviceAdd is signed by a device the bootstrap does not name")
+    })?;
     let verified =
-        authenticate_entry(&device_add.signed_bytes, &founder_key).map_err(anyhow::Error::msg)?;
+        authenticate_entry(&device_add.signed_bytes, signer_key).map_err(anyhow::Error::msg)?;
     anyhow::ensure!(
         verified.entry_hash == expected_hash,
         "enrollment DeviceAdd hash does not match the receipt"
@@ -3125,9 +3165,16 @@ pub(crate) fn stored_device_pubkeys(
     Ok(out)
 }
 
-/// Whether the entry certifies its OWN signer key with no prior state — the genesis arm of
-/// [`add_self_pubkey`]. The enrollment bootstrap's causal ingest order treats exactly these as
-/// worklist roots (a DeviceAdd certifies the ADDED key, never its signer, so it is not a root).
+/// Whether the entry certifies its OWN signer key with no prior state. The enrollment bootstrap's
+/// causal ingest order treats exactly these as worklist roots.
+///
+/// A genesis is one. So is a DeviceAdd whose subject IS its signer — `add_self_pubkey` certifies
+/// the added device's key, and nothing stops a device adding itself. That is harmless, because a
+/// certified key authorizes nothing: the fold rejects such a DeviceAdd unless its signer already
+/// held a live owner incarnation. And it must NOT be tightened. Ingest stores these as candidates,
+/// enrollment serves every held candidate, and any peer can plant one over sync — so a stricter
+/// root predicate would leave an honest owner's snapshot unadoptable, and fail an enrollment after
+/// its one-time nonce was spent.
 pub(super) fn self_certifies_signer(header: &AccountEntryHeader, payload: &[u8]) -> bool {
     let mut map = HashMap::new();
     add_self_pubkey(&mut map, header, payload);

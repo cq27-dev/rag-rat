@@ -464,9 +464,7 @@ pub fn validate_device_add_label(label: Option<&str>) -> anyhow::Result<()> {
 /// Any owner may author it: like every control op it cites the local device's own open owner
 /// incarnation as `authority_ref`. A `DeviceAdd` from a non-owner still folds `Rejected`, so this
 /// verifies the joiner became roster-effective and errors otherwise, rather than reporting a
-/// rejected enrollment as success. The joiner's side does not yet accept a `DeviceAdd` signed by
-/// anyone but the founder, so enrolling from another owner authors correctly here and is refused
-/// at the joiner until that verification is generalized (#1416).
+/// rejected enrollment as success.
 pub fn author_device_add_in_tx(
     tx: &Transaction<'_>,
     joiner: EnrollingDevice,
@@ -479,29 +477,16 @@ pub fn author_device_add_in_tx(
 /// Enrollment-specific DeviceAdd authoring. Mandatory wraps and the durable receipt are committed
 /// before latent pre-verify work is retried, so opaque queue state cannot consume their capacity.
 ///
-/// Founder-only, under the founder's GENESIS incarnation, though any owner can author a plain
-/// `DeviceAdd`: this one becomes an enrollment receipt, and the joiner's
-/// [`verify_enrollment_device_add`](storage::verify_enrollment_device_add) accepts only a DeviceAdd
-/// that cites the genesis and carries the founder's signature. Redemption consumes the one-time
-/// nonce in the same transaction, so authoring anything else here would spend it on an enrollment
-/// the joiner refuses, identically on every replay. That includes a founder demoted and re-promoted
-/// after the invite was minted — its DeviceAdd would cite the promotion's incarnation. Widen this
-/// together with that verifier (#1416).
+/// Any owner may author it: the joiner accepts a DeviceAdd from whichever owner signed it, because
+/// its fold decides who was entitled. Everything that could refuse it runs before redemption spends
+/// the nonce — the shared control seam refuses a non-owner before signing, and the roster fact
+/// check below refuses a DeviceAdd its own fold does not make effective.
 pub fn author_enrollment_device_add_in_tx(
     tx: &Transaction<'_>,
     joiner: EnrollingDevice,
     role: ops::DeviceRole,
     now_ms: i64,
 ) -> anyhow::Result<AccountEntryHash> {
-    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
-        .context("cannot enroll a device before the store's local account is minted")?;
-    let device = local_device(tx, now_ms)?;
-    anyhow::ensure!(
-        storage::effective_owner_incarnation_for_device(tx, account_id, device.fingerprint())?
-            == Some(genesis_hash.into()),
-        "only the founder, under its genesis incarnation, can author an enrollment a joiner will \
-         accept",
-    );
     author_device_add_with_promotion_in_tx(tx, joiner, role, now_ms, DeviceAddPromotion::Defer)
 }
 
@@ -2717,11 +2702,11 @@ mod tests {
             "it acts under the incarnation the promotion minted, not the closed genesis one",
         );
 
-        // But not an ENROLLMENT DeviceAdd: a joiner accepts only one citing the genesis, so this
-        // would spend an invite's nonce on a receipt the joiner refuses.
+        // An ENROLLMENT DeviceAdd too: the joiner accepts it from whichever owner signed it, so the
+        // re-promoted founder can enroll again under the incarnation the promotion minted.
         let later = DeviceSecret::from_seed(&[0x69; 32]);
         let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
-        let error = author_enrollment_device_add_in_tx(
+        let enrollment = author_enrollment_device_add_in_tx(
             &tx,
             EnrollingDevice {
                 ed25519_pubkey: later.public().to_bytes(),
@@ -2731,45 +2716,52 @@ mod tests {
             ops::DeviceRole::Member,
             NOW + 5,
         )
-        .expect_err("a re-promoted founder cannot author an enrollment a joiner accepts");
-        drop(tx);
-        assert!(error.to_string().contains("only the founder"), "refused as such: {error}");
+        .expect("a re-promoted founder authors an enrollment");
+        tx.commit().unwrap();
+        assert_eq!(
+            authored_header(&founder, enrollment).authority_ref,
+            Some(promotion.into()),
+            "under the promotion's incarnation",
+        );
     }
 
-    /// The enrollment DeviceAdd is the one a joiner verifies, against the founder's key and genesis
-    /// incarnation alone. Any owner can author a plain DeviceAdd; authoring THIS one from a second
-    /// owner would spend an invite's nonce on a receipt the joiner refuses.
+    /// A second owner authors an enrollment DeviceAdd, and the joiner's verifier accepts it: the
+    /// verifier authenticates whoever signed it, and the fold decides who was entitled.
     #[test]
-    fn only_the_founder_authors_an_enrollment_device_add() {
+    fn a_second_owner_authors_an_enrollment_the_joiner_verifies() {
         let founder = db();
         let account = bootstrap::local_account(&founder, NOW).unwrap();
         let (second, _) = joined_store(&founder, account, ops::DeviceRole::Owner);
-        let enrolling = |seed: u8| {
-            let joiner = DeviceSecret::from_seed(&[seed; 32]);
-            EnrollingDevice {
-                ed25519_pubkey: joiner.public().to_bytes(),
-                x25519_pubkey: DeviceX25519Secret::from_seed(&[seed.wrapping_add(1); 32])
-                    .public()
-                    .to_bytes(),
-                label: None,
-            }
-        };
+        let joiner = DeviceSecret::from_seed(&[0x6b; 32]);
+        let joiner_x = DeviceX25519Secret::from_seed(&[0x6c; 32]).public().to_bytes();
 
         let tx = Transaction::new_unchecked(&second, TransactionBehavior::Immediate).unwrap();
-        let error = author_enrollment_device_add_in_tx(
+        let device_add = author_enrollment_device_add_in_tx(
             &tx,
-            enrolling(0x6b),
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: joiner_x,
+                label: None,
+            },
             ops::DeviceRole::Member,
             NOW + 2,
         )
-        .expect_err("a second owner cannot author an enrollment a joiner accepts");
-        drop(tx);
-        assert!(error.to_string().contains("only the founder"), "refused as such: {error}");
-
-        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
-        author_enrollment_device_add_in_tx(&tx, enrolling(0x6d), ops::DeviceRole::Member, NOW + 2)
-            .expect("the founder still authors enrollments");
+        .expect("a second owner authors an enrollment");
         tx.commit().unwrap();
+
+        let entries = storage::account_entries_for_enrollment(&second, account).unwrap();
+        let signed =
+            entries.iter().find(|e| e.entry_hash == device_add).unwrap().signed_bytes.clone();
+        let bootstrap: Vec<Vec<u8>> = entries.into_iter().map(|e| e.signed_bytes).collect();
+        storage::verify_enrollment_device_add(
+            &bootstrap,
+            account,
+            device_add,
+            &signed,
+            joiner.public().to_bytes(),
+            joiner_x,
+        )
+        .expect("the joiner verifies a DeviceAdd a second owner signed");
     }
 
     /// Under a pin, a second owner's first control op still opens its own chain. Its held and
@@ -2792,5 +2784,61 @@ mod tests {
         assert_eq!((header.seq, header.prev_hash), (0, None), "it opens its own chain");
         assert_eq!(header.op_version, v2_ops::CONTROL_VERSION, "signed as control v2");
         assert!(!still_enrolled(&second, account, subject), "and the removal takes effect");
+    }
+
+    /// Depth two: an owner that a non-founder owner enrolled enrolls a device in turn. The joiner's
+    /// verifier resolves its signer through two DeviceAdds to the genesis, and adoption's fold
+    /// authorizes it through two incarnations — neither of which is the founder's.
+    #[test]
+    fn an_owner_enrolled_by_another_owner_enrolls_in_turn() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let (second, _) = joined_store(&founder, account, ops::DeviceRole::Owner);
+        let (third, third_incarnation) = joined_store(&second, account, ops::DeviceRole::Owner);
+
+        let joined = db();
+        let device = local_device(&joined, NOW).unwrap();
+        let tx = Transaction::new_unchecked(&third, TransactionBehavior::Immediate).unwrap();
+        let device_add = author_enrollment_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: device.ed25519_public_key(),
+                x25519_pubkey: device.x25519_public_key(),
+                label: None,
+            },
+            ops::DeviceRole::Member,
+            NOW + 2,
+        )
+        .expect("an owner enrolled by a non-founder owner enrolls a device");
+        tx.commit().unwrap();
+        assert_eq!(
+            authored_header(&third, device_add).authority_ref,
+            Some(third_incarnation.into()),
+            "under its own incarnation",
+        );
+
+        let entries = storage::account_entries_for_enrollment(&third, account).unwrap();
+        let signed =
+            entries.iter().find(|e| e.entry_hash == device_add).unwrap().signed_bytes.clone();
+        let bootstrap_bytes: Vec<Vec<u8>> = entries.into_iter().map(|e| e.signed_bytes).collect();
+        let genesis_hash = storage::verify_enrollment_device_add(
+            &bootstrap_bytes,
+            account,
+            device_add,
+            &signed,
+            device.ed25519_public_key(),
+            device.x25519_public_key(),
+        )
+        .expect("the verifier resolves the signer through two DeviceAdds");
+        bootstrap::adopt_enrollment_bootstrap(&joined, bootstrap::EnrollmentBootstrap {
+            account_entries: &bootstrap_bytes,
+            account_id: account,
+            genesis_hash,
+            device_fingerprint: device.fingerprint(),
+            device_add_hash: device_add,
+            now_ms: NOW + 3,
+        })
+        .expect("and adoption's fold authorizes it");
+        assert_eq!(bootstrap::read_local_account(&joined).unwrap(), Some(account));
     }
 }
