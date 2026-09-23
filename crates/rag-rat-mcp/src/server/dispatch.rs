@@ -42,6 +42,9 @@ impl RagRatService {
         // (the format is chosen once at launch; MCP has no per-call flag).
         let text = rag_rat_core::render(&value, self.output_format);
         let mut content = vec![ContentBlock::text(text)];
+        if let Some(note) = crate::tools::deprecation_note(name) {
+            content.push(ContentBlock::text(note));
+        }
         if let Some(nudge) = self.stale_memory_nudge(name) {
             content.push(ContentBlock::text(nudge));
         }

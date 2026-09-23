@@ -70,7 +70,7 @@ fn mcp_stdio_smoke_lists_and_calls_core_tools() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
-    for name in ["semantic_search", "read_chunk", "papertrail_for_symbol"] {
+    for name in ["semantic_search", "read_chunk", "history_for"] {
         assert!(tool_names.contains(&name), "missing tool {name}");
     }
 

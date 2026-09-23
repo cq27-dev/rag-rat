@@ -482,3 +482,112 @@ fn index_status_includes_embeddings_on_request() {
     assert!(!text(json!({})).contains("embeddings:"), "absent by default");
     assert!(text(json!({"include": ["embeddings"]})).contains("embeddings:"), "present on request");
 }
+
+fn payload(svc: &RagRatService, name: &str, args: Value) -> Value {
+    let result = svc.call(name, args).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+    let ContentBlock::Text(text) = &result.content[0] else { panic!("{name}: no text") };
+    serde_json::from_str(&text.text)
+        .unwrap_or_else(|e| panic!("{name}: not JSON ({e}): {}", text.text))
+}
+
+fn json_service() -> (rag_rat_base::test_scratch::ScratchDir, RagRatService) {
+    let (root, config) = config_over_temp_repo();
+    (root, RagRatService::new(config, OutputFormat::Json))
+}
+
+/// Each target returns the kinds of history it supports, under the part's name, and each part is
+/// exactly what the tool it replaces returns.
+#[test]
+fn history_for_answers_each_target_with_the_parts_it_supports() {
+    let (_root, svc) = json_service();
+    let keys = |value: &Value| {
+        let mut keys = value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        keys
+    };
+    let by_path = payload(&svc, "history_for", json!({"path": "src/lib.rs"}));
+    assert_eq!(keys(&by_path), ["commits", "tracker"]);
+    assert_eq!(
+        by_path["commits"],
+        payload(&svc, "git_history_for_path", json!({"path": "src/lib.rs", "limit": 50})),
+        "delegates to the tool it replaces"
+    );
+    let by_symbol = payload(&svc, "history_for", json!({"symbol": "open_database"}));
+    assert_eq!(keys(&by_symbol), ["commits", "tracker"]);
+    let by_commit = payload(&svc, "history_for", json!({"commit": "abc123"}));
+    assert_eq!(keys(&by_commit), ["tracker"]);
+    let narrowed =
+        payload(&svc, "history_for", json!({"path": "src/lib.rs", "include": ["tracker"]}));
+    assert_eq!(keys(&narrowed), ["tracker"]);
+}
+
+#[test]
+fn history_for_refuses_an_ambiguous_target_or_an_unsupported_part() {
+    let (_root, svc) = json_service();
+    let err = |args| format!("{:?}", svc.call("history_for", args).unwrap_err());
+    assert!(err(json!({})).contains("exactly one target"));
+    assert!(err(json!({"path": "src/lib.rs", "commit": "abc"})).contains("exactly one target"));
+    let unsupported = err(json!({"path": "src/lib.rs", "include": ["blame"]}));
+    assert!(unsupported.contains("`blame` is not available") && unsupported.contains("`commits`"));
+}
+
+/// A temp repo with one real commit, so commit and change searches have something to find — on an
+/// empty history every source answers `[]` and routing is invisible.
+fn json_service_with_history() -> (rag_rat_base::test_scratch::ScratchDir, RagRatService) {
+    let (root, config) = config_over_temp_repo();
+    let git = |args: &[&str]| rag_rat_base::test_git::run(&config.root, args);
+    git(&["init", "-q"]);
+    git(&["-c", "user.email=t@e.com", "-c", "user.name=t", "add", "-A"]);
+    git(&[
+        "-c",
+        "user.email=t@e.com",
+        "-c",
+        "user.name=t",
+        "commit",
+        "-qm",
+        "add the search entry point",
+    ]);
+    IndexDatabase::rebuild(&config).unwrap();
+    (root, RagRatService::new(config, OutputFormat::Json))
+}
+
+#[test]
+fn history_search_routes_each_source_to_its_search() {
+    let (_root, svc) = json_service_with_history();
+    assert_ne!(
+        payload(&svc, "commit_search", json!({"query": "search"})),
+        payload(&svc, "commits_touching_query", json!({"query": "search"})),
+        "the fixture must tell the commit searches apart, or this proves nothing"
+    );
+    // `issues` and `rationale` both answer `[]` without a tracker cache, so a swap between those
+    // two is not caught here; the commit pair is.
+    for (source, tool) in [
+        ("commits", "commit_search"),
+        ("changes", "commits_touching_query"),
+        ("issues", "papertrail_issue_search"),
+        ("rationale", "rationale_search"),
+    ] {
+        assert_eq!(
+            payload(&svc, "history_search", json!({"query": "search", "source": source})),
+            payload(&svc, tool, json!({"query": "search"})),
+            "{source} answers as {tool}"
+        );
+    }
+}
+
+/// A deprecated name still answers, unchanged, and says what replaced it.
+#[test]
+fn a_deprecated_tool_still_answers_and_names_its_replacement() {
+    let (_root, svc) = json_service();
+    let result = svc.call("git_history_for_path", json!({"path": "src/lib.rs"})).unwrap();
+    let notes = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) if text.text.starts_with("note:") => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("history_for {path"), "{}", notes[0]);
+}

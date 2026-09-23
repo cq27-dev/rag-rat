@@ -385,6 +385,26 @@ const SCHEMA_ROWS: &[SchemaRow] = &[
     row("find_clones", &[], &["limit", "min_copies", "min_similarity"]),
     row("clones_for_symbol", &[], &["id", "line", "path", "ref"]),
     row("ffi_surface", &[], &["limit"]),
+    SchemaRow {
+        include: Some(&["commits", "blame", "tracker", "fallback"]),
+        ..row("history_for", &[], &[
+            "allow_ambiguous",
+            "chunk_id",
+            "commit",
+            "id",
+            "include",
+            "lang",
+            "limit",
+            "path",
+            "ref",
+            "symbol",
+        ])
+    },
+    SchemaRow {
+        include: Some(&["fallback"]),
+        enums: &[("source", &["commits", "changes", "issues", "rationale"])],
+        ..row("history_search", &["query", "source"], &["include", "limit", "query", "source"])
+    },
     // Symbol selector only: the handler never read the graph knobs it used to advertise.
     row("docs_for_symbol", &[], SYMBOL_REF_ARGS),
     SchemaRow {
@@ -1748,7 +1768,12 @@ fn toolsets_decide_what_is_listed_and_nothing_else() {
     assert!(
         listed(&[Graph]).contains(&"memory_edges") && !listed(&[Graph]).contains(&"heal_index")
     );
-    assert_eq!(listed(&[Admin, Graph]), TOOL_NAMES.to_vec(), "both toolsets list everything");
+    let not_deprecated = TOOL_NAMES
+        .iter()
+        .copied()
+        .filter(|name| super::replacement(name).is_none())
+        .collect::<Vec<_>>();
+    assert_eq!(listed(&[Admin, Graph]), not_deprecated, "both toolsets list all but deprecated");
 }
 
 #[test]

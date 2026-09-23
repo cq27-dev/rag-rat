@@ -47,18 +47,22 @@ you're actually asking (full schemas: `docs/mcp-tools.md`):
 | Orient in an unfamiliar repo | `repo_brief` (spine / churn / god_modules / refactor_candidates), `repo_clusters` |
 | Find the load-bearing symbols | `important_symbols` |
 | Check if code duplicates what's already here | `find_clones`; the clone class of one symbol → `clones_for_symbol` |
-| Understand **why** code exists (rationale) | `papertrail_for_symbol` / `papertrail_for_chunk`, `rationale_search` |
-| Trace **when/why** something changed | `git_history_for_symbol` / `git_history_for_path`, `commit_search`, `commits_touching_query`, `git_blame_chunk` |
-| Pull a tracker issue/PR or refs for a path | `papertrail_issue_search`, `papertrail_refs_for_path`, `papertrail_for_commit` |
+| Understand **why** code exists, or **when/why** it changed | **`history_for`** a symbol (`symbol`/`ref`/`id`), `path`, `chunk_id` or `commit` — commits, blame, and the tracker issues / reviews that reference it |
+| Search history by keyword | `history_search` with `source`: `commits`, `changes` (commits + the files they touched), `issues`, `rationale` |
 | Read docs / doc-comments for a symbol | `docs_for_symbol` |
-| Map the FFI / binding surface | `ffi_surface` |
-| Audit whether the graph is trustworthy here | `compare_graph_to_scip` (vs compiler), `compare_graph_to_text` (vs regex) |
-| Recall prior notes and their links | `memory_search`, `memory_for_symbol` / `memory_for_path` / `memory_for_call_path`, `memory_edges` |
-| Triage the memory-maintenance worklist | `dream` → `dream_review` (see the **dream-review** skill) |
-| Check index / embedding / papertrail-cache health | `index_status`, `llm_status`, `papertrail_sync_status`; repair drift with `heal_index` |
+| Recall prior notes | `memory_search`, `memory_for_symbol` / `memory_for_path` / `memory_for_call_path` |
+| Check index / embedding / tracker-cache health | `index_status` (`include: ["embeddings"]` for embedding coverage) |
 
-Reaching for the right tool is cheap and eager: prefer the specific one (`papertrail_for_symbol` for
-*why*, `find_clones` before writing a helper) over defaulting to `semantic_search` for everything.
+**Optional toolsets.** Maintenance and diagnostics are off the default tool list; if you need one and
+it is not among your tools, ask the user to add it to `[mcp] toolsets` in `rag-rat.toml` and reconnect:
+
+| Toolset | Tools |
+|---|---|
+| `admin` | `dream` → `dream_review` (see the **dream-review** skill), `heal_index` (repair drift), `memory_doctor`, `memory_validate`, `compare_graph_to_scip` / `compare_graph_to_text` (is the graph trustworthy here?), `check_library_usage`, `ffi_surface`, `llm_status`, `papertrail_sync_status` |
+| `graph` | `memory_edges`, `memory_edge_add`, `memory_edge_remove` (memory task-graph links) |
+
+Reaching for the right tool is cheap and eager: prefer the specific one (`history_for` for *why*,
+`find_clones` before writing a helper) over defaulting to `semantic_search` for everything.
 
 **Symbol handle:** symbol-returning tools emit `id`, an opaque `sym_<hex>` token — the stable handle
 to cache and pass back into graph/impact/memory tools as `id` (copy verbatim; never parse it as a

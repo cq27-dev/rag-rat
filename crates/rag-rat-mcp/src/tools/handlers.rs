@@ -145,6 +145,23 @@ pub(crate) fn call_tool_with_db(
                 surface: memory_surface
             })?)
         },
+        "history_for" => history_for_tool(db, arguments, graded_history, memory_surface)?,
+        "history_search" => {
+            let args: HistorySearchArgs = serde_json::from_value(arguments.clone())?;
+            let tool = match args.source {
+                HistorySource::Commits => "commit_search",
+                HistorySource::Changes => "commits_touching_query",
+                HistorySource::Issues => "papertrail_issue_search",
+                HistorySource::Rationale => "rationale_search",
+            };
+            let mut sub = json!({ "query": args.query, "limit": args.limit });
+            if tool == "rationale_search"
+                && let Some(include) = arguments.get("include")
+            {
+                sub["include"] = include.clone();
+            }
+            call_tool_with_db(db, tool, sub, graded_history, memory_surface)?
+        },
         "commit_search" => {
             let args: QueryArgs = serde_json::from_value(arguments)?;
             json!(db.commit_search(&args.query, args.limit)?)
@@ -465,6 +482,92 @@ pub(crate) fn graph_tool(
         },
         SymbolAnswer::Done(answer) => Ok(answer),
     }
+}
+
+/// `history_for`: one target, several kinds of history, each answered by the tool that already
+/// owns it — so the merged tool cannot drift from what those return.
+fn history_for_tool(
+    db: &IndexDatabase,
+    arguments: Value,
+    graded_history: bool,
+    memory_surface: MemorySurface,
+) -> anyhow::Result<Value> {
+    let args: HistoryForArgs = serde_json::from_value(arguments.clone())?;
+    let pick = |keys: &[&str]| {
+        let mut sub = serde_json::Map::new();
+        for key in keys {
+            if let Some(value) = arguments.get(*key) {
+                sub.insert((*key).to_string(), value.clone());
+            }
+        }
+        sub.insert("limit".to_string(), json!(args.limit));
+        Value::Object(sub)
+    };
+    let symbol_keys = ["symbol", "ref", "id", "allow_ambiguous", "lang"];
+    // (part, tool, arguments) for every kind of history this target supports.
+    let supported: Vec<(HistoryPart, &str, Value)> =
+        match (args.selector.names_a_symbol(), &args.path, args.chunk_id, &args.commit) {
+            (true, None, None, None) => vec![
+                (HistoryPart::Commits, "git_history_for_symbol", pick(&symbol_keys)),
+                (HistoryPart::Tracker, "papertrail_for_symbol", pick(&symbol_keys)),
+            ],
+            (false, Some(path), None, None) => vec![
+                (
+                    HistoryPart::Commits,
+                    "git_history_for_path",
+                    json!({ "path": path, "limit": args.limit }),
+                ),
+                (
+                    HistoryPart::Tracker,
+                    "papertrail_refs_for_path",
+                    json!({ "path": path, "limit": args.limit }),
+                ),
+            ],
+            (false, None, Some(chunk_id), None) => vec![
+                (HistoryPart::Blame, "git_blame_chunk", json!({ "chunk_id": chunk_id })),
+                (
+                    HistoryPart::Tracker,
+                    "papertrail_for_chunk",
+                    json!({ "chunk_id": chunk_id, "limit": args.limit }),
+                ),
+            ],
+            (false, None, None, Some(commit)) => {
+                let mut sub = json!({ "commit_hash": commit, "limit": args.limit });
+                if included(&args.include, HistoryPart::Fallback, false) {
+                    sub["include"] = json!(["fallback"]);
+                }
+                vec![(HistoryPart::Tracker, "papertrail_for_commit", sub)]
+            },
+            _ => anyhow::bail!(
+                "name exactly one target: a symbol (`symbol`, `ref` or `id`), a `path`, a \
+                 `chunk_id`, or a `commit`"
+            ),
+        };
+    if let Some(requested) = &args.include {
+        for part in requested {
+            anyhow::ensure!(
+                *part == HistoryPart::Fallback || supported.iter().any(|(p, ..)| p == part),
+                "`{}` is not available for this target; it supports {}",
+                serde_json::to_value(part)?.as_str().unwrap_or_default(),
+                supported
+                    .iter()
+                    .map(|(p, ..)| format!(
+                        "`{}`",
+                        serde_json::to_value(p).unwrap_or_default().as_str().unwrap_or_default()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    let mut out = serde_json::Map::new();
+    for (part, tool, sub) in supported {
+        if args.include.is_none() || included(&args.include, part, false) {
+            let key = serde_json::to_value(part)?.as_str().unwrap_or_default().to_string();
+            out.insert(key, call_tool_with_db(db, tool, sub, graded_history, memory_surface)?);
+        }
+    }
+    Ok(Value::Object(out))
 }
 
 /// The embedding status report, shared by `llm_status` and `index_status {include: [embeddings]}`.

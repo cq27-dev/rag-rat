@@ -782,6 +782,66 @@ pub struct HealIndexArgs {
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, Default)]
 pub struct EmptyArgs {}
 
+/// What `history_for` returns about its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryPart {
+    /// Commits that touched the target (symbol or path), newest first.
+    Commits,
+    /// Who last touched each line (chunk).
+    Blame,
+    /// Cached tracker items and review discussion referencing the target.
+    Tracker,
+    /// For a commit target: widen tracker matching past literal references.
+    Fallback,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct HistoryForArgs {
+    #[serde(flatten)]
+    pub selector: SymbolSelectorArgs,
+    #[serde(rename = "lang")]
+    pub language: Option<String>,
+    /// A current file path, repo-relative.
+    pub path: Option<String>,
+    /// A chunk id from a search or read result.
+    pub chunk_id: Option<i64>,
+    /// A commit hash.
+    pub commit: Option<String>,
+    /// Which history to return: `commits` (symbol, path), `blame` (chunk), `tracker` (any target),
+    /// `fallback` (commit). Omit for everything the target supports.
+    #[serde(default, deserialize_with = "de_seq_or_json_string")]
+    pub include: Option<Vec<HistoryPart>>,
+    #[serde(default = "default_graph_limit")]
+    pub limit: u32,
+}
+
+/// What `history_search` searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySource {
+    /// Commit subjects and bodies.
+    Commits,
+    /// Commit messages plus the files those commits changed ("what work relates to X?").
+    Changes,
+    /// Tracker issue and change-request titles and bodies.
+    Issues,
+    /// Tracker rationale: review comments and issue / change-request discussion.
+    Rationale,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct HistorySearchArgs {
+    pub query: String,
+    pub source: HistorySource,
+    #[serde(default = "default_search_limit")]
+    pub limit: u32,
+    /// `fallback` (rationale only): search snippets even when the query names a tracker item that
+    /// has literal references.
+    #[serde(default, deserialize_with = "de_rationale_include")]
+    pub include: Option<Vec<RationaleInclude>>,
+}
+
 /// `index_status` `include` flags, off by default: freshness is what a thin result usually needs,
 /// embedding coverage the next question. (The tracker cache is always in the report.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
