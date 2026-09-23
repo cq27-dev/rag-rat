@@ -439,3 +439,30 @@ fn absent_stamp_takes_the_recompute_path() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Chunks the policy never embeds are reported skipped, not missing:
+/// counting them as missing sent `doctor`'s `next` to a reconcile that embeds nothing. Every chunk
+/// of this fixture is below the `SkipTooSmall` floor.
+#[test]
+fn status_reports_policy_skipped_chunks_as_skipped_not_missing() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/tiny.rs"), "pub fn a() {}\n").unwrap();
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Rust)).unwrap();
+    let conn = db.storage.connection();
+    let total = ai::chunk_count(conn).unwrap();
+    assert!(total > 0, "the fixture must produce chunks, or this proves nothing");
+
+    let status = ai::fastembed_operational_status(
+        conn,
+        &ai::active_embedding_model_id(conn).unwrap(),
+        total,
+    )
+    .unwrap();
+    assert_eq!(status.skipped_embeddings, total, "every chunk is too small to embed");
+    assert_eq!(status.eligible_embeddings, 0);
+    assert_eq!(status.missing_embeddings, 0);
+    assert_ne!(status.next.as_deref(), Some("rag-rat reconcile --limit 500"));
+    let _ = fs::remove_dir_all(&root);
+}

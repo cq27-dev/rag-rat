@@ -161,7 +161,7 @@ pub(crate) fn stamped_policy_certified(
 /// Read the per-policy counts straight from the persisted `chunks.embedding_policy` column, but
 /// ONLY when [`stamped_policy_certified`] holds. `None` — stamp absent/stale, or a different cap —
 /// tells the caller to recompute.
-fn policy_skip_summary_from_column(
+pub(crate) fn policy_skip_summary_from_column(
     conn: &Connection,
     max_embedding_chars: usize,
 ) -> anyhow::Result<Option<BTreeMap<String, u64>>> {

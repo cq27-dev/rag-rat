@@ -185,10 +185,14 @@ pub(crate) fn fastembed_operational_status(
     let stale = stale_artifact_count(conn, report_model_id)?;
     let failed = status_artifact_count(conn, report_model_id, ArtifactStatus::Failed)?;
     let blocked = status_artifact_count(conn, report_model_id, ArtifactStatus::Blocked)?;
-    // Exact `skipped` (embedding input too large) needs the decompressed text per chunk — deferred
-    // to `reconcile --plan`. The status treats every chunk as eligible, so the invariant
-    // `eligible + skipped == total` holds with `skipped == 0`.
-    let eligible = total_chunks;
+    // Chunks the embedding policy never embeds (too small, generated, fixtures, …) are skipped, not
+    // missing: counting them as missing made `next` point at a reconcile that embeds nothing. The
+    // stamped `chunks.embedding_policy` column gives the per-policy counts cheaply, but only while
+    // its stamp is certified at the default cap; otherwise the exact split needs the per-chunk
+    // re-derivation `reconcile --plan` does, and every chunk is reported eligible as before.
+    let skipped = policy_skip_summary_from_column(conn, DEFAULT_MAX_EMBEDDING_CHARS)?
+        .map_or(0, |by_policy| by_policy.values().sum::<u64>().min(total_chunks));
+    let eligible = total_chunks - skipped;
     let missing = eligible.saturating_sub(
         current.saturating_add(stale).saturating_add(failed).saturating_add(blocked),
     );
@@ -215,7 +219,7 @@ pub(crate) fn fastembed_operational_status(
         status: model.status,
         current_embeddings: current,
         eligible_embeddings: eligible,
-        skipped_embeddings: 0,
+        skipped_embeddings: skipped,
         stale_embeddings: stale,
         missing_embeddings: missing,
         failed_embeddings: failed,
