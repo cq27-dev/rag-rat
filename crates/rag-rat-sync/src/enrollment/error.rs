@@ -9,6 +9,13 @@ pub enum InviteError {
     /// matching this, and keying that off formatted text would revert silently on a reword.
     #[error("{0}")]
     TicketVersionSkew(&'static str),
+    /// The account's control-log pin is not the one this invite was minted under. Terminal for
+    /// this ticket: the pin is permanent, so the owner must mint a fresh one rather than retry.
+    #[error(
+        "enrollment invite was minted under a different control-log checkpoint; ask the owner for \
+         a new invite"
+    )]
+    CheckpointPinMoved,
     #[error("enrollment invite expired")]
     Expired,
     #[error("enrollment invite was already used")]

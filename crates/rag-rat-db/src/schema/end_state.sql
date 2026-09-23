@@ -2106,7 +2106,7 @@ CREATE TABLE "sync_invites"(
              receipt_entries BLOB CHECK(
                  receipt_entries IS NULL OR length(receipt_entries) % 32 = 0
              ),
-             receipt_bytes BLOB,
+             receipt_bytes BLOB, checkpoint_digest BLOB CHECK(checkpoint_digest IS NULL OR length(checkpoint_digest)=32),
              CHECK((role = 'writer') = (stream_id IS NOT NULL)),
              CHECK(
                  (used_at_ms IS NULL
@@ -2355,5 +2355,6 @@ INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALU
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('129_table_sync_suffix_coverage',1789841199858,'sha256:rag-rat-table-sync-suffix-coverage-v129','Retain promised suffix tips across interrupted table floor adoption (#892)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('130_account_control_pins',1789841199858,'sha256:rag-rat-account-control-pins-v130','Retain permanent external account checkpoint pins and signed evidence (#1311)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('131_account_view_citations',1789841199859,'sha256:rag-rat-account-view-citations-v131','Record the pre-cut view a control-v2 cut names, so candidate admission grants the view-manifest reserve only to a manifest some stored cut cites; backfilled from the stored signed control payloads so cuts admitted before this migration still name their evidence (#1367)');
+INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('132_invite_checkpoint_digest',1789841199860,'sha256:rag-rat-invite-checkpoint-digest-v132','Record which control-log pin an invite was minted under, so a pin installed between mint and redemption is refused before the one-time nonce is consumed rather than after (#1311)');
 INSERT INTO "repos"("repo_id","display_name","registered_at_ms") VALUES('__unassigned__','',0);
 INSERT INTO "content_digest_state"("id","state","rows_folded") VALUES(1,'0000000000000000000000000000000000000000000000000000000000000000',0);

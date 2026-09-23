@@ -127,7 +127,11 @@ pub(super) enum EnrollmentResponse {
     Refused(RefusalCode),
 }
 
-#[derive(Clone, Copy)]
+/// `EnumIter` so the round-trip test ranges over the enum itself. A hand-listed set would let a
+/// new code be added to `as_str` and forgotten in `from_str` — a token the owner can emit and no
+/// joiner can read — with nothing failing to say so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(strum::EnumIter))]
 pub(super) enum RefusalCode {
     Expired,
     Used,
@@ -137,6 +141,7 @@ pub(super) enum RefusalCode {
     Revoked,
     JoinerCapacity,
     HeldStateConflict,
+    CheckpointPinMoved,
 }
 
 impl EnrollmentReceipt {
@@ -229,6 +234,7 @@ impl RefusalCode {
             Self::Revoked => "revoked",
             Self::JoinerCapacity => "joiner_capacity",
             Self::HeldStateConflict => "held_state_conflict",
+            Self::CheckpointPinMoved => "checkpoint_pin_moved",
         }
     }
 
@@ -242,6 +248,7 @@ impl RefusalCode {
             "revoked" => Ok(Self::Revoked),
             "joiner_capacity" => Ok(Self::JoinerCapacity),
             "held_state_conflict" => Ok(Self::HeldStateConflict),
+            "checkpoint_pin_moved" => Ok(Self::CheckpointPinMoved),
             _ => Err(InviteError::Malformed(format!("unknown enrollment refusal {value}"))),
         }
     }
@@ -256,6 +263,7 @@ impl RefusalCode {
             Self::Revoked => InviteError::Revoked,
             Self::JoinerCapacity => InviteError::JoinerCapacity,
             Self::HeldStateConflict => InviteError::HeldStateConflict,
+            Self::CheckpointPinMoved => InviteError::CheckpointPinMoved,
         }
     }
 }
@@ -390,6 +398,9 @@ pub(super) fn refusal_code(error: &InviteError) -> Option<RefusalCode> {
         InviteError::Revoked => Some(RefusalCode::Revoked),
         InviteError::JoinerCapacity => Some(RefusalCode::JoinerCapacity),
         InviteError::HeldStateConflict => Some(RefusalCode::HeldStateConflict),
+        // The owner holds the pin state, so only the owner can see this; the joiner has to be told
+        // or it cannot tell a terminal ticket from a retryable transport failure.
+        InviteError::CheckpointPinMoved => Some(RefusalCode::CheckpointPinMoved),
         // A transport failure never reached a redemption and has never produced a wire
         // refusal; it is named here rather than left to a wildcard so it cannot start to.
         // Version skew is decided reading a ticket string, before any connection exists, so it
