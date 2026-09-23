@@ -1,4 +1,5 @@
 use rag_rat_base::config::McpToolset;
+use rag_rat_base::language::Language;
 
 use super::*;
 
@@ -137,6 +138,31 @@ pub fn list_tools() -> Value {
     )
 }
 
+/// `symbol_lookup`'s description, naming every language that emits symbols. Built from
+/// [`Language::all`] so a newly registered language is listed without editing this text; Markdown
+/// is chunked as prose and has no symbols.
+fn symbol_lookup_description() -> &'static str {
+    static DESCRIPTION: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let names: Vec<&str> = Language::all()
+            .iter()
+            .filter(|&&language| language != Language::Markdown)
+            .map(|language| language.display_name())
+            .collect();
+        let (last, rest) = names.split_last().expect("at least one symbol language");
+        format!(
+            "Resolve a symbol name (or ref/id) to its definition(s) in {}, or {last} — exact or \
+             fuzzy. Returns candidates with signatures, locations, logical-symbol grouping (cfg \
+             variants), and any bound repo memories. Use to disambiguate before a graph or read \
+             call. Generated bindings (codegen, ubrn FFI output) are excluded by default; pass \
+             include: [\"generated\"] to see them. A candidate whose symbol has distilled \
+             decision records carries them as `distilled_records` (labeled unreviewed, capped at \
+             2; empty for almost every symbol).",
+            rest.join(", ")
+        )
+    });
+    &DESCRIPTION
+}
+
 pub fn description(name: &str) -> &'static str {
     match name {
         "semantic_search" =>
@@ -149,14 +175,7 @@ pub fn description(name: &str) -> &'static str {
              distilled decision record (the model's resolved root-cause / decision / outcome over \
              the tracker thread that shaped it), it rides along as `distilled_records` — labeled \
              unreviewed, capped at 2; empty for almost every hit.",
-        "symbol_lookup" =>
-            "Resolve a symbol name (or ref/id) to its definition(s) in Rust, TypeScript, Kotlin, \
-             C, C++, Python, or Swift — exact or fuzzy. Returns candidates with signatures, \
-             locations, logical-symbol grouping (cfg variants), and any bound repo memories. Use \
-             to disambiguate before a graph or read call. Generated bindings (codegen, ubrn FFI \
-             output) are excluded by default; pass include: [\"generated\"] to see them. A \
-             candidate whose symbol has distilled decision records carries them as \
-             `distilled_records` (labeled unreviewed, capped at 2; empty for almost every symbol).",
+        "symbol_lookup" => symbol_lookup_description(),
         "find_callers" =>
             "Find what calls a symbol (reverse call graph), instead of grepping for call sites. \
              Returns call sites with confidence + target verification, a completeness / \

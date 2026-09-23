@@ -237,55 +237,15 @@ mod recovered_descendant_tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    use rag_rat_base::language::Language;
-
     use super::{ErrorNodePolicy, syntactic_edges_with_error_policy};
     use crate::index::parser;
 
     #[test]
     fn malformed_error_descendants_have_bounded_edge_deltas() {
-        let fixtures = [
-            (
-                "rust",
-                "broken.rs",
-                Language::Rust,
-                "fn f() { if { target(); } }\n",
-                &[("calls_name", "target")][..],
-            ),
-            (
-                "typescript",
-                "broken.ts",
-                Language::TypeScript,
-                "function broken( { target(); }\n",
-                &[][..],
-            ),
-            ("kotlin", "broken.kt", Language::Kotlin, "fun broken( { target() }\n", &[][..]),
-            (
-                "c",
-                "broken.c",
-                Language::C,
-                "void broken( { target(); }\n",
-                &[("calls_name", "target")][..],
-            ),
-            (
-                "cpp",
-                "broken.cpp",
-                Language::Cpp,
-                "void broken( { target(); }\n",
-                &[("calls_name", "target")][..],
-            ),
-            ("python", "broken.py", Language::Python, "def broken(:\n    target()\n", &[][..]),
-            (
-                "swift",
-                "broken.swift",
-                Language::Swift,
-                "func f() { if { target() } }\n",
-                &[("calls_name", "target")][..],
-            ),
-        ];
-
-        for (label, path, language, source, expected) in fixtures {
-            let path = Path::new(path);
+        for (language, fixture) in crate::index::languages::test_support::fixtures() {
+            let (label, source, expected) =
+                (language.as_db_str(), fixture.malformed, fixture.malformed_recovered);
+            let path = Path::new(fixture.path);
             let grammar = parser::grammar_for(parser::parser_kind(path, language)).unwrap();
             let tree = parser::parse_within_budget(grammar, source, parser::PARSE_BUDGET).unwrap();
             assert!(tree.root_node().has_error(), "{label} fixture must remain malformed");
@@ -388,16 +348,20 @@ impl EdgeEmitter<'_> {
 }
 
 /// Build a qualified call from the callee's captured identifiers. Borrow the path so callers
-/// that also emit a receiver-type edge do not need to walk the callee again.
+/// that also emit a receiver-type edge do not need to walk the callee again. `kinds` are the
+/// grammar's identifier kinds, for the [`call_target_name`] fallback when the path is empty.
 pub(crate) fn qualified_call_edge(
     locator: &SymbolLocator<'_>,
     node: Node<'_>,
     text: &str,
     identifiers: &IdentifierPath<'_>,
+    kinds: &[&str],
     edge_kind: EdgeKind,
 ) -> Option<EdgeCandidate> {
-    let name =
-        identifiers.last_text().map(ToOwned::to_owned).or_else(|| call_target_name(node, text))?;
+    let name = identifiers
+        .last_text()
+        .map(ToOwned::to_owned)
+        .or_else(|| call_target_name(node, text, kinds))?;
     Some(symbol_edge_with_context(
         locator,
         node,
@@ -691,54 +655,27 @@ mod contains_edges_tests {
 mod collect_edges_depth_tests {
     use std::path::Path;
 
-    use rag_rat_base::language::Language;
+    use crate::index::languages::test_support;
 
+    /// The edge walk (collect_edges) visits the whole tree just like the symbol walk, so it has
+    /// the same stack-overflow exposure on deeply-nested input (#520), and the extractors call
+    /// name-finding helpers that recurse to full SUBTREE depth, which `grow_stack` must grow
+    /// instead of overflowing (#543). A callee inside thousands of nested parens drives both —
+    /// `call_target_name -> last_identifier_text` recurses that deep — in every language, on a
+    /// deliberately small stack.
     #[test]
     fn deeply_nested_input_does_not_overflow_the_edge_walk() {
-        // The edge walk (collect_edges) recurses the whole tree just like the symbol walk, so it
-        // has the same stack-overflow exposure on deeply-nested input (#520). Small stack + a
-        // thousands-deep tree: a per-node recursive walk overflows here; the iterative one does
-        // not.
-        let depth = 8_000;
-        let src = format!("fn deep_edges_fn() {}{}\n", "{".repeat(depth), "}".repeat(depth));
-        std::thread::Builder::new()
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                super::edge_candidates(Path::new("deep.rs"), Language::Rust, &src, &[])
-                    .expect("edge extraction")
-            })
-            .expect("spawn walk thread")
-            .join()
-            .expect("the edge walk must not overflow the stack on deeply-nested input");
-    }
-}
-
-#[cfg(test)]
-mod deep_expression_helper_tests {
-    use std::path::Path;
-
-    use rag_rat_base::language::Language;
-
-    // The whole-tree walks (collect_edges/collect_symbols) are iterative (#520), but the extractors
-    // call name-finding helpers that recurse to full SUBTREE depth. A hostile file whose CALLEE is
-    // thousands of nested parens drives those helpers deep — grow_stack must grow the stack instead
-    // of overflowing it (#543). The input is far under the 512 KB parse cap and aborts with a stack
-    // overflow WITHOUT the grow_stack wraps.
-
-    #[test]
-    fn a_call_with_a_deeply_nested_paren_callee_does_not_overflow() {
-        // `((((…g…))))();` — the callee is 8000 nested parens (unambiguous, so the parse is fast),
-        // so call_target_name -> last_identifier_text -> collect_identifiers recurses 8000 deep.
-        let depth = 8_000;
-        let src = format!("fn f() {{ {}g{}(); }}\n", "(".repeat(depth), ")".repeat(depth));
-        std::thread::Builder::new()
-            .stack_size(512 * 1024)
-            .spawn(move || {
-                super::edge_candidates(Path::new("deep.rs"), Language::Rust, &src, &[])
-                    .expect("edge extraction");
-            })
-            .expect("spawn")
-            .join()
-            .expect("a deeply-nested paren callee must not overflow the stack");
+        for (language, fixture) in test_support::fixtures() {
+            let src = fixture.deep_call(8_000);
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    super::edge_candidates(Path::new(fixture.path), language, &src, &[])
+                        .expect("edge extraction")
+                })
+                .expect("spawn walk thread")
+                .join()
+                .unwrap_or_else(|_| panic!("{language}: the edge walk overflowed the stack"));
+        }
     }
 }

@@ -254,7 +254,7 @@ fn kind_position_literals<'tree>(
 }
 
 /// The literals in `node`, plus those of any const of the set it names (`NAME_KINDS`,
-/// `parser::NAME_KINDS`).
+/// `super::IDENTIFIER_KINDS`).
 fn literals_through_consts<'tree>(
     node: Node<'tree>,
     file: &Parsed,
@@ -510,10 +510,11 @@ fn every_kind_the_go_backend_names_exists_in_the_grammar() {
 }
 
 /// The shared tables serve every grammar, so a name there must be a node of at least one of them.
+/// Identifier and name kinds are per-backend consts, checked against their own grammar above.
 #[test]
 fn every_kind_the_shared_tables_name_exists_in_some_grammar() {
     let names = assert_kinds_exist(SHARED_SOURCES, ALL_GRAMMARS, &[]);
-    assert_found_at_least(&names, 10);
+    assert_found_at_least(&names, 4);
 }
 
 /// Assert every production `.rs` file under `dir` (recursively) is read by a tripwire above, or is

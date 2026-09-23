@@ -37,7 +37,7 @@ pub(in crate::index::languages) fn python_edges(
 fn python_from_import_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter<'_>) {
     let module = node.child_by_field_name("module_name");
     if let Some(module) = module
-        && let Some(name) = last_identifier_text(module, text)
+        && let Some(name) = last_identifier_text(module, text, super::IDENTIFIER_KINDS)
     {
         out.push(file_edge(path, module, text, name, EdgeKind::Imports));
     }
@@ -91,7 +91,7 @@ fn python_call_edges(
     out: &mut EdgeEmitter<'_>,
 ) {
     let function = node.child_by_field_name("function").unwrap_or(node);
-    let identifiers = IdentifierPath::under(function, text);
+    let identifiers = IdentifierPath::under(function, text, super::IDENTIFIER_KINDS);
     // `handlers[key]()` — the callee is the subscript RESULT, not the index variable
     // `last()` would pick. There's no clean callee identifier, so emit nothing (a wrong
     // `calls_name key` is worse than a missing edge).
@@ -152,10 +152,11 @@ fn python_class_edges(
         // review), which needs an in-corpus Python module model to close, not a
         // per-base special case.
         if let Some(head) = python_static_base_head(base, text)
-            && let Some(name) = last_identifier_text(head, text)
+            && let Some(name) = last_identifier_text(head, text, super::IDENTIFIER_KINDS)
         {
-            let callee =
-                last_identifier_node(head).map(final_segment_node).map(CalleeRange::of_node);
+            let callee = last_identifier_node(head, super::IDENTIFIER_KINDS)
+                .map(final_segment_node)
+                .map(CalleeRange::of_node);
             out.push(symbol_edge(locator, base, name, EdgeKind::Implements, callee));
         }
         emit_python_type_refs(base, locator, text, out);
@@ -177,7 +178,7 @@ fn python_decorator_edges(
     if !matches!(inner.kind(), "identifier" | "attribute") {
         return;
     }
-    let identifiers = IdentifierPath::under(inner, text);
+    let identifiers = IdentifierPath::under(inner, text, super::IDENTIFIER_KINDS);
     let Some(name) = identifiers.last_text().map(ToOwned::to_owned) else {
         return;
     };
@@ -227,13 +228,15 @@ fn emit_python_type_refs(
             });
         },
         "identifier" =>
-            if let Some(name) = last_identifier_text(node, text) {
+            if let Some(name) = last_identifier_text(node, text, super::IDENTIFIER_KINDS) {
                 out.push(symbol_edge(
                     locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
+                    last_identifier_node(node, super::IDENTIFIER_KINDS)
+                        .map(final_segment_node)
+                        .map(CalleeRange::of_node),
                 ));
             },
         // A QUALIFIED type reference (`pkg.Account`, `a.b.C`, `Account.Inner`): record the receiver
@@ -244,7 +247,7 @@ fn emit_python_type_refs(
         // qualified name the rebind would have nothing to rewrite and resolution would fall
         // back to the ambiguous bare tail.
         "attribute" | "dotted_name" => {
-            let identifiers = IdentifierPath::under(node, text);
+            let identifiers = IdentifierPath::under(node, text, super::IDENTIFIER_KINDS);
             if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
                 let receiver = node
                     .child_by_field_name("object")
@@ -315,7 +318,7 @@ fn python_attribute_is_static(node: Node<'_>, text: &str) -> bool {
             "identifier" => return !matches!(node_text(current, text).as_str(), "self" | "cls"),
             "dotted_name" =>
                 return !matches!(
-                    first_identifier_text(current, text).as_deref(),
+                    first_identifier_text(current, text, super::IDENTIFIER_KINDS).as_deref(),
                     Some("self" | "cls")
                 ),
             "attribute" => match current.child_by_field_name("object") {
@@ -419,7 +422,7 @@ fn python_rebinding_effective_byte(node: Node<'_>, name: &str, text: &str) -> Op
         "function_definition" | "class_definition" | "type_alias_statement" => node
             .child_by_field_name("name")
             .or_else(|| node.named_child(0))
-            .and_then(|name_node| last_identifier_text(name_node, text))
+            .and_then(|name_node| last_identifier_text(name_node, text, super::IDENTIFIER_KINDS))
             .filter(|defined| defined == name)
             .map(|_| node.start_byte()),
         "expression_statement" => node.named_child(0).and_then(|inner| {
@@ -477,14 +480,16 @@ fn python_import_binds_name(node: Node<'_>, name: &str, text: &str) -> bool {
         match child.kind() {
             "aliased_import" => child
                 .child_by_field_name("alias")
-                .and_then(|alias| last_identifier_text(alias, text))
+                .and_then(|alias| last_identifier_text(alias, text, super::IDENTIFIER_KINDS))
                 .is_some_and(|alias| alias == name),
             // from-import: the imported leaf (`from m import Account`). plain import: the
             // top-level segment of the dotted module path (`import other.Account` binds
             // `other`).
             "dotted_name" if from_import =>
-                last_identifier_text(child, text).is_some_and(|leaf| leaf == name),
-            "dotted_name" => first_identifier_text(child, text).is_some_and(|root| root == name),
+                last_identifier_text(child, text, super::IDENTIFIER_KINDS)
+                    .is_some_and(|leaf| leaf == name),
+            "dotted_name" => first_identifier_text(child, text, super::IDENTIFIER_KINDS)
+                .is_some_and(|root| root == name),
             _ => false,
         }
     })
@@ -507,9 +512,9 @@ fn python_import_target(
     if record_alias
         && child.kind() == "aliased_import"
         && let Some(target_node) = child.child_by_field_name("name")
-        && let Some(target) = last_identifier_text(target_node, text)
+        && let Some(target) = last_identifier_text(target_node, text, super::IDENTIFIER_KINDS)
         && let Some(alias_node) = child.child_by_field_name("alias")
-        && let Some(alias) = last_identifier_text(alias_node, text)
+        && let Some(alias) = last_identifier_text(alias_node, text, super::IDENTIFIER_KINDS)
     {
         // The alias binding is valid from the import until the name is REBOUND at module scope —
         // Python is order-dependent, so a later `alias = …` / `def alias` / `class alias` /
@@ -538,7 +543,7 @@ fn python_import_target(
         _ => None,
     };
     if let Some(target) = target
-        && let Some(name) = last_identifier_text(target, text)
+        && let Some(name) = last_identifier_text(target, text, super::IDENTIFIER_KINDS)
     {
         out.push(file_edge(path, target, text, name, EdgeKind::Imports));
     }

@@ -7,6 +7,14 @@ use crate::index::parser::{self, ParserKind};
 
 mod edges;
 pub(super) use edges::c_like_edges;
+
+/// The node kinds that name a declaration when it has no `name` field (`parser::child_name`).
+const NAME_KINDS: &[&str] =
+    &["identifier", "type_identifier", "field_identifier", "namespace_identifier"];
+
+/// The node kinds the identifier helpers ([`crate::index::edges::identifiers_under`] and friends)
+/// collect.
+const IDENTIFIER_KINDS: &[&str] = NAME_KINDS;
 #[cfg(test)]
 mod query_spike;
 
@@ -29,13 +37,18 @@ impl ParserBackend for C {
         // Index definitions, not prototypes/forward declarations/uses: otherwise type-reference
         // edges bind to the tiny declaration occurrence instead of the real definition (#61).
         match node.kind() {
-            "function_definition" =>
-                Some(("function", function_name(node).or_else(|| parser::child_name(node))?)),
-            "struct_specifier" if has_body(node) => Some(("struct", parser::child_name(node)?)),
-            "union_specifier" if has_body(node) => Some(("union", parser::child_name(node)?)),
-            "enum_specifier" if has_body(node) => Some(("enum", parser::child_name(node)?)),
-            "type_definition" => Some(("type", parser::child_name(node)?)),
-            "preproc_function_def" => Some(("macro", parser::child_name(node)?)),
+            "function_definition" => Some((
+                "function",
+                function_name(node).or_else(|| parser::child_name(node, NAME_KINDS))?,
+            )),
+            "struct_specifier" if has_body(node) =>
+                Some(("struct", parser::child_name(node, NAME_KINDS)?)),
+            "union_specifier" if has_body(node) =>
+                Some(("union", parser::child_name(node, NAME_KINDS)?)),
+            "enum_specifier" if has_body(node) =>
+                Some(("enum", parser::child_name(node, NAME_KINDS)?)),
+            "type_definition" => Some(("type", parser::child_name(node, NAME_KINDS)?)),
+            "preproc_function_def" => Some(("macro", parser::child_name(node, NAME_KINDS)?)),
             _ => None,
         }
     }
@@ -43,7 +56,7 @@ impl ParserBackend for C {
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         match node.kind() {
             "struct_specifier" | "union_specifier" if has_body(node) =>
-                parser::node_text(parser::child_name(node)?, text),
+                parser::node_text(parser::child_name(node, NAME_KINDS)?, text),
             _ => None,
         }
     }
@@ -65,24 +78,31 @@ impl ParserBackend for Cpp {
     fn symbol_node<'tree>(&self, node: Node<'tree>, _text: &str) -> Option<SymbolMatch<'tree>> {
         // As for C, bodyless declarations are deliberately not symbols (#61).
         match node.kind() {
-            "function_definition" =>
-                Some(("function", function_name(node).or_else(|| parser::child_name(node))?)),
-            "class_specifier" if has_body(node) => Some(("class", parser::child_name(node)?)),
-            "struct_specifier" if has_body(node) => Some(("struct", parser::child_name(node)?)),
-            "union_specifier" if has_body(node) => Some(("union", parser::child_name(node)?)),
-            "enum_specifier" if has_body(node) => Some(("enum", parser::child_name(node)?)),
-            "type_definition" | "alias_declaration" => Some(("type", parser::child_name(node)?)),
-            "namespace_definition" => Some(("namespace", parser::child_name(node)?)),
-            "preproc_function_def" => Some(("macro", parser::child_name(node)?)),
+            "function_definition" => Some((
+                "function",
+                function_name(node).or_else(|| parser::child_name(node, NAME_KINDS))?,
+            )),
+            "class_specifier" if has_body(node) =>
+                Some(("class", parser::child_name(node, NAME_KINDS)?)),
+            "struct_specifier" if has_body(node) =>
+                Some(("struct", parser::child_name(node, NAME_KINDS)?)),
+            "union_specifier" if has_body(node) =>
+                Some(("union", parser::child_name(node, NAME_KINDS)?)),
+            "enum_specifier" if has_body(node) =>
+                Some(("enum", parser::child_name(node, NAME_KINDS)?)),
+            "type_definition" | "alias_declaration" =>
+                Some(("type", parser::child_name(node, NAME_KINDS)?)),
+            "namespace_definition" => Some(("namespace", parser::child_name(node, NAME_KINDS)?)),
+            "preproc_function_def" => Some(("macro", parser::child_name(node, NAME_KINDS)?)),
             _ => None,
         }
     }
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         let name = match node.kind() {
-            "namespace_definition" => parser::child_name(node)?,
+            "namespace_definition" => parser::child_name(node, NAME_KINDS)?,
             "struct_specifier" | "union_specifier" | "class_specifier" if has_body(node) =>
-                parser::child_name(node)?,
+                parser::child_name(node, NAME_KINDS)?,
             _ => return None,
         };
         parser::node_text(name, text)
@@ -100,10 +120,10 @@ fn has_body(node: Node<'_>) -> bool {
 fn function_name(node: Node<'_>) -> Option<Node<'_>> {
     let declarator = parser::first_descendant_node(node, &["function_declarator"]).unwrap_or(node);
     let name_root = declarator.child_by_field_name("declarator").unwrap_or(declarator);
-    if parser::NAME_KINDS.contains(&name_root.kind()) {
+    if NAME_KINDS.contains(&name_root.kind()) {
         return Some(name_root);
     }
-    parser::last_descendant_node(name_root, parser::NAME_KINDS)
+    parser::last_descendant_node(name_root, NAME_KINDS)
 }
 
 pub(super) const RESOLVER_POLICY: ResolutionPolicy =

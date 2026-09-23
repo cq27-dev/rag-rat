@@ -8,15 +8,15 @@ pub(in crate::index::languages) fn kotlin_edges(
 ) {
     match node.kind() {
         "import" =>
-            for name in identifiers_under(node, text) {
+            for name in identifiers_under(node, text, super::IDENTIFIER_KINDS) {
                 out.push(file_edge(path, node, text, name, EdgeKind::Imports));
             },
         "call_expression" => {
-            let identifiers = IdentifierPath::under(node, text);
+            let identifiers = IdentifierPath::under(node, text, super::IDENTIFIER_KINDS);
             if let Some(name) = identifiers
                 .last_text()
                 .map(ToOwned::to_owned)
-                .or_else(|| first_identifier_text(node, text))
+                .or_else(|| first_identifier_text(node, text, super::IDENTIFIER_KINDS))
             {
                 out.push(symbol_edge_with_context(
                     locator,
@@ -68,23 +68,27 @@ pub(in crate::index::languages) fn kotlin_edges(
             }
         },
         "user_type" =>
-            if let Some(name) = last_identifier_text(node, text) {
+            if let Some(name) = last_identifier_text(node, text, super::IDENTIFIER_KINDS) {
                 out.push(symbol_edge(
                     locator,
                     node,
                     name,
                     EdgeKind::ReferencesType,
-                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
+                    last_identifier_node(node, super::IDENTIFIER_KINDS)
+                        .map(final_segment_node)
+                        .map(CalleeRange::of_node),
                 ));
             },
         "delegation_specifier" =>
-            if let Some(name) = last_identifier_text(node, text) {
+            if let Some(name) = last_identifier_text(node, text, super::IDENTIFIER_KINDS) {
                 out.push(symbol_edge(
                     locator,
                     node,
                     name,
                     EdgeKind::Implements,
-                    last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
+                    last_identifier_node(node, super::IDENTIFIER_KINDS)
+                        .map(final_segment_node)
+                        .map(CalleeRange::of_node),
                 ));
             },
         _ => {},

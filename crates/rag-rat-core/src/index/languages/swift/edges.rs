@@ -994,7 +994,7 @@ fn swift_inherited_type_name(node: Node<'_>) -> Option<Node<'_>> {
     if inherited.kind() == "user_type" {
         return Some(inherited);
     }
-    last_identifier_node(inherited).map(final_segment_node)
+    last_identifier_node(inherited, super::IDENTIFIER_KINDS).map(final_segment_node)
 }
 
 fn swift_inheritance_is_enum_raw_type(node: Node<'_>, text: &str) -> bool {

@@ -74,7 +74,7 @@ pub(crate) fn policy_fromtext_calls() -> usize {
 /// stale-but-matching stamp would let the fast path serve mixed-code counts). A version mismatch
 /// instead correctly forces the slow recompute. See the freshness-model Risk memory bound to this
 /// file.
-pub(crate) const EMBEDDING_POLICY_VERSION: &str = "b2fc1397b6b22bcf";
+pub(crate) const EMBEDDING_POLICY_VERSION: &str = "66239851961c99e7";
 
 /// `repo_meta` keys carrying the embedding-policy freshness stamp a full rebuild writes
 /// (`mark_embedding_policy_current`). PER-REPO, not the DB-global `index_meta`: one database can
@@ -631,7 +631,6 @@ mod policy_version_tests {
     use std::path::Path;
 
     use rag_rat_base::hash::hex_sha256;
-    use rag_rat_base::language::Language;
 
     use super::{
         DEFAULT_MAX_EMBEDDING_CHARS, EMBEDDING_POLICY_VERSION, LowSignalCheck, MIN_EMBEDDING_CHARS,
@@ -863,77 +862,14 @@ mod policy_version_tests {
         // Low-signal via FromSpan across every grammar: a pure-plumbing file (imports/comments
         // only, >=80 chars so it reaches the low-signal gate) classifies low-signal; a file
         // with a real definition classifies as signal. Exercises `is_plumbing_node` per
-        // language + the grammar. (label, path, language, plumbing_src, def_src)
+        // language + the grammar, for every language the fixture table covers.
         // Every fixture is >=80 chars so it clears the SkipTooSmall gate and actually reaches the
         // span classifier (the point of the FromSpan cases). Whatever each classifies as is the
         // pinned behavior; a grammar bump that reclassifies a node flips the hash.
-        let span_cases: &[(&str, &str, Language, &str, &str)] = &[
-            (
-                "rust",
-                "s.rs",
-                Language::Rust,
-                "use std::collections::HashMap;\nuse std::fmt::Debug;\n// a descriptive comment \
-                 line\nuse std::io::Read;\nuse std::sync::Arc;\n",
-                "pub fn real_function(input: i32) -> i32 {\n    let value = input + 1;\n    \
-                 println!(\"{}\", value);\n    another_call(value)\n}\n",
-            ),
-            (
-                "typescript",
-                "s.ts",
-                Language::TypeScript,
-                "import defaultThing from 'a';\n// a descriptive comment line here now\nimport { \
-                 namedThing } from 'b';\nimport * as ns from 'c';\n",
-                "export function realFunction(input: number): number {\n    const value = input + \
-                 1;\n    return value + compute(value);\n}\n",
-            ),
-            (
-                "kotlin",
-                "s.kt",
-                Language::Kotlin,
-                "package com.example.app\nimport kotlin.collections.List\n// a descriptive \
-                 comment line here now\nimport kotlin.io.println\n",
-                "fun realFunction(input: Int): Int {\n    val value = input + 1\n    return value \
-                 + compute(value)\n}\n",
-            ),
-            (
-                "c",
-                "s.c",
-                Language::C,
-                "#include <stdio.h>\n#include \"local_header.h\"\n// a descriptive comment line \
-                 here now goes on\n#include <string.h>\n",
-                "int real_function(int input) {\n    int value = input + 1;\n    return value + \
-                 compute(value);\n}\n",
-            ),
-            (
-                "cpp",
-                "s.cpp",
-                Language::Cpp,
-                "#include <vector>\n#include <string>\n// a descriptive comment line here now \
-                 goes on and on\n#include <memory>\n",
-                "int real_function(int input) {\n    int value = input + 1;\n    return value + \
-                 compute(value);\n}\n",
-            ),
-            (
-                "python",
-                "s.py",
-                Language::Python,
-                "import os\nimport sys\nfrom collections import defaultdict\n# a descriptive \
-                 comment line here now goes on\n",
-                "def real_function(input):\n    value = input + 1\n    result = value + \
-                 compute(value)\n    return result\n",
-            ),
-            (
-                "swift",
-                "s.swift",
-                Language::Swift,
-                "import Foundation\nimport Dispatch\n// a descriptive comment line here now goes \
-                 on long enough\nimport Observation\n",
-                "func realFunction(_ input: Int) -> Int {\n    let value = input + 1\n    return \
-                 value + compute(value)\n}\n",
-            ),
-        ];
-        for (label, path, language, plumbing, def) in span_cases {
-            let pf = crate::index::parser::parse_file(Path::new(path), *language, plumbing)
+        for (language, fixture) in crate::index::languages::test_support::fixtures() {
+            let (label, path) = (language.as_db_str(), fixture.path);
+            let (plumbing, def) = (fixture.plumbing, fixture.definition);
+            let pf = crate::index::parser::parse_file(Path::new(path), language, plumbing)
                 .expect("plumbing parses");
             let d = embedding_policy_for_chunk(
                 &crate::index::ai::ChunkPolicyInput {
@@ -946,7 +882,7 @@ mod policy_version_tests {
                 },
                 4000,
                 LowSignalCheck::FromSpan {
-                    language: *language,
+                    language,
                     root: pf.root(),
                     start_byte: 0,
                     end_byte: plumbing.len(),
@@ -954,7 +890,7 @@ mod policy_version_tests {
             );
             record(&mut sig, &format!("span_plumbing_{label}"), &d);
 
-            let df = crate::index::parser::parse_file(Path::new(path), *language, def)
+            let df = crate::index::parser::parse_file(Path::new(path), language, def)
                 .expect("def parses");
             let d = embedding_policy_for_chunk(
                 &crate::index::ai::ChunkPolicyInput {
@@ -967,7 +903,7 @@ mod policy_version_tests {
                 },
                 4000,
                 LowSignalCheck::FromSpan {
-                    language: *language,
+                    language,
                     root: df.root(),
                     start_byte: 0,
                     end_byte: def.len(),

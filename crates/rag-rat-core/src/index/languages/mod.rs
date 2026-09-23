@@ -24,6 +24,8 @@ mod markdown;
 mod python;
 mod rust;
 mod swift;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod typescript;
 
 pub(super) type SymbolMatch<'tree> = (&'static str, Node<'tree>);
@@ -106,9 +108,10 @@ pub(super) trait ParserBackend: Sync {
         Vec::new()
     }
 
-    fn is_plumbing_node(&self, node: Node<'_>) -> bool {
-        node.kind().contains("comment")
-    }
+    /// Whether a top-level node is plumbing (imports, comments, package headers) for the
+    /// low-signal embedding gate. Required: a default would let a new language silently classify
+    /// its imports as signal.
+    fn is_plumbing_node(&self, node: Node<'_>) -> bool;
 }
 
 /// Grammar-specific edge recognition for one node visited by the shared depth-safe edge walk.
@@ -454,9 +457,55 @@ mod tests {
 
 #[cfg(test)]
 mod registry_tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::all_symbol_kinds;
+
+    /// Every symbol kind a backend can emit, classified as a function body the clone engine
+    /// fingerprints or not. A new kind reddens here until someone decides whether its bodies are
+    /// clone candidates — the gate in `rag_rat_clones` otherwise skips it without a sound (Go
+    /// `method` was skipped that way).
+    #[test]
+    fn clone_fingerprint_gate_classifies_every_indexed_kind() {
+        const FINGERPRINTED: &[&str] = &["constructor", "function", "method"];
+        const NOT_FINGERPRINTED: &[&str] = &[
+            "actor",
+            "class",
+            "const",
+            "enum",
+            "enum_case",
+            "extension",
+            "impl",
+            "interface",
+            "macro",
+            "module",
+            "namespace",
+            "object",
+            "operator",
+            "precedence_group",
+            "property",
+            "protocol",
+            "static",
+            "struct",
+            "trait",
+            "type",
+            "union",
+            "var",
+        ];
+        let classified: BTreeSet<&str> =
+            FINGERPRINTED.iter().chain(NOT_FINGERPRINTED).copied().collect();
+        assert_eq!(
+            classified,
+            all_symbol_kinds(),
+            "classify every emitted symbol kind as fingerprinted or not"
+        );
+        for &kind in FINGERPRINTED {
+            assert!(rag_rat_clones::symbol_kind_is_fingerprinted(kind), "{kind}");
+        }
+        for &kind in NOT_FINGERPRINTED {
+            assert!(!rag_rat_clones::symbol_kind_is_fingerprinted(kind), "{kind}");
+        }
+    }
 
     /// The class tripwire (#635): EVERY symbol kind any language backend can emit must carry an
     /// explicit rank. Driven off `languages::all_symbol_kinds()` — the backends' own declaration —

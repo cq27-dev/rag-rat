@@ -14,6 +14,19 @@ mod dispatch;
 mod edges;
 pub(super) use edges::rust_edges;
 
+/// The node kinds that name a declaration when it has no `name` field (`parser::child_name`).
+const NAME_KINDS: &[&str] = &["identifier", "type_identifier", "field_identifier"];
+
+/// The node kinds the identifier helpers ([`crate::index::edges::identifiers_under`] and friends)
+/// collect.
+const IDENTIFIER_KINDS: &[&str] = &[
+    "identifier",
+    "type_identifier",
+    "scoped_identifier",
+    "scoped_type_identifier",
+    "field_identifier",
+];
+
 pub(super) static SUPPORT: Rust = Rust;
 
 pub(super) struct Rust;
@@ -32,16 +45,16 @@ impl ParserBackend for Rust {
 
     fn symbol_node<'tree>(&self, node: Node<'tree>, _text: &str) -> Option<SymbolMatch<'tree>> {
         match node.kind() {
-            "function_item" => Some(("function", parser::child_name(node)?)),
-            "struct_item" => Some(("struct", parser::child_name(node)?)),
-            "enum_item" => Some(("enum", parser::child_name(node)?)),
-            "trait_item" => Some(("trait", parser::child_name(node)?)),
+            "function_item" => Some(("function", parser::child_name(node, NAME_KINDS)?)),
+            "struct_item" => Some(("struct", parser::child_name(node, NAME_KINDS)?)),
+            "enum_item" => Some(("enum", parser::child_name(node, NAME_KINDS)?)),
+            "trait_item" => Some(("trait", parser::child_name(node, NAME_KINDS)?)),
             "impl_item" => Some(("impl", impl_name(node).unwrap_or(node))),
-            "mod_item" => Some(("module", parser::child_name(node)?)),
-            "const_item" => Some(("const", parser::child_name(node)?)),
-            "static_item" => Some(("static", parser::child_name(node)?)),
-            "type_item" => Some(("type", parser::child_name(node)?)),
-            "macro_definition" => Some(("macro", parser::child_name(node)?)),
+            "mod_item" => Some(("module", parser::child_name(node, NAME_KINDS)?)),
+            "const_item" => Some(("const", parser::child_name(node, NAME_KINDS)?)),
+            "static_item" => Some(("static", parser::child_name(node, NAME_KINDS)?)),
+            "type_item" => Some(("type", parser::child_name(node, NAME_KINDS)?)),
+            "macro_definition" => Some(("macro", parser::child_name(node, NAME_KINDS)?)),
             _ => None,
         }
     }
@@ -62,7 +75,7 @@ impl ParserBackend for Rust {
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         let name = match node.kind() {
-            "mod_item" | "trait_item" => parser::child_name(node)?,
+            "mod_item" | "trait_item" => parser::child_name(node, NAME_KINDS)?,
             "impl_item" => {
                 // Both halves of the segment substitute the same binders, and `scope_segment` runs
                 // once per member of the impl — so the parameter list is walked once here rather

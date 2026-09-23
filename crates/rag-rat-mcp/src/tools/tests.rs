@@ -1801,3 +1801,12 @@ fn toolsets_merge_config_with_the_environment_and_skip_unknown_names() {
     assert_eq!(super::merge_toolsets(&[], ""), vec![]);
     assert_eq!(super::merge_toolsets(&[Graph], " admin , nope ,graph"), vec![Admin, Graph]);
 }
+
+#[test]
+fn symbol_lookup_description_names_every_symbol_language() {
+    let text = description("symbol_lookup");
+    for &language in Language::all().iter().filter(|&&language| language != Language::Markdown) {
+        assert!(text.contains(language.display_name()), "missing {language}: {text}");
+    }
+    assert!(!text.contains("Markdown"), "{text}");
+}

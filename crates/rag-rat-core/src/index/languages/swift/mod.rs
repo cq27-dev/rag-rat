@@ -11,6 +11,13 @@ use crate::index::parser::{self, ParserKind};
 
 mod edges;
 pub(super) use edges::swift_edges;
+
+/// The node kinds that name a declaration when it has no `name` field (`parser::child_name`).
+const NAME_KINDS: &[&str] = &["identifier", "type_identifier", "simple_identifier"];
+
+/// The node kinds the identifier helpers ([`crate::index::edges::identifiers_under`] and friends)
+/// collect.
+const IDENTIFIER_KINDS: &[&str] = NAME_KINDS;
 pub(super) mod syntax;
 
 pub(super) static SUPPORT: Swift = Swift;
@@ -95,8 +102,9 @@ impl ParserBackend for Swift {
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         match node.kind() {
             "class_declaration" | "protocol_declaration" =>
-                syntax::qualified_name(parser::child_name(node)?, text),
-            "function_declaration" => parser::node_text(parser::child_name(node)?, text),
+                syntax::qualified_name(parser::child_name(node, NAME_KINDS)?, text),
+            "function_declaration" =>
+                parser::node_text(parser::child_name(node, NAME_KINDS)?, text),
             "init_declaration" => parser::node_text(direct_child_of_kind(node, "init")?, text),
             "deinit_declaration" => parser::node_text(direct_child_of_kind(node, "deinit")?, text),
             "subscript_declaration" =>
@@ -198,19 +206,20 @@ fn symbol_node(node: Node<'_>) -> Option<SymbolMatch<'_>> {
                 "struct" => "struct",
                 _ => return None,
             };
-            Some((kind, parser::child_name(node)?))
+            Some((kind, parser::child_name(node, NAME_KINDS)?))
         },
-        "protocol_declaration" => Some(("protocol", parser::child_name(node)?)),
+        "protocol_declaration" => Some(("protocol", parser::child_name(node, NAME_KINDS)?)),
         "function_declaration" | "protocol_function_declaration" =>
-            Some(("function", parser::child_name(node)?)),
+            Some(("function", parser::child_name(node, NAME_KINDS)?)),
         "init_declaration" => Some(("constructor", direct_child_of_kind(node, "init")?)),
         "deinit_declaration" => Some(("function", direct_child_of_kind(node, "deinit")?)),
         "subscript_declaration" => Some(("function", direct_child_of_kind(node, "subscript")?)),
         "typealias_declaration" | "associatedtype_declaration" =>
-            Some(("type", parser::child_name(node)?)),
-        "macro_declaration" => Some(("macro", parser::child_name(node)?)),
+            Some(("type", parser::child_name(node, NAME_KINDS)?)),
+        "macro_declaration" => Some(("macro", parser::child_name(node, NAME_KINDS)?)),
         "operator_declaration" => Some(("operator", operator_name(node)?)),
-        "precedence_group_declaration" => Some(("precedence_group", parser::child_name(node)?)),
+        "precedence_group_declaration" =>
+            Some(("precedence_group", parser::child_name(node, NAME_KINDS)?)),
         _ => None,
     }
 }

@@ -658,7 +658,17 @@ pub fn current_oracle_comparisons(
 /// An oracle backend — a batch SCIP indexer or a live language server — and the persisted tool id
 /// its verdicts and runs are keyed by. Persisted enum → `as_db_str` / `from_db_str` per
 /// `rust-modern-style`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::EnumString, strum::IntoStaticStr)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::VariantArray,
+)]
 #[strum(serialize_all = "kebab-case")]
 pub enum OracleTool {
     /// `rust-analyzer scip` — Rust (phase 2, #69).
@@ -705,20 +715,12 @@ pub enum OracleTool {
 }
 
 impl OracleTool {
-    /// Every known oracle tool, for "report on all tools" surfaces (`oracle status` with no
-    /// `--tool`). Later language backends extend this alongside the enum. Includes the LIVE tools
-    /// (`RaLsp`, `TsLsp`) — read surfaces merge across every writer with a run; batch-only DRIVERS
-    /// must filter through [`Self::batch_capable`].
-    pub const ALL: &[OracleTool] = &[
-        Self::RustAnalyzer,
-        Self::ScipClang,
-        Self::ScipPython,
-        Self::ScipTypescript,
-        Self::ScipJava,
-        Self::RaLsp,
-        Self::TsLsp,
-        Self::ClangdLsp,
-    ];
+    /// Every known oracle tool, in declaration order, for "report on all tools" surfaces (`oracle
+    /// status` with no `--tool`). Derived from the enum, so a new variant is included without a
+    /// second list to update. Includes the LIVE tools (`RaLsp`, `TsLsp`) — read surfaces merge
+    /// across every writer with a run; batch-only DRIVERS must filter through
+    /// [`Self::batch_capable`].
+    pub const ALL: &[OracleTool] = <Self as strum::VariantArray>::VARIANTS;
 
     pub fn as_db_str(self) -> &'static str {
         self.into()

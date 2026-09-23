@@ -12,6 +12,13 @@ use crate::index::parser::{self, ParserKind};
 mod edges;
 pub(super) use edges::python_edges;
 
+/// The node kinds that name a declaration when it has no `name` field (`parser::child_name`).
+const NAME_KINDS: &[&str] = &["identifier"];
+
+/// The node kinds the identifier helpers ([`crate::index::edges::identifiers_under`] and friends)
+/// collect.
+const IDENTIFIER_KINDS: &[&str] = NAME_KINDS;
+
 pub(super) static SUPPORT: Python = Python;
 
 pub(super) struct Python;
@@ -36,13 +43,13 @@ impl ParserBackend for Python {
                     "class_definition" => "class",
                     _ => return None,
                 };
-                Some((kind, parser::child_name(inner)?))
+                Some((kind, parser::child_name(inner, NAME_KINDS)?))
             },
             "function_definition" if !parent_is_decorated(node) =>
-                Some(("function", parser::child_name(node)?)),
+                Some(("function", parser::child_name(node, NAME_KINDS)?)),
             "class_definition" if !parent_is_decorated(node) =>
-                Some(("class", parser::child_name(node)?)),
-            "type_alias_statement" => Some(("type", parser::child_name(node)?)),
+                Some(("class", parser::child_name(node, NAME_KINDS)?)),
+            "type_alias_statement" => Some(("type", parser::child_name(node, NAME_KINDS)?)),
             // Only module/class SCREAMING_SNAKE_CASE assignments are symbols, never uppercase
             // function-local temporaries.
             "assignment" if assignment_is_const_scope(node) => {
@@ -58,7 +65,7 @@ impl ParserBackend for Python {
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         match node.kind() {
             "class_definition" | "function_definition" =>
-                parser::node_text(parser::child_name(node)?, text),
+                parser::node_text(parser::child_name(node, NAME_KINDS)?, text),
             _ => None,
         }
     }

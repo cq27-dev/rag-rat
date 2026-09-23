@@ -41,7 +41,11 @@ use tree_sitter::Node;
 /// (`let f = { … }`) and `constructor` (`init`) bodies now fingerprint like every other function
 /// body. Same auto-exclude-then-recompute path; the bump forces re-fingerprinting on the next
 /// reindex.
-pub const NORM_VERSION: i64 = 4;
+///
+/// `5` (#1462): Go `method` symbols (`func (r T) Name()`) join the fingerprintable set; the gate
+/// admitted only `function` / `constructor`, so no Go method was ever clone-detected. Widens the
+/// fingerprinted set only; the token stream of every already-fingerprinted symbol is unchanged.
+pub const NORM_VERSION: i64 = 5;
 /// Bumped when the LCS alignment / refinement algorithm changes; participates in the content-
 /// addressed `refinement_key` and in the `clone_refinements` cache freshness predicate, so a bump
 /// invalidates every cached refinement without a schema migration (the same discipline as
@@ -148,6 +152,17 @@ fn symbol_is_function_valued(node: Node<'_>) -> bool {
     })
 }
 
+/// Whether symbols of this parser symbol kind are function bodies to fingerprint: `function`, a
+/// `constructor` (Swift `init` — the analog of a Rust `fn new()`), and a Go `method`.
+///
+/// Every kind a language backend can emit must be classified here or in the engine's
+/// completeness test over the symbol-kind registry, so a new function-shaped kind cannot be
+/// silently left out of clone detection. Adding a kind here changes what is fingerprinted, which
+/// is a [`NORM_VERSION`] bump.
+pub fn symbol_kind_is_fingerprinted(symbol_kind: &str) -> bool {
+    matches!(symbol_kind, "function" | "constructor" | "method")
+}
+
 /// Boundary view of one indexed symbol the engine wants fingerprinted (span + kind only).
 pub struct FingerprintCandidate<'a> {
     pub start_byte: usize,
@@ -158,11 +173,11 @@ pub struct FingerprintCandidate<'a> {
 /// Baseline fingerprints for a file's fingerprintable symbols, walking the SHARED parse tree (no
 /// re-parse, no DB). Returns `(local_symbol_index, fingerprint)` pairs keyed by index into
 /// `symbols`, so the caller maps each to the right DB id when it writes. A symbol is fingerprinted
-/// when it is a `kind == "function"` symbol OR a function-valued declarator
-/// ([`symbol_is_function_valued`], #232 #5); symbols that can't be located in the tree and bodies
-/// that normalize below `MIN_TOKENS` are skipped. The full-rebuild prepare phase calls this from
-/// the parse it already did for symbols/edges; the incremental path re-parses and calls it from
-/// `store_symbol_fingerprints`.
+/// when its kind passes [`symbol_kind_is_fingerprinted`] (function / constructor / method) OR it is
+/// a function-valued declarator ([`symbol_is_function_valued`], #232 #5); symbols that can't be
+/// located in the tree and bodies that normalize below `MIN_TOKENS` are skipped. The full-rebuild
+/// prepare phase calls this from the parse it already did for symbols/edges; the incremental path
+/// re-parses and calls it from `store_symbol_fingerprints`.
 pub fn fingerprint_symbols(
     root: Node<'_>,
     text: &str,
@@ -174,11 +189,9 @@ pub fn fingerprint_symbols(
         let Some(node) = root.descendant_for_byte_range(symbol.start_byte, symbol.end_byte) else {
             continue;
         };
-        // Fingerprint a `function` symbol, a `constructor` (Swift `init` — a real function body,
-        // and the direct analog of a Rust `fn new()`, which fingerprints as a `function`),
-        // OR a function-valued declarator (the node check rejects plain-value consts —
-        // `const x = 5;` — so symbol `kind` stays unchanged, #232 #5 / R2).
-        if !matches!(symbol.kind, "function" | "constructor") && !symbol_is_function_valued(node) {
+        // A function-shaped symbol kind, OR a function-valued declarator (the node check rejects
+        // plain-value consts — `const x = 5;` — so symbol `kind` stays unchanged, #232 #5 / R2).
+        if !symbol_kind_is_fingerprinted(symbol.kind) && !symbol_is_function_valued(node) {
             continue;
         }
         if let Some(fp) = fingerprint_symbol(node, text, lang) {
@@ -249,13 +262,32 @@ mod tests {
     }
 
     #[test]
-    fn norm_version_is_4() {
-        // #635: Swift string-body leaves now bucket (their VALUE used to leak into the stream), and
-        // Swift closure properties + `init` bodies joined the fingerprintable set — a stream change
-        // on top of the #253 Kotlin/C++ bucketing that took it to 3. The read filter + content-
-        // addressed refinement key both key off this constant, so a stream change without the bump
-        // silently serves stale fingerprints/refinements.
-        assert_eq!(NORM_VERSION, 4);
+    fn norm_version_is_5() {
+        // #1462: Go methods joined the fingerprintable set. The read filter + content-addressed
+        // refinement key both key off this constant, so a change to what is fingerprinted or to
+        // the token stream without the bump silently serves stale fingerprints/refinements.
+        assert_eq!(NORM_VERSION, 5);
+    }
+
+    /// Go emits `method` for `func (r T) Name()`; the fingerprint gate must admit it through the
+    /// real `fingerprint_symbols` path, not only through the kind-blind `fp_lang` harness.
+    #[test]
+    fn go_methods_are_fingerprinted() {
+        let src = "package p\n\nfunc (s *Store) Load(key string) int {\n\tvalue := \
+                   s.get(key)\n\tchecked := validate(value)\n\treturn combine(value, checked) + \
+                   1\n}\n";
+        let parsed = parser::parse_file(Path::new("s.go"), Language::Go, src).expect("parse");
+        let method = parsed
+            .symbols
+            .iter()
+            .position(|s| s.kind == "method" && s.name == "Store.Load")
+            .unwrap_or_else(|| panic!("a Go method symbol: {:?}", parsed.symbols));
+        let fingerprints =
+            fingerprint_symbols(parsed.root(), src, Language::Go, &candidates_of(&parsed.symbols));
+        assert!(
+            fingerprints.iter().any(|(i, _)| *i == method),
+            "the Go method must fingerprint: {fingerprints:?}"
+        );
     }
 
     /// Swift closure-valued properties and `init` bodies are fingerprintable function bodies, and a
