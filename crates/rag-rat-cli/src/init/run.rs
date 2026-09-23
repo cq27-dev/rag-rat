@@ -482,10 +482,7 @@ pub(crate) fn offer_hooks_install(config: &Config, assume_yes: bool) -> anyhow::
         return Ok(());
     }
     let git = git_paths(&config.root)?;
-    fs::create_dir_all(git.hooks_dir())?;
-    for &hook in crate::MANAGED_HOOKS {
-        crate::install_hook(git.hooks_dir(), hook)?;
-    }
+    crate::hooks_support::install_managed_hooks(git.hooks_dir())?;
     eprintln!("init: installed hooks in {}", git.hooks_dir().display());
     Ok(())
 }
