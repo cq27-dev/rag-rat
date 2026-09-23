@@ -2197,3 +2197,92 @@ fn an_empty_sealed_batch_is_a_noop_and_does_not_arm_the_ratchet() {
             .expect("plaintext authoring still works after an empty sealed batch");
     assert_eq!(authored.len(), 1, "the empty sealed batch did not arm the downgrade ratchet");
 }
+
+/// Author one node on `stream` in its own transaction under `policy`; the entry's hash.
+fn author_node_as(
+    conn: &Connection,
+    stream: StreamId,
+    id: &str,
+    policy: SealPolicy,
+) -> anyhow::Result<AccountEntryHash> {
+    let prepared = prepare_content_authoring(conn, stream, policy, NOW)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+    let hashes =
+        author_prepared_content_batch_in_tx(&tx, stream, &[node_create(id, id)], &prepared, NOW)?;
+    tx.commit().unwrap();
+    Ok(hashes[0])
+}
+
+fn author_node(conn: &Connection, stream: StreamId, id: &str) -> anyhow::Result<AccountEntryHash> {
+    author_node_as(conn, stream, id, SealPolicy::Plaintext)
+}
+
+/// A copy of `conn` as a backup would hold it: every row, the device identity included.
+fn restored_copy(conn: &Connection, dir: &tempfile::TempDir) -> Connection {
+    let path = dir.path().join("restored.db");
+    conn.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).unwrap();
+    Connection::open(&path).unwrap()
+}
+
+fn content_bytes(conn: &Connection, hash: AccountEntryHash) -> Vec<u8> {
+    conn.query_row(
+        "SELECT signed_bytes FROM content_entries WHERE entry_hash = ?1",
+        [hash.as_slice()],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// A store restored from an older copy that authors before catching up signs a second entry at a
+/// seq its identity already used (#1417). Once the store holds both, its held tail may be the
+/// losing sibling, so it must not extend that chain again — and it says why. Both content signing
+/// paths, plaintext and sealed, have their own guard, so both are driven.
+#[test]
+fn a_store_holding_two_of_its_own_content_entries_at_one_seq_refuses_to_extend_that_chain() {
+    for policy in [SealPolicy::Plaintext, SealPolicy::Sealed] {
+        refuses_to_extend_a_forked_content_chain(policy);
+    }
+}
+
+fn refuses_to_extend_a_forked_content_chain(policy: SealPolicy) {
+    let author_node = |conn: &Connection, stream, id| author_node_as(conn, stream, id, policy);
+    let dir = tempfile::tempdir().unwrap();
+    let live = db();
+    let (account, stream) = owned_v2(&live);
+    author_node(&live, stream, "n1").unwrap();
+    let restored = restored_copy(&live, &dir);
+
+    author_node(&live, stream, "n2").unwrap();
+    let sibling = author_node(&restored, stream, "n3").expect("the stale copy cannot tell");
+    crate::content_ingest(&live, &content_bytes(&restored, sibling), NOW + 1).unwrap();
+
+    let forked = crate::ForkedChain {
+        lane: crate::ForkedLane::Content { stream_id: stream, author_account_id: account },
+        seq: 1,
+    };
+    let err = author_node(&live, stream, "n4").expect_err("a forked chain is not extended");
+    assert_eq!(err.downcast_ref::<crate::ForkedChain>(), Some(&forked), "{policy:?}: {err:#}");
+    assert_eq!(crate::local_forked_chains(&live).unwrap(), vec![forked], "and it is reported");
+}
+
+/// The common restore: the copy syncs before it authors. Receiving its own later entries only
+/// extends its tail, so nothing is refused.
+#[test]
+fn a_restored_store_that_catches_up_before_authoring_extends_its_chain_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let live = db();
+    let (_, stream) = owned_v2(&live);
+    author_node(&live, stream, "n1").unwrap();
+    let restored = restored_copy(&live, &dir);
+    let later = author_node(&live, stream, "n2").unwrap();
+
+    crate::content_ingest(&restored, &content_bytes(&live, later), NOW + 1).unwrap();
+    content_storage::settle_pending_content_refolds(
+        &restored,
+        &content_storage::ContentRefoldBudget::unbounded(),
+        NOW + 1,
+    )
+    .unwrap();
+    author_node(&restored, stream, "n3").expect("a caught-up copy authors past what it received");
+    assert!(crate::local_forked_chains(&restored).unwrap().is_empty());
+}

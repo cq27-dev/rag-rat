@@ -218,8 +218,29 @@ fn catch_up(db: &IndexDatabase, target: rag_rat_oplog::DeviceFingerprint) -> any
 fn whoami(db: &IndexDatabase) -> anyhow::Result<()> {
     let account_id = db.sync_whoami()?;
     let owner = db.sync_owner_config()?;
+    let hex = |bytes: [u8; 32]| rag_rat_base::hash::hex_lower(&bytes);
+    let forked_chains = db
+        .sync_forked_chains()?
+        .into_iter()
+        .map(|fork| match fork.lane {
+            rag_rat_oplog::ForkedLane::Account { account_id, log_id } => serde_json::json!({
+                "account_id": hex(account_id.to_bytes()),
+                "log_id": log_id,
+                "seq": fork.seq,
+                "error": fork.to_string(),
+            }),
+            rag_rat_oplog::ForkedLane::Content { stream_id, author_account_id } =>
+                serde_json::json!({
+                    "stream_id": hex(stream_id.to_bytes()),
+                    "author_account_id": hex(author_account_id.to_bytes()),
+                    "seq": fork.seq,
+                    "error": fork.to_string(),
+                }),
+        })
+        .collect::<Vec<_>>();
     print_output(&serde_json::json!({
         "account_id": account_id,
+        "forked_chains": forked_chains,
         "repo_id": db.active_repo_id,
         "contribution_owner_account_id": owner.contribution_owner_account_id,
         "subscription_owner_account_id": owner.subscription_owner_account_id,

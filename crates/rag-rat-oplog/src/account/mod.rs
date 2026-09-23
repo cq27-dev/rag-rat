@@ -29,6 +29,7 @@ mod cut;
 pub mod discovery;
 mod envelope;
 mod fold;
+mod fork;
 mod id;
 // C4.1 content-key crypto primitives (#607). C4.3a (`secrets::author`) consumes the seal/unwrap +
 // key-id path; the remaining primitives (deterministic `from_seed` / seed-injected seal) are still
@@ -132,6 +133,7 @@ pub use fold::{
     GrantAuthority, GrantDeviceAuthority, GrantDeviceBoundary, OwnerAuthority, OwnerChainAuthority,
     RosterContentAuthority,
 };
+pub use fork::{ForkedChain, ForkedLane, local_forked_chains};
 pub use id::{AccountEntryHash, AccountId, GrantId, OwnerId, RosterRef, SignedHash};
 // C4.1 content-key primitives the C4.3b sealing surface exposes: `ContentKey` is the `Ready`
 // payload C5's seal path consumes; `KeyId` is the selection identity (#607).

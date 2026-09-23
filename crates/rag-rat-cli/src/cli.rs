@@ -411,7 +411,9 @@ pub(crate) enum SyncCommand {
         #[arg(value_name = "TICKET")]
         ticket: SecretArg,
     },
-    /// Print this store's local account id — the identity an owner grants with `sync grant`.
+    /// Print this store's local account id — the identity an owner grants with `sync grant` — and
+    /// any chain this device can no longer extend because it signed two entries at one seq (its
+    /// store was restored from an older copy, or copied to another machine).
     Whoami,
     /// List locally observed unresolved table rows for the active repository.
     Diagnostics {

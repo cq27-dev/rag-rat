@@ -147,6 +147,12 @@ impl IndexDatabase {
         Ok(rag_rat_base::hash::hex_lower(&account.to_bytes()))
     }
 
+    /// Every chain this device can no longer extend because it holds two of its own entries at one
+    /// seq — the store was restored from an older copy, or copied to another machine (#1417).
+    pub fn sync_forked_chains(&self) -> anyhow::Result<Vec<rag_rat_oplog::ForkedChain>> {
+        rag_rat_oplog::local_forked_chains(self.storage.connection())
+    }
+
     /// Grant `grantee` (the account id from its `sync whoami`) Writer authority on
     /// the active repo's owner stream (#1164), so that identity can author memories into this
     /// repo's shared set. Owner-only; requires a published repo. Returns the grant id as hex.
