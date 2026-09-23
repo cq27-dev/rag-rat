@@ -575,10 +575,23 @@ fn history_search_routes_each_source_to_its_search() {
     }
 }
 
-/// A deprecated name still answers, unchanged, and says what replaced it.
+/// A deprecated name still answers, unchanged, and says what replaced it — in TOON. In `--json`
+/// mode the answer is the payload alone, so a client that joins the text blocks still parses JSON.
 #[test]
 fn a_deprecated_tool_still_answers_and_names_its_replacement() {
-    let (_root, svc) = json_service();
+    let (_root, json_svc) = json_service();
+    let json_result = json_svc.call("git_history_for_path", json!({"path": "src/lib.rs"})).unwrap();
+    let joined = json_result
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text(text) => text.text.clone(),
+            _ => String::new(),
+        })
+        .collect::<String>();
+    serde_json::from_str::<Value>(&joined).expect("--json output stays pure JSON");
+
+    let (_root, svc) = service_over_temp_repo();
     let result = svc.call("git_history_for_path", json!({"path": "src/lib.rs"})).unwrap();
     let notes = result
         .content
