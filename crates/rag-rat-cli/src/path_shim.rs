@@ -82,9 +82,10 @@ fn status(path_var: &OsStr, shim_dir: Option<&Path>) -> serde_json::Value {
             ))
         },
         (None, None) => Some(
-            "`rag-rat` is not on PATH. Run commands as `npx -y @rag-rat/bin <command>`, or \
-             install it with `npm install -g @rag-rat/bin` (the agent plugins add a shim in \
-             ~/.local/bin on their next launch)."
+            "`rag-rat` is not on PATH. With an agent plugin it appears in ~/.local/bin once the \
+             plugin's MCP server starts; otherwise install it with `npm install -g @rag-rat/bin`. \
+             As a last resort run `npx -y @rag-rat/bin@<version> <command>`, pinned to your MCP \
+             server's version (an unpinned run can migrate the index past what it can open)."
                 .to_string(),
         ),
     };

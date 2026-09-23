@@ -426,7 +426,11 @@ pub(crate) fn setup_model_and_reconcile(
 /// Print the project-scoped one-liner instead, so the connection step stays discoverable. See the
 /// README "Connect it to your agent (MCP)" section.
 fn print_mcp_connect_hint() {
-    eprintln!("Next — connect your coding agent to rag-rat (run from this repo):");
+    eprintln!(
+        "Next — if you installed the rag-rat plugin, it is already connected: reconnect its MCP \
+         server (Claude Code: /mcp) so it picks up the new index, and skip the rest."
+    );
+    eprintln!("Otherwise connect your coding agent to rag-rat (run from this repo):");
     eprintln!("    claude mcp add --scope project rag-rat -- rag-rat mcp   # Claude Code");
     eprintln!("    codex  mcp add rag-rat -- rag-rat mcp                   # Codex");
 }
