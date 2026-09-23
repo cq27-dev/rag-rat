@@ -9,8 +9,6 @@
 //! - [`widgets`] — small shared step widgets (option list, help panel).
 //! - [`hooks`] — git-hook conflict choices + the chained-hook renderer.
 
-pub(crate) mod hooks;
-
 mod dispatch;
 mod distillation;
 pub(super) mod embedding;

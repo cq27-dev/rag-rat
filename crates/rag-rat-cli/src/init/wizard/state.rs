@@ -1,6 +1,5 @@
 //! WizardState and WizardUiState — minimal state container.
 
-use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use rag_rat_papertrail::ResolvedTracker;
@@ -9,7 +8,6 @@ use super::catalog::CookbookCatalog;
 use super::draft::{TrackerMode, WizardDraft};
 use super::probe::ProbeRegistry;
 use super::steps::embedding::RemoteModeChoice;
-use super::steps::hooks::HookConflict;
 use super::steps::{CheckResult, StepId, StepState};
 use crate::init::RepoScan;
 
@@ -112,7 +110,6 @@ pub(crate) struct WizardState {
     pub scan: RepoScan,
     pub probes: ProbeRegistry,
     pub checks: Vec<CheckResult>,
-    pub hook_conflicts: HashMap<&'static str, HookConflict>,
     pub step: Option<StepState>,
     pub provision_log_rx: Option<Receiver<String>>,
     pub provision_log_lines: Vec<String>,
@@ -151,7 +148,6 @@ impl WizardState {
             scan,
             probes: ProbeRegistry::new(),
             checks: vec![CheckResult::ok(); n],
-            hook_conflicts: HashMap::new(),
             step: None,
             provision_log_rx: None,
             provision_log_lines: Vec::new(),

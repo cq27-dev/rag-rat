@@ -17,7 +17,6 @@ use super::embedding::{
     model_rows, new_connect_remote, new_connect_remote_from, new_ephemeral_remote,
     remote_config_for, render_embedding, selected_cookbook_idx, validate_embedding,
 };
-use super::hooks;
 use super::indexing::{candidates_for, render_indexing, selected_dir_path, validate_indexing};
 use super::integration::validate_hooks;
 use super::oracle::{handle_oracle, render_oracle};
@@ -177,17 +176,6 @@ fn step_dispatch_render_and_validation_smoke() {
         let _ = step_handle_key(step, key(KeyCode::BackTab), &mut state);
         let _ = step_handle_key(step, key(KeyCode::Enter), &mut state);
     }
-}
-
-#[test]
-fn chained_hook_renderer_preserves_existing_body_and_appends_maintenance() {
-    let rendered = hooks::render_chained_hook("#!/bin/sh\necho before\n", "pre-commit");
-
-    assert!(rendered.starts_with("#!/bin/sh\n# Chained hook"));
-    assert!(rendered.contains("echo before"));
-    assert!(rendered.contains("npx -y @rag-rat/bin@"), "npx first");
-    assert!(rendered.contains("rag-rat maintenance --trigger pre-commit"), "then PATH");
-    assert!(rendered.contains("--trigger pre-commit"));
 }
 
 #[test]
@@ -1252,7 +1240,7 @@ fn integration_combines_version_check_and_hooks() {
 }
 
 #[test]
-fn integration_blocks_unresolved_foreign_hook_conflicts() {
+fn integration_warns_about_foreign_hooks_without_blocking() {
     // `validate_hooks` resolves the repo through the env-aware `git_paths` (#213), so an ambient
     // `GIT_DIR`/`GIT_WORK_TREE` (or a global `core.hooksPath`) would make this test
     // machine-dependent (#970) — and seeding through the same env-aware path would write the
@@ -1262,7 +1250,7 @@ fn integration_blocks_unresolved_foreign_hook_conflicts() {
         let home = rag_rat_base::test_scratch::ScratchDir::new("wizard-hooks-home");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
-                "init::wizard::steps::tests::integration_blocks_unresolved_foreign_hook_conflicts",
+                "init::wizard::steps::tests::integration_warns_about_foreign_hooks_without_blocking",
                 "--exact",
                 "--nocapture",
             ])
@@ -1295,15 +1283,14 @@ fn integration_blocks_unresolved_foreign_hook_conflicts() {
     let scan = scan_repo(dir.path()).unwrap();
     let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     draft.hooks.git = true;
-    let mut state = WizardState::new(draft, scan);
+    let state = WizardState::new(draft, scan);
 
-    let unresolved = validate_hooks(&state);
-    state.hook_conflicts.insert(hook, hooks::HookConflict::Skip);
-    let resolved = validate_hooks(&state);
-
-    assert_eq!(unresolved.severity, Sev::Block);
-    assert!(unresolved.message.unwrap().contains(hook));
-    assert_eq!(resolved.severity, Sev::Ok);
+    // A foreign hook warns and names itself, but never blocks saving the config: hooks install
+    // all or nothing, and the warning says how to clear the slot.
+    let check = validate_hooks(&state);
+    assert_eq!(check.severity, Sev::Warn);
+    let message = check.message.unwrap();
+    assert!(message.contains(hook) && message.contains("rag-rat hooks install"), "{message}");
 }
 
 #[test]

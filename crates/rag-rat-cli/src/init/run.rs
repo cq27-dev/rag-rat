@@ -11,15 +11,24 @@ use rag_rat_core::index::ai::ReconcileOptions;
 
 use super::render::{config_root_value, render_config, supported_languages};
 use super::scan::{estimated_chunks, recommend_backend, resolved_bindings, scan_repo};
-use super::wizard::{self, HookConflict, WizardResult, render_chained_hook};
+use super::wizard::{self, WizardResult};
 use super::{InitOptions, InitPlan, RepoScan, TerminalResetGuard};
 use crate::commands::apply_embedding_runtime_env;
 use crate::hooks_support::git_paths;
 use crate::render::{render_index_progress, render_reconcile_progress};
-use crate::{hook_script, install_hook, is_rag_rat_hook, make_executable, write_atomic};
 
 pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Result<()> {
     let options = InitOptions::from_args(args, config_path);
+    // The wizard needs a terminal on both ends. Without one it failed on the tty open (an agent's
+    // shell) or drew escape codes into a pipe and hung; say what to run instead.
+    if !options.yes {
+        use std::io::IsTerminal;
+        anyhow::ensure!(
+            std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+            "`rag-rat init` is an interactive wizard and needs a terminal. Without one, run \
+             `rag-rat init --yes` (add `--dry-run` to preview the config first)"
+        );
+    }
     let _terminal_reset = TerminalResetGuard::install_if_interactive(!options.yes)?;
     let root = rag_rat_base::paths::canonicalize(env::current_dir()?)?;
 
@@ -72,15 +81,14 @@ fn run_non_interactive(
         return Ok(());
     }
 
-    if options.config_path.exists() && !options.force && !options.yes {
-        let overwrite = Confirm::new()
-            .with_prompt(format!("Overwrite {}?", options.config_path.display()))
-            .default(false)
-            .interact()?;
-        if !overwrite {
-            anyhow::bail!("init cancelled; {} already exists", options.config_path.display());
-        }
-    }
+    // Only `--yes` reaches here, and it asks nothing — so it must not replace a config someone
+    // customised (trackers, remote embedding, distillation) with defaults unless told to.
+    anyhow::ensure!(
+        options.force || !options.config_path.exists(),
+        "{} already exists; `init --yes` will not replace it with defaults. Run `rag-rat init` in \
+         a terminal to reconfigure it, or pass `--force` to overwrite",
+        options.config_path.display()
+    );
 
     write_and_apply(options, &config_text, |config, db| {
         setup_model_and_reconcile(config, db, options.yes)?;
@@ -217,79 +225,29 @@ fn config_dir(config_path: &Path) -> anyhow::Result<PathBuf> {
 /// Apply the git maintenance hooks the wizard selected, honoring each foreign-hook conflict
 /// resolution.
 ///
-/// Mirrors the install mechanics the `hooks` command uses, but driven by the wizard's `HooksDraft`
-/// and per-hook `HookConflict` map instead of re-prompting. Claude/Codex agent hooks are installed
-/// by the rag-rat plugin, not here.
+/// Install the git maintenance hooks when the wizard's draft enables them, all or nothing: a hook
+/// rag-rat does not manage leaves every slot untouched and is reported, never a reason to fail a
+/// setup whose config is already written. Claude/Codex agent hooks are installed by the plugin,
+/// not here.
 fn apply_wizard_hooks(config: &Config, result: &WizardResult) -> anyhow::Result<()> {
     if result.hooks.git {
-        apply_git_hooks(config, &result.hook_conflicts)?;
+        install_git_hooks(config);
     }
     Ok(())
 }
 
-/// Install the rag-rat git maintenance hooks per the wizard's foreign-hook conflict resolutions.
-///
-/// For each managed hook: a clean slot (or one already managed by rag-rat) installs normally; a
-/// foreign file is resolved by the user's [`HookConflict`] choice — `Skip` leaves it, `Overwrite`
-/// replaces it, `Chain` wraps it via [`render_chained_hook`], `UninstallRagRatOnly` is a no-op for
-/// a foreign file, and `Abort` skips all hook changes.
-fn apply_git_hooks(
-    config: &Config,
-    conflicts: &std::collections::HashMap<&'static str, HookConflict>,
-) -> anyhow::Result<()> {
+fn install_git_hooks(config: &Config) {
     let git = match git_paths(&config.root) {
         Ok(git) => git,
         Err(err) => {
             eprintln!("init: skipped git hooks (not a git worktree: {err})");
-            return Ok(());
+            return;
         },
     };
-    // `Abort` on any resolved conflict means "don't touch hooks at all".
-    if conflicts.values().any(|c| *c == HookConflict::Abort) {
-        eprintln!("init: skipped git hooks (conflict aborted)");
-        return Ok(());
+    match crate::hooks_support::install_managed_hooks(git.hooks_dir()) {
+        Ok(_) => eprintln!("init: installed git hooks in {}", git.hooks_dir().display()),
+        Err(err) => eprintln!("init: skipped git hooks — {err}"),
     }
-    fs::create_dir_all(git.hooks_dir())?;
-    let mut installed = Vec::new();
-    for &hook in crate::MANAGED_HOOKS {
-        let path = git.hooks_dir().join(hook.as_trigger());
-        let foreign = path.exists() && !is_rag_rat_hook(&path)?;
-        match conflicts.get(hook.as_trigger()).copied() {
-            // A foreign file with an explicit resolution.
-            Some(HookConflict::Skip) | Some(HookConflict::UninstallRagRatOnly) => {
-                // Leave the foreign hook in place; install nothing for this slot.
-            },
-            Some(HookConflict::Overwrite) => {
-                write_atomic(&path, hook_script(hook).as_bytes())?;
-                make_executable(&path)?;
-                installed.push(hook.as_trigger());
-            },
-            Some(HookConflict::Chain) => {
-                let original = fs::read_to_string(&path).unwrap_or_default();
-                write_atomic(&path, render_chained_hook(&original, hook.as_trigger()).as_bytes())?;
-                make_executable(&path)?;
-                installed.push(hook.as_trigger());
-            },
-            Some(HookConflict::Abort) => unreachable!("handled above"),
-            // No conflict recorded: a clean slot, or one already managed by rag-rat.
-            None => {
-                if foreign {
-                    // A foreign file with no resolution should have been caught by the wizard's
-                    // unresolved-conflict gate; be conservative and leave it untouched.
-                    eprintln!(
-                        "init: leaving unmanaged hook {} in place (no resolution recorded)",
-                        path.display()
-                    );
-                } else {
-                    // `install_hook` is safe here: the slot is empty or already a rag-rat hook.
-                    install_hook(git.hooks_dir(), hook)?;
-                    installed.push(hook.as_trigger());
-                }
-            },
-        }
-    }
-    eprintln!("init: installed git hooks in {} ({:?})", git.hooks_dir().display(), installed);
-    Ok(())
 }
 pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
     let languages = supported_languages()
@@ -506,7 +464,7 @@ mod default_plan_tests {
         .unwrap();
         let config = Config::load(&config_path).unwrap();
 
-        apply_git_hooks(&config, &std::collections::HashMap::new()).unwrap();
+        install_git_hooks(&config);
 
         assert!(!root.path().join(".git/hooks").exists());
     }

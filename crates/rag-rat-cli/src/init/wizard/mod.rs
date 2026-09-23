@@ -11,7 +11,6 @@ mod state;
 mod steps;
 mod theme;
 
-use std::collections::HashMap;
 use std::io::{Stdout, stdout};
 use std::path::Path;
 use std::time::Duration;
@@ -35,7 +34,6 @@ use self::catalog::CookbookCatalog;
 pub(crate) use self::draft::{HooksDraft, WizardDraft};
 use self::review::ReviewModel;
 use self::state::{OneShotHelp, WizardState};
-pub(crate) use self::steps::hooks::{HookConflict, render_chained_hook};
 use self::steps::{StepId, init_step, render_step, step_footer, step_handle_key, step_title};
 use crate::init::RepoScan;
 use crate::init::render::config_root_value;
@@ -43,7 +41,6 @@ use crate::init::render::config_root_value;
 pub(crate) struct WizardResult {
     pub toml: String,
     pub hooks: HooksDraft,
-    pub hook_conflicts: HashMap<&'static str, HookConflict>,
 }
 
 /// The draft as it will be WRITTEN: distillation is forced off when no tracker resolves (the pass
@@ -382,11 +379,7 @@ impl Wizard {
             Some(orig) => draft.patch_existing(orig)?,
             None => draft.write_fresh(),
         };
-        Ok(WizardResult {
-            toml,
-            hooks: draft.hooks.clone(),
-            hook_conflicts: self.state.hook_conflicts.clone(),
-        })
+        Ok(WizardResult { toml, hooks: draft.hooks.clone() })
     }
 
     // ── render ──────────────────────────────────────────────────────────────
