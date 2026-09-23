@@ -28,6 +28,9 @@
 //   5. download+verify  — fetch the platform archive from the GitHub release, checksum, cache it
 //                         (skipped under --no-install)
 //
+// A resolved managed or npx-cached binary is also exposed on PATH through a stable shim in
+// ~/.local/bin (see ensurePathShim), the way Claude Code's native installer exposes `claude`.
+//
 // CRITICAL: stdout is the MCP stdio protocol channel. Every diagnostic here goes to stderr.
 
 "use strict";
@@ -39,6 +42,10 @@ const crypto = require("node:crypto");
 const { spawn, spawnSync } = require("node:child_process");
 
 const GH_REPO = "cq27-dev/rag-rat";
+// The marker line a Windows `rag-rat.cmd` PATH shim carries (see ensurePathShim). Plain words only:
+// cmd.exe parses redirection even on a `rem` line, so a `>` here could truncate a file on every run.
+// Declared up here: the shim runs from the resolution steps below, before a later `const` would exist.
+const SHIM_MARKER = "rem rag-rat plugin shim";
 
 // A leading `--no-install` (hook invocations) means: resolve from an existing binary only.
 let _args = process.argv.slice(2);
@@ -155,10 +162,12 @@ function detectTriple() {
 }
 
 // ---- 1) managed cache (version-exact) ------------------------------------------------------------
-const cacheHome = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+// Absolute even when XDG_CACHE_HOME is relative: the PATH shim links into this tree from another
+// directory, and compares shim targets against it.
+const cacheHome = path.resolve(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"));
 const cacheDir = path.join(cacheHome, "rag-rat", "bin", VERSION);
 const managedBin = path.join(cacheDir, bin);
-if (isExecutable(managedBin)) return run(managedBin);
+if (isExecutable(managedBin)) return runLinked(managedBin);
 
 // ---- 2) plugin-local pre-seeded binary -----------------------------------------------------------
 const seeded = path.join(pluginRoot, "bin", bin);
@@ -170,7 +179,7 @@ if (isExecutable(seeded)) return run(seeded);
 // shared cache that keeps the `--no-install` hook path fast (and non-empty) now that the MCP runs
 // through npx rather than this launcher.
 const npxBin = npxCachedBin();
-if (npxBin) return run(npxBin);
+if (npxBin) return runLinked(npxBin);
 
 // ---- 3) PATH rag-rat, only if it matches the declared version ------------------------------------
 const onPath = which(bin);
@@ -197,7 +206,7 @@ async function downloadAndRun() {
   const lock = path.join(cacheDir, ".download.lock");
   const release = await acquireLock(lock);
   try {
-    if (isExecutable(managedBin)) return run(managedBin); // another launch finished while we waited
+    if (isExecutable(managedBin)) return runLinked(managedBin); // another launch finished while we waited
 
     const archive = `rag-rat-${triple}.${ext}`;
     const base = `https://github.com/${GH_REPO}/releases/download/v${VERSION}`;
@@ -228,7 +237,105 @@ async function downloadAndRun() {
   } finally {
     release();
   }
-  run(managedBin);
+  runLinked(managedBin);
+}
+
+// ---- PATH shim -----------------------------------------------------------------------------------
+// The binary lives in a private per-version cache, so `rag-rat <command>` would not work from a
+// shell. Keep a stable `rag-rat` in ~/.local/bin pointing at the binary this plugin resolved — a
+// symlink, or on Windows (where symlinks need privileges) a `rag-rat.cmd` wrapper.
+//
+// Never edits shell rc files or the Windows user PATH: ~/.local/bin is expected to be on PATH, and
+// `rag-rat doctor` says how to add it when it is not. Never replaces a `rag-rat` it did not create —
+// a user's own install there always wins. Upgrade-only, so two plugins on different versions (one
+// per agent) do not re-point it back and forth; every launch re-checks, so a race between two
+// launches settles on the next one. RAG_RAT_NO_PATH_SHIM=1 turns it off; RAG_RAT_SHIM_DIR moves it.
+// Fail-open: the shim is a convenience and must never stop the binary from running.
+function runLinked(target) {
+  ensurePathShim(target);
+  run(target);
+}
+
+
+function ensurePathShim(resolved) {
+  if (process.env.RAG_RAT_NO_PATH_SHIM === "1") return;
+  // A relative target (a relative npm_config_cache) runs from here but would dangle from the shim.
+  const target = path.resolve(resolved);
+  try {
+    const dir = process.env.RAG_RAT_SHIM_DIR || path.join(os.homedir(), ".local", "bin");
+    const windows = process.platform === "win32";
+    const shim = path.join(dir, windows ? "rag-rat.cmd" : "rag-rat");
+    const current = currentShimTarget(shim, windows);
+    if (current === undefined || current === target) return; // not ours, or already right
+    if (current !== null && !isNewer(VERSION, versionOf(current))) return; // never downgrade
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = path.join(dir, `.rag-rat-shim-${process.pid}`);
+    fs.rmSync(tmp, { force: true });
+    // The target appears only inside the quoted exec line, where `&` and `>` stay literal.
+    if (windows) fs.writeFileSync(tmp, `@echo off\r\n${SHIM_MARKER}\r\n"${target}" %*\r\n`);
+    else fs.symlinkSync(target, tmp);
+    fs.renameSync(tmp, shim); // atomic replace
+    log(`exposed rag-rat v${VERSION} on PATH: ${shim} -> ${target}`);
+  } catch (e) {
+    log(`could not update the PATH shim: ${e.message}`);
+  }
+}
+
+// What the existing shim points at: null when there is none, undefined when something is there that
+// this launcher did not create (a real file, a foreign symlink, an unmarked .cmd).
+function currentShimTarget(shim, windows) {
+  let st;
+  try {
+    st = fs.lstatSync(shim);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw e;
+  }
+  let target;
+  if (windows) {
+    if (!st.isFile()) return undefined;
+    const lines = fs.readFileSync(shim, "utf8").split(/\r?\n/);
+    if (!lines.includes(SHIM_MARKER)) return undefined;
+    const exec = lines.map((l) => l.match(/^"(.+)" %\*$/)).find(Boolean);
+    if (!exec) return undefined;
+    target = exec[1];
+  } else {
+    if (!st.isSymbolicLink()) return undefined;
+    target = fs.readlinkSync(shim);
+  }
+  return isOurBinary(target) ? target : undefined;
+}
+
+// A binary this launcher links: the managed cache, or the npx cache of @rag-rat/bin.
+function isOurBinary(p) {
+  const norm = path.normalize(p);
+  return (
+    path.basename(norm) === bin &&
+    (norm.startsWith(path.join(cacheHome, "rag-rat", "bin") + path.sep) ||
+      norm.includes(path.join("@rag-rat", "bin", "node_modules", ".bin_real") + path.sep))
+  );
+}
+
+// The version a linked binary is, from its cache path when it carries one, else by asking it.
+// "" when neither works (a dangling link) — anything replaces that.
+function versionOf(p) {
+  if (!isExecutable(p)) return "";
+  const managedRoot = path.join(cacheHome, "rag-rat", "bin") + path.sep;
+  const norm = path.normalize(p);
+  if (norm.startsWith(managedRoot)) return norm.slice(managedRoot.length).split(path.sep)[0];
+  return readBinVersion(p);
+}
+
+// Whether release `a` is strictly newer than `b`. Only plain X.Y.Z orders; an unparseable `b` (a
+// dangling or unreadable link) is always replaced, an unparseable `a` never replaces anything.
+function isNewer(a, b) {
+  const parse = (v) => (/^\d+\.\d+\.\d+$/.test(v) ? v.split(".").map(Number) : null);
+  const x = parse(a);
+  const y = parse(b);
+  if (!x) return false;
+  if (!y) return true;
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i];
+  return false;
 }
 
 // ---- helpers -------------------------------------------------------------------------------------

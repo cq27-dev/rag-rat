@@ -2,6 +2,7 @@ mod cli;
 mod commands;
 mod fs_atomic;
 mod hooks_support;
+mod path_shim;
 mod render;
 #[cfg(test)]
 mod test_support;

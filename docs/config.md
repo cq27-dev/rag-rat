@@ -1,8 +1,7 @@
 # Config Reference
 
-Commands here are written as `rag-rat <command>`. If `rag-rat` is not on your `PATH` (the plugin
-alone does not put it there), run `npx -y @rag-rat/bin <command>` instead — see
-[Running the CLI](../README.md#running-the-cli).
+Commands here are written as `rag-rat <command>`. If `rag-rat` is not on your `PATH`, run
+`npx -y @rag-rat/bin <command>` instead — see [Running the CLI](../README.md#running-the-cli).
 
 `rag-rat.toml` has an `[index]` table, optional simple `[target_bindings]`, and optional richer `[[target]]` blocks.
 

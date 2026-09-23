@@ -273,7 +273,7 @@ pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
         "scope": "repo",
         "config_root": config.root,
         "database": config.database,
-        "schema": schema,
+        "schema": schema_summary(&schema)?,
         "storage": storage,
         "file_health": file_health,
         "discovery": discovery,
@@ -285,6 +285,7 @@ pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
             "kind": target.kind.as_db_str(),
         })).collect::<Vec<_>>(),
         "index": index,
+        "cli": crate::path_shim::doctor_status(),
         "mcp": {
             "transport": "stdio",
             "tools": rag_rat_mcp::tools::TOOL_NAMES,
@@ -307,8 +308,9 @@ pub(crate) fn doctor_global_store(database: &Path) -> anyhow::Result<()> {
         "database": overview.database,
         "exists": overview.exists,
         "size_bytes": overview.size_bytes,
-        "schema": overview.schema,
+        "schema": schema_summary(&overview.schema)?,
         "repos": overview.repos,
+        "cli": crate::path_shim::doctor_status(),
         "mcp": {
             "transport": "stdio",
             "tools": rag_rat_mcp::tools::TOOL_NAMES,
@@ -316,6 +318,19 @@ pub(crate) fn doctor_global_store(database: &Path) -> anyhow::Result<()> {
             "index_writes": "sqlite_auto_heal"
         }
     }))
+}
+
+/// `doctor`'s view of the schema: the version state without the applied-migration list, which runs
+/// to over a hundred entries and buries the rest of the report. The count stays; `rag-rat status`
+/// still lists them.
+fn schema_summary(schema: &impl serde::Serialize) -> anyhow::Result<serde_json::Value> {
+    let mut schema = serde_json::to_value(schema)?;
+    if let Some(object) = schema.as_object_mut()
+        && let Some(serde_json::Value::Array(migrations)) = object.remove("migrations")
+    {
+        object.insert("migration_count".into(), migrations.len().into());
+    }
+    Ok(schema)
 }
 
 /// `doctor --vacuum`: reclaim dead space by rewriting the database (#574). Explicit operator action

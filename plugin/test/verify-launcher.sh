@@ -34,6 +34,76 @@ for harness in auto cursor vscode; do
   fi
 done
 
+# ---- PATH shim (~/.local/bin/rag-rat) --------------------------------------------------------
+# Stub binaries in a fake managed cache stand in for releases, so these run without a download.
+SHIM_CACHE="$TMP/cache"
+SHIM_DIR="$TMP/shim"
+stub() { # stub <version>: a managed-cache binary that reports that version
+  d="$SHIM_CACHE/rag-rat/bin/$1"
+  mkdir -p "$d"
+  printf '#!/bin/sh\necho "rag-rat %s"\n' "$1" > "$d/rag-rat"
+  chmod +x "$d/rag-rat"
+}
+launch_as() { # launch_as <plugin version> [env...]: one launcher run under that plugin version
+  v="$1"; shift
+  mkdir -p "$TMP/p-$v"
+  printf '{"version":"%s"}\n' "$v" > "$TMP/p-$v/plugin.json"
+  env -u RAG_RAT_BIN PLUGIN_ROOT="$TMP/p-$v" XDG_CACHE_HOME="$SHIM_CACHE" RAG_RAT_SHIM_DIR="$SHIM_DIR" \
+    "$@" node "$LAUNCH" --no-install --version </dev/null >/dev/null 2>&1 || fail "launcher run as $v failed"
+}
+target() { readlink "$SHIM_DIR/rag-rat" 2>/dev/null || echo "<none>"; }
+stub 1.2.0
+stub 1.3.0
+
+launch_as 1.2.0 RAG_RAT_NO_PATH_SHIM=1
+[ ! -e "$SHIM_DIR/rag-rat" ] || fail "RAG_RAT_NO_PATH_SHIM=1 still created a shim"
+pass "shim: opt-out creates nothing"
+
+launch_as 1.2.0
+[ "$(target)" = "$SHIM_CACHE/rag-rat/bin/1.2.0/rag-rat" ] || fail "shim not created: $(target)"
+[ "$("$SHIM_DIR/rag-rat" --version)" = "rag-rat 1.2.0" ] || fail "shim does not run the binary"
+pass "shim: created, pointing at the managed binary"
+
+launch_as 1.3.0
+[ "$(target)" = "$SHIM_CACHE/rag-rat/bin/1.3.0/rag-rat" ] || fail "shim not upgraded: $(target)"
+pass "shim: a newer plugin re-points it"
+
+launch_as 1.2.0
+[ "$(target)" = "$SHIM_CACHE/rag-rat/bin/1.3.0/rag-rat" ] || fail "shim downgraded: $(target)"
+pass "shim: an older plugin does not downgrade it"
+
+rm -rf "$SHIM_CACHE/rag-rat/bin/1.3.0"
+launch_as 1.2.0
+[ "$(target)" = "$SHIM_CACHE/rag-rat/bin/1.2.0/rag-rat" ] || fail "dangling shim kept: $(target)"
+pass "shim: a dangling link is replaced"
+
+# The npx cache is linked too, when that is where the plugin's binary is.
+NPX_BIN="$TMP/npm/_npx/abc123/node_modules/@rag-rat/bin/node_modules/.bin_real"
+mkdir -p "$NPX_BIN"
+printf '#!/bin/sh\necho "rag-rat 1.5.0"\n' > "$NPX_BIN/rag-rat"
+chmod +x "$NPX_BIN/rag-rat"
+launch_as 1.5.0 npm_config_cache="$TMP/npm"
+[ "$(target)" = "$NPX_BIN/rag-rat" ] || fail "npx-cached binary not linked: $(target)"
+pass "shim: links the npx-cached binary"
+
+# A relative npm cache still yields an absolute link (a relative one would dangle from the shim).
+rm -f "$SHIM_DIR/rag-rat"
+(cd "$TMP" && launch_as 1.5.0 npm_config_cache=npm)
+[ "$(target)" = "$NPX_BIN/rag-rat" ] || fail "relative npm cache linked as: $(target)"
+pass "shim: a relative cache path is linked absolutely"
+
+ln -sf /usr/bin/true "$SHIM_DIR/rag-rat"
+stub 1.4.0
+launch_as 1.4.0
+[ "$(target)" = "/usr/bin/true" ] || fail "foreign symlink replaced: $(target)"
+pass "shim: a symlink it did not create is left alone"
+
+rm -f "$SHIM_DIR/rag-rat"
+printf '#!/bin/sh\necho mine\n' > "$SHIM_DIR/rag-rat"
+launch_as 1.4.0
+[ "$(cat "$SHIM_DIR/rag-rat")" = "$(printf '#!/bin/sh\necho mine')" ] || fail "user's own rag-rat replaced"
+pass "shim: a user's own rag-rat is left alone"
+
 do_handshake=0
 [ -n "${RAG_RAT_BIN:-}" ] && do_handshake=1
 [ "${RAG_RAT_REQUIRE_HANDSHAKE:-0}" = "1" ] && do_handshake=1

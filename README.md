@@ -62,9 +62,9 @@ sequenceDiagram
 ## Quickstart
 
 For Claude Code, Codex, and opencode, install the plugin. It registers the MCP server, adds the
-hooks, and fetches a version-matched `rag-rat` binary into its own cache on first run — not onto
-your `PATH`; see [Running the CLI](#running-the-cli) (the Claude Code and Codex bundles also add the
-skills; on opencode add them with `npx @rag-rat/skills`):
+hooks, and fetches a version-matched `rag-rat` binary on first run, exposed as `~/.local/bin/rag-rat`
+— see [Running the CLI](#running-the-cli) (the Claude Code and Codex bundles also add the skills; on
+opencode add them with `npx @rag-rat/skills`):
 
 ```bash
 # Claude Code
@@ -521,9 +521,17 @@ feature of the index, query, or MCP surface is affected:
 ### Running the CLI
 
 Commands in this README and in `docs/` are written as `rag-rat <command>`. That works as written when
-`rag-rat` is on your `PATH` — `npm install -g @rag-rat/bin` or `cargo install rag-rat` puts it
-there. The plugin alone does not: it keeps its binary in a private, per-version cache. Without a
-`PATH` install, run the same command through npx:
+`rag-rat` is on your `PATH`:
+
+- **Plugin:** the launcher keeps a `rag-rat` shim in `~/.local/bin` (Windows:
+  `%USERPROFILE%\.local\bin\rag-rat.cmd`) pointing at its cached binary, and moves it forward when
+  the plugin updates. Like Claude Code's installer, it does not edit your shell profile or PATH — if
+  `~/.local/bin` is not on your PATH, `rag-rat doctor` (its `cli` section) says so and how to add
+  it. It never replaces a `rag-rat` there that it did not create; set `RAG_RAT_NO_PATH_SHIM=1` to
+  turn it off.
+- **Standalone:** `npm install -g @rag-rat/bin` or `cargo install rag-rat`.
+
+Otherwise, run the same command through npx:
 
 ```bash
 npx -y @rag-rat/bin <command>               # e.g. npx -y @rag-rat/bin hooks install
