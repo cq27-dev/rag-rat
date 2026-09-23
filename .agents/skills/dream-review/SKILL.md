@@ -22,6 +22,10 @@ and `semantic_search` / `symbol_lookup` / `impact_surface` / `find_callers` / `g
 the MCP but may not have the binary on PATH). It is a batch chore meant to run a few times a day, not
 continuously.
 
+`dream` and `dream_review` are in the MCP server's **`admin` toolset**, which is not listed by
+default. If they are not among your tools, tell the user to add `[mcp] toolsets = ["admin"]` to the
+repo's `rag-rat.toml` and reconnect the rag-rat MCP server (in Claude Code: `/mcp`), then continue.
+
 ## 1. Preflight
 
 - Confirm the index is fresh: call **`index_status`**. If it reports drift, call **`heal_index`** to

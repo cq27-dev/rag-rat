@@ -1,3 +1,5 @@
+use rag_rat_base::config::McpToolset;
+
 use super::*;
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -49,6 +51,37 @@ pub const TOOL_NAMES: &[&str] = &[
     "dream",
     "dream_review",
 ];
+
+/// The optional toolset a tool belongs to; `None` for the default surface every server lists.
+///
+/// The default list is what an agent reaches for while coding. Maintenance and diagnostics — index
+/// repair, memory audits, dream review, resolver comparisons, the status reports `index_status`
+/// folds in — and the memory task-graph edges stay callable, but are listed only when their toolset
+/// is enabled (`[mcp] toolsets` in rag-rat.toml, or `RAG_RAT_TOOLSETS`), so they don't cost every
+/// agent context for tools it rarely calls.
+pub fn toolset(name: &str) -> Option<McpToolset> {
+    match name {
+        "heal_index"
+        | "memory_validate"
+        | "memory_doctor"
+        | "dream"
+        | "dream_review"
+        | "compare_graph_to_text"
+        | "compare_graph_to_scip"
+        | "check_library_usage"
+        | "ffi_surface"
+        | "llm_status"
+        | "papertrail_sync_status" => Some(McpToolset::Admin),
+        "memory_edge_add" | "memory_edge_remove" | "memory_edges" => Some(McpToolset::Graph),
+        _ => None,
+    }
+}
+
+/// Whether a server with `enabled` toolsets lists `name`. Listing only: every tool in
+/// [`TOOL_NAMES`] stays callable either way.
+pub fn is_listed(name: &str, enabled: &[McpToolset]) -> bool {
+    toolset(name).is_none_or(|set| enabled.contains(&set))
+}
 
 pub fn list_tools() -> Value {
     json!(
@@ -204,7 +237,8 @@ pub fn description(name: &str) -> &'static str {
              last sync time.",
         "index_status" =>
             "Index freshness vs HEAD: git/indexed head, per-language file counts, parser failures, \
-             FTS sync state, and schema version.",
+             FTS sync state, schema version and the tracker cache. Check it when results look thin \
+             or stale; `include: [\"embeddings\"]` adds embedding coverage.",
         "memory_create" =>
             "Record a durable, source-anchored repo memory (Invariant / Decision / Risk / \
              BugPattern / …) bound to a symbol, chunk, path, edge/call-path, commit, or tracker \
@@ -348,11 +382,9 @@ fn arg_schema(name: &str) -> Option<Value> {
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
         "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),
         "memory_mark_obsolete" | "memory_show" => schema_for::<MemoryIdArgs>(),
-        "llm_status"
-        | "papertrail_sync_status"
-        | "index_status"
-        | "memory_validate"
-        | "memory_doctor" => schema_for::<EmptyArgs>(),
+        "index_status" => schema_for::<IndexStatusArgs>(),
+        "llm_status" | "papertrail_sync_status" | "memory_validate" | "memory_doctor" =>
+            schema_for::<EmptyArgs>(),
         "memory_edge_add" => schema_for::<MemoryEdgeAddArgs>(),
         "memory_edge_remove" => schema_for::<MemoryEdgeRemoveArgs>(),
         "memory_edges" => schema_for::<MemoryEdgesArgs>(),

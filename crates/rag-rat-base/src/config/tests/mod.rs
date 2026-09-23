@@ -5,11 +5,11 @@ use path_slash::PathExt;
 
 use super::{
     self as config, Config, ConfigError, DEFAULT_DISCOVERY_NODE, DEFAULT_SYNC_RELAY,
-    DistillLlmConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel,
-    MemoryConfig, MemorySurface, OracleConfig, OracleLiveConfig, RawConfig, RawMemory, RawOracle,
-    RawSearch, RawSync, RawTarget, RawVersionCheck, RawWatch, RemoteBackend, RemoteDreamConfig,
-    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, SyncConfig, TargetKind, TrackerAuth,
-    VersionCheckConfig, WatchConfig,
+    DistillLlmConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig, LogFormat, LogLevel, McpConfig,
+    McpToolset, MemoryConfig, MemorySurface, OracleConfig, OracleLiveConfig, RawConfig, RawMemory,
+    RawOracle, RawSearch, RawSync, RawTarget, RawVersionCheck, RawWatch, RemoteBackend,
+    RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, SyncConfig, TargetKind,
+    TrackerAuth, VersionCheckConfig, WatchConfig,
 };
 use crate::language::Language;
 

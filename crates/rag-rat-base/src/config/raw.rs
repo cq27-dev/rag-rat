@@ -6,9 +6,10 @@ use serde::Deserialize;
 use super::{
     ConfigError, DEFAULT_QUERY_ENDPOINT, DistillLlmConfig, DreamLlmConfig, EmbeddingBackend,
     EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig, LogConfig,
-    MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface, OracleConfig, OracleLiveConfig,
-    PapertrailConfig, RemoteBackend, RemoteDreamConfig, RemoteEmbeddingConfig, SearchConfig,
-    SyncConfig, Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig, types,
+    MAX_REMOTE_EMBEDDING_CONCURRENCY, McpConfig, McpToolset, MemoryConfig, MemorySurface,
+    OracleConfig, OracleLiveConfig, PapertrailConfig, RemoteBackend, RemoteDreamConfig,
+    RemoteEmbeddingConfig, SearchConfig, SyncConfig, Tracker, TrackerAuth, TrackerConfig,
+    VersionCheckConfig, WatchConfig, types,
 };
 use crate::embedding_models::Backend;
 
@@ -38,6 +39,8 @@ pub(crate) struct RawConfig {
     pub(crate) log: RawLog,
     #[serde(default)]
     pub(crate) version_check: RawVersionCheck,
+    #[serde(default)]
+    pub(crate) mcp: RawMcp,
     #[serde(default)]
     pub(crate) oracle: RawOracle,
     #[serde(default)]
@@ -284,6 +287,31 @@ impl TryFrom<RawLog> for LogConfig {
             retention_days: raw.retention_days.unwrap_or(d.retention_days),
             max_files: raw.max_files.unwrap_or(d.max_files),
         })
+    }
+}
+
+#[derive(Debug, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RawMcp {
+    #[serde(default)]
+    toolsets: Vec<String>,
+}
+
+impl TryFrom<RawMcp> for McpConfig {
+    type Error = ConfigError;
+
+    fn try_from(raw: RawMcp) -> Result<Self, Self::Error> {
+        let mut toolsets = raw
+            .toolsets
+            .iter()
+            .map(|name| {
+                McpToolset::from_config_str(name.trim())
+                    .ok_or_else(|| ConfigError::McpToolsetUnknown(name.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        toolsets.sort_unstable();
+        toolsets.dedup();
+        Ok(Self { toolsets })
     }
 }
 

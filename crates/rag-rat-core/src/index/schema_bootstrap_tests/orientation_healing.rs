@@ -183,6 +183,7 @@ fn clean_checkout_file_resolves_against_its_own_package_roots() {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

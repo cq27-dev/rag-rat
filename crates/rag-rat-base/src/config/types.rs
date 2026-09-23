@@ -22,6 +22,7 @@ pub struct Config {
     pub watch: WatchConfig,
     pub log: LogConfig,
     pub version_check: VersionCheckConfig,
+    pub mcp: McpConfig,
     pub oracle: OracleConfig,
     pub search: SearchConfig,
     pub memory: MemoryConfig,
@@ -270,6 +271,45 @@ impl Default for OracleLiveConfig {
             max_requests_per_pass: 200,
             max_checkouts: 1,
         }
+    }
+}
+
+/// `[mcp]`: which optional MCP toolsets this repo's server lists, beyond the default surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpConfig {
+    pub toolsets: Vec<McpToolset>,
+}
+
+/// A group of MCP tools kept off the default tool list. Every tool stays callable and reachable
+/// through `rag-rat tools`; a toolset only decides what the server advertises, so an agent's tool
+/// list carries what it reaches for while coding and not the maintenance surface.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    strum::EnumIter,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum McpToolset {
+    /// Index and memory maintenance, diagnostics, and dream review.
+    Admin,
+    /// The memory task-graph edges.
+    Graph,
+}
+
+impl McpToolset {
+    pub fn as_config_str(self) -> &'static str {
+        self.into()
+    }
+
+    pub fn from_config_str(value: &str) -> Option<Self> {
+        value.parse().ok()
     }
 }
 

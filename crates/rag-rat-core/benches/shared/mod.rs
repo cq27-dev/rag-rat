@@ -74,6 +74,7 @@ pub fn bench_config(subdir: &str) -> (Config, rag_rat_base::test_scratch::Scratc
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

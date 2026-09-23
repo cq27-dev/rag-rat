@@ -447,6 +447,7 @@ fn whole_root_c_config(root: PathBuf) -> Config {
         llm: Default::default(),
         watch: rag_rat_base::config::WatchConfig { overlay_quiet_secs: 0, ..Default::default() },
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

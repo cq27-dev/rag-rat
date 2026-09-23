@@ -45,6 +45,7 @@ fn source_config(root: PathBuf, language: Language) -> Config {
         llm: Default::default(),
         watch: Default::default(),
         version_check: Default::default(),
+        mcp: Default::default(),
         oracle: Default::default(),
         search: Default::default(),
         memory: Default::default(),

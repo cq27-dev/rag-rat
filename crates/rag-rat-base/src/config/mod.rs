@@ -20,10 +20,10 @@ pub use raw::{endpoint_authority_has_userinfo, valid_tracker_base_url, valid_tra
 pub use types::{
     Config, DEFAULT_DISCOVERY_NODE, DEFAULT_QUERY_ENDPOINT, DEFAULT_SYNC_RELAY, DistillLlmConfig,
     DreamLlmConfig, EmbeddingBackend, EmbeddingConfig, EmbeddingRuntimeConfig, LlmConfig,
-    LogConfig, LogFormat, LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, MemoryConfig, MemorySurface,
-    OracleConfig, OracleLiveConfig, PapertrailConfig, RemoteBackend, RemoteDreamConfig,
-    RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, SyncConfig, TargetKind, Tracker,
-    TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
+    LogConfig, LogFormat, LogLevel, MAX_REMOTE_EMBEDDING_CONCURRENCY, McpConfig, McpToolset,
+    MemoryConfig, MemorySurface, OracleConfig, OracleLiveConfig, PapertrailConfig, RemoteBackend,
+    RemoteDreamConfig, RemoteEmbeddingConfig, ResolvedTarget, SearchConfig, SyncConfig, TargetKind,
+    Tracker, TrackerAuth, TrackerConfig, VersionCheckConfig, WatchConfig,
 };
 
 #[cfg(test)]

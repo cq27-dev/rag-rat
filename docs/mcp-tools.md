@@ -92,7 +92,20 @@ use `--arguments-json '<object>'`.
 
 ## Tools
 
-The catalog is **47 tools** in nine groups. The signatures below use canonical MCP snake_case.
+The signatures below use canonical MCP snake_case. **Every tool is callable, but not every tool is
+listed**: the server advertises the coding surface by default, and two optional toolsets carry the
+rest so they don't cost every agent context for tools it rarely calls:
+
+- **`admin`** — index and memory maintenance, diagnostics and dream review: `heal_index`,
+  `memory_validate`, `memory_doctor`, `dream`, `dream_review`, `compare_graph_to_text`,
+  `compare_graph_to_scip`, `check_library_usage`, `ffi_surface`, and the status reports
+  `index_status` folds in (`llm_status`, `papertrail_sync_status`).
+- **`graph`** — the memory task-graph edges: `memory_edge_add`, `memory_edge_remove`,
+  `memory_edges`.
+
+Enable them per repo with `[mcp] toolsets = ["admin", "graph"]` in `rag-rat.toml`, or per launch
+with `RAG_RAT_TOOLSETS=admin,graph` in the server's environment (a dormant server has no config, so
+the variable is its only switch). Every tool also stays reachable through `rag-rat tools`.
 The native CLI exposes the same names in kebab case under `rag-rat tools` and derives its flags from
 the same schemas. Every read tool also accepts an optional `"worktree": string`, an absolute path to
 a linked git worktree served as a branch overlay over the indexed checkout. A path that is not a
@@ -152,7 +165,7 @@ declare the parameter nor honor one.
 - `llm_status`: `{}`
 - `heal_index`: `{ "limit"?: number }`
 - `papertrail_sync_status`: `{}`
-- `index_status`: `{}`
+- `index_status`: `{ "include"?: ("embeddings")[] }` — `embeddings` adds the `llm_status` report
 
 **Repo memories**
 

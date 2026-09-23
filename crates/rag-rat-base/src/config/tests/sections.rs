@@ -328,3 +328,20 @@ fn log_tokens_are_pinned_and_case_insensitive() {
     assert_eq!(log.level, LogLevel::Trace);
     assert_eq!(log.format, LogFormat::Json);
 }
+
+#[test]
+fn mcp_toolsets_parse_dedupe_and_reject_unknown_names() {
+    let parse = |text: &str| {
+        let raw: RawConfig = toml::from_str(text).unwrap();
+        McpConfig::try_from(raw.mcp)
+    };
+    assert_eq!(parse("[index]\nroot = \".\"\n").unwrap(), McpConfig::default());
+    assert_eq!(
+        parse("[index]\nroot = \".\"\n[mcp]\ntoolsets = [\"graph\", \"admin\", \"admin\"]\n")
+            .unwrap()
+            .toolsets,
+        vec![McpToolset::Admin, McpToolset::Graph]
+    );
+    let err = parse("[index]\nroot = \".\"\n[mcp]\ntoolsets = [\"everything\"]\n").unwrap_err();
+    assert!(err.to_string().contains("everything"), "{err}");
+}
