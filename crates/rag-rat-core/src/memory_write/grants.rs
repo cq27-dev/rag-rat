@@ -203,8 +203,9 @@ pub(crate) fn promote_account_device(
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let subject = rag_rat_oplog::resolve_roster_device(&tx, device)?;
     rag_rat_oplog::author_owner_promote_in_tx(&tx, subject.fingerprint, now_ms)?;
+    let promoted = rag_rat_oplog::resolve_roster_device(&tx, &subject.fingerprint.to_string())?;
     tx.commit()?;
-    Ok(subject)
+    Ok(promoted)
 }
 
 /// Grant `grantee_account_id` Writer authority on the ACTIVE repo's owner stream (#1164), so a
