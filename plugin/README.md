@@ -51,6 +51,13 @@ Claude/Codex.) Node, not `.sh`, so it works on native Windows too. Resolution or
    lockfile-serialized. **Skipped under `--no-install`** — until the MCP server's first `npx` run has
    installed the binary, a hook is a harmless no-op.
 
+When the binary resolves from the managed cache (2, 5) or the npx cache (3), the launcher also keeps
+a `rag-rat` shim in `~/.local/bin` pointing at it — a symlink, or `rag-rat.cmd` on Windows — so the
+CLI runs from a shell. It never edits shell profiles or PATH (`rag-rat doctor` reports when
+`~/.local/bin` is not on PATH), never replaces a `rag-rat` there it did not create, and only moves
+the shim to a newer version, so two plugins on different versions do not fight over it.
+`RAG_RAT_NO_PATH_SHIM=1` disables it; `RAG_RAT_SHIM_DIR` relocates it.
+
 Version comes from `plugin.json`. Intel Mac has no prebuilt → the launcher prints the source path
 (`cargo install rag-rat --no-default-features --features model2vec`).
 

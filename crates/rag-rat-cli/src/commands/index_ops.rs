@@ -285,6 +285,7 @@ pub(crate) fn doctor(config: &Config, args: &DoctorArgs) -> anyhow::Result<()> {
             "kind": target.kind.as_db_str(),
         })).collect::<Vec<_>>(),
         "index": index,
+        "cli": crate::path_shim::doctor_status(),
         "mcp": {
             "transport": "stdio",
             "tools": rag_rat_mcp::tools::TOOL_NAMES,
@@ -309,6 +310,7 @@ pub(crate) fn doctor_global_store(database: &Path) -> anyhow::Result<()> {
         "size_bytes": overview.size_bytes,
         "schema": overview.schema,
         "repos": overview.repos,
+        "cli": crate::path_shim::doctor_status(),
         "mcp": {
             "transport": "stdio",
             "tools": rag_rat_mcp::tools::TOOL_NAMES,
