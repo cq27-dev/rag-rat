@@ -95,7 +95,9 @@ use `--arguments-json '<object>'`.
 The catalog is **47 tools** in nine groups. The signatures below use canonical MCP snake_case.
 The native CLI exposes the same names in kebab case under `rag-rat tools` and derives its flags from
 the same schemas. Every read tool also accepts an optional `"worktree": string`, an absolute path to
-a linked git worktree served as a branch overlay over the indexed checkout. It is omitted from the
+a linked git worktree served as a branch overlay over the indexed checkout. A path that is not a
+linked worktree of this repo is ignored without an error, so results then come from the indexed
+checkout — check the path when an answer looks like the wrong branch. It is omitted from the
 signatures below for brevity. The write tools
 and `compare_graph_to_text` do not: they stay scoped to the indexed checkout, so they neither
 declare the parameter nor honor one.
@@ -104,7 +106,7 @@ declare the parameter nor honor one.
 
 - `semantic_search`: `{ "query": string, "limit"?: number, "include_graph"?: "none" | "compact" | "full", "graph_limit"?: number, "include"?: ("generated" | "git" | "papertrail" | "fallback")[], "explain"?: boolean }`
 - `symbol_lookup`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number, "include"?: ("memories" | "generated")[] }`
-- `docs_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
+- `docs_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "lang"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
 
 **Call graph & impact**
 

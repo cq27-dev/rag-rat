@@ -342,11 +342,15 @@ impl schemars::JsonSchema for SymHandle {
 // comment, so schemars publishes nothing extra for the flattened block.
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct SymbolSelectorArgs {
+    /// Symbol name, exact or fuzzy.
     pub symbol: Option<String>,
+    /// Qualified name, `path::name`, as symbol results print it.
     #[serde(rename = "ref")]
     pub symbol_path: Option<String>,
+    /// Opaque `sym_<hex>` handle from a previous result; the most precise selector.
     #[serde(rename = "id", default)]
     pub logical_symbol_id: Option<SymHandle>,
+    /// Answer for every match instead of asking to disambiguate.
     #[serde(default)]
     pub allow_ambiguous: bool,
 }

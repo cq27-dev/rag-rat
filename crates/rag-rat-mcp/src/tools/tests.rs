@@ -385,11 +385,8 @@ const SCHEMA_ROWS: &[SchemaRow] = &[
     row("find_clones", &[], &["limit", "min_copies", "min_similarity"]),
     row("clones_for_symbol", &[], &["id", "line", "path", "ref"]),
     row("ffi_surface", &[], &["limit"]),
-    SchemaRow {
-        include: Some(GRAPH_INCLUDE),
-        enums: GRAPH_ENUMS,
-        ..row("docs_for_symbol", &[], GRAPH_ARGS)
-    },
+    // Symbol selector only: the handler never read the graph knobs it used to advertise.
+    row("docs_for_symbol", &[], SYMBOL_REF_ARGS),
     SchemaRow {
         include: Some(&["memories"]),
         enums: &[("include_graph", GRAPH_MODE)],
