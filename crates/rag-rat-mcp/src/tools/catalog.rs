@@ -308,7 +308,9 @@ pub fn description(name: &str) -> &'static str {
         "memory_get" =>
             "Read memories: one in full by `memory_id`, or those bound to a symbol (`symbol` / \
              `ref` / `id`), a `path`, or a call path (`edge_sequence_hash`).",
-        "memory_search" => "Full-text search across active (or stale) repo memories by keyword.",
+        "memory_search" =>
+            "Search active (or stale) repo memories by keyword and, when an embedding model is \
+             installed, by meaning — a paraphrase of a memory finds it too.",
         "memory_for_symbol" =>
             "Return repo memories bound to a symbol (or its logical-symbol group).",
         "memory_for_path" => "Return repo memories bound to a path.",

@@ -48,7 +48,7 @@ fn conn_with_duplicated_fts_row() -> Connection {
 #[test]
 fn duplicate_fts_rows_collapse_to_one_hit_per_memory() {
     let conn = conn_with_duplicated_fts_row();
-    let hits = memory_search(&conn, "quokkaform", 10).unwrap();
+    let hits = memory_search_scored(&conn, "quokkaform", 10).unwrap();
     assert_eq!(hits.len(), 4, "one hit per memory, not one per FTS row: {hits:?}");
 }
 
@@ -61,8 +61,8 @@ fn duplicate_fts_rows_collapse_to_one_hit_per_memory() {
 #[test]
 fn a_duplicate_fts_row_does_not_consume_a_limit_slot() {
     let conn = conn_with_duplicated_fts_row();
-    let hits = memory_search(&conn, "quokkaform", 3).unwrap();
-    let ids: BTreeSet<&str> = hits.iter().map(|hit| hit.memory_id.as_str()).collect();
+    let hits = memory_search_scored(&conn, "quokkaform", 3).unwrap();
+    let ids: BTreeSet<&str> = hits.iter().map(|(hit, _)| hit.memory_id.as_str()).collect();
     assert_eq!(hits.len(), 3, "the limit is spent in full: {hits:?}");
     assert_eq!(ids.len(), 3, "limit counts distinct memories, not FTS rows: {hits:?}");
 }

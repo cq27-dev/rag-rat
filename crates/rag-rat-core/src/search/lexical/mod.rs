@@ -258,5 +258,67 @@ fn search_with_query_embedding(
     Ok(hits)
 }
 
+/// A memory reached only by the vector arm must clear this cosine to enter the results, so a query
+/// with no real match returns nothing rather than the nearest unrelated notes. A BM25 hit needs no
+/// floor: the keyword match is its evidence. Measured on this repo's memories with
+/// jina-embeddings-v2-base-code: the intended memory scored at or above ~0.42 for nine in ten
+/// paraphrased queries, while off-topic queries peaked at 0.23-0.44. Cosine scales differ per
+/// model, so this is a noise gate, not a relevance threshold.
+const MEMORY_VECTOR_MIN_SIMILARITY: f32 = 0.45;
+
+/// Hybrid repo-memory search (#1443): BM25 over `repo_memory_fts` fused with the memory vector
+/// arm, using the same weights and rank transform as code search. `query_embedding` `None` (no
+/// model, or the query embed failed) is BM25 order.
+pub(crate) fn memory_search(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    query_embedding: Option<&ai::QueryEmbedding>,
+) -> anyhow::Result<Vec<rag_rat_query::memory::RepoMemory>> {
+    let mut fused = std::collections::HashMap::new();
+    for (rank, (memory_id, _)) in rag_rat_query::memory::memory_search_ranked_ids(
+        conn,
+        query,
+        limit.max(10).saturating_mul(8),
+    )?
+    .into_iter()
+    .enumerate()
+    {
+        fused.insert(memory_id, BM25_WEIGHT * scoring::lexical_rank_score(rank));
+    }
+    // Every memory's similarity, not a top-k: a keyword hit must get its vector contribution even
+    // when vector-only candidates outscore it, or those candidates would decide which keyword hits
+    // get fused scores. A failed vector read degrades to BM25 order, like a failed query embed.
+    let similarities = match query_embedding.map(|q| ai::memory_vector_similarities(conn, q)) {
+        Some(Ok(similarities)) => similarities,
+        Some(Err(err)) => {
+            tracing::warn!(
+                target: "rag_rat_core::search",
+                error = %err,
+                "memory vector arm unavailable; ranking by BM25 only"
+            );
+            Vec::new()
+        },
+        None => Vec::new(),
+    };
+    for (memory_id, similarity) in similarities {
+        if !fused.contains_key(&memory_id) && similarity < MEMORY_VECTOR_MIN_SIMILARITY {
+            continue;
+        }
+        *fused.entry(memory_id).or_insert(0.0) +=
+            VECTOR_WEIGHT * f64::from(similarity).clamp(0.0, 1.0);
+    }
+    let mut ranked = fused.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut memories = Vec::new();
+    for (memory_id, _) in ranked {
+        if memories.len() >= usize::try_from(limit)? {
+            break;
+        }
+        memories.extend(rag_rat_query::memory::memory_by_id(conn, &memory_id)?);
+    }
+    Ok(memories)
+}
+
 #[cfg(test)]
 mod tests;
