@@ -41,20 +41,24 @@ pub(super) const CANDIDATES_PER_ACCOUNT_MAX: usize = 4_096;
 const CANDIDATES_GLOBAL_MAX: usize = 16_384;
 pub(super) const CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize = 16 * 1024 * 1024;
 const CANDIDATE_BYTES_GLOBAL_MAX: usize = 64 * 1024 * 1024;
-/// The slice of the per-account budget reachable ONLY by a control-v2 view manifest.
+/// The slice of the per-account budget reachable ONLY by revocation: a `DeviceRemove` cut and the
+/// control-v2 view manifest a stored cut cites.
 ///
-/// A cut's evidence is a DETACHED manifest that competes for the same grow-only budget as ordinary
-/// traffic, and the cut can land first. Without a floor an insider can fill the budget and leave
-/// every honest manifest permanently unadmitted — which parks the cuts naming them forever, so the
-/// devices those cuts revoke stay un-revoked. Capacity never drains, so that state is terminal.
+/// Removal is the operation every recovery starts from — a compromised device is removed, a stuck
+/// one is removed and replaced — and candidate capacity never drains. Without a floor, an account
+/// whose ordinary budget is full (by an insider or by ordinary use) could never author a removal
+/// again, and the devices it should revoke stay un-revoked for good (#1409). The cut alone is not
+/// enough: under a pin its evidence is a DETACHED manifest that competes for the same budget, can
+/// land after the cut, and parks the cut forever if starved out.
 ///
 /// A manifest naming the maximum `control_v2::views::MAX_VIEW_ENTRIES` identities signs to roughly
 /// 64 KiB, so the byte floor holds sixteen of the largest an account can produce and hundreds of
 /// ordinary ones. The floor is per-ACCOUNT only: a globally exhausted store is an operator-level
 /// condition no per-account arithmetic can rescue.
-const VIEW_MANIFEST_FLOOR_ENTRIES: usize = 64;
-const VIEW_MANIFEST_FLOOR_BYTES: usize = 1024 * 1024;
-/// The share of the manifest floor ONE device fingerprint may hold.
+const REVOCATION_FLOOR_ENTRIES: usize = 64;
+const REVOCATION_FLOOR_BYTES: usize = 1024 * 1024;
+/// The share of the revocation floor ONE device fingerprint may hold, removals and manifests
+/// together.
 ///
 /// The floor is a raised CEILING, not a pool with recorded membership, and the citation gate asks
 /// only whether SOME stored row cites this payload — so one admitted device can mint many manifests
@@ -62,17 +66,21 @@ const VIEW_MANIFEST_FLOOR_BYTES: usize = 1024 * 1024;
 /// that device takes the whole floor and every other device's evidence is refused, which is the
 /// terminal state the floor exists to prevent, reached from inside the roster (#1393).
 ///
+/// A removal needs no citation, so any enrolled device can spend its share on removals the fold
+/// will reject; the share, not the fold, is what bounds that. Counting the two kinds against ONE
+/// share keeps each signer's reach where it was before removals joined the floor.
+///
 /// A quarter of each floor leaves three other devices' worth standing. Both dimensions are capped
 /// because bytes bind first: a manifest naming `control_v2::views::MAX_VIEW_ENTRIES` identities
 /// signs to roughly 63 KiB, so an entry-only share would still let one signer take half the byte
 /// floor.
-const VIEW_MANIFEST_SIGNER_ENTRIES: usize = VIEW_MANIFEST_FLOOR_ENTRIES / 4;
-const VIEW_MANIFEST_SIGNER_BYTES: usize = VIEW_MANIFEST_FLOOR_BYTES / 4;
-/// The per-account caps an ORDINARY candidate may reach — everything above the manifest floor.
+const REVOCATION_SIGNER_ENTRIES: usize = REVOCATION_FLOOR_ENTRIES / 4;
+const REVOCATION_SIGNER_BYTES: usize = REVOCATION_FLOOR_BYTES / 4;
+/// The per-account caps an ORDINARY candidate may reach — everything above the revocation floor.
 pub(super) const ORDINARY_CANDIDATES_PER_ACCOUNT_MAX: usize =
-    CANDIDATES_PER_ACCOUNT_MAX - VIEW_MANIFEST_FLOOR_ENTRIES;
+    CANDIDATES_PER_ACCOUNT_MAX - REVOCATION_FLOOR_ENTRIES;
 pub(super) const ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX: usize =
-    CANDIDATE_BYTES_PER_ACCOUNT_MAX - VIEW_MANIFEST_FLOOR_BYTES;
+    CANDIDATE_BYTES_PER_ACCOUNT_MAX - REVOCATION_FLOOR_BYTES;
 
 pub(super) struct AccountProjection {
     pub(super) history: fold::AccountAuthHistory,
@@ -2831,9 +2839,9 @@ pub(super) fn insert_candidate(
     if already_present {
         return Ok(CandidateInsert::AlreadyPresent);
     }
-    // A view manifest reaches the whole per-account budget ONLY while a stored cut names it;
-    // everything else stops at the floor that keeps a cut's evidence admissible (see
-    // [`VIEW_MANIFEST_FLOOR_ENTRIES`]). An UNCITED manifest is ordinary traffic and is charged as
+    // A removal cut, and a view manifest while a stored cut names it, reach the whole per-account
+    // budget; everything else stops at the floor that keeps revocation authorable (see
+    // [`REVOCATION_FLOOR_ENTRIES`]). An UNCITED manifest is ordinary traffic and is charged as
     // such: the tag alone cannot be the key, or anything wearing it reaches the reserve, and
     // filling the reserve with manifests no cut names leaves an honest cut's evidence permanently
     // unadmitted — the terminal state the reserve exists to prevent (#1367).
@@ -2847,10 +2855,10 @@ pub(super) fn insert_candidate(
     // Manifest-first stays legitimate; it is simply not widened. Replication orders entries
     // `log_id, seq, entry_hash`, and control is log 0 to the annex's log 3, so cut-before-manifest
     // is the DEFAULT arrival order and the citation is already stored when the manifest is charged.
-    let cited_manifest = is_view_manifest(h)
-        && a_stored_cut_cites(tx, h.account_id, &verified.payload)?
-        && signer_is_under_its_manifest_share(tx, h, signed_bytes.len())?;
-    let (account_entries_max, account_bytes_max) = if cited_manifest {
+    let revocation = (is_removal_cut(h)
+        || is_view_manifest(h) && a_stored_cut_cites(tx, h.account_id, &verified.payload)?)
+        && signer_is_under_its_revocation_share(tx, h, signed_bytes.len())?;
+    let (account_entries_max, account_bytes_max) = if revocation {
         (CANDIDATES_PER_ACCOUNT_MAX, CANDIDATE_BYTES_PER_ACCOUNT_MAX)
     } else {
         (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX, ORDINARY_CANDIDATE_BYTES_PER_ACCOUNT_MAX)
@@ -3691,12 +3699,12 @@ fn is_view_manifest(header: &AccountEntryHeader) -> bool {
 /// recorded is a STRUCTURAL fact about the payload — which view this cut names — never a claim
 /// that the cut is executable here. Candidate admission reads no pin state at all, and a cut may
 /// arrive before any pin exists, so gating on a match would record nothing for the cut that
-/// arrives first — the ordinary order the manifest reserve depends on — and would make a stored
+/// arrives first — the ordinary order the revocation reserve depends on — and would make a stored
 /// column's meaning depend on mutable state that the V131 backfill would then have to replicate.
 ///
 /// The checkpoint question belongs to execution, which holds the pin and drops a manifest naming
 /// another checkpoint. What this width admits is bounded: an admitted signer can spend its own
-/// share of the manifest floor on evidence the executor will never use, and no more (#1393).
+/// share of the revocation floor on evidence the executor will never use, and no more (#1393).
 fn cited_view_digest(header: &AccountEntryHeader, payload: &[u8]) -> Option<[u8; 32]> {
     if header.log_id != fold::CONTROL_LOG
         || header.crypto_suite != 0
@@ -3707,43 +3715,58 @@ fn cited_view_digest(header: &AccountEntryHeader, payload: &[u8]) -> Option<[u8;
     control_v2::ops::decode(header.entry_type, payload).ok()?.pre_cut_view
 }
 
-/// Whether a stored cut on this account names this manifest payload as its evidence.
+/// A `DeviceRemove` at either control version. Keyed on the signed header alone, like
+/// [`is_view_manifest`]: whether the removal is authorized is the fold's question, and the
+/// per-signer share bounds what an unauthorized one can occupy.
+fn is_removal_cut(header: &AccountEntryHeader) -> bool {
+    header.log_id == fold::CONTROL_LOG
+        && header.crypto_suite == 0
+        && (header.op_version == fold::SUPPORTED_OP_VERSION
+            || header.op_version == control_v2::ops::CONTROL_VERSION)
+        && header.entry_type == ops::entry_type::DEVICE_REMOVE
+}
+
+/// Whether this entry's SIGNER still has room inside its share of the revocation floor.
 ///
-/// The digest is `sha256` of exactly the payload bytes — the value a cut signs and the planner keys
-/// manifests by — NOT the entry hash, which covers the header and signature too.
-/// Whether this entry's SIGNER still has room inside its share of the view-manifest floor.
-///
-/// Counted over EVERY manifest row this fingerprint holds, cited or not. A device that parked
-/// manifests as ordinary traffic can therefore be refused the raised ceiling later, which is the
-/// intended reading: the share bounds how much manifest material one signer holds, however it was
-/// admitted, and being refused the ceiling is not being refused — the entry competes as ordinary
-/// traffic.
+/// Counted over EVERY removal and manifest row this fingerprint holds, cited or not, authorized or
+/// not. A device that stored them as ordinary traffic can therefore be refused the raised ceiling
+/// later, which is the intended reading: the share bounds how much revocation material one signer
+/// holds, however it was admitted, and being refused the ceiling is not being refused — the entry
+/// competes as ordinary traffic.
 ///
 /// Counted from `log_id` + `entry_type` alone, which is broader than [`is_view_manifest`]: the
 /// header's `crypto_suite` and `op_version` are not stored columns, so an odd-suite annex entry
-/// wearing the manifest tag counts here too. That errs toward withholding the raised ceiling and
+/// wearing the manifest tag, or a control entry wearing the removal tag at an unknown version,
+/// counts here too. That errs toward withholding the raised ceiling and
 /// never toward granting it, and an entry refused the ceiling is not refused — it competes as
 /// ordinary traffic, exactly like a manifest no cut cites.
-fn signer_is_under_its_manifest_share(
+fn signer_is_under_its_revocation_share(
     tx: &Transaction<'_>,
     header: &AccountEntryHeader,
     incoming_bytes: usize,
 ) -> rusqlite::Result<bool> {
     let (entries, bytes): (i64, i64) = tx.query_row(
         "SELECT COUNT(*), COALESCE(SUM(length(signed_bytes)), 0) FROM account_entries
-          WHERE account_id = ?1 AND log_id = ?2 AND entry_type = ?3 AND device_fingerprint = ?4",
+          WHERE account_id = ?1 AND device_fingerprint = ?2
+            AND ((log_id = ?3 AND entry_type = ?4) OR (log_id = ?5 AND entry_type = ?6))",
         params![
             header.account_id.to_bytes().as_slice(),
+            header.device_fingerprint.to_bytes().as_slice(),
             fold::ANNEX_LOG,
             annex::ops::entry_type::VIEW_MANIFEST,
-            header.device_fingerprint.to_bytes().as_slice(),
+            fold::CONTROL_LOG,
+            ops::entry_type::DEVICE_REMOVE,
         ],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(entries < VIEW_MANIFEST_SIGNER_ENTRIES as i64
-        && bytes.saturating_add(incoming_bytes as i64) <= VIEW_MANIFEST_SIGNER_BYTES as i64)
+    Ok(entries < REVOCATION_SIGNER_ENTRIES as i64
+        && bytes.saturating_add(incoming_bytes as i64) <= REVOCATION_SIGNER_BYTES as i64)
 }
 
+/// Whether a stored cut on this account names this manifest payload as its evidence.
+///
+/// The digest is `sha256` of exactly the payload bytes — the value a cut signs and the planner keys
+/// manifests by — NOT the entry hash, which covers the header and signature too.
 fn a_stored_cut_cites(
     tx: &Transaction<'_>,
     account_id: AccountId,

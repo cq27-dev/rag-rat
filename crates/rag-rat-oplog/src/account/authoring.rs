@@ -1715,48 +1715,40 @@ mod tests {
         );
     }
 
-    /// The manifest lands in the view-manifest reserve, not the ordinary budget.
+    /// A pinned removal — the cut AND its manifest — is authorable with the ordinary budget
+    /// exhausted (#1409).
     ///
-    /// `insert_candidate` grants a manifest the raised ceiling only when a STORED cut already
-    /// cites it, and that citation is written when the control row lands — so the cut has to be
-    /// authored first. Reserving all but ONE ordinary slot discriminates the order exactly: the
-    /// cut takes the last ordinary slot and the manifest can only come from the reserve. Authored
-    /// the other way round the manifest would consume that slot and the cut would hit capacity.
+    /// Zero ordinary slots also pins the authoring order: `insert_candidate` grants a manifest the
+    /// raised ceiling only when a STORED cut already cites it, so a manifest authored before its
+    /// cut would be charged the ordinary budget and refused.
     #[test]
-    fn a_pinned_removal_seats_its_manifest_in_the_reserve_not_the_ordinary_budget() {
+    fn a_pinned_removal_is_authorable_with_the_ordinary_budget_exhausted() {
         let conn = db();
         let (account, _) = account_owning_a_public_stream(&conn);
         let subject = enrol(&conn, 0x7d);
         crate::account::test_support::install_real_pin(&conn, account, NOW);
-
-        let held: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1",
-                params![account.to_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        // Leave exactly one ordinary slot. Expiry is judged against the WALL CLOCK, never the
-        // caller's `now_ms`, so a fold coordinate here would reserve nothing.
-        let spare = storage::ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as i64 - held - 1;
-        conn.execute(
-            "INSERT INTO account_candidate_reservations(
-                 reservation_id, account_id, reserved_entries, reserved_bytes, expires_at_ms)
-             VALUES(?1, ?2, ?3, 0, ?4)",
-            params![
-                [0x9c_u8; 32].as_slice(),
-                account.to_bytes().as_slice(),
-                spare,
-                rag_rat_base::time::now_ms() + 600_000,
-            ],
-        )
-        .unwrap();
+        reserve_all_but(&conn, account, stored_entries(&conn, account), 0);
 
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         author_device_remove_in_tx(&tx, subject, "left", NOW)
-            .expect("the cut takes the last ordinary slot and the manifest comes from the reserve");
+            .expect("the cut and its manifest both come from the revocation reserve");
         tx.commit().unwrap();
         assert_eq!(annex_payloads(&conn, account).len(), 1, "the manifest was stored");
+    }
+
+    /// The v1 removal an unpinned account authors is just as reachable from an exhausted budget:
+    /// removal is where every recovery starts, and capacity never drains (#1409).
+    #[test]
+    fn an_unpinned_removal_is_authorable_with_the_ordinary_budget_exhausted() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let subject = enrol(&conn, 0x7e);
+        reserve_all_but(&conn, account, stored_entries(&conn, account), 0);
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, subject, "left", NOW)
+            .expect("the removal comes from the revocation reserve");
+        tx.commit().unwrap();
     }
 
     /// An unpinned account removes a device the v1 way: no view exists to name, so authoring one

@@ -966,7 +966,7 @@ fn enrollment_budget_reports_raw_headroom_and_clamps_at_zero() {
     let local_fp = crate::local_device(&conn, NOW).unwrap().fingerprint();
     let budget = super::super::bootstrap::enrollment_budget(&conn, account).unwrap();
     // The ORDINARY cap: an enrollment receipt is ordinary traffic, so the preflight measures it
-    // against the budget above the view-manifest floor — the one admission will apply to it.
+    // against the budget above the revocation floor — the one admission will apply to it.
     assert_eq!(budget.account_entries_remaining as usize, ORDINARY_CANDIDATES_PER_ACCOUNT_MAX);
     assert_eq!(budget.global_entries_remaining as usize, CANDIDATES_GLOBAL_MAX);
 
@@ -3402,19 +3402,18 @@ fn a_view_manifest_a_stored_cut_cites_reaches_capacity_an_ordinary_candidate_can
     );
 }
 
-/// One admitted device must not be able to take the whole view-manifest reserve (#1393).
+/// One admitted device must not be able to take the whole revocation reserve (#1393).
 ///
 /// The reserve is a raised CEILING, not a pool with recorded membership, and the citation gate asks
 /// only whether SOME stored row cites this payload. Every manifest below encodes the same view, so
-/// ONE stored cut satisfies all of them: the burst costs its author one cut plus ordinary slots,
-/// not one cut per manifest.
+/// ONE stored cut satisfies all of them: the burst costs its author one cut, not one per manifest.
 ///
 /// The second device is certified BEFORE the budget is filled. `stored_device_pubkeys` reads a
 /// STORED genesis/`DeviceAdd` (it does not require acceptance), so a `DeviceAdd` arriving after the
 /// fill would itself hit capacity and the honest manifest would then park for a reason that has
 /// nothing to do with the reserve.
 #[test]
-fn one_device_cannot_take_the_whole_view_manifest_reserve() {
+fn one_device_cannot_take_the_whole_revocation_reserve() {
     let conn = db();
     crate::local_device(&conn, NOW).unwrap();
     let founder = Dev::new(0x97);
@@ -3470,7 +3469,7 @@ fn one_device_cannot_take_the_whole_view_manifest_reserve() {
     // accepted-slot index bounds how far one device extends its own annex chain.
     let mut taken = 0;
     let mut prev: Option<[u8; 32]> = None;
-    for seq in 0..VIEW_MANIFEST_FLOOR_ENTRIES as u64 {
+    for seq in 0..REVOCATION_FLOOR_ENTRIES as u64 {
         let burst = view_manifest_entry(account_id, &founder, seq, prev);
         prev = Some(burst.entry_hash.into());
         if ingest_branch(&account_ingest(&conn, &burst.signed_bytes, NOW + 3).unwrap())
@@ -3479,8 +3478,10 @@ fn one_device_cannot_take_the_whole_view_manifest_reserve() {
             taken += 1;
         }
     }
+    // The cut is a removal, so it is the first entry of its signer's share.
     assert_eq!(
-        taken, VIEW_MANIFEST_SIGNER_ENTRIES,
+        taken,
+        REVOCATION_SIGNER_ENTRIES - 1,
         "the burst is bounded by the signer's share, not by the floor",
     );
 
@@ -3490,6 +3491,81 @@ fn one_device_cannot_take_the_whole_view_manifest_reserve() {
         "ingested",
         "another admitted device's cited manifest stays admissible after the burst (burst took \
          {taken} slots)",
+    );
+}
+
+/// A removal needs no citation to reach the revocation reserve, so a device with no authority to
+/// remove anyone can still store removals the fold will reject. The per-signer share is what bounds
+/// that: a flood from one such device takes its share, and an owner's removal still lands (#1409).
+#[test]
+fn one_device_flooding_removals_takes_only_its_share_of_the_revocation_reserve() {
+    let conn = db();
+    crate::local_device(&conn, NOW).unwrap();
+    let founder = Dev::new(0x9b);
+    let member = Dev::new(0x9c);
+    let victim = Dev::new(0x9d);
+    let (account_id, genesis_bytes, genesis_hash) = genesis(&founder);
+    let owner = Some(OwnerId::from_bytes(genesis_hash));
+    account_ingest(&conn, &genesis_bytes, NOW).unwrap();
+    let mut founder_prev = genesis_hash;
+    for (seq, dev) in [(1, &member), (2, &victim)] {
+        let (add, hash) = op(
+            account_id,
+            &founder,
+            seq,
+            Some(founder_prev),
+            owner,
+            &device_add(dev, DeviceRole::Member),
+        );
+        founder_prev = hash;
+        assert_eq!(ingest_branch(&account_ingest(&conn, &add, NOW).unwrap()), "ingested");
+    }
+    let remove = |subject: &Dev, reason: &str| AccountOp::DeviceRemove {
+        device_fingerprint: subject.fp,
+        control_cut: crate::account::cut::Cut::Empty,
+        secrets_cut: crate::account::cut::Cut::Empty,
+        content_cuts: vec![],
+        reason: reason.into(),
+    };
+
+    let held: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM account_entries WHERE account_id = ?1",
+            params![account_id.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    super::super::bootstrap::upsert_account_candidate_reservation_in_tx(
+        &tx,
+        account_id,
+        [0x7f; 32],
+        (ORDINARY_CANDIDATES_PER_ACCOUNT_MAX as i64 - held) as u64,
+        0,
+        0,
+        i64::MAX,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let mut taken = 0;
+    let mut prev: Option<[u8; 32]> = None;
+    for seq in 0..REVOCATION_FLOOR_ENTRIES as u64 {
+        let (flood, hash) =
+            op(account_id, &member, seq, prev, None, &remove(&founder, &format!("flood {seq}")));
+        prev = Some(hash);
+        if ingest_branch(&account_ingest(&conn, &flood, NOW + 1).unwrap()) == "ingested" {
+            taken += 1;
+        }
+    }
+    assert_eq!(taken, REVOCATION_SIGNER_ENTRIES, "the flood is bounded by the signer's share");
+
+    let (honest, _) =
+        op(account_id, &founder, 3, Some(founder_prev), owner, &remove(&member, "compromised"));
+    assert_eq!(
+        ingest_branch(&account_ingest(&conn, &honest, NOW + 2).unwrap()),
+        "ingested",
+        "the owner's removal of the flooding device still lands",
     );
 }
 
@@ -3526,7 +3602,7 @@ fn a_signers_manifest_share_binds_on_bytes_before_entries() {
     {
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
         assert!(
-            signer_is_under_its_manifest_share(&tx, &probe, 1).unwrap(),
+            signer_is_under_its_revocation_share(&tx, &probe, 1).unwrap(),
             "a signer holding no manifest is under its share",
         );
     }
@@ -3545,7 +3621,7 @@ fn a_signers_manifest_share_binds_on_bytes_before_entries() {
                 founder.fp.to_bytes().as_slice(),
                 seq as i64,
                 annex::ops::entry_type::VIEW_MANIFEST,
-                vec![0u8; VIEW_MANIFEST_SIGNER_BYTES / 4],
+                vec![0u8; REVOCATION_SIGNER_BYTES / 4],
                 NOW,
             ],
         )
@@ -3567,7 +3643,7 @@ fn a_signers_manifest_share_binds_on_bytes_before_entries() {
         .unwrap();
     assert_eq!(stored, 4, "entry slots are nowhere near the share");
     assert!(
-        !signer_is_under_its_manifest_share(&tx, &probe, 1).unwrap(),
+        !signer_is_under_its_revocation_share(&tx, &probe, 1).unwrap(),
         "the byte share binds while twelve entry slots remain",
     );
 }
@@ -5286,7 +5362,7 @@ fn promotion_at_the_last_slot_is_stable_across_opposite_arrival_orders() {
                 PreVerifyInsert::Parked { evicted: Vec::new() },
             );
         }
-        // One free slot at the cap ORDINARY traffic reaches — the view-manifest floor above it is
+        // One free slot at the cap ORDINARY traffic reaches — the revocation floor above it is
         // not a slot a promoted control entry may take.
         seed_candidate_rows(
             &conn,
