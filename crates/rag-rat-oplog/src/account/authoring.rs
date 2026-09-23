@@ -64,7 +64,8 @@ pub fn ensure_owned_stream_v2_with_mode_in_tx(
     now_ms: i64,
 ) -> anyhow::Result<StreamId> {
     // The local account (author == owner of its `/2` streams) must already exist; resolve it and
-    // its genesis entry hash (the founder incarnation a control op cites) WITHOUT minting.
+    // its genesis entry hash (the account root every control op cites as `parent_ref`) WITHOUT
+    // minting.
     let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
         "cannot ensure a /2 owned stream before the store's local account is minted (call \
          local_account first)",
@@ -215,32 +216,38 @@ fn author_account_op_in_tx(
             return Err(UnsupportedAccountControlVersion { pin }.into()),
     };
     let fingerprint = device.fingerprint();
-    // Chain from the control-log tail. Post-genesis the tail is never empty (the genesis is seq 0);
-    // an empty chain here means the caller skipped the mint, which is a programming error.
-    let (tail_seq, tail_hash) = account_chain_tail(tx, account_id, fingerprint, fold::CONTROL_LOG)?
-        .context(
-            "cannot author a non-genesis account op on an empty control chain (mint the genesis \
-             first)",
-        )?;
+    // The owner incarnation this device acts under: its OWN, which is the genesis only for the
+    // founder. Citing the genesis from any other owner — or from a founder that was demoted and
+    // re-promoted, whose genesis incarnation is closed — signs an entry its own fold rejects.
+    let incarnation = storage::effective_owner_incarnation_for_device(tx, account_id, fingerprint)?
+        .context("this device is not an owner of the account, so it cannot author a control op")?;
+    // Chain from this device's OWN control-log tail. An empty chain is the origin slot for every
+    // device but the founder (whose seq 0 is the genesis), so a second owner's first control op
+    // starts its own chain at seq 0 with no predecessor — exactly as the secrets log does.
+    let tail = account_chain_tail(tx, account_id, fingerprint, fold::CONTROL_LOG)?;
     if pin.is_some() {
-        // Under a pin the raw tail is a trap. A v2 entry's ancestry is walked back to its first
-        // non-v2 ancestor, which must be one the checkpoint accepted; a retained row above the
-        // accepted tail (for example a v1 op authored between proposing and installing the pin)
-        // makes that walk fail, and because the frozen epoch never grows the park is PERMANENT —
-        // taking every later entry on this device's chain with it. Chaining from the accepted tail
-        // instead would put two entries in one slot and decide our own op by a hash tiebreak, so
-        // refuse while nothing has been authored.
+        // Under a pin the held tail must also be the accepted tail. Branch selection builds each
+        // device's accepted chain only from EFFECTIVE entries, contiguously from seq 0, so an entry
+        // chained onto an unaccepted tail is forked; and chaining from the accepted tail instead
+        // would share a slot with an entry whose verdict can still change, deciding between two of
+        // our own entries by hash. Both chains being empty agrees.
         let accepted = account_accepted_chain_tail(tx, account_id, fingerprint, fold::CONTROL_LOG)?;
         anyhow::ensure!(
-            accepted.is_some_and(|(seq, hash)| seq == tail_seq && hash == tail_hash),
-            "this device's control chain ends in an entry the checkpoint did not accept, so a \
-             control v2 entry chained onto it could never fold; catch this device up (or re-pin \
-             over the current history) before authoring",
+            accepted == tail,
+            "this device's control chain ends in an entry the checkpoint-accepted chain did not \
+             accept, so a control v2 entry chained onto it could never take effect; this device \
+             cannot author control ops for this account, and another owner can remove it",
         );
     }
-    let seq = tail_seq
-        .checked_add(1)
-        .context("account control chain tail is at u64::MAX seq; cannot extend")?;
+    let (seq, prev_hash) = match tail {
+        Some((tail_seq, tail_hash)) => (
+            tail_seq
+                .checked_add(1)
+                .context("account control chain tail is at u64::MAX seq; cannot extend")?,
+            Some(tail_hash),
+        ),
+        None => (0, None),
+    };
 
     // Cite our own CURRENT effective control-fold length as `auth_len`, read BEFORE authoring: the
     // fold parks an entry whose asserted `auth_len` runs ahead of the fold it lands in (§7), so
@@ -289,8 +296,8 @@ fn author_account_op_in_tx(
         log_id: 0,
         device_fingerprint: fingerprint,
         seq,
-        // seq > 0 ⇒ prev_hash non-null (the header nullity rule); the device-chain predecessor.
-        prev_hash: Some(tail_hash),
+        // Null exactly at seq 0 (the header nullity rule); otherwise the device-chain predecessor.
+        prev_hash,
         // The account root every non-genesis control op cites as its parent (§6): the genesis hash,
         // NOT the device-chain tail (that is `prev_hash`'s job, and the two are distinct — the tail
         // only equals the genesis for the first post-genesis entry). The fold reads `parent_ref`
@@ -303,9 +310,7 @@ fn author_account_op_in_tx(
         crypto_suite: 0,
         auth_len,
         key_id: None,
-        // The founder incarnation this op acts under (§"authority rule"): the account's own
-        // genesis, whose incarnation id is its own entry hash.
-        authority_ref: Some(genesis_hash.into()),
+        authority_ref: Some(incarnation),
     };
     let signed = sign_account_entry(device.secret(), &header, &payload)?;
     let verified = VerifiedAccountEntry {
@@ -456,12 +461,12 @@ pub fn validate_device_add_label(label: Option<&str>) -> anyhow::Result<()> {
 /// (which, for `role == Owner`, IS the added device's owner-incarnation id). Neither opens nor
 /// commits the txn — the pairing/enrollment seam a durable core wrapper drives.
 ///
-/// FOUNDER-owner only for now: like [`author_account_op_in_tx`] it cites the account genesis as
-/// `authority_ref`, so the LOCAL device must be the account founder. A `DeviceAdd` authored by a
-/// non-founder (or any non-owner) folds `Rejected`; this verifies the joiner became
-/// roster-effective and errors otherwise, rather than reporting a rejected enrollment as success.
-/// Enrolling from a PROMOTED owner (citing that owner's own incarnation, not genesis) is a
-/// follow-up.
+/// Any owner may author it: like every control op it cites the local device's own open owner
+/// incarnation as `authority_ref`. A `DeviceAdd` from a non-owner still folds `Rejected`, so this
+/// verifies the joiner became roster-effective and errors otherwise, rather than reporting a
+/// rejected enrollment as success. The joiner's side does not yet accept a `DeviceAdd` signed by
+/// anyone but the founder, so enrolling from another owner authors correctly here and is refused
+/// at the joiner until that verification is generalized (#1416).
 pub fn author_device_add_in_tx(
     tx: &Transaction<'_>,
     joiner: EnrollingDevice,
@@ -473,12 +478,30 @@ pub fn author_device_add_in_tx(
 
 /// Enrollment-specific DeviceAdd authoring. Mandatory wraps and the durable receipt are committed
 /// before latent pre-verify work is retried, so opaque queue state cannot consume their capacity.
+///
+/// Founder-only, under the founder's GENESIS incarnation, though any owner can author a plain
+/// `DeviceAdd`: this one becomes an enrollment receipt, and the joiner's
+/// [`verify_enrollment_device_add`](storage::verify_enrollment_device_add) accepts only a DeviceAdd
+/// that cites the genesis and carries the founder's signature. Redemption consumes the one-time
+/// nonce in the same transaction, so authoring anything else here would spend it on an enrollment
+/// the joiner refuses, identically on every replay. That includes a founder demoted and re-promoted
+/// after the invite was minted — its DeviceAdd would cite the promotion's incarnation. Widen this
+/// together with that verifier (#1416).
 pub fn author_enrollment_device_add_in_tx(
     tx: &Transaction<'_>,
     joiner: EnrollingDevice,
     role: ops::DeviceRole,
     now_ms: i64,
 ) -> anyhow::Result<AccountEntryHash> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
+        .context("cannot enroll a device before the store's local account is minted")?;
+    let device = local_device(tx, now_ms)?;
+    anyhow::ensure!(
+        storage::effective_owner_incarnation_for_device(tx, account_id, device.fingerprint())?
+            == Some(genesis_hash.into()),
+        "only the founder, under its genesis incarnation, can author an enrollment a joiner will \
+         accept",
+    );
     author_device_add_with_promotion_in_tx(tx, joiner, role, now_ms, DeviceAddPromotion::Defer)
 }
 
@@ -551,9 +574,8 @@ fn author_device_add_with_promotion_in_tx(
             if roster_ref == entry_hash.into() && effective_role == role => {},
         _ => anyhow::bail!(
             "the DeviceAdd did not become the joiner's effective roster entry at the requested \
-             role — the local device lacks effective owner authority to enroll (founder-owner \
-             enrollment only for now), the device was previously removed, or a concurrent \
-             enrollment won the fold",
+             role — the local device lacks effective owner authority to enroll, the device was \
+             previously removed, or a concurrent enrollment won the fold",
         ),
     }
     Ok(entry_hash)
@@ -925,9 +947,9 @@ pub fn retry_enrollment_pre_verify(
 }
 
 /// One `(account, log_id, device)` chain's tail: its highest-`seq` entry as `(seq, entry_hash)`, or
-/// `None` for an empty chain. The empty case is the CALLER's to interpret: on the CONTROL log a
-/// non-genesis author treats it as a programming error (the genesis is always seq 0), while on the
-/// SECRETS log (which has no genesis) it is the legitimate first-wrap case (seq 0, no predecessor).
+/// `None` for an empty chain, which on every log is a device's first entry (seq 0, no predecessor).
+/// On the CONTROL log only the founder's chain already begins with the genesis at seq 0; any other
+/// owner's first control op opens its own chain, exactly as a first wrap does on the SECRETS log.
 /// `log_id`-parameterized because the secrets chain is `(account, device)`-scoped across ALL
 /// streams (never per-stream), so C4.3a reads its dense seq from the shared `log = 1` tail via this
 /// same reader. Unlike `/3` content, an `account_entries.seq` is a plain numeric INTEGER, so `ORDER
@@ -2389,5 +2411,386 @@ mod tests {
             status, "accepted",
             "genesis → StreamOwn → /3 content accepts through the real fold, no seeded facts",
         );
+    }
+
+    /// A second store that joined `founder`'s account exactly as enrollment does: mint the joiner's
+    /// own identity, have the founder author its `DeviceAdd` at `role`, and adopt the account's
+    /// entries. Its local device is the joined one, so everything authored there is signed by it.
+    /// Returns the store and the `DeviceAdd` hash, which for an Owner is its incarnation id.
+    fn joined_store(
+        founder: &Connection,
+        account: AccountId,
+        role: ops::DeviceRole,
+    ) -> (Connection, AccountEntryHash) {
+        let joined = db();
+        let device = local_device(&joined, NOW).unwrap();
+        let tx = Transaction::new_unchecked(founder, TransactionBehavior::Immediate).unwrap();
+        let device_add = author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: device.ed25519_public_key(),
+                x25519_pubkey: device.x25519_public_key(),
+                label: None,
+            },
+            role,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let entries: Vec<Vec<u8>> = storage::account_entries_for_enrollment(founder, account)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.signed_bytes)
+            .collect();
+        bootstrap::adopt_enrollment_bootstrap(&joined, bootstrap::EnrollmentBootstrap {
+            account_entries: &entries,
+            account_id: account,
+            genesis_hash: bootstrap::read_local_account_genesis(founder).unwrap().unwrap(),
+            device_fingerprint: device.fingerprint(),
+            device_add_hash: device_add,
+            now_ms: NOW + 1,
+        })
+        .unwrap();
+        (joined, device_add)
+    }
+
+    fn authored_header(conn: &Connection, hash: AccountEntryHash) -> AccountEntryHeader {
+        let bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT signed_bytes FROM account_entries WHERE entry_hash = ?1",
+                [hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::account::envelope::decode_account_signed(&bytes).unwrap().header
+    }
+
+    fn is_accepted(conn: &Connection, hash: AccountEntryHash) -> bool {
+        conn.query_row(
+            "SELECT accepted FROM account_entries WHERE entry_hash = ?1",
+            [hash.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn still_enrolled(conn: &Connection, account: AccountId, device: DeviceFingerprint) -> bool {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_roster_history
+                            WHERE account_id = ?1 AND device_fingerprint = ?2
+                              AND closed_at IS NULL)",
+            params![account.to_bytes().as_slice(), device.to_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A second owner authors its FIRST control op, from an empty chain: seq 0, no predecessor,
+    /// under its own incarnation. The seam used to treat an empty chain as a programming error and
+    /// cite the genesis, so no device but the founder could author anything — a lost founder device
+    /// left an account nobody could administer.
+    #[test]
+    fn a_second_owner_authors_its_first_control_op_from_an_empty_chain() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let subject = enrol(&founder, 0x61);
+        let (second, second_incarnation) = joined_store(&founder, account, ops::DeviceRole::Owner);
+        assert!(still_enrolled(&second, account, subject), "the joined store sees the subject");
+
+        let tx = Transaction::new_unchecked(&second, TransactionBehavior::Immediate).unwrap();
+        let removal = author_device_remove_in_tx(&tx, subject, "lost", NOW + 2)
+            .expect("a second owner authors a removal");
+        tx.commit().unwrap();
+
+        let header = authored_header(&second, removal);
+        assert_eq!(
+            (header.seq, header.prev_hash),
+            (0, None),
+            "its first control op opens its chain"
+        );
+        assert_eq!(
+            header.authority_ref,
+            Some(second_incarnation.into()),
+            "it acts under its own incarnation, never the genesis",
+        );
+        assert!(is_accepted(&second, removal), "the removal is accepted after refold");
+        assert!(!still_enrolled(&second, account, subject), "and the subject leaves the roster");
+    }
+
+    /// A device holding no owner incarnation is refused by the shared control seam before anything
+    /// is signed. It used to sign an entry citing the genesis, which its own fold then rejected.
+    ///
+    /// Driven at the seam itself: `author_device_remove_in_tx` states its own owner check first, so
+    /// a test through it would pass without this one.
+    #[test]
+    fn a_device_that_is_not_an_owner_is_refused_before_anything_is_signed() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let (member, _) = joined_store(&founder, account, ops::DeviceRole::Member);
+        let device = local_device(&member, NOW).unwrap();
+        let genesis = bootstrap::read_local_account_genesis(&member).unwrap().unwrap();
+        let (_, op) = crate::account::test_support::stream_own_public(account);
+
+        let tx = Transaction::new_unchecked(&member, TransactionBehavior::Immediate).unwrap();
+        // Both counts are read INSIDE the transaction, before it is dropped: reading them after
+        // would compare two post-rollback states that match whether or not anything was inserted.
+        let count = |tx: &Transaction<'_>| -> i64 {
+            tx.query_row("SELECT COUNT(*) FROM account_entries", [], |row| row.get(0)).unwrap()
+        };
+        let before = count(&tx);
+        let error = author_account_op_in_tx(&tx, &device, account, genesis, &op, None, NOW + 2)
+            .expect_err("a Member cannot author a control op");
+        let after = count(&tx);
+        drop(tx);
+        assert!(error.to_string().contains("not an owner"), "expected the owner refusal: {error}");
+        assert_eq!(before, after, "nothing was signed or inserted");
+    }
+
+    /// The founder's authored bytes do not change: its own incarnation and its own enrollment are
+    /// both the genesis, so resolving them from the device's standing resolves to what it cited
+    /// before.
+    #[test]
+    fn the_founder_still_cites_the_genesis() {
+        let founder = db();
+        bootstrap::local_account(&founder, NOW).unwrap();
+        let genesis = bootstrap::read_local_account_genesis(&founder).unwrap().unwrap();
+        let subject = enrol(&founder, 0x63);
+
+        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+        let stream = ensure_owned_stream_v2_in_tx(&tx, "repo-x", NOW).unwrap();
+        let removal = author_device_remove_in_tx(&tx, subject, "left", NOW).unwrap();
+        let content = super::super::content::author_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("n1", "by the founder")],
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let header = authored_header(&founder, removal);
+        assert_eq!(header.authority_ref, Some(genesis.into()), "control cites the genesis");
+        assert!(header.seq > 0 && header.prev_hash.is_some(), "and continues the founder's chain");
+        let roster_ref: Vec<u8> = founder
+            .query_row(
+                "SELECT roster_ref FROM content_entries WHERE entry_hash = ?1",
+                [content[0].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(roster_ref, genesis.as_slice(), "content cites the genesis enrollment");
+    }
+
+    /// A Member device writes content under its OWN enrollment. It used to cite the genesis, which
+    /// acceptance checks against the signer's own roster entry — so no device but the founder could
+    /// write.
+    #[test]
+    fn a_member_authors_content_under_its_own_enrollment() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+        let stream = ensure_owned_stream_v2_in_tx(&tx, "repo-x", NOW).unwrap();
+        tx.commit().unwrap();
+        let (member, member_enrollment) = joined_store(&founder, account, ops::DeviceRole::Member);
+
+        let tx = Transaction::new_unchecked(&member, TransactionBehavior::Immediate).unwrap();
+        let hashes = super::super::content::author_content_batch_in_tx(
+            &tx,
+            stream,
+            &[node_create("n1", "by a member")],
+            NOW + 2,
+        )
+        .expect("a Member authors content on its account's stream");
+        tx.commit().unwrap();
+
+        let (status, roster_ref): (String, Vec<u8>) = member
+            .query_row(
+                "SELECT s.status, e.roster_ref
+                   FROM content_entry_status s JOIN content_entries e USING (entry_hash)
+                  WHERE entry_hash = ?1",
+                [hashes[0].as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(roster_ref, member_enrollment.as_slice(), "it cites its own enrollment");
+        assert_eq!(status, "accepted", "and the content is accepted through the real fold");
+    }
+
+    /// Carry everything `from` holds for `account` into `to`, as sync would, and refold there.
+    fn deliver(from: &Connection, to: &Connection, account: AccountId) {
+        for entry in storage::account_entries_for_enrollment(from, account).unwrap() {
+            storage::account_ingest(to, &entry.signed_bytes, NOW + 3).unwrap();
+        }
+    }
+
+    /// Removing the founder device actually stops it: once the removal reaches the founder's own
+    /// store, it can no longer author. This became reachable with non-founder authoring — nothing
+    /// but the founder could author a removal of the founder before.
+    #[test]
+    fn a_removed_founder_can_no_longer_author() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let founder_fp = local_device(&founder, NOW).unwrap().fingerprint();
+        let (second, _) = joined_store(&founder, account, ops::DeviceRole::Owner);
+
+        let tx = Transaction::new_unchecked(&second, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, founder_fp, "lost", NOW + 2)
+            .expect("another owner removes the founder device");
+        tx.commit().unwrap();
+        deliver(&second, &founder, account);
+        assert!(!still_enrolled(&founder, account, founder_fp), "the founder sees its removal");
+
+        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+        let joiner = DeviceSecret::from_seed(&[0x65; 32]);
+        let result = author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[0x66; 32]).public().to_bytes(),
+                label: None,
+            },
+            ops::DeviceRole::Member,
+            NOW + 4,
+        );
+        drop(tx);
+        // The removal closed its incarnation, so it is refused as a non-owner before signing — not
+        // by some later failure that would pass an `is_err` just as well.
+        let error = result.expect_err("a removed founder cannot enroll anyone");
+        assert!(error.to_string().contains("not an owner"), "refused as a non-owner: {error}");
+    }
+
+    /// A founder that was demoted and re-promoted authors again. Its genesis incarnation closed at
+    /// the demotion, so citing the genesis — as every control op used to — signed entries its own
+    /// fold rejected: the account's founder could no longer administer it. It now acts under the
+    /// incarnation the promotion minted.
+    #[test]
+    fn a_founder_demoted_and_re_promoted_authors_again() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let genesis = bootstrap::read_local_account_genesis(&founder).unwrap().unwrap();
+        let founder_fp = local_device(&founder, NOW).unwrap().fingerprint();
+        let (second, _) = joined_store(&founder, account, ops::DeviceRole::Owner);
+
+        // No production seam authors a promotion or demotion, so the second owner drives the shared
+        // control seam directly — the same one every control op passes through.
+        let second_device = local_device(&second, NOW).unwrap();
+        let tx = Transaction::new_unchecked(&second, TransactionBehavior::Immediate).unwrap();
+        let (tip_seq, tip_hash) =
+            account_chain_tail(&tx, account, founder_fp, fold::CONTROL_LOG).unwrap().unwrap();
+        let demote = AccountOp::OwnerDemote {
+            device_fingerprint: founder_fp,
+            owner_id: genesis.into(),
+            control_cut: crate::account::cut::Cut::At { seq: tip_seq, hash: tip_hash },
+            secrets_cut: crate::account::cut::Cut::Empty,
+            reason: "demoted".into(),
+        };
+        author_account_op_in_tx(&tx, &second_device, account, genesis, &demote, None, NOW + 2)
+            .unwrap();
+        let promote = AccountOp::OwnerPromote { device_fingerprint: founder_fp };
+        let promotion =
+            author_account_op_in_tx(&tx, &second_device, account, genesis, &promote, None, NOW + 2)
+                .unwrap();
+        tx.commit().unwrap();
+        deliver(&second, &founder, account);
+        assert!(
+            is_accepted(&founder, promotion),
+            "the founder's store accepts its re-promotion, or this pins nothing",
+        );
+
+        let joiner = DeviceSecret::from_seed(&[0x67; 32]);
+        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+        let enrolled = author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[0x68; 32]).public().to_bytes(),
+                label: None,
+            },
+            ops::DeviceRole::Member,
+            NOW + 4,
+        )
+        .expect("a re-promoted founder enrolls a device");
+        tx.commit().unwrap();
+        assert_eq!(
+            authored_header(&founder, enrolled).authority_ref,
+            Some(promotion.into()),
+            "it acts under the incarnation the promotion minted, not the closed genesis one",
+        );
+
+        // But not an ENROLLMENT DeviceAdd: a joiner accepts only one citing the genesis, so this
+        // would spend an invite's nonce on a receipt the joiner refuses.
+        let later = DeviceSecret::from_seed(&[0x69; 32]);
+        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+        let error = author_enrollment_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: later.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[0x6a; 32]).public().to_bytes(),
+                label: None,
+            },
+            ops::DeviceRole::Member,
+            NOW + 5,
+        )
+        .expect_err("a re-promoted founder cannot author an enrollment a joiner accepts");
+        drop(tx);
+        assert!(error.to_string().contains("only the founder"), "refused as such: {error}");
+    }
+
+    /// The enrollment DeviceAdd is the one a joiner verifies, against the founder's key and genesis
+    /// incarnation alone. Any owner can author a plain DeviceAdd; authoring THIS one from a second
+    /// owner would spend an invite's nonce on a receipt the joiner refuses.
+    #[test]
+    fn only_the_founder_authors_an_enrollment_device_add() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let (second, _) = joined_store(&founder, account, ops::DeviceRole::Owner);
+        let enrolling = |seed: u8| {
+            let joiner = DeviceSecret::from_seed(&[seed; 32]);
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[seed.wrapping_add(1); 32])
+                    .public()
+                    .to_bytes(),
+                label: None,
+            }
+        };
+
+        let tx = Transaction::new_unchecked(&second, TransactionBehavior::Immediate).unwrap();
+        let error = author_enrollment_device_add_in_tx(
+            &tx,
+            enrolling(0x6b),
+            ops::DeviceRole::Member,
+            NOW + 2,
+        )
+        .expect_err("a second owner cannot author an enrollment a joiner accepts");
+        drop(tx);
+        assert!(error.to_string().contains("only the founder"), "refused as such: {error}");
+
+        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+        author_enrollment_device_add_in_tx(&tx, enrolling(0x6d), ops::DeviceRole::Member, NOW + 2)
+            .expect("the founder still authors enrollments");
+        tx.commit().unwrap();
+    }
+
+    /// Under a pin, a second owner's first control op still opens its own chain. Its held and
+    /// accepted tails are both empty, and that agrees; requiring an accepted tail to exist would
+    /// refuse every device with no control history of its own.
+    #[test]
+    fn under_a_pin_a_second_owners_first_control_op_opens_its_chain() {
+        let founder = db();
+        let account = bootstrap::local_account(&founder, NOW).unwrap();
+        let subject = enrol(&founder, 0x71);
+        let (second, _) = joined_store(&founder, account, ops::DeviceRole::Owner);
+        crate::account::test_support::install_real_pin(&second, account, NOW + 2);
+
+        let tx = Transaction::new_unchecked(&second, TransactionBehavior::Immediate).unwrap();
+        let removal = author_device_remove_in_tx(&tx, subject, "lost", NOW + 3)
+            .expect("a second owner authors its first control op under the pin");
+        tx.commit().unwrap();
+
+        let header = authored_header(&second, removal);
+        assert_eq!((header.seq, header.prev_hash), (0, None), "it opens its own chain");
+        assert_eq!(header.op_version, v2_ops::CONTROL_VERSION, "signed as control v2");
+        assert!(!still_enrolled(&second, account, subject), "and the removal takes effect");
     }
 }

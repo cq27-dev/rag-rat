@@ -1508,16 +1508,16 @@ pub fn account_effective_count(conn: &Connection, account_id: AccountId) -> anyh
 }
 
 /// The `owner_id` of the device's CURRENTLY-LIVE owner incarnation — the `entry_hash` of the still
-/// -open genesis / `OwnerPromote` that put it in the owner role — or `None` when the device holds
-/// no open owner incarnation. A REVERSE lookup by device, distinct from
+/// -open genesis, Owner `DeviceAdd` or `OwnerPromote` that put it in the owner role — or `None`
+/// when the device holds no open owner incarnation. A REVERSE lookup by device, distinct from
 /// [`owner_incarnation_effective`] (which self-opens a Deferred txn and VALIDATES a known
 /// `owner_id`); this reads whatever snapshot `conn` is already in, so the in-tx author seam calls
 /// it with its own `tx`. Normally exactly one open incarnation exists per device; `ORDER BY
-/// effective_at DESC, owner_id` keeps the pick deterministic if more than one ever coexisted. The
-/// `StreamKeyWrap` author cites this as `authority_ref`: for the founder it resolves to the genesis
-/// hash (a founder's `owner_id` IS its genesis), but a demoted-then-repromoted or non-founder owner
-/// gets its CURRENT incarnation, so a hard-coded genesis would cite a CLOSED incarnation and roll
-/// every mint back.
+/// effective_at DESC, owner_id` keeps the pick deterministic if more than one ever coexisted. Every
+/// owner-authored seam — control ops, `StreamKeyWrap`s — cites this as `authority_ref`: for the
+/// founder it resolves to the genesis hash (a founder's `owner_id` IS its genesis), but a
+/// demoted-then-repromoted or non-founder owner gets its CURRENT incarnation, so a hard-coded
+/// genesis would cite a CLOSED or foreign incarnation and its own fold would reject the entry.
 pub(in crate::account) fn effective_owner_incarnation_for_device(
     conn: &Connection,
     account_id: AccountId,
@@ -3275,8 +3275,13 @@ pub(super) fn effective_roster_entry_in_snapshot(
     super::control_policy::require_foldable_account_control(conn, account_id)?;
     let row: Option<(Vec<u8>, String)> = conn
         .query_row(
+            // The fold rejects a duplicate `DeviceAdd`, so a second open row for one fingerprint
+            // is not expected — but `device_is_effective_writer` is written for it,
+            // and this result is signed into content as its `roster_ref`, so the pick
+            // is total rather than left to SQLite's row order.
             "SELECT roster_ref, role FROM account_roster_history
-             WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL",
+             WHERE account_id = ?1 AND device_fingerprint = ?2 AND closed_at IS NULL
+             ORDER BY effective_at DESC, roster_ref LIMIT 1",
             params![account_id.to_bytes().as_slice(), fingerprint.to_bytes().as_slice()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )

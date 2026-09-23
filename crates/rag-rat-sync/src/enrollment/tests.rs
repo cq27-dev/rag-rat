@@ -2519,3 +2519,158 @@ fn a_pin_that_moved_after_consumption_still_replays_the_acknowledged_receipt() {
         .expect("a lost response must still be answerable after the pin moves");
     assert_eq!(replayed, receipt, "the replay must be the receipt already acknowledged");
 }
+
+/// A store that joined `founder`'s account at `role`, exactly as enrollment adopts one: its local
+/// device is the joined device, so everything it mints is authorized as that device.
+fn joined_store(founder: &Connection, account: AccountId, role: DeviceRole) -> Connection {
+    let joined = db();
+    let device = rag_rat_oplog::local_device(&joined, NOW).unwrap();
+    let tx = Transaction::new_unchecked(founder, TransactionBehavior::Immediate).unwrap();
+    let device_add = rag_rat_oplog::author_device_add_in_tx(
+        &tx,
+        rag_rat_oplog::EnrollingDevice {
+            ed25519_pubkey: device.ed25519_public_key(),
+            x25519_pubkey: device.x25519_public_key(),
+            label: None,
+        },
+        role,
+        NOW,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let entries: Vec<Vec<u8>> = rag_rat_oplog::account_entries_for_enrollment(founder, account)
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.signed_bytes)
+        .collect();
+    rag_rat_oplog::adopt_enrollment_bootstrap(&joined, rag_rat_oplog::EnrollmentBootstrap {
+        account_entries: &entries,
+        account_id: account,
+        genesis_hash: rag_rat_oplog::read_local_account_genesis(founder).unwrap().unwrap(),
+        device_fingerprint: device.fingerprint(),
+        device_add_hash: device_add,
+        now_ms: NOW + 1,
+    })
+    .unwrap();
+    joined
+}
+
+/// A second owner can author a `DeviceAdd`, but it must not be able to MINT an invite yet. The
+/// joiner verifies a receipt's DeviceAdd against the founder's key alone, and redemption consumes
+/// the nonce before the joiner checks anything — so an invite a second owner minted would be spent
+/// on an enrollment the joiner then refuses, identically on every replay. The gate has to widen
+/// together with that verifier, not ahead of it.
+#[test]
+fn a_second_owner_cannot_mint_until_the_joiner_accepts_its_device_add() {
+    let founder = db();
+    let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let owner = joined_store(&founder, account, DeviceRole::Owner);
+
+    let refused = mint_invite(&owner, InviteSpec {
+        account_id: account,
+        inviter_node_id: crate::endpoint::node_id_from_secret([2; 32]),
+        relay_url: "https://relay.example".into(),
+        role: DeviceRole::Member,
+        label: Some("laptop"),
+        now_ms: &|| NOW,
+        ttl: Duration::from_secs(60),
+    });
+    // Never `{:?}` the `Ok` side: an invite ticket's Debug output carries its one-time nonce, which
+    // is a bearer secret for the enrollment it grants.
+    match refused {
+        Err(InviteError::Storage(error)) => assert!(
+            error.to_string().contains("founder authority"),
+            "refused at the gate, before any nonce exists: {error}",
+        ),
+        Err(error) => panic!("refused for the wrong reason: {error}"),
+        Ok(_) => panic!("a second owner must not mint an invite yet"),
+    }
+    let invites: i64 =
+        owner.query_row("SELECT COUNT(*) FROM sync_invites", [], |row| row.get(0)).unwrap();
+    assert_eq!(invites, 0, "the refusal left no invite behind");
+
+    // Why the gate stays closed: the second owner CAN author the DeviceAdd, and the joiner refuses
+    // it. When the verifier learns to accept a non-founder DeviceAdd, this half fails — which is
+    // the signal that the gate above may now widen with it.
+    let joiner = rag_rat_oplog::local_device(&db(), NOW).unwrap();
+    let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
+    let device_add = rag_rat_oplog::author_device_add_in_tx(
+        &tx,
+        rag_rat_oplog::EnrollingDevice {
+            ed25519_pubkey: joiner.ed25519_public_key(),
+            x25519_pubkey: joiner.x25519_public_key(),
+            label: None,
+        },
+        DeviceRole::Member,
+        NOW + 2,
+    )
+    .expect("a second owner authors the DeviceAdd itself");
+    tx.commit().unwrap();
+    let entries = rag_rat_oplog::account_entries_for_enrollment(&owner, account).unwrap();
+    let device_add_signed = entries
+        .iter()
+        .find(|entry| entry.entry_hash == device_add)
+        .expect("the authored DeviceAdd is held")
+        .signed_bytes
+        .clone();
+    let bootstrap: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.signed_bytes).collect();
+    let error = rag_rat_oplog::verify_enrollment_device_add(
+        &bootstrap,
+        account,
+        device_add,
+        &device_add_signed,
+        joiner.ed25519_public_key(),
+        joiner.x25519_public_key(),
+    )
+    .expect_err("the joiner does not yet accept a DeviceAdd a non-founder signed");
+    assert!(
+        error.to_string().contains("founder"),
+        "refused for citing a non-founder authority: {error}",
+    );
+}
+
+/// A redemption that cannot author an enrollment the joiner accepts rolls back with the nonce
+/// unspent. Here the founder minted the invite and was then removed by another owner, so by
+/// redemption time it can no longer author the DeviceAdd. The refusal must come from inside the
+/// redemption transaction, before `used_at_ms` is written — moving the authoring below the
+/// consume would spend the invite on nothing.
+#[test]
+fn an_enrollment_the_founder_can_no_longer_author_leaves_the_nonce_unspent() {
+    let founder = db();
+    let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let founder_fp = rag_rat_oplog::local_device(&founder, NOW).unwrap().fingerprint();
+    let ticket = ticket(&founder, account, DeviceRole::Member);
+
+    let second = joined_store(&founder, account, DeviceRole::Owner);
+    let tx = Transaction::new_unchecked(&second, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::author_device_remove_in_tx(&tx, founder_fp, "lost", NOW + 2).unwrap();
+    tx.commit().unwrap();
+    for entry in rag_rat_oplog::account_entries_for_enrollment(&second, account).unwrap() {
+        rag_rat_oplog::account_ingest(&founder, &entry.signed_bytes, NOW + 3).unwrap();
+    }
+
+    let (ed25519_pubkey, x25519_pubkey) = joiner_keys();
+    let request = EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    let error = redeem_invite(&founder, request, [9; 32], &|| NOW + 4)
+        .expect_err("a removed founder cannot complete an enrollment");
+    assert!(
+        error.to_string().contains("only the founder"),
+        "refused by the enrollment seam, not by something that ran before it: {error}",
+    );
+    let used: Option<i64> = founder
+        .query_row(
+            "SELECT used_at_ms FROM sync_invites WHERE nonce = ?1",
+            [ticket.nonce.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(used, None, "the refusal rolled back with the one-time nonce unspent");
+}

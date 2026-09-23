@@ -139,6 +139,20 @@ struct ContentChainTail {
     entry_hash: AccountEntryHash,
 }
 
+/// The roster entry that enrolled this store's local device — what a content entry's
+/// `roster_ref` must name, since acceptance checks it against the signer's own enrollment. It is
+/// the genesis only for the founder; citing the genesis from any other device authors content the
+/// fold rejects.
+fn own_roster_ref(
+    tx: &Transaction<'_>,
+    account_id: AccountId,
+    fingerprint: DeviceFingerprint,
+) -> anyhow::Result<RosterRef> {
+    account_storage::effective_roster_entry_in_snapshot(tx, account_id, fingerprint)?
+        .map(|(roster_ref, _)| roster_ref)
+        .context("this device is not enrolled on the account, so it cannot author content")
+}
+
 /// Author `ops` as owner-authored `/3` content on `stream_id` WITHIN the caller's transaction:
 /// chain each entry from the current tail (genesis when the chain is empty), insert it as a
 /// candidate, refold the stream ONCE, then verify every entry folded `accepted` — else `bail!` so
@@ -152,14 +166,14 @@ pub fn author_content_batch_in_tx(
     ops: &[MemoryOp],
     now_ms: i64,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
-    // Owner-authored: the store's single local account is both author and owner. Resolve it (and
-    // its genesis entry hash, the `roster_ref`) from the pointer WITHOUT minting — the account
-    // must already exist.
-    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+    // Owner-authored: the store's single local account is both author and owner. Resolve it from
+    // the pointer WITHOUT minting — the account must already exist.
+    let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?.context(
         "cannot author /3 content before the store's local account is minted (call local_account \
          first)",
     )?;
     let device = local_device(tx, now_ms)?;
+    let roster_ref = own_roster_ref(tx, account_id, device.fingerprint())?;
     // The freshness seam, read in THIS snapshot (see the module header): cite our own current
     // effective control-fold length as both auth_len fields.
     let auth_len = account_storage::account_effective_count(tx, account_id)?;
@@ -169,7 +183,7 @@ pub fn author_content_batch_in_tx(
             stream_id,
             account_id,
             device: &device,
-            roster_ref: genesis_hash.into(),
+            roster_ref,
             // Owner-authored: author == owner, so no delegated grant.
             grant_id: None,
             owner_auth_len: auth_len,
@@ -319,7 +333,7 @@ pub fn author_grantee_content_batch_in_tx(
     ops: &[MemoryOp],
     now_ms: i64,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
-    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
+    let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?
         .context("cannot author granted /3 content before the store's local account is minted")?;
     anyhow::ensure!(
         account_id != owner_account_id,
@@ -327,6 +341,8 @@ pub fn author_grantee_content_batch_in_tx(
          authors via author_content_batch_in_tx",
     );
     let device = local_device(tx, now_ms)?;
+    // Our roster citation is in our OWN account, whose owner this contributor is not.
+    let roster_ref = own_roster_ref(tx, account_id, device.fingerprint())?;
     // Cite the OWNER's current fold count for the ownership/grant citations' freshness, and our OWN
     // count for our roster citation — the two provenance halves the acceptance fold checks
     // separately.
@@ -338,7 +354,7 @@ pub fn author_grantee_content_batch_in_tx(
             stream_id,
             account_id,
             device: &device,
-            roster_ref: genesis_hash.into(),
+            roster_ref,
             grant_id: Some(grant_id),
             owner_auth_len,
             author_auth_len,
@@ -652,9 +668,10 @@ fn seal_and_author_in_tx(
     device: &LocalDevice,
     now_ms: i64,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
-    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?
+    let LocalAccountRef { account_id, .. } = bootstrap::local_account_ref(tx)?
         .context("cannot author sealed /3 content before the store's local account is minted")?;
     let fingerprint = device.fingerprint();
+    let roster_ref = own_roster_ref(tx, account_id, fingerprint)?;
     let auth_len = account_storage::account_effective_count(tx, account_id)?;
 
     // Stream-global LWW clock (#1164) — see `author_content_batch_in_tx`.
@@ -684,7 +701,7 @@ fn seal_and_author_in_tx(
             lamport,
             prev_hash,
             grant_id: None,
-            roster_ref: genesis_hash.into(),
+            roster_ref,
             owner_auth_len: auth_len,
             author_auth_len: auth_len,
             crypto_suite: 0,
