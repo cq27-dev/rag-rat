@@ -155,6 +155,25 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         ],
     )
     .map_err(|error| InviteError::Storage(error.into()))?;
+    // Stamp the pin the account ACTUALLY carries, read in the mint transaction — never a caller
+    // argument, so a caller can neither forget it nor forge one. `None` while the account is
+    // unpinned, which is every ticket today: minting is still refused under a pin until the
+    // enrollment gates open.
+    let checkpoint_digest = match rag_rat_oplog::account_control_policy(&tx, account_id)
+        .map_err(InviteError::Storage)?
+    {
+        rag_rat_oplog::AccountControlPolicy::LegacyV1 => None,
+        rag_rat_oplog::AccountControlPolicy::ControlV2(pin) => Some(pin.checkpoint_digest),
+        // Fail CLOSED for a version this binary cannot execute. `None` would be the fail-OPEN
+        // spelling of "I don't know": the ticket would assert that a pinned account is unpinned,
+        // and a joiner would enrol without installing its pin — the exact failure the domain bump
+        // exists to prevent, only silent. Unreachable today, since both pinned states are refused
+        // above; it is here so opening that gate has to decide this rather than inherit it.
+        rag_rat_oplog::AccountControlPolicy::UnsupportedVersion(pin) =>
+            return Err(InviteError::Storage(
+                rag_rat_oplog::UnsupportedAccountControlVersion { pin }.into(),
+            )),
+    };
     tx.commit().map_err(|error| InviteError::Storage(error.into()))?;
     Ok(InviteTicket {
         kind: InviteTicketKind::Pairing,
@@ -163,6 +182,7 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         relay_url,
         nonce,
         expires_at_ms,
+        checkpoint_digest,
     })
 }
 
@@ -280,6 +300,9 @@ pub fn mint_writer_invite(
         relay_url,
         nonce,
         expires_at_ms,
+        // A writer grant is cross-account and pins nothing; decode refuses one that carries a
+        // digest, so this is the only value it may take.
+        checkpoint_digest: None,
     })
 }
 

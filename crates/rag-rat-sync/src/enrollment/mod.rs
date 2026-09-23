@@ -26,7 +26,7 @@ pub use session::{
     run_enrollment_dialer_with_progress, run_writer_grant_dialer,
 };
 pub(crate) use session::{RESPONSE_ACK, RESPONSE_ACK_TIMEOUT};
-pub use ticket::{InviteTicket, InviteTicketKind};
+pub use ticket::{InviteTicket, InviteTicketKind, TICKET_KIND_PREFIX};
 pub use wire::{EnrollmentReceipt, EnrollmentRequest, WriterGrantReceipt, WriterGrantRequest};
 
 pub const ENROLL_ALPN: &[u8] = b"rag-rat/enroll/1";

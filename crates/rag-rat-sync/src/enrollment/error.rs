@@ -4,6 +4,11 @@
 pub enum InviteError {
     #[error("malformed enrollment data: {0}")]
     Malformed(String),
+    /// The ticket is well-formed but names a different revision of the ticket format. Its own
+    /// variant rather than a `Malformed` string: the operator-facing message is selected by
+    /// matching this, and keying that off formatted text would revert silently on a reword.
+    #[error("{0}")]
+    TicketVersionSkew(&'static str),
     #[error("enrollment invite expired")]
     Expired,
     #[error("enrollment invite was already used")]
