@@ -464,5 +464,17 @@ fn status_reports_policy_skipped_chunks_as_skipped_not_missing() {
     assert_eq!(status.eligible_embeddings, 0);
     assert_eq!(status.missing_embeddings, 0);
     assert_ne!(status.next.as_deref(), Some("rag-rat reconcile --limit 500"));
+
+    // `SkipTooLarge` depends on the configured cap, which the status cannot see — a raised cap
+    // makes those chunks embeddable — so they stay counted as eligible.
+    conn.execute("UPDATE chunks SET embedding_policy = 'SkipTooLarge'", []).unwrap();
+    let status = ai::fastembed_operational_status(
+        conn,
+        &ai::active_embedding_model_id(conn).unwrap(),
+        total,
+    )
+    .unwrap();
+    assert_eq!(status.skipped_embeddings, 0, "a cap-dependent skip is not counted");
+    assert_eq!(status.missing_embeddings, total);
     let _ = fs::remove_dir_all(&root);
 }

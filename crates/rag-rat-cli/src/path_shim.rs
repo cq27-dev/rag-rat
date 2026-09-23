@@ -103,8 +103,11 @@ const CMD_MARKER: &str = "rem rag-rat plugin shim";
 
 /// Where the plugins cache the binary: the launcher's managed cache and npm's `npx` cache.
 struct Caches {
-    /// `<XDG_CACHE_HOME|~/.cache>/rag-rat/bin`, whose children are named by version.
-    managed: PathBuf,
+    /// `<XDG_CACHE_HOME|~/.cache>/rag-rat/bin`, whose children are named by version — in both its
+    /// lexical and its symlink-resolved form. `current_exe()` reports the resolved path, while a
+    /// shim the plugin launcher once wrote may name the lexical one; a cache reached through a
+    /// symlink must be recognised either way.
+    managed: Vec<PathBuf>,
 }
 
 impl Caches {
@@ -112,7 +115,19 @@ impl Caches {
         let cache_home = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::home_dir().map(|home| home.join(".cache")))?;
-        Some(Self { managed: std::path::absolute(cache_home).ok()?.join("rag-rat").join("bin") })
+        Self::at(cache_home)
+    }
+
+    fn at(cache_home: PathBuf) -> Option<Self> {
+        let lexical = std::path::absolute(&cache_home).ok()?.join("rag-rat").join("bin");
+        let mut managed = vec![lexical.clone()];
+        // The cache root, not `rag-rat/bin` under it: that may not exist yet on a first run.
+        if let Ok(root) = rag_rat_base::paths::canonicalize(&cache_home)
+            && root.join("rag-rat").join("bin") != lexical
+        {
+            managed.push(root.join("rag-rat").join("bin"));
+        }
+        Some(Self { managed })
     }
 
     /// A binary the plugins put there — the only kind the shim ever points at, or replaces.
@@ -120,7 +135,7 @@ impl Caches {
         let name = if cfg!(windows) { "rag-rat.exe" } else { "rag-rat" };
         let npx = Path::new("@rag-rat").join("bin").join("node_modules").join(".bin_real");
         binary.file_name() == Some(OsStr::new(name))
-            && (binary.starts_with(&self.managed)
+            && (self.managed.iter().any(|root| binary.starts_with(root))
                 || binary.parent().is_some_and(|dir| dir.ends_with(&npx)))
     }
 
@@ -130,7 +145,7 @@ impl Caches {
         if !binary.is_file() {
             return None;
         }
-        if let Ok(rest) = binary.strip_prefix(&self.managed) {
+        if let Some(rest) = self.managed.iter().find_map(|root| binary.strip_prefix(root).ok()) {
             return rest.iter().next().map(|v| v.to_string_lossy().into_owned());
         }
         let out = std::process::Command::new(binary).arg("--version").output().ok()?;
@@ -324,7 +339,7 @@ mod tests {
 
         fn fixture() -> Fixture {
             let dir = tempfile::tempdir().unwrap();
-            let caches = Caches { managed: dir.path().join("cache/rag-rat/bin") };
+            let caches = Caches { managed: vec![dir.path().join("cache/rag-rat/bin")] };
             let shims = dir.path().join("shims");
             let npx =
                 dir.path().join("npm/_npx/abc/node_modules/@rag-rat/bin/node_modules/.bin_real");
@@ -342,7 +357,7 @@ mod tests {
 
         impl Fixture {
             fn managed(&self, version: &str) -> PathBuf {
-                stub(&self.caches.managed.join(version), version)
+                stub(&self.caches.managed[0].join(version), version)
             }
             fn refresh(&self, binary: &Path, version: &str) -> bool {
                 refresh_at(binary, version, &self.caches, &self.shims).unwrap()
@@ -366,6 +381,23 @@ mod tests {
             fs::remove_file(&v2).unwrap();
             assert!(f.refresh(&v1, "1.2.0"), "a dangling link is replaced by anything");
             assert_eq!(f.target(), Some(v1));
+        }
+
+        /// `current_exe()` reports the resolved path; a cache reached through a symlink must still
+        /// be recognised as the plugin's.
+        #[test]
+        fn a_cache_reached_through_a_symlink_is_still_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("real-cache");
+            fs::create_dir_all(&real).unwrap();
+            let link = dir.path().join("cache-link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let caches = Caches::at(link).unwrap();
+            let resolved =
+                rag_rat_base::paths::canonicalize(&real).unwrap().join("rag-rat/bin/1.0.0");
+            let binary = stub(&resolved, "1.0.0");
+            assert!(caches.holds(&binary), "the resolved path of a symlinked cache is ours");
+            assert_eq!(caches.version_of(&binary).as_deref(), Some("1.0.0"));
         }
 
         #[test]

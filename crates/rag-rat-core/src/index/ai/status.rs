@@ -190,8 +190,21 @@ pub(crate) fn fastembed_operational_status(
     // stamped `chunks.embedding_policy` column gives the per-policy counts cheaply, but only while
     // its stamp is certified at the default cap; otherwise the exact split needs the per-chunk
     // re-derivation `reconcile --plan` does, and every chunk is reported eligible as before.
-    let skipped = policy_skip_summary_from_column(conn, DEFAULT_MAX_EMBEDDING_CHARS)?
-        .map_or(0, |by_policy| by_policy.values().sum::<u64>().min(total_chunks));
+    //
+    // `SkipTooLarge` is left out: it depends on the configured `max_embedding_chars`, which the
+    // status cannot see, and a raised cap makes those chunks embeddable. Every other skip policy is
+    // cap-independent.
+    let skipped = policy_skip_summary_from_column(conn, DEFAULT_MAX_EMBEDDING_CHARS)?.map_or(
+        0,
+        |by_policy| {
+            by_policy
+                .iter()
+                .filter(|(policy, _)| policy.as_str() != EmbeddingPolicy::SkipTooLarge.as_db_str())
+                .map(|(_, count)| count)
+                .sum::<u64>()
+                .min(total_chunks)
+        },
+    );
     let eligible = total_chunks - skipped;
     let missing = eligible.saturating_sub(
         current.saturating_add(stale).saturating_add(failed).saturating_add(blocked),
