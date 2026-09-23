@@ -34,9 +34,9 @@ readiness probe are backend-independent. Only the **route** differs:
 
 | Backend | Image (pinned, `#689`) | Port | Embeddings route | GPU | Model load |
 |---|---|---|---|---|---|
-| `ollama` | `ollama/ollama:0.32.1@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0` | 11434 | `/v1/embeddings` | optional | `ollama pull` after boot |
+| `ollama` | `ollama/ollama:0.34.3@sha256:7ab595e4ead391f6818c7215297781282babe0701f6d9a9f8862ac591360a58b` | 11434 | `/v1/embeddings` | optional | `ollama pull` after boot |
 | `infinity` | `michaelf34/infinity:0.0.77@sha256:11e8b3921b9f1a58965afaad4a844c435c9807cbc82c51e47cb147b7d977fc88` (GPU) / `michaelf34/infinity:latest-cpu@sha256:161ef2dd48ba050ad29a413d671270502acb4ad67759d695eb0d325c033a935d` (CPU) | 7997 | `/embeddings` | optional | auto-download on boot |
-| `vllm` | `vllm/vllm-openai:v0.25.1@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089` | 8000 | `/v1/embeddings` | **required** | auto-download on boot |
+| `vllm` | `vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90` | 8000 | `/v1/embeddings` | **required** | auto-download on boot |
 
 Images are pinned `tag@digest` (see `recipes/backends.mts`) — an unpinned `:latest` let upstream image
 bumps change server behavior with no change on our side; bump the pin deliberately, never revert to

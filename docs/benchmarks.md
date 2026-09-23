@@ -24,7 +24,7 @@ one slot.
 | CPU | AMD Ryzen 5 3600 — 6 cores / 12 threads, up to ~4.2 GHz |
 | RAM | 64 GB (62 GiB) DDR4 |
 | Storage | 2× Samsung MZVLB512HBJQ NVMe SSD in Linux mdraid **RAID1**, ext4 — kernel checkout + index DB both on NVMe (`KERNEL_WORK` set off the box's RAM-backed `/tmp`) |
-| Build + run env | `tools/bench.Containerfile` — `debian:trixie-slim`, rustc/cargo **1.96.0** (stable), release build (`cargo build --release --no-default-features`) |
+| Build + run env | `tools/bench.Containerfile` — `debian:trixie-slim`, rustc/cargo **1.98.0** (stable), release build (`cargo build --release --no-default-features`) |
 
 The rebuild's per-wave prepare stage is parallel (rayon), but the bulk of the wall-clock — the edge
 resolve + insert + index rebuild + FTS pipeline — is serial and storage-bound, so storage speed

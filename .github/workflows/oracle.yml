@@ -118,7 +118,7 @@ jobs:
       tier: ${{ steps.select.outputs.tier }}
       corpora: ${{ steps.select.outputs.corpora }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: select
         run: |
           set -euo pipefail
@@ -149,14 +149,12 @@ jobs:
       matrix:
         corpus: ${{ fromJSON(needs.matrix.outputs.corpora) }}
     steps:
-      - uses: actions/checkout@v5
-      # Pinned to 1.96.0, not `@stable`: rust-analyzer 1.97's `next_solver` panics generating the
-      # ground-truth SCIP for the rust-time corpus ("expected int of size 8, but got size 1") — see
-      # #553. 1.96.0 is the last stable whose rust-analyzer emits the fixture SCIP cleanly; revert to
-      # `@stable` once a released RA no longer panics. rust-analyzer as a toolchain component still
-      # pins the SCIP emitter to a stable release (not the weekly `releases/latest`), so the rust-time
-      # leg's numbers don't shift under the PR.
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@v7
+      # Pinned to an exact stable, not `@stable`: rust-analyzer 1.97's `next_solver` panicked
+      # generating the ground-truth SCIP for the rust-time corpus ("expected int of size 8, but got
+      # size 1") — see #553; 1.98.0 emits it cleanly. The exact pin keeps the SCIP emitter from moving
+      # under a PR, so the rust-time leg's numbers only shift when this line is bumped deliberately.
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rust-analyzer
       - uses: Swatinem/rust-cache@v2
@@ -177,10 +175,10 @@ jobs:
             rust-analyzer)
               # Already installed as a rustup component (toolchain step). Resolve the proxy from the
               # DEFAULT toolchain the `dtolnay/rust-toolchain` step set — NOT a hardcoded `--toolchain
-              # stable`, which would ignore the pin (currently 1.96.0, see the toolchain step) and copy
-              # the panicking stable rust-analyzer. Toolchain-agnostic, so the pin's `uses:` version is
-              # the single line to change when un-pinning. Copy the proxy to an absolute path on PATH
-              # so the oracle's `rust-analyzer scip` probe finds it.
+              # stable`, which would ignore the pin (currently 1.98.0, see the toolchain step) and copy
+              # whatever rust-analyzer the floating stable ships. Toolchain-agnostic, so the pin's
+              # `uses:` version is the single line to change when bumping. Copy the proxy to an
+              # absolute path on PATH so the oracle's `rust-analyzer scip` probe finds it.
               ra="$(rustup which rust-analyzer)"
               # A symlink, not a copy: the binary finds librustc_driver through an rpath relative
               # to its real location, so a copy elsewhere fails to load.
@@ -224,7 +222,7 @@ jobs:
 
       - name: Upload resolution report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oracle-report-${{ matrix.corpus }}
           path: ${{ runner.temp }}/${{ matrix.corpus }}-report.json
@@ -241,10 +239,10 @@ jobs:
     if: always() && needs.matrix.outputs.tier == 'small' && needs.small.result != 'skipped'
     runs-on: ubicloud-standard-2
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download all corpus reports
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: oracle-report-*
           path: reports
@@ -253,7 +251,7 @@ jobs:
       # main's last reports, for the Δ column. restore-keys prefix-matches the most recent main save;
       # absent on the first run / a brand-new corpus → the script degrades to absolute-only.
       - name: Restore the main baseline reports
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: baselines
           key: oracle-baseline-${{ github.run_id }}
@@ -279,7 +277,7 @@ jobs:
 
       - name: Upload the rendered report (consumed by oracle-pr-comment.yml)
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oracle-report-md
           path: |
@@ -294,7 +292,7 @@ jobs:
           rm -rf baselines && mkdir baselines && cp reports/*-report.json baselines/
       - name: Save the main baseline cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: baselines
           key: oracle-baseline-${{ github.run_id }}
@@ -318,7 +316,7 @@ jobs:
       BENCHER_TESTBED: hetzner-bigmem
       BENCHER_API_KEY: ${{ secrets.BENCHER_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Pinned bench environment: rust-analyzer + scip-clang + kernel-build deps live in the image,
       # so the SCIP indexer versions are reproducible (the content-addressed tool_version). Layer-
@@ -361,7 +359,7 @@ jobs:
 
       - name: Upload report + BMF
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: oracle-heavy-${{ matrix.corpus }}
           path: |

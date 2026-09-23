@@ -11,7 +11,7 @@
 # Pinned by digest: `latest` would let `docker compose build --pull` swap Code-OSS for
 # an unreviewed upstream release on an unchanged repo revision — including changes to
 # the public security surface. Bump deliberately; the tag stays for readability.
-FROM codercom/code-server:4.131.0@sha256:3623e6362abdec6258472882b06fdeec9d6ce2ad3fda316b3c5d7ed092b89add
+FROM codercom/code-server:4.138.0@sha256:81706b71ace316157850cbcfb574714d1067249c107a415b3a03dc6b613ebfbc
 
 USER root
 COPY artifacts/rag-rat /usr/local/bin/rag-rat

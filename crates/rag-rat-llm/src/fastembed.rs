@@ -40,8 +40,8 @@ impl FastEmbedEmbedder {
         dim: usize,
         intra_threads: Option<usize>,
     ) -> anyhow::Result<Self> {
-        use fastembed::{InitOptions, TextEmbedding};
-        let mut options = InitOptions::new(model)
+        use fastembed::{TextEmbedding, TextInitOptions};
+        let mut options = TextInitOptions::new(model)
             .with_cache_dir(fastembed_cache_dir())
             .with_show_download_progress(true);
         // `ort_threads` caps the ONNX Runtime intra-op thread pool. Microsoft's prebuilt ORT

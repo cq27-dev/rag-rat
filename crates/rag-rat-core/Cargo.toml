@@ -31,7 +31,7 @@ gix.workspace = true
 httpdate.workspace = true
 iroh.workspace = true
 ignore = "0.4.33"
-model2vec-rs = { version = "0.2.1", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
+model2vec-rs = { version = "0.3.0", default-features = false, features = ["hf-hub", "fancy-regex"], optional = true }
 notify = "8.2.0"
 pulldown-cmark.workspace = true
 rayon.workspace = true

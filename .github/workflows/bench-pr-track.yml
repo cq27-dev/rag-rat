@@ -46,14 +46,14 @@ jobs:
     runs-on: ubicloud-standard-2
     steps:
       # Only the trusted tracker revision is checked out, never the benchmark's PR head.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Test artifact selection
         run: node --test .github/scripts/benchmark-artifact.test.cjs
       - name: Select the successful attempt's artifact
         id: artifact
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const select = require('./.github/scripts/benchmark-artifact.cjs');
@@ -63,7 +63,7 @@ jobs:
             core.setOutput('head_sha', selected.headSha);
             core.info(`Publishing run ${selected.runId}, attempt ${selected.attempt}, artifact ${selected.artifactId}`);
       - name: Download benchmark results (from step 1)
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           artifact-ids: ${{ steps.artifact.outputs.artifact_id }}
           run-id: ${{ steps.artifact.outputs.run_id }}
@@ -73,7 +73,7 @@ jobs:
           path: benchmark-input
 
       - name: Extract PR metadata from the saved event
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           BENCHMARK_HEAD_SHA: ${{ steps.artifact.outputs.head_sha }}
         with:

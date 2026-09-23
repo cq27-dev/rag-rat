@@ -37,7 +37,7 @@ jobs:
   skill-parity:
     runs-on: ubicloud-standard-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: bash plugin/test/verify-skill-parity.sh
 
   # ── Build a rag-rat once so the launcher matrix can drive a real MCP handshake ──────────────────
@@ -45,11 +45,11 @@ jobs:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
     runs-on: ubicloud-standard-4-ubuntu-2404 # glibc 2.39 — this IS the binary's runtime floor
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build rag-rat (debug answers mcp + agent-hook fine)
         run: cargo build -p rag-rat --bin rag-rat
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rag-rat-linux-gnu
           path: target/debug/rag-rat
@@ -65,8 +65,8 @@ jobs:
       matrix:
         image: ["ubuntu:24.04", "fedora:41"] # glibc 2.39 / ~2.40 — the shipped gnu binary
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: rag-rat-linux-gnu
           path: bin
@@ -88,8 +88,8 @@ jobs:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
     runs-on: ubicloud-standard-2
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - run: npm install -g @anthropic-ai/claude-code
@@ -100,8 +100,8 @@ jobs:
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.release_version != '') }}
     runs-on: ubicloud-standard-2
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - run: npm install -g @openai/codex
@@ -116,7 +116,7 @@ jobs:
       matrix:
         image: ["ubuntu:24.04", "fedora:41"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: "download-path handshake in ${{ matrix.image }} (v${{ github.event.inputs.release_version }})"
         env:
           VER: ${{ github.event.inputs.release_version }}

@@ -145,8 +145,8 @@ const OLLAMA_SPEC: BackendServerSpec = {
   capabilities: ["embed", "chat"],
   requiresGpu: false,
   modelLoad: "ollama-pull",
-  // #689: pinned to ollama 0.32.1 (resolved from `:latest` 2026-07-18) — bump deliberately.
-  image: () => "ollama/ollama:0.32.1@sha256:6345fbc18bd73a1e16404be681dbc6fd291a027cab43ed541abe78c4c81051b0",
+  // #689: pinned to ollama 0.34.3 (resolved from `:latest` 2026-09-23) — bump deliberately.
+  image: () => "ollama/ollama:0.34.3@sha256:7ab595e4ead391f6818c7215297781282babe0701f6d9a9f8862ac591360a58b",
   // `serve` boots an empty server regardless of capability; the model (embed or chat) is pulled after.
   entrypointArgs: () => ["serve"],
   servePath: (capability) => (capability === "chat" ? "/v1/chat/completions" : "/v1/embeddings"),
@@ -219,10 +219,10 @@ const VLLM_SPEC: BackendServerSpec = {
   // vLLM's published image (`vllm/vllm-openai`) is CUDA-only — a provider must attach a GPU.
   requiresGpu: true,
   modelLoad: "in-launch",
-  // #689: pinned to vLLM v0.25.1 (resolved from `:latest` 2026-07-18) — bump deliberately. This is
+  // #689: pinned to vLLM v0.30.0 (resolved from `:latest` 2026-09-23) — bump deliberately. This is
   // the exact issue's motivating case: an unpinned `:latest` let an upstream vLLM regression change
   // engine behavior under every ephemeral chat/embed box with no change on our side.
-  image: () => "vllm/vllm-openai:v0.25.1@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089",
+  image: () => "vllm/vllm-openai:v0.30.0@sha256:8a69ffad015f138d7170c4ddc429e230a3bc1c1719f67e14324749df200a4b90",
   // Entrypoint is `vllm serve`, so the model id is the first positional. vLLM binds loopback unless
   // `--host 0.0.0.0` is passed — the classic "up but unreachable" trap. The RUNNER is capability-
   // dependent: `--runner pooling` puts vLLM in embedding mode (current flag; the old `--task embed`

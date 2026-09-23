@@ -510,7 +510,7 @@ attached to each release and published to `@rag-rat/bin`, so `npx @rag-rat/bin` 
 SQLite is bundled (compiled from source via `rusqlite`), so there's no system-library prerequisite,
 but each platform needs a C toolchain: Linux ships one; on macOS install the Xcode Command Line
 Tools (`xcode-select --install`); on Windows install the Visual Studio Build Tools with the C++
-workload (MSVC). Requires **Rust 1.96+**; the workspace tracks that stable baseline for its
+workload (MSVC). Requires **Rust 1.98+**; the workspace tracks that stable baseline for its
 dependencies (the bundled SQLite build itself requires at least Rust 1.95 for `cfg_select!`).
 
 A few maintenance conveniences are Unix- or Linux-only by design and degrade quietly elsewhere — no

@@ -25,9 +25,9 @@ version = "0.23.2"
 authors = ["Kristaps Karlsons"]
 edition = "2024"
 # Bundled SQLite (rusqlite `bundled` -> libsqlite3-sys 0.38.1) compiles a build script that uses the
-# `cfg_select!` macro, stabilized in Rust 1.95. The workspace tracks Rust 1.96 so dependencies can
-# use the next stable standard-library baseline without compatibility shims.
-rust-version = "1.96"
+# `cfg_select!` macro, stabilized in Rust 1.95. The workspace tracks the current stable (1.98) so
+# dependencies can use the latest standard-library baseline without compatibility shims.
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/cq27-dev/rag-rat"
 readme = "README.md"
@@ -82,7 +82,7 @@ hkdf = "0.13"
 # canonicalization through the same crate is what keeps our roots comparable to gix's `workdir()`.
 # No-op on non-Windows. Already in the tree via gix; this only makes it a direct dependency.
 dunce = "1.0"
-fastembed = { version = "6.1.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+fastembed = { version = "7.1.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 # Cross-platform mtime setter, used only by `test_scratch`'s sweep test to age a fixture dir past
 # the sweep threshold (already in the tree transitively; a dev-dependency, not shipped).
 filetime = "0.2"
@@ -124,7 +124,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # when installed in the OS store; minimal Linux images must include a CA bundle. The transport is
 # driven on the papertrail module's private runtime at the sync boundary.
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-rmcp = { version = "3.3.0", features = ["transport-io"] }
+rmcp = { version = "3.4.1", features = ["transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 rayon = "1.12"
 regex = "1.13"
@@ -141,7 +141,7 @@ protobuf = "=3.7.2"
 scip = "0.10.0"
 # Rust identifier case classification needs the Unicode Annex #31 XID tables; `char::is_alphanumeric`
 # does not implement Rust's XID_Continue semantics.
-unicode-ident = "1.0.24"
+unicode-ident = "1.0.26"
 unicode-normalization = "0.1.25"
 # On-demand stack growth for the tree-sitter descent helpers. A hostile source file (a callee that
 # is thousands of nested parens, a thousands-deep generic type) parses within budget but recursing
@@ -173,12 +173,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "registry"] }
 tracing-appender = "0.2"
 # Grammar crates are exact-pinned so parser node coverage changes deliberately.
-tree-sitter = "=0.26.11"
+tree-sitter = "=0.27.0"
 tree-sitter-c = "=0.24.2"
 tree-sitter-cpp = "=0.23.4"
 # tree-sitter-go 0.25.0 is the latest published release; its own manifest requires
 # `tree-sitter ^0.25.8`, which — like tree-sitter-python's identical `^0.25.8` req below —
-# resolves fine against this workspace's pinned `tree-sitter = "=0.26.11"` core.
+# resolves fine against this workspace's pinned `tree-sitter = "=0.27.0"` core.
 tree-sitter-go = "=0.25.0"
 tree-sitter-kotlin = { package = "tree-sitter-kotlin-ng", version = "1.1.0" }
 tree-sitter-python = "=0.25.0"
