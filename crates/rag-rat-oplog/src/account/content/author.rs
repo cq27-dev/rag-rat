@@ -239,6 +239,7 @@ fn author_batch_in_tx(
         Some(max) => max.checked_add(1).context("/3 stream lamport clock overflow")?,
         None => 0,
     };
+    require_unforked_chain(tx, stream_id, account_id, fingerprint)?;
     let mut authored = Vec::with_capacity(ops.len());
     for (index, op) in ops.iter().enumerate() {
         // Mint the seq from the candidate tail. Under verify-accepted+rollback the candidate tail
@@ -679,6 +680,7 @@ fn seal_and_author_in_tx(
         Some(max) => max.checked_add(1).context("/3 stream lamport clock overflow")?,
         None => 0,
     };
+    require_unforked_chain(tx, stream_id, account_id, fingerprint)?;
     let mut authored = Vec::with_capacity(ops.len());
     for (index, op) in ops.iter().enumerate() {
         let (seq, prev_hash) = match content_chain_tail(tx, stream_id, account_id, fingerprint)? {
@@ -815,6 +817,31 @@ pub fn content_stream_is_empty(conn: &Connection, stream_id: StreamId) -> anyhow
 /// The `(stream, author, device)` chain's highest-`seq` `/3` candidate, or `None` for an empty
 /// chain (→ genesis: seq 0, no predecessor). `seq` is stored as an 8-byte big-endian blob, so a
 /// blob `ORDER BY seq DESC` compares byte-wise and is numerically correct for the fixed width.
+/// Refuse to extend a content chain the device has forked (#1417); see
+/// `authoring::account_chain_tail` for why. Called once per batch, before its loop: it scans the
+/// whole chain, and a batch cannot fork a chain it extends itself. Refusing also covers
+/// [`content_chain_tail`]'s missing hash tiebreak, which only a forked chain could hit.
+fn require_unforked_chain(
+    tx: &Transaction<'_>,
+    stream_id: StreamId,
+    author_account_id: AccountId,
+    device_fingerprint: DeviceFingerprint,
+) -> anyhow::Result<()> {
+    match super::super::fork::content_chain_fork(
+        tx,
+        stream_id,
+        author_account_id,
+        device_fingerprint,
+    )? {
+        Some(seq) => Err(super::super::fork::ForkedChain {
+            lane: super::super::fork::ForkedLane::Content { stream_id, author_account_id },
+            seq,
+        }
+        .into()),
+        None => Ok(()),
+    }
+}
+
 fn content_chain_tail(
     tx: &Transaction<'_>,
     stream_id: StreamId,

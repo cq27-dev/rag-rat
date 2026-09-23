@@ -945,6 +945,17 @@ pub(super) fn account_chain_tail(
     device_fingerprint: DeviceFingerprint,
     log_id: u8,
 ) -> anyhow::Result<Option<(u64, AccountEntryHash)>> {
+    // Every account signing path extends its chain from here, so this is where a forked chain stops
+    // (#1417): the held tail of a forked chain may be the losing sibling, and everything signed on
+    // top of it would be silently forked too.
+    if let Some(seq) = super::fork::account_chain_fork(tx, account_id, device_fingerprint, log_id)?
+    {
+        return Err(super::fork::ForkedChain {
+            lane: super::fork::ForkedLane::Account { account_id, log_id },
+            seq,
+        }
+        .into());
+    }
     chain_tail(tx, account_id, device_fingerprint, log_id, TailScope::Held)
 }
 
@@ -2832,5 +2843,48 @@ mod tests {
         })
         .expect("and adoption's fold authorizes it");
         assert_eq!(bootstrap::read_local_account(&joined).unwrap(), Some(account));
+    }
+
+    /// A fork stops only the chain it is on (#1417). The same device keeps signing its other
+    /// chains, which is what keeps recovery reachable: a sole owner whose secrets chain forked
+    /// still needs its control chain to promote another device and have itself removed.
+    #[test]
+    fn a_forked_secrets_chain_refuses_secrets_authoring_and_leaves_control_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = db();
+        let (account, _) = account_owning_a_public_stream(&live);
+        let incarnation = |conn: &Connection, repo: &str| {
+            let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+            let hash = crate::advance_repo_incarnation_in_tx(&tx, repo, NOW)?;
+            tx.commit().unwrap();
+            anyhow::Ok(hash)
+        };
+        incarnation(&live, "repo-a").unwrap();
+        let path = dir.path().join("restored.db");
+        live.execute("VACUUM INTO ?1", [path.to_str().unwrap()]).unwrap();
+        let restored = Connection::open(&path).unwrap();
+
+        incarnation(&live, "repo-b").unwrap();
+        let sibling = incarnation(&restored, "repo-c").expect("the stale copy cannot tell");
+        let bytes: Vec<u8> = restored
+            .query_row(
+                "SELECT signed_bytes FROM account_entries WHERE entry_hash = ?1",
+                [sibling.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        storage::account_ingest(&live, &bytes, NOW + 1).unwrap();
+
+        let forked = crate::ForkedChain {
+            lane: crate::ForkedLane::Account { account_id: account, log_id: fold::SECRETS_LOG },
+            seq: 1,
+        };
+        let err = incarnation(&live, "repo-d").expect_err("a forked chain is not extended");
+        assert_eq!(err.downcast_ref::<crate::ForkedChain>(), Some(&forked), "got: {err:#}");
+        assert_eq!(crate::local_forked_chains(&live).unwrap(), vec![forked]);
+
+        let tx = Transaction::new_unchecked(&live, TransactionBehavior::Immediate).unwrap();
+        ensure_owned_stream_v2_in_tx(&tx, "repo-e", NOW).expect("the control chain is not forked");
+        tx.commit().unwrap();
     }
 }
