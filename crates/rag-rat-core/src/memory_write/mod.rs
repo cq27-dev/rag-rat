@@ -40,8 +40,8 @@ pub(crate) use drain::{drain_synced_stream_for_repo, drain_synced_streams_for_al
 pub(crate) use edges::{add_edge, remove_edge};
 pub(crate) use grants::{
     RepoGrantListing, RepoRevokeReport, catch_up_enrolled_device_keys, enable_public_authoring,
-    enable_sealed_authoring, grant_repo_writer, list_repo_grants, published_grant_target,
-    revoke_repo_writer,
+    enable_sealed_authoring, grant_repo_writer, list_repo_grants, promote_account_device,
+    published_grant_target, remove_account_device, revoke_repo_writer,
 };
 pub(crate) use ownership::{
     RepoOwnerConfig, SubscribeTrust, SubscriptionRouting, clear_contribution_owner,

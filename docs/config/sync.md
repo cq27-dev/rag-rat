@@ -278,6 +278,18 @@ re-drain seeds only the anchors each memory's author published.
 Discovery failing — unreachable, slow, rate-limited, or answering with nonsense — never fails a
 sync. The configured peers are dialed exactly as they would have been.
 
+### Managing devices
+
+`rag-rat sync devices` lists the account's enrolled devices: fingerprint, role, label, whether each
+holds owner authority, and which one is this store. The other two commands name a device by its
+fingerprint or its first 8+ hex digits, and must run on an owner device:
+
+- `rag-rat sync remove-device <device> [--reason <text>]` removes a lost device, or one whose store
+  forked (`sync whoami` lists forked chains: the store was restored from an older copy or copied to
+  another machine). A device cannot remove itself.
+- `rag-rat sync promote <device>` gives an enrolled member device owner authority, so a sole owner
+  can hand over before its own device is removed. A read-only device cannot be promoted.
+
 ### What a removed device keeps
 
 Removing a device revokes it, but per host and not instantly: a serving host authorizes every peer

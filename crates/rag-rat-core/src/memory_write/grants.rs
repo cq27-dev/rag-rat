@@ -175,6 +175,38 @@ pub(crate) fn catch_up_enrolled_device_keys(
     Ok(report)
 }
 
+/// Remove an enrolled device from the local account (owner-only) — the recovery for a device whose
+/// chain forked (#1417), or one that was lost. Account-scoped, not repo-scoped: the roster spans
+/// every repo. Stream keys the removed device held rotate at the next seal. Returns the device.
+pub(crate) fn remove_account_device(
+    conn: &Connection,
+    device: &str,
+    reason: &str,
+    now_ms: i64,
+) -> anyhow::Result<rag_rat_oplog::RosterDevice> {
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let subject = rag_rat_oplog::resolve_roster_device(&tx, device)?;
+    rag_rat_oplog::author_device_remove_in_tx(&tx, subject.fingerprint, reason, now_ms)?;
+    tx.commit()?;
+    Ok(subject)
+}
+
+/// Grant an enrolled member device owner authority on the local account (owner-only), so a sole
+/// owner can hand removal authority to another device before its own store is retired.
+pub(crate) fn promote_account_device(
+    conn: &Connection,
+    device: &str,
+    now_ms: i64,
+) -> anyhow::Result<rag_rat_oplog::RosterDevice> {
+    let _durability = AuthoredDurability::begin(conn)?;
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    let subject = rag_rat_oplog::resolve_roster_device(&tx, device)?;
+    rag_rat_oplog::author_owner_promote_in_tx(&tx, subject.fingerprint, now_ms)?;
+    tx.commit()?;
+    Ok(subject)
+}
+
 /// Grant `grantee_account_id` Writer authority on the ACTIVE repo's owner stream (#1164), so a
 /// separate identity can author memories into this repo's shared set. Owner-only: authoring the
 /// grant verifies it became the effective fact, which a non-owner device cannot produce. v1
