@@ -8,9 +8,8 @@ use std::path::PathBuf;
 
 use rag_rat_base::config::RemoteBackend;
 use rag_rat_base::language::Language;
+use rag_rat_setup::DirCandidate;
 use tui_tree_widget::TreeState;
-
-use crate::init::DirCandidate;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum StepId {

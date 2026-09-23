@@ -14,9 +14,7 @@ use crate::render::{
     print_output, print_output_or, print_reconcile_plan, render_index_progress,
     render_reconcile_progress,
 };
-use crate::{
-    DEFAULT_MAINTENANCE_SECONDS, acquire_cli_write_lock, open_index, report_pending_schema_upgrade,
-};
+use crate::{acquire_cli_write_lock, open_index, report_pending_schema_upgrade};
 
 pub(crate) fn index(config: &Config, args: &IndexArgs) -> anyhow::Result<()> {
     // The empty-index refusal is enforced ONCE, in the core `rebuild_with_progress` (#427); the CLI
@@ -509,10 +507,10 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // run must stay bounded by its index budget — a mirror flight can start a full backfill or
     // wait on provider rate limits, far past `--max-seconds`. Explicit mirroring is
     // `rag-rat papertrail sync`.
-    let hook_trigger = crate::hooks_support::ManagedHook::from_trigger(&trigger).is_some();
+    let hook_trigger = rag_rat_setup::hooks::ManagedHook::from_trigger(&trigger).is_some();
 
-    if crate::hooks_support::ManagedHook::from_trigger(&trigger)
-        == Some(crate::hooks_support::ManagedHook::PostCheckout)
+    if rag_rat_setup::hooks::ManagedHook::from_trigger(&trigger)
+        == Some(rag_rat_setup::hooks::ManagedHook::PostCheckout)
         && branch_checkout.as_deref() == Some("0")
     {
         MaintenanceReport {
@@ -532,8 +530,8 @@ pub(crate) fn maintenance(config: &Config, args: &MaintenanceArgs) -> anyhow::Re
     // doubles the work + memory pressure. Defer to the watcher; the query-path heal covers the
     // brief staleness gap. post-commit / post-rewrite touch only git metadata, which the
     // file-watcher can't see, so those still run (and are cheap — no file content changed).
-    if crate::hooks_support::ManagedHook::from_trigger(&trigger)
-        .is_some_and(crate::hooks_support::ManagedHook::changes_files)
+    if rag_rat_setup::hooks::ManagedHook::from_trigger(&trigger)
+        .is_some_and(rag_rat_setup::hooks::ManagedHook::changes_files)
         && crate::agent_hook::watcher_state(config).0
     {
         // The git action is still a tracker-change signal even when the index pass is the
@@ -725,7 +723,7 @@ fn run_maintenance_pass(
     args: &MaintenanceArgs,
     trigger: &str,
 ) -> anyhow::Result<MaintenanceReport> {
-    let max_seconds = args.max_seconds.unwrap_or(DEFAULT_MAINTENANCE_SECONDS);
+    let max_seconds = args.max_seconds.unwrap_or(rag_rat_setup::hooks::DEFAULT_MAINTENANCE_SECONDS);
     let started = Instant::now();
 
     // Debug-log span for the whole pass (off unless `[log]`/`RAG_RAT_LOG`). This is the entry point

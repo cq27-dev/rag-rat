@@ -3,13 +3,13 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use rag_rat_papertrail::ResolvedTracker;
+use rag_rat_setup::RepoScan;
+use rag_rat_setup::draft::{SetupDraft, TrackerMode};
 
 use super::catalog::CookbookCatalog;
-use super::draft::{TrackerMode, WizardDraft};
 use super::probe::ProbeRegistry;
 use super::steps::embedding::RemoteModeChoice;
 use super::steps::{CheckResult, StepId, StepState};
-use crate::init::RepoScan;
 
 pub(crate) const PROVISION_CONFIRM_WORD: &str = "provision";
 
@@ -83,7 +83,7 @@ pub(crate) fn provision_confirm_satisfied(ui: &WizardUiState) -> bool {
 /// corrupt a binding (e.g. a Jira tracker in a GitHub-hosted repo becomes GitHub while keeping the
 /// Jira project/auth). For a fresh draft it just pre-selects the detected provider so switching to
 /// Configure starts from the right place.
-fn seed_tracker_from_detection(draft: &mut WizardDraft, detected: Option<&ResolvedTracker>) {
+fn seed_tracker_from_detection(draft: &mut SetupDraft, detected: Option<&ResolvedTracker>) {
     if draft.tracker.mode != TrackerMode::AutoDetect {
         return;
     }
@@ -96,7 +96,7 @@ fn seed_tracker_from_detection(draft: &mut WizardDraft, detected: Option<&Resolv
 }
 
 pub(crate) struct WizardState {
-    pub draft: WizardDraft,
+    pub draft: SetupDraft,
     pub cookbooks: CookbookCatalog,
     /// What auto-detection resolves from the `origin` remote — the AutoDetect gate + panel
     /// (runtime auto-detection always uses `origin`, regardless of a binding's configured
@@ -118,12 +118,12 @@ pub(crate) struct WizardState {
 
 impl WizardState {
     #[cfg(test)]
-    pub(crate) fn new(draft: WizardDraft, scan: RepoScan) -> Self {
+    pub(crate) fn new(draft: SetupDraft, scan: RepoScan) -> Self {
         Self::with_cookbooks(draft, scan, CookbookCatalog::default())
     }
 
     pub(crate) fn with_cookbooks(
-        mut draft: WizardDraft,
+        mut draft: SetupDraft,
         scan: RepoScan,
         cookbooks: CookbookCatalog,
     ) -> Self {
@@ -217,13 +217,13 @@ impl WizardState {
 #[cfg(test)]
 mod tests {
     use rag_rat_base::config::Tracker;
+    use rag_rat_setup::RepoScan;
+    use rag_rat_setup::draft::SetupDraft;
 
     use super::*;
-    use crate::init::RepoScan;
-    use crate::init::wizard::draft::WizardDraft;
 
-    fn draft() -> WizardDraft {
-        WizardDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."))
+    fn draft() -> SetupDraft {
+        SetupDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."))
     }
 
     #[test]

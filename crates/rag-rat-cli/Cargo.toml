@@ -35,6 +35,7 @@ rag-rat-oplog.workspace = true
 rag-rat-sync.workspace = true
 rag-rat-query.workspace = true
 rag-rat-mcp = { workspace = true }
+rag-rat-setup.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "signal"] }

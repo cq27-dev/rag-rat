@@ -3,13 +3,13 @@
 //! `provision` confirm because it provisions a paid GPU.
 
 use rag_rat_base::config::valid_tracker_base_url;
+use rag_rat_setup::draft::DistillMode;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::super::draft::DistillMode;
 use super::super::state::{PROVISION_CONFIRM_WORD, WizardState, provision_confirm_satisfied};
 use super::super::theme;
 use super::embedding::one_line_field;
@@ -296,9 +296,10 @@ pub(super) fn validate_distillation(state: &WizardState) -> CheckResult {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_setup::RepoScan;
+    use rag_rat_setup::draft::{SetupDraft, TrackerMode};
+
     use super::*;
-    use crate::init::RepoScan;
-    use crate::init::wizard::draft::{TrackerMode, WizardDraft};
     use crate::init::wizard::state::{PROVISION_CONFIRM_WORD, WizardState};
 
     /// A wizard state whose tracker resolution is deterministic: a temp-dir root has no `origin`,
@@ -306,7 +307,7 @@ mod tests {
     fn state(tracker_mode: TrackerMode, detected: bool) -> WizardState {
         let dir = tempfile::tempdir().unwrap();
         let mut d =
-            WizardDraft::from_scan(&RepoScan::default(), ".".into(), dir.path().to_path_buf());
+            SetupDraft::from_scan(&RepoScan::default(), ".".into(), dir.path().to_path_buf());
         d.tracker.mode = tracker_mode;
         let mut s = WizardState::new(d, RepoScan::default());
         let make = || {

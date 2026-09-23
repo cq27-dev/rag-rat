@@ -12,13 +12,13 @@
 //! [`ReviewModel::can_confirm`] is false if any step carries a `Block` severity — the write gate
 //! is closed.
 
+use rag_rat_setup::draft::{DistillMode, RemoteMode, TrackerAuthMode, TrackerMode};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use super::draft::{DistillMode, RemoteMode, TrackerAuthMode, TrackerMode};
 use super::probe::{ProbeKind, ProbeStatus};
 use super::state::WizardState;
 use super::steps::{CheckResult, Sev as CheckSeverity, StepId, can_write};
@@ -404,19 +404,19 @@ mod tests {
     use std::path::PathBuf;
 
     use rag_rat_base::language::Language;
+    use rag_rat_setup::RepoScan;
+    use rag_rat_setup::draft::SetupDraft;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::init::RepoScan;
-    use crate::init::wizard::draft::WizardDraft;
     use crate::init::wizard::probe::{ProbeKind, ProbeMsg};
     use crate::init::wizard::state::WizardState;
     use crate::init::wizard::steps::CheckResult;
 
     fn bare_state() -> WizardState {
         let draft =
-            WizardDraft::from_scan(&RepoScan::default(), ".".to_string(), PathBuf::from("."));
+            SetupDraft::from_scan(&RepoScan::default(), ".".to_string(), PathBuf::from("."));
         WizardState::new(draft, RepoScan::default())
     }
 
@@ -435,7 +435,7 @@ mod tests {
     /// A state whose draft uses an EPHEMERAL remote with no passing spin-up probe → the Review
     /// model is `ephemeral_unverified` (the probe registry has no `Done(Ok)` entry by default).
     fn state_with_unverified_ephemeral() -> WizardState {
-        use crate::init::wizard::draft::{RemoteDraft, RemoteMode};
+        use rag_rat_setup::draft::{RemoteDraft, RemoteMode};
         let mut st = bare_state();
         st.draft.remote = Some(RemoteDraft {
             model: "all-minilm".to_string(),

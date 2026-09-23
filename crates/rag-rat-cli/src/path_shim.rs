@@ -201,8 +201,8 @@ fn refresh_at(binary: &Path, version: &str, caches: &Caches, dir: &Path) -> anyh
     }
     if let Some(current) = &current {
         let newer = match (
-            crate::hooks_support::release_version(version),
-            caches.version_of(current).as_deref().and_then(crate::hooks_support::release_version),
+            rag_rat_setup::hooks::release_version(version),
+            caches.version_of(current).as_deref().and_then(rag_rat_setup::hooks::release_version),
         ) {
             (Some(ours), Some(theirs)) => ours > theirs,
             (Some(_), None) => true, // dangling or unreadable: anything replaces it

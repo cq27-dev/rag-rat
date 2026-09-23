@@ -3,13 +3,13 @@
 
 use rag_rat_base::config::{Tracker, valid_tracker_base_url, valid_tracker_project};
 use rag_rat_papertrail::ResolvedTracker;
+use rag_rat_setup::draft::{TrackerAuthMode, TrackerDraft, TrackerMode};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use super::super::draft::{TrackerAuthMode, TrackerDraft, TrackerMode};
 use super::super::state::WizardState;
 use super::super::theme;
 use super::embedding::one_line_field;
@@ -382,14 +382,15 @@ pub(super) fn validate_papertrail(state: &WizardState) -> CheckResult {
 
 #[cfg(test)]
 mod tests {
+    use rag_rat_setup::RepoScan;
+    use rag_rat_setup::draft::SetupDraft;
+
     use super::*;
-    use crate::init::RepoScan;
-    use crate::init::wizard::draft::WizardDraft;
     use crate::init::wizard::state::WizardState;
 
     fn state() -> WizardState {
         let dir = tempfile::tempdir().unwrap();
-        let d = WizardDraft::from_scan(&RepoScan::default(), ".".into(), dir.path().to_path_buf());
+        let d = SetupDraft::from_scan(&RepoScan::default(), ".".into(), dir.path().to_path_buf());
         WizardState::new(d, RepoScan::default())
     }
 

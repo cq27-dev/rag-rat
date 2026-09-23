@@ -1,20 +1,19 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 use dialoguer::Confirm;
 use rag_rat_base::config::Config;
 use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, HASH_MODEL_ID, MODEL2VEC_MODEL_ID};
-use rag_rat_base::language::Language;
 use rag_rat_core::IndexDatabase;
 use rag_rat_core::index::ai::ReconcileOptions;
+use rag_rat_setup::hooks::git_paths;
+use rag_rat_setup::render::{config_root_value, render_config};
+use rag_rat_setup::scan::scan_repo;
+use rag_rat_setup::{RepoScan, default_plan};
 
-use super::render::{config_root_value, render_config, supported_languages};
-use super::scan::{estimated_chunks, recommend_backend, resolved_bindings, scan_repo};
 use super::wizard::{self, WizardResult};
-use super::{InitOptions, InitPlan, RepoScan, TerminalResetGuard};
+use super::{InitOptions, TerminalResetGuard};
 use crate::commands::apply_embedding_runtime_env;
-use crate::hooks_support::git_paths;
 use crate::render::{render_index_progress, render_reconcile_progress};
 
 pub(crate) fn run(args: &crate::cli::InitArgs, config_path: &str) -> anyhow::Result<()> {
@@ -244,37 +243,9 @@ fn install_git_hooks(config: &Config) {
             return;
         },
     };
-    match crate::hooks_support::install_managed_hooks(git.hooks_dir()) {
+    match rag_rat_setup::hooks::install_managed_hooks(git.hooks_dir()) {
         Ok(_) => eprintln!("init: installed git hooks in {}", git.hooks_dir().display()),
         Err(err) => eprintln!("init: skipped git hooks — {err}"),
-    }
-}
-pub(crate) fn default_plan(root_value: String, scan: &RepoScan) -> InitPlan {
-    let languages = supported_languages()
-        .into_iter()
-        .filter(|language| scan.language_counts.get(language).copied().unwrap_or_default() > 0)
-        .collect::<Vec<_>>();
-    let languages = if languages.is_empty() { vec![Language::Rust] } else { languages };
-    let bindings: BTreeMap<Language, Vec<PathBuf>> = languages
-        .iter()
-        .filter_map(|language| {
-            let defaults = resolved_bindings(scan, *language);
-            if defaults.is_empty() { None } else { Some((*language, defaults)) }
-        })
-        .collect();
-    // Keep `languages` consistent with the bindings actually emitted (a dropped env-only Python
-    // must not linger in the language list).
-    let languages =
-        languages.into_iter().filter(|language| bindings.contains_key(language)).collect();
-    let backend = recommend_backend(estimated_chunks(scan.total_source_bytes));
-    // Non-interactive default mirrors `OracleConfig`'s default: off until explicitly enabled.
-    InitPlan {
-        root_value,
-        languages,
-        bindings,
-        backend,
-        oracle_auto_run: false,
-        distill_enabled: false,
     }
 }
 pub(crate) fn setup_index(config: &Config, config_path: &Path) -> anyhow::Result<IndexDatabase> {
@@ -444,7 +415,7 @@ pub(crate) fn offer_hooks_install(config: &Config, assume_yes: bool) -> anyhow::
         return Ok(());
     }
     let git = git_paths(&config.root)?;
-    crate::hooks_support::install_managed_hooks(git.hooks_dir())?;
+    rag_rat_setup::hooks::install_managed_hooks(git.hooks_dir())?;
     eprintln!("init: installed hooks in {}", git.hooks_dir().display());
     Ok(())
 }
@@ -452,8 +423,10 @@ pub(crate) fn offer_hooks_install(config: &Config, assume_yes: bool) -> anyhow::
 mod default_plan_tests {
     use std::path::Path;
 
+    use rag_rat_base::language::Language;
+    use rag_rat_setup::scan::add_file_to_dir_counts;
+
     use super::*;
-    use crate::init::scan::add_file_to_dir_counts;
 
     #[test]
     fn wizard_git_hook_install_skips_non_git_roots() {

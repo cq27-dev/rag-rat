@@ -3,9 +3,8 @@
 //! These entries drive selector UX only. Runtime still persists and consumes plain
 //! `[llm.embedding.remote] cookbook` / `gpu` strings.
 
+use rag_rat_setup::draft::{MODAL_GPUS, RUNPOD_GPUS};
 use toml_edit::{DocumentMut, Item, TableLike};
-
-use super::draft::{MODAL_GPUS, RUNPOD_GPUS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CookbookEntry {
