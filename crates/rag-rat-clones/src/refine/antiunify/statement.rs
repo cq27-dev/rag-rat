@@ -12,7 +12,6 @@ fn is_statement_kind(kind: &str) -> bool {
         kind,
         "expression_statement"
             | "let_declaration"
-            | "let_statement"
             | "return_statement"
             | "macro_invocation"
             | "if_expression"
@@ -20,7 +19,6 @@ fn is_statement_kind(kind: &str) -> bool {
             | "for_expression"
             | "while_expression"
             | "loop_expression"
-            | "item"
             | "use_declaration"
     )
 }

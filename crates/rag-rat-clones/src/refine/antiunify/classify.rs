@@ -329,9 +329,10 @@ pub(super) fn classify_run(
 }
 
 /// `true` for an anchor node kind that opens a call or method head (the callee/path-head lives
-/// inside). Used by the differing-callee guard.
+/// inside). Used by the differing-callee guard. A method call is a `call_expression` too: its
+/// function child is a `field_expression` whose `field` is the method name.
 fn opens_call_head(kind: &str) -> bool {
-    matches!(kind, "call_expression" | "method_call_expression" | "macro_invocation")
+    matches!(kind, "call_expression" | "macro_invocation")
 }
 
 /// `true` for a callee-leaf node kind: the kind a function/method/macro callee head surfaces as
@@ -383,9 +384,8 @@ pub(super) fn run_in_callee_position(anchor: &RefineMember, lo: usize, hi: usize
     // enclosing call — NOT the receiver and NOT an argument:
     //
     // - A method-name head is a `field_identifier` in the call's function position (the `.map` of
-    //   `x.map(a)`): Rust models it as a `field_expression` field; the synthetic fixture as a bare
-    //   `field_identifier` sibling. Either way it is a `field_identifier` NOT inside the call's
-    //   `arguments` → method callee.
+    //   `x.map(a)`): Rust models it as the `field` of the call's `field_expression` function child
+    //   — a `field_identifier` NOT inside the call's `arguments` → method callee.
     // - A free-fn / macro callee shares the call's `start_byte` (`foo(...)` → `foo`) AND is NOT a
     //   method-call RECEIVER. The receiver (`x` of `x.map(a)`) ALSO shares the call's `start_byte`
     //   (the `field_expression`/method call begins at the receiver), so the head-position match
@@ -445,8 +445,8 @@ fn call_has_method_name_head(anchor: &RefineMember, call: &NodeSpan, run_end: us
 
 /// `true` when the run `[run_start..run_end]` is contained in an `arguments`/`argument_list` node
 /// nested inside the enclosing call `call` — i.e. the run is an ARGUMENT, not the method-name head.
-/// Used to keep the `method_call_expression` callee branch from promoting a differing argument leaf
-/// (`obj.map(x)` vs `obj.map(y)`) to a closure_param callee (P2b). Reconstructs the nesting from
+/// Used to keep the method-call callee branch from promoting a differing argument leaf
+/// (`obj.map(x)` vs `obj.map(y)`) to a closure_param callee. Reconstructs the nesting from
 /// the pre-order `node_spans` by byte-span containment (no parent pointers): an `arguments`-kind
 /// node inside `call` that contains the run.
 fn run_in_arguments_position(
@@ -471,7 +471,6 @@ fn is_closureish_kind(kind: &str) -> bool {
     matches!(
         kind,
         "call_expression"
-            | "method_call_expression"
             | "macro_invocation"
             | "field_expression"
             | "binary_expression"

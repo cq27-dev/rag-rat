@@ -66,7 +66,11 @@ pub const NORM_VERSION: i64 = 4;
 /// exhausted. A budget-exhausting class used to drain the shared cross-class allowance by the cells
 /// of every skipped member, so later classes in the same pass degraded (and latched
 /// `lcs_sampled`) earlier than the allowance intends; their cached templates move.
-pub(crate) const ALIGNMENT_VERSION: i64 = 4;
+///
+/// `5`: a Rust `item` token is no longer a statement snap unit. The only `item` node
+/// tree-sitter-rust has is the anonymous fragment-specifier token of a `$x:item` macro pattern,
+/// which the insertion snap mistook for a statement; classes containing one re-align.
+pub(crate) const ALIGNMENT_VERSION: i64 = 5;
 /// Smallest normalized-token count a symbol must reach to be fingerprinted (skip trivial getters).
 pub const MIN_TOKENS: usize = 20;
 

@@ -17,6 +17,8 @@ use super::parser::ParserKind;
 
 mod c_family;
 mod go;
+#[cfg(test)]
+mod grammar_kind_tests;
 mod kotlin;
 mod markdown;
 mod python;
@@ -30,13 +32,13 @@ pub(super) type SymbolMatch<'tree> = (&'static str, Node<'tree>);
 /// own span. A single binding retains the complete declaration span and signature.
 pub(super) fn emit_bindings<'tree>(
     node: Node<'tree>,
-    kind: &'static str,
+    symbol_kind: &'static str,
     names: Vec<Node<'tree>>,
     emit: &mut dyn FnMut(Node<'tree>, SymbolMatch<'tree>),
 ) {
     let multiple = names.len() > 1;
     for name in names {
-        emit(if multiple { name } else { node }, (kind, name));
+        emit(if multiple { name } else { node }, (symbol_kind, name));
     }
 }
 
