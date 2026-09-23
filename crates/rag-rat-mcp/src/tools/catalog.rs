@@ -40,6 +40,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "memory_rebind",
     "memory_update",
     "memory_search",
+    "memory_get",
     "memory_for_symbol",
     "memory_for_path",
     "memory_for_call_path",
@@ -95,6 +96,13 @@ pub fn replacement(name: &str) -> Option<&'static str> {
         "commits_touching_query" => "history_search {query, source: \"changes\"}",
         "papertrail_issue_search" => "history_search {query, source: \"issues\"}",
         "rationale_search" => "history_search {query, source: \"rationale\"}",
+        "memory_show" => "memory_get {memory_id}",
+        "memory_for_symbol" => "memory_get {symbol | ref | id}",
+        "memory_for_path" => "memory_get {path}",
+        "memory_for_call_path" => "memory_get {edge_sequence_hash}",
+        "memory_mark_obsolete" => "memory_update {memory_id, status: \"obsolete\"}",
+        "memory_rebind" => "memory_update {memory_id, bind}",
+        "clones_for_symbol" => "find_clones {id | ref | path + line}",
         _ => return None,
     })
 }
@@ -207,7 +215,9 @@ pub fn description(name: &str) -> &'static str {
              must be in [0.5, 1.0] (default 0.7). A LIMITED query (`limit: N`) is capped at the \
              refine budget (currently 50) — it returns at most 50 classes, all refined; pass \
              `limit: null`/omit it to retrieve all classes (only the top 50 refined). \
-             `completeness.refine_budget_clamped` is true when a supplied limit hit that cap.",
+             `completeness.refine_budget_clamped` is true when a supplied limit hit that cap. Name \
+             a symbol (`id` / `ref`, or `path` + `line`) instead for that symbol's clone class — \
+             null if it is unique — e.g. before writing a helper.",
         "clones_for_symbol" =>
             "The clone class containing a symbol (by id / ref / path+line). Returns the candidate \
              class if the symbol is fingerprinted and has clone siblings; null if it is unique or \
@@ -292,7 +302,12 @@ pub fn description(name: &str) -> &'static str {
              location — use this after a symbol moves or is renamed rather than obsoleting and \
              recreating the memory. Replaces the binding and refreshes the source_text_hash so the \
              memory stays current.",
-        "memory_update" => "Update a repo memory's text, status, confidence, kind, or tags by id.",
+        "memory_update" =>
+            "Update a repo memory by id: text, kind, confidence, tags, status (`\"obsolete\"` \
+             retires it), or `bind` to re-anchor it to a new symbol / path.",
+        "memory_get" =>
+            "Read memories: one in full by `memory_id`, or those bound to a symbol (`symbol` / \
+             `ref` / `id`), a `path`, or a call path (`edge_sequence_hash`).",
         "memory_search" => "Full-text search across active (or stale) repo memories by keyword.",
         "memory_for_symbol" =>
             "Return repo memories bound to a symbol (or its logical-symbol group).",
@@ -423,6 +438,7 @@ fn arg_schema(name: &str) -> Option<Value> {
         "memory_create" => schema_for::<MemoryCreateArgs>(),
         "memory_rebind" => schema_for::<MemoryRebindArgs>(),
         "memory_update" => schema_for::<MemoryUpdateArgs>(),
+        "memory_get" => schema_for::<MemoryGetArgs>(),
         "memory_for_symbol" => schema_for::<MemoryForSymbolArgs>(),
         "memory_for_path" => schema_for::<MemoryForPathArgs>(),
         "memory_for_call_path" => schema_for::<MemoryForCallPathArgs>(),

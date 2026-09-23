@@ -410,8 +410,8 @@ fn mcp_stdio_every_advertised_tool_is_routable() {
         .map(|tool| tool["name"].as_str().unwrap().to_string())
         .collect::<Vec<_>>();
     assert!(
-        advertised.contains(&"memory_rebind".to_string()),
-        "memory_rebind should be advertised"
+        advertised.contains(&"memory_update".to_string()),
+        "the memory write tool should be advertised"
     );
 
     let mut unroutable = Vec::new();

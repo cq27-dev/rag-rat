@@ -139,8 +139,7 @@ declare the parameter nor honor one.
 
 **Clones**
 
-- `find_clones`: `{ "min_similarity"?: number, "min_copies"?: number, "limit"?: number }`
-- `clones_for_symbol`: `{ "id"?: string, "ref"?: string, "path"?: string, "line"?: number }`
+- `find_clones`: `{ "min_similarity"?: number, "min_copies"?: number, "limit"?: number, "id"?: string, "ref"?: string, "path"?: string, "line"?: number }` — repo-wide clone classes; with a symbol (`id` / `ref`, or `path` + `line`), that symbol's clone class instead (null if unique), and the other parameters do not apply.
 
 **Read**
 
@@ -170,16 +169,17 @@ declare the parameter nor honor one.
 **Repo memories**
 
 - `memory_create`: `{ "kind": MemoryKind, "title": string, "body": string, "confidence": "high" | "medium" | "low", "created_by"?: string, "source"?: "agent" | "human" | "imported" | "generated", "tags"?: string[], "payload"?: object, "bind"?: BindTarget }`
-- `memory_rebind`: `{ "memory_id": string, "bind": BindTarget }`
-- `memory_update`: `{ "memory_id": string, "kind"?: MemoryKind, "title"?: string, "body"?: string, "confidence"?: "high" | "medium" | "low", "status"?: "active" | "stale" | "obsolete" | "rejected", "tags"?: string[], "payload"?: object }`
+- `memory_update`: `{ "memory_id": string, "kind"?: MemoryKind, "title"?: string, "body"?: string, "confidence"?: "high" | "medium" | "low", "status"?: "active" | "stale" | "obsolete" | "rejected", "tags"?: string[], "payload"?: object, "bind"?: BindTarget }` — `status: "obsolete"` retires a memory; `bind` re-anchors it (applied after any field changes, as its own write). A call that changes nothing is refused.
 - `memory_search`: `{ "query": string, "limit"?: number }`
-- `memory_for_symbol`: `{ "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "limit"?: number }`
-- `memory_for_path`: `{ "path": string, "limit"?: number }`
-- `memory_for_call_path`: `{ "edge_sequence_hash": string, "limit"?: number }`
-- `memory_show`: `{ "memory_id": string }`
+- `memory_get`: `{ "memory_id"?: string, "symbol"?: string, "ref"?: string, "id"?: string, "allow_ambiguous"?: boolean, "path"?: string, "edge_sequence_hash"?: string, "limit"?: number }` — exactly one selector: `memory_id` returns that memory in full; a symbol, `path` or call path (`edge_sequence_hash`) returns the memories bound there.
 - `memory_validate`: `{}`
 - `memory_doctor`: `{}`
-- `memory_mark_obsolete`: `{ "memory_id": string }`
+
+Deprecated — callable for one release, not listed, results carry a note naming the replacement:
+`memory_show`, `memory_for_symbol`, `memory_for_path`, `memory_for_call_path` (→ `memory_get`);
+`memory_mark_obsolete`, `memory_rebind` (→ `memory_update`); `clones_for_symbol` (→ `find_clones`).
+Their arguments are unchanged.
+
 - `memory_edge_add`: `{ "source_node_id": string, "relation": "depends_on" | "relates_to" | "supersedes" | "derived_from" | "tracks", "target_node_id"?: string, "target_repo_id"?: string, "github_owner"?: string, "github_repo"?: string, "github_number"?: number }`
 - `memory_edge_remove`: `{ "edge_key": string }`
 - `memory_edges`: `{ "direction": "from" | "into", "node_id"?: string, "github_owner"?: string, "github_repo"?: string, "github_number"?: number }`

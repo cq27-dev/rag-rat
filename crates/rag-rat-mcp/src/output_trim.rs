@@ -130,7 +130,7 @@ fn stub(id: &str, title: &str) -> Value {
     json!({
         "memory_id": id,
         "title": title,
-        "elided": "already surfaced this session — memory_show for detail",
+        "elided": "already surfaced this session — memory_get for detail",
     })
 }
 
