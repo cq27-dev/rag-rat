@@ -162,7 +162,9 @@ function detectTriple() {
 }
 
 // ---- 1) managed cache (version-exact) ------------------------------------------------------------
-const cacheHome = process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+// Absolute even when XDG_CACHE_HOME is relative: the PATH shim links into this tree from another
+// directory, and compares shim targets against it.
+const cacheHome = path.resolve(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"));
 const cacheDir = path.join(cacheHome, "rag-rat", "bin", VERSION);
 const managedBin = path.join(cacheDir, bin);
 if (isExecutable(managedBin)) return runLinked(managedBin);
@@ -255,8 +257,10 @@ function runLinked(target) {
 }
 
 
-function ensurePathShim(target) {
+function ensurePathShim(resolved) {
   if (process.env.RAG_RAT_NO_PATH_SHIM === "1") return;
+  // A relative target (a relative npm_config_cache) runs from here but would dangle from the shim.
+  const target = path.resolve(resolved);
   try {
     const dir = process.env.RAG_RAT_SHIM_DIR || path.join(os.homedir(), ".local", "bin");
     const windows = process.platform === "win32";

@@ -86,6 +86,12 @@ launch_as 1.5.0 npm_config_cache="$TMP/npm"
 [ "$(target)" = "$NPX_BIN/rag-rat" ] || fail "npx-cached binary not linked: $(target)"
 pass "shim: links the npx-cached binary"
 
+# A relative npm cache still yields an absolute link (a relative one would dangle from the shim).
+rm -f "$SHIM_DIR/rag-rat"
+(cd "$TMP" && launch_as 1.5.0 npm_config_cache=npm)
+[ "$(target)" = "$NPX_BIN/rag-rat" ] || fail "relative npm cache linked as: $(target)"
+pass "shim: a relative cache path is linked absolutely"
+
 ln -sf /usr/bin/true "$SHIM_DIR/rag-rat"
 stub 1.4.0
 launch_as 1.4.0
