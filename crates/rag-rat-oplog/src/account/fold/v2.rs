@@ -2650,6 +2650,168 @@ mod tests {
         );
     }
 
+    /// A composed `Outcome::Rejected` is not final against later evidence. (This is the effect
+    /// pass's outcome, not the executor's `Verdict::Rejected`, which is a different
+    /// classification.) Two owners remove the same device; the composition rejects whichever
+    /// removal finds it already gone. A later cut that condemns the WINNING removal's author
+    /// takes that removal back out of the effect pass, and the rejected one then finds the
+    /// device still enrolled and takes effect. Branch selection preserves this at the storage
+    /// level: before the cut the rejected removal never enters the effective set, and after it
+    /// the revived removal and its condemner form a contiguous chain.
+    ///
+    /// This is why a device whose control tail holds a rejected v2 entry cannot reclaim that slot
+    /// by chaining a new entry from its accepted tail: the rejected entry can come back, and the
+    /// device's two entries would then compete for one slot by minimum hash.
+    #[test]
+    fn a_removal_rejected_by_another_takes_effect_when_that_one_is_condemned() {
+        let fixture = demoted_owner();
+        let frozen = fixture.checkpoint.frozen_legacy();
+        let tip = founder_tip(&fixture);
+        let account = fixture.checkpoint.pin().account_id;
+        let second = Dev::new(41);
+        let second_incarnation = *frozen
+            .open_owners()
+            .get(&second.fp)
+            .expect("the fixture's second owner holds an open incarnation");
+        // Enrolled as a Member by the subject's accepted seq 0, and touched by nothing else.
+        let target = Dev::new(12);
+
+        let author = |signer: &crate::device::DeviceSecret,
+                      incarnation: OwnerId,
+                      seq: u64,
+                      prev: AccountEntryHash,
+                      op: &AccountOp| {
+            let payload = v2_ops::ControlOp {
+                checkpoint: fixture.checkpoint.pin().checkpoint_digest,
+                pre_cut_view: Some([9; 32]),
+                op: op.clone(),
+            }
+            .encode()
+            .unwrap();
+            let signed = envelope::sign_account_entry(
+                signer,
+                &AccountEntryHeader {
+                    account_id: account,
+                    log_id: 0,
+                    device_fingerprint: signer.public().fingerprint(),
+                    seq,
+                    prev_hash: (seq != 0).then_some(prev),
+                    parent_ref: Some(prev),
+                    entry_type: ops::entry_type_of(op),
+                    op_version: v2_ops::CONTROL_VERSION,
+                    crypto_suite: 0,
+                    auth_len: 1,
+                    key_id: None,
+                    authority_ref: Some(incarnation),
+                },
+                &payload,
+            )
+            .unwrap();
+            Candidate::new(
+                VerifiedAccountEntry {
+                    header: signed.header,
+                    payload: signed.payload,
+                    entry_hash: signed.entry_hash,
+                },
+                op.clone(),
+            )
+        };
+        let remove = |device: DeviceFingerprint, control_cut: Cut| AccountOp::DeviceRemove {
+            device_fingerprint: device,
+            control_cut,
+            secrets_cut: Cut::Empty,
+            content_cuts: vec![],
+            reason: "removed".into(),
+        };
+        // Exactly the registers `cut_op_registers` derives from a whole-device removal.
+        let registers_for = |device: DeviceFingerprint, control_cut: Cut| {
+            [
+                (RegisterKey::Device { account, log: CONTROL_LOG, device }, control_cut),
+                (RegisterKey::Device { account, log: SECRETS_LOG, device }, Cut::Empty),
+            ]
+        };
+
+        let by_founder = author(
+            fixture.founder.secret(),
+            fixture.incarnation,
+            tip.seq + 1,
+            tip.hash,
+            &remove(target.fp, Cut::Empty),
+        );
+        let by_second =
+            author(&second.secret, second_incarnation, 0, tip.hash, &remove(target.fp, Cut::Empty));
+        let target_registers = registers_for(target.fp, Cut::Empty);
+
+        let before = pinned_history(frozen, &[
+            AppliedOperation { entry: &by_founder, registers: &target_registers },
+            AppliedOperation { entry: &by_second, registers: &target_registers },
+        ]);
+        let effective = |history: &AccountAuthHistory, entry: &Candidate| {
+            history.outcome(&entry.hash()).is_some_and(|outcome| outcome.is_effective())
+        };
+        let (winner, loser) =
+            match (effective(&before, &by_founder), effective(&before, &by_second)) {
+                (true, false) => (&by_founder, &by_second),
+                (false, true) => (&by_second, &by_founder),
+                both => panic!("exactly one removal of the same device takes effect, got {both:?}"),
+            };
+        assert!(
+            matches!(before.outcome(&loser.hash()), Some(Outcome::Rejected(_))),
+            "the losing removal must be DECIDED ineffective, not parked, or this pins nothing: \
+             {:?}",
+            before.outcome(&loser.hash()),
+        );
+
+        // Condemn the winner's whole chain beyond the point it forked from the checkpoint, authored
+        // by the OTHER owner on its own next slot.
+        let (condemner, condemner_registers) = if std::ptr::eq(winner, &by_founder) {
+            let founder_fp = fixture.founder.fingerprint();
+            let cut = Cut::At { seq: tip.seq, hash: tip.hash };
+            (
+                author(
+                    &second.secret,
+                    second_incarnation,
+                    1,
+                    by_second.hash(),
+                    &remove(founder_fp, cut.clone()),
+                ),
+                registers_for(founder_fp, cut),
+            )
+        } else {
+            (
+                author(
+                    fixture.founder.secret(),
+                    fixture.incarnation,
+                    tip.seq + 2,
+                    by_founder.hash(),
+                    &remove(second.fp, Cut::Empty),
+                ),
+                registers_for(second.fp, Cut::Empty),
+            )
+        };
+
+        let after = pinned_history(frozen, &[
+            AppliedOperation { entry: &by_founder, registers: &target_registers },
+            AppliedOperation { entry: &by_second, registers: &target_registers },
+            AppliedOperation { entry: &condemner, registers: &condemner_registers },
+        ]);
+        assert!(
+            effective(&after, &condemner),
+            "the condemning removal must itself take effect: {:?}",
+            after.outcome(&condemner.hash()),
+        );
+        assert!(
+            matches!(after.outcome(&winner.hash()), Some(Outcome::Condemned(_))),
+            "the winning removal must be condemned, or this pins nothing: {:?}",
+            after.outcome(&winner.hash()),
+        );
+        assert!(
+            effective(&after, loser),
+            "the removal rejected earlier now finds the device enrolled and takes effect: {:?}",
+            after.outcome(&loser.hash()),
+        );
+    }
+
     #[test]
     fn the_composed_boundary_is_a_function_of_the_register_multiset_not_its_order() {
         // Closure being absorbing is what makes the boundary order-free. Replicas holding different
