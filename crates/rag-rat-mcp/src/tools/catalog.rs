@@ -274,10 +274,13 @@ pub fn description(name: &str) -> &'static str {
 /// The silent-fallback warning is load-bearing: `resolve_worktree_scope` drops a path that isn't a
 /// linked worktree of this repo to the base scope without an error, so a typo reads as a plausible
 /// answer about the wrong checkout — the exact failure the parameter exists to prevent.
-const WORKTREE_PARAM_DESCRIPTION: &str =
-    "Absolute path of the checkout to scope reads to — pass a linked worktree to read its branch \
-     overlay. Defaults to the server's working directory. A path that is not a linked worktree of \
-     this repo is silently ignored: results then come from the indexed checkout, with no error.";
+///
+/// Kept to one sentence: this text is repeated in every worktree-scoped tool's schema, so every
+/// word is paid for dozens of times in the tool list an agent loads. The full contract is in
+/// docs/mcp-tools.md.
+const WORKTREE_PARAM_DESCRIPTION: &str = "Absolute path of a linked worktree to read instead of \
+                                          this checkout; a path that is not one is ignored \
+                                          without error.";
 
 pub fn schema(name: &str) -> Value {
     let mut schema = arg_schema(name).unwrap_or_else(|| json!({"type": "object"}));
@@ -319,8 +322,9 @@ fn arg_schema(name: &str) -> Option<Value> {
         "symbol_lookup" => schema_for::<SymbolArgs>(),
         // Pure selector args, no `include` — these resolve via select_symbol (source-only) and
         // don't honor a generated opt-in, so they must not advertise one (#202 review).
-        "git_history_for_symbol" | "papertrail_for_symbol" => schema_for::<SymbolRefArgs>(),
-        "find_callers" | "trace_callees" | "docs_for_symbol" => schema_for::<SymbolGraphArgs>(),
+        "git_history_for_symbol" | "papertrail_for_symbol" | "docs_for_symbol" =>
+            schema_for::<SymbolRefArgs>(),
+        "find_callers" | "trace_callees" => schema_for::<SymbolGraphArgs>(),
         "compare_graph_to_text" => schema_for::<CompareGraphTextArgs>(),
         "compare_graph_to_scip" => schema_for::<EmptyArgs>(),
         "impact_surface" => schema_for::<ImpactArgs>(),

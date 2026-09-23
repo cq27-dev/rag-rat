@@ -132,7 +132,7 @@ pub(crate) fn call_tool_with_db(
             json!(db.ffi_surface(args.limit)?)
         },
         "docs_for_symbol" => {
-            let args: SymbolGraphArgs = serde_json::from_value(arguments)?;
+            let args: SymbolRefArgs = serde_json::from_value(arguments)?;
             docs_for_symbol_tool(db, args)?
         },
         "read_chunk" => {
@@ -468,9 +468,9 @@ pub(crate) fn graph_tool(
 
 pub(crate) fn docs_for_symbol_tool(
     db: &IndexDatabase,
-    args: SymbolGraphArgs,
+    args: SymbolRefArgs,
 ) -> anyhow::Result<Value> {
-    let selector = args.selector.selector(None, args.limit);
+    let selector = args.selector.selector(optional_language(args.language)?, args.limit);
     match select_for_answer(db, &selector)? {
         SymbolAnswer::Selected(symbol) =>
             Ok(json!(db.docs_for_selected_symbol(&symbol, args.limit)?)),
