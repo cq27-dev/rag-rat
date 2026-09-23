@@ -82,6 +82,9 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                         "path": path,
                         "exists": path.exists(),
                         "managed": managed,
+                        // A managed hook written by another rag-rat version (or before hooks ran
+                        // through npx) is not current; `hooks install` rewrites it.
+                        "current": managed && crate::hooks_support::hook_is_current(&path, *hook),
                     })
                 })
                 .collect::<Vec<_>>();

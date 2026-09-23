@@ -185,7 +185,8 @@ fn chained_hook_renderer_preserves_existing_body_and_appends_maintenance() {
 
     assert!(rendered.starts_with("#!/bin/sh\n# Chained hook"));
     assert!(rendered.contains("echo before"));
-    assert!(rendered.contains("rag-rat maintenance"));
+    assert!(rendered.contains("npx -y @rag-rat/bin@"), "npx first");
+    assert!(rendered.contains("rag-rat maintenance --trigger pre-commit"), "then PATH");
     assert!(rendered.contains("--trigger pre-commit"));
 }
 

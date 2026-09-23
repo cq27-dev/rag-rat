@@ -27,6 +27,16 @@ pub(crate) fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> 
         // Detached, fail-open, dies with the process — no-ops unless opted in. Never spawned for a
         // dormant server (no repo to refresh or rank).
         spawn_detached_version_refresh(config);
+        // A plugin update moves this server to a new release; carry the hooks along with it.
+        // Fail-open: hooks are a freshness aid, never a reason not to serve.
+        match crate::git_paths(&config.root)
+            .and_then(|git| crate::hooks_support::refresh_managed_hooks(git.hooks_dir()))
+        {
+            Ok(refreshed) if !refreshed.is_empty() =>
+                tracing::info!(?refreshed, "refreshed git hooks to this rag-rat version"),
+            Ok(_) => {},
+            Err(error) => tracing::warn!(%error, "could not refresh git hooks"),
+        }
         spawn_detached_oracle_auto_run(config);
     }
     // Small worker pool: the stdio JSON-RPC loop is mostly serial and CPU-heavy indexing is rayon,
