@@ -7,7 +7,7 @@ use minicbor::{Decoder, Encoder};
 use rag_rat_oplog::AccountId;
 
 use super::error::InviteError;
-use super::wire::{decode, ensure_consumed, fixed32};
+use super::wire::{InviteNonce, decode, ensure_consumed, fixed32};
 
 // `/2` added the kind discriminator (arity 6 -> 7) when the pairing ticket and the writer
 // invite merged into one struct; a `/1` binary rejects the new domain legibly. `/3` appends the
@@ -107,7 +107,7 @@ pub struct InviteTicket {
     pub account_id: AccountId,
     pub inviter_node_id: [u8; 32],
     pub relay_url: String,
-    pub nonce: [u8; 32],
+    pub nonce: InviteNonce,
     pub expires_at_ms: i64,
     /// The digest of the control checkpoint the inviting account is pinned to, or `None` when it
     /// is unpinned. This is the pin's trusted channel: the ticket is what an operator carries
@@ -144,7 +144,7 @@ impl InviteTicket {
         enc.bytes(&self.account_id.to_bytes()).expect("owned Vec");
         enc.bytes(&self.inviter_node_id).expect("owned Vec");
         enc.str(&self.relay_url).expect("owned Vec");
-        enc.bytes(&self.nonce).expect("owned Vec");
+        enc.bytes(self.nonce.as_slice()).expect("owned Vec");
         enc.i64(self.expires_at_ms).expect("owned Vec");
         match self.checkpoint_digest {
             Some(digest) => enc.bytes(&digest).expect("owned Vec"),
@@ -193,7 +193,7 @@ impl InviteTicket {
             account_id,
             inviter_node_id,
             relay_url,
-            nonce,
+            nonce: nonce.into(),
             expires_at_ms,
             checkpoint_digest,
         };

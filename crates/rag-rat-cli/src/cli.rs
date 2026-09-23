@@ -300,6 +300,34 @@ pub(crate) enum CheckpointCommand {
     Status,
 }
 
+/// A command-line argument that may hold an invite ticket. The encoded ticket carries the invite's
+/// one-time nonce, a bearer secret, so its `Debug` is redacted: the parsed command derives `Debug`,
+/// and one `{:?}` of it in an error path or a tracing field must not write the ticket into a log.
+#[derive(Clone)]
+pub(crate) struct SecretArg(String);
+
+impl std::str::FromStr for SecretArg {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl std::ops::Deref for SecretArg {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretArg(<redacted>)")
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum SyncCommand {
     /// Permanently enable sealed authoring for subsequent local memory changes.
@@ -381,7 +409,7 @@ pub(crate) enum SyncCommand {
     Join {
         /// The invite ticket string printed by `rag-rat sync init` on the owner device.
         #[arg(value_name = "TICKET")]
-        ticket: String,
+        ticket: SecretArg,
     },
     /// Print this store's local account id — the identity an owner grants with `sync grant`.
     Whoami,
@@ -455,7 +483,7 @@ pub(crate) enum SyncCommand {
         /// flow), or the owner's 64-hex account id from `rag-rat sync whoami` (the manual flow —
         /// the owner must separately `sync grant` this account, from `sync whoami` here).
         #[arg(value_name = "TICKET_OR_OWNER_ACCOUNT_ID")]
-        account: String,
+        account: SecretArg,
     },
     /// Mirror another identity's published memories into this repo, read-only.
     #[command(long_about = "Configures this repo's memories to materialize from ANOTHER \
@@ -1358,8 +1386,23 @@ mod tests {
             .expect("parse");
         match contribute.command {
             Command::Sync(SyncArgs { command: SyncCommand::Contribute { account } }) =>
-                assert_eq!(account, "ragratinviteabcd"),
+                assert_eq!(&*account, "ragratinviteabcd"),
             other => panic!("expected sync contribute, got {other:?}"),
+        }
+    }
+
+    /// A ticket on the command line carries the invite's one-time nonce. The parsed command derives
+    /// `Debug`, so formatting it must never print the ticket, compact or pretty.
+    #[test]
+    fn debug_formatting_never_prints_a_ticket_argument() {
+        let ticket = "ragratinvitesecretnoncebytes";
+        for args in [["rag-rat", "sync", "join", ticket], ["rag-rat", "sync", "contribute", ticket]]
+        {
+            let cli = Cli::try_parse_from(args).expect("parse");
+            for rendered in [format!("{:?}", cli.command), format!("{:#?}", cli.command)] {
+                assert!(!rendered.contains(ticket), "{} prints the ticket: {rendered}", args[2]);
+                assert!(rendered.contains("<redacted>"), "{} redacts it: {rendered}", args[2]);
+            }
         }
     }
 
@@ -1398,7 +1441,7 @@ mod tests {
             .expect("parse");
         match cli.command {
             Command::Sync(SyncArgs { command: SyncCommand::Contribute { account } }) =>
-                assert_eq!(account, "cd".repeat(32)),
+                assert_eq!(&*account, "cd".repeat(32)),
             other => panic!("expected sync contribute, got {other:?}"),
         }
     }

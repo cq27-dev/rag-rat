@@ -187,7 +187,7 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
         account_id,
         inviter_node_id,
         relay_url,
-        nonce,
+        nonce: nonce.into(),
         expires_at_ms,
         checkpoint_digest,
     })
@@ -376,7 +376,7 @@ pub fn mint_writer_invite(
         account_id,
         inviter_node_id,
         relay_url,
-        nonce,
+        nonce: nonce.into(),
         expires_at_ms,
         // A writer grant is cross-account and pins nothing; decode refuses one that carries a
         // digest, so this is the only value it may take.
@@ -396,7 +396,7 @@ pub fn redeem_writer_invite(
 ) -> Result<WriterGrantReceipt, InviteError> {
     let locked = match screen_under_writer_lock(
         conn,
-        request.nonce,
+        *request.nonce.as_bytes(),
         now_ms,
         |_| Ok(()),
         |conn, invite, at_ms| screen_writer_invite(conn, request, invite, at_ms),
@@ -509,7 +509,7 @@ pub fn redeem_invite(
     }
     let locked = match screen_under_writer_lock(
         conn,
-        request.nonce,
+        *request.nonce.as_bytes(),
         now_ms,
         |invite| {
             // A writer nonce presented to the pairing flow is as unknown as a random one, refused
@@ -538,7 +538,7 @@ pub fn redeem_invite(
     // released (other outstanding invites' reservations still count), so it passes only if the
     // DeviceAdd plus the CURRENT wraps genuinely fit — a shortfall rolls back, preserving the
     // nonce and restoring the reservation instead of stranding the ticket mid-redemption.
-    rag_rat_oplog::release_account_candidate_reservation_in_tx(tx, request.nonce)?;
+    rag_rat_oplog::release_account_candidate_reservation_in_tx(tx, *request.nonce.as_bytes())?;
     // Resolve ownership in this same redemption snapshot. A long-running server can ingest
     // StreamOwn/StreamRevoke entries after startup; caching this set would either omit a newly
     // owned stream's key wrap or make a stale, no-longer-owned stream abort the whole enrollment.
