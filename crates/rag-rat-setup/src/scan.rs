@@ -5,25 +5,25 @@ use rag_rat_base::config::EmbeddingBackend;
 use rag_rat_base::language::Language;
 use rag_rat_core::index::ignore_rules::{IgnoreMatcher, is_virtualenv_dir};
 
-use super::render::display_rel;
-use super::{DirCandidate, RepoScan, SKIPPED_DIRS};
+use crate::plan::{DirCandidate, RepoScan, SKIPPED_DIRS};
+use crate::render::display_rel;
 
 /// Very rough chunk-count estimate from total indexable source bytes (~500 chars per chunk after
 /// policy skips). Used only to *recommend* an embedding backend at init time.
-pub(crate) fn estimated_chunks(total_source_bytes: u64) -> u64 {
+pub fn estimated_chunks(total_source_bytes: u64) -> u64 {
     total_source_bytes / 500
 }
 /// Recommend an embedding backend by repo scale. The FastEmbed (MiniLM) cold backfill is CPU-bound
 /// at ~10-100 chunks/sec, so it's only comfortable for repos that finish in a few minutes; larger
 /// repos default to the static Model2Vec backend (orders of magnitude faster, some quality cost).
-pub(crate) fn recommend_backend(estimated_chunks: u64) -> EmbeddingBackend {
+pub fn recommend_backend(estimated_chunks: u64) -> EmbeddingBackend {
     if estimated_chunks <= 5_000 {
         EmbeddingBackend::fast_embed()
     } else {
         EmbeddingBackend::model2vec()
     }
 }
-pub(crate) fn backend_label(backend: EmbeddingBackend) -> &'static str {
+pub fn backend_label(backend: EmbeddingBackend) -> &'static str {
     if backend == EmbeddingBackend::NONE {
         "none — BM25 + structure only, no dense vectors"
     } else if backend == EmbeddingBackend::model2vec() {
@@ -32,7 +32,7 @@ pub(crate) fn backend_label(backend: EmbeddingBackend) -> &'static str {
         "minilm — MiniLM transformer; best quality, CPU backfill ~10-100 chunks/sec"
     }
 }
-pub(crate) fn scan_repo(root: &Path) -> anyhow::Result<RepoScan> {
+pub fn scan_repo(root: &Path) -> anyhow::Result<RepoScan> {
     let mut scan = RepoScan::default();
     // The scan honors the SAME ignore rules as the index walk (gitignore + the unconditional floor)
     // so what it counts as candidate source matches what the index will actually contain (#181
@@ -49,7 +49,7 @@ pub(crate) fn scan_repo(root: &Path) -> anyhow::Result<RepoScan> {
 /// binding that actually covers the header tree (so the indexer parses those `.h` as C++). A
 /// genuinely mixed C-and-C++ repo gets its headers under C++ (a clear default; C++ subsumes C-style
 /// headers) — the user can split them with an explicit `[[target]]` if needed.
-pub(crate) fn assign_headers(root: &Path, scan: &mut RepoScan) -> anyhow::Result<()> {
+pub fn assign_headers(root: &Path, scan: &mut RepoScan) -> anyhow::Result<()> {
     let header_lang = if scan.language_counts.get(&Language::Cpp).copied().unwrap_or(0) > 0 {
         Language::Cpp
     } else {
@@ -61,7 +61,7 @@ pub(crate) fn assign_headers(root: &Path, scan: &mut RepoScan) -> anyhow::Result
     }
     Ok(())
 }
-pub(crate) fn scan_dir(
+pub fn scan_dir(
     root: &Path,
     dir: &Path,
     ignore: &IgnoreMatcher,
@@ -128,7 +128,7 @@ pub(crate) fn scan_dir(
     }
     Ok(())
 }
-pub(crate) fn add_file_to_dir_counts(
+pub fn add_file_to_dir_counts(
     root: &Path,
     path: &Path,
     language: Language,
@@ -160,10 +160,10 @@ pub(crate) fn add_file_to_dir_counts(
     }
     Ok(())
 }
-pub(crate) fn should_skip_dir(name: &str) -> bool {
+pub fn should_skip_dir(name: &str) -> bool {
     SKIPPED_DIRS.contains(&name)
 }
-pub(crate) fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCandidate> {
+pub fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCandidate> {
     let Some(counts) = scan.dir_counts.get(&language) else {
         return Vec::new();
     };
@@ -201,13 +201,13 @@ pub(crate) fn candidate_dirs(scan: &RepoScan, language: Language) -> Vec<DirCand
 }
 
 /// Shared helper both plan-generation call sites (`run.rs::default_plan`,
-/// `draft.rs::WizardDraft::from_scan`) use so they can no longer drift apart. Wraps the
+/// `draft.rs::SetupDraft::from_scan`) use so they can no longer drift apart. Wraps the
 /// uncapped `default_dirs`, applying the same "no safe default" edge case both call sites used
 /// to implement separately: for Python with candidates present but none flagged default (an
 /// env-only repo — every `.py` lives under a dependency tree, see `fallback_excluded`),
 /// return empty so the caller omits the language rather than falling back to `["."]`, which
 /// would index installed deps (#173/#181). Every other language falls back to `["."]`.
-pub(crate) fn resolved_bindings(scan: &RepoScan, language: Language) -> Vec<PathBuf> {
+pub fn resolved_bindings(scan: &RepoScan, language: Language) -> Vec<PathBuf> {
     let defaults = default_dirs(scan, language);
     if !defaults.is_empty() {
         return defaults;
@@ -218,7 +218,7 @@ pub(crate) fn resolved_bindings(scan: &RepoScan, language: Language) -> Vec<Path
     }
     vec![PathBuf::from(".")]
 }
-pub(crate) fn default_dir(scan: &RepoScan, language: Language, path: &Path) -> bool {
+pub fn default_dir(scan: &RepoScan, language: Language, path: &Path) -> bool {
     let text = display_rel(path);
     match language {
         Language::Rust => text == "src" || text.ends_with("/src"),
@@ -307,7 +307,7 @@ fn python_root_has_direct_source(scan: &RepoScan, path: &Path) -> bool {
             > 0
 }
 
-pub(crate) fn directly_contains_source(scan: &RepoScan, language: Language, path: &Path) -> bool {
+pub fn directly_contains_source(scan: &RepoScan, language: Language, path: &Path) -> bool {
     path != Path::new(".")
         && scan
             .direct_dir_counts
@@ -317,7 +317,7 @@ pub(crate) fn directly_contains_source(scan: &RepoScan, language: Language, path
             .unwrap_or_default()
             > 0
 }
-pub(crate) fn path_depth(path: &Path) -> usize {
+pub fn path_depth(path: &Path) -> usize {
     if path == Path::new(".") { 0 } else { path.components().count() }
 }
 
@@ -326,7 +326,7 @@ pub(crate) fn path_depth(path: &Path) -> usize {
 /// UI-only `path_depth <= 4` filter and `truncate(32)`: this is the raw set init logic reasons
 /// over, not the trimmed set the picker UI renders. Manifest-root promotion is a later task —
 /// deliberately not implemented here.
-pub(crate) fn default_dirs(scan: &RepoScan, language: Language) -> Vec<PathBuf> {
+pub fn default_dirs(scan: &RepoScan, language: Language) -> Vec<PathBuf> {
     let Some(counts) = scan.dir_counts.get(&language) else {
         return Vec::new();
     };
@@ -366,7 +366,7 @@ pub(crate) fn default_dirs(scan: &RepoScan, language: Language) -> Vec<PathBuf> 
 /// language-agnostic pass usable for any binding set. Shallowest paths win: sort by depth
 /// ascending first, then keep a path only if no already-kept path is an ancestor of it (via
 /// `starts_with`). Output is sorted for deterministic, order-independent results.
-pub(crate) fn dedup_ancestors(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+pub fn dedup_ancestors(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.sort_by_key(|path| path_depth(path));
     let mut kept: Vec<PathBuf> = Vec::new();
     for path in paths {
@@ -386,7 +386,7 @@ pub(crate) fn dedup_ancestors(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[cfg(test)]
 mod header_assignment_tests {
     use super::*;
-    use crate::init::run::default_plan;
+    use crate::plan::default_plan;
 
     fn temp_root(tag: &str) -> rag_rat_base::test_scratch::ScratchDir {
         rag_rat_base::test_scratch::ScratchDir::new(&format!("hdr-{tag}"))

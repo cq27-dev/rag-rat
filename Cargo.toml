@@ -13,6 +13,7 @@ members = [
   "crates/rag-rat-core",
   "crates/rag-rat-mcp",
   "crates/rag-rat-sync",
+  "crates/rag-rat-setup",
 ]
 resolver = "3"
 
@@ -50,6 +51,7 @@ rag-rat-query = { version = "0.23.2", path = "crates/rag-rat-query", default-fea
 rag-rat-core = { version = "0.23.2", path = "crates/rag-rat-core", default-features = false }
 rag-rat-mcp = { version = "0.23.2", path = "crates/rag-rat-mcp", default-features = false }
 rag-rat-sync = { version = "0.23.2", path = "crates/rag-rat-sync", default-features = false }
+rag-rat-setup = { version = "0.23.2", path = "crates/rag-rat-setup" }
 anyhow = "1.0"
 axum = "0.8"
 # ed25519 device-identity signing for the op-log's signed entry envelope (§C4 layer-1). Default

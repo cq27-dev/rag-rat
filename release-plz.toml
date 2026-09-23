@@ -51,6 +51,7 @@ changelog_include = [
     "rag-rat-clones",
     "rag-rat-oplog",
     "rag-rat-sync",
+    "rag-rat-setup",
 ]
 
 [[package]]
@@ -115,5 +116,10 @@ changelog_update = false
 # like every other member (no `publish = false`).
 [[package]]
 name = "rag-rat-sync"
+version_group = "rag-rat"
+changelog_update = false
+
+[[package]]
+name = "rag-rat-setup"
 version_group = "rag-rat"
 changelog_update = false

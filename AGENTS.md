@@ -137,7 +137,7 @@ not.
 
 ## Repo orientation
 
-- Rust workspace, 13 crates in a layered DAG (Rust 2024 edition):
+- Rust workspace, 14 crates in a layered DAG (Rust 2024 edition):
   - `rag-rat-base` — foundation: config, repo identity/discovery, language + embedding-model
     registries, path classification, canonical JSON, locks, logging.
   - `rag-rat-db` — the SQLite substrate: schema/migrations (+ the `MigrationHooks` seam),
@@ -155,6 +155,8 @@ not.
   - `rag-rat-core` — the engine that remains: indexing + tree-sitter graph, the
     `IndexDatabase` query surface, memory-write orchestration, watcher, eval.
   - `rag-rat-sync` — iroh QUIC peer transport for exchanging signed op-log entries.
+  - `rag-rat-setup` — repository setup shared by the CLI wizard, `init --yes` and the MCP setup
+    tools: repo scan, the configuration draft and its `rag-rat.toml` rendering, git hooks.
   - entrypoints: `rag-rat-mcp` (the STDIO MCP server) and `rag-rat-cli` (package name `rag-rat`,
     the CLI binary).
   All crates version in lockstep; see docs/releasing.md.

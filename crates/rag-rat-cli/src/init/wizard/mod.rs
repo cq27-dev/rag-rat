@@ -4,7 +4,6 @@
 //! Every frame starts with `Clear` on the full area so nothing bleeds.
 
 mod catalog;
-mod draft;
 mod probe;
 mod review;
 mod state;
@@ -16,6 +15,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use rag_rat_base::config::Config;
+use rag_rat_setup::RepoScan;
+pub(crate) use rag_rat_setup::draft::{HooksDraft, SetupDraft};
+use rag_rat_setup::render::config_root_value;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -31,12 +33,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Tabs, Wrap};
 
 use self::catalog::CookbookCatalog;
-pub(crate) use self::draft::{HooksDraft, WizardDraft};
 use self::review::ReviewModel;
 use self::state::{OneShotHelp, WizardState};
 use self::steps::{StepId, init_step, render_step, step_footer, step_handle_key, step_title};
-use crate::init::RepoScan;
-use crate::init::render::config_root_value;
 
 pub(crate) struct WizardResult {
     pub toml: String,
@@ -46,10 +45,10 @@ pub(crate) struct WizardResult {
 /// The draft as it will be WRITTEN: distillation is forced off when no tracker resolves (the pass
 /// depends on one). Both `build_result` and the review diff go through this, so the previewed diff
 /// always matches the file saved on confirmation.
-pub(super) fn normalized_write_draft(state: &WizardState) -> WizardDraft {
+pub(super) fn normalized_write_draft(state: &WizardState) -> SetupDraft {
     let mut result = state.draft.clone();
     if !steps::tracker_is_set_up(state) {
-        result.distill.mode = draft::DistillMode::Off;
+        result.distill.mode = rag_rat_setup::draft::DistillMode::Off;
     }
     result
 }
@@ -736,10 +735,10 @@ fn initial_draft(
     existing: Option<&(String, Config)>,
     config_path: &Path,
     scan_root: std::path::PathBuf,
-) -> (WizardDraft, Option<String>, CookbookCatalog) {
+) -> (SetupDraft, Option<String>, CookbookCatalog) {
     match existing {
         Some((raw, cfg)) => (
-            WizardDraft::from_existing(raw, cfg, config_path),
+            SetupDraft::from_existing(raw, cfg, config_path),
             Some(raw.clone()),
             CookbookCatalog::from_raw(raw),
         ),
@@ -747,9 +746,9 @@ fn initial_draft(
     }
 }
 
-fn fresh_draft(scan: &RepoScan, config_path: &Path, root_abs: std::path::PathBuf) -> WizardDraft {
+fn fresh_draft(scan: &RepoScan, config_path: &Path, root_abs: std::path::PathBuf) -> SetupDraft {
     let root_value = config_root_value(&root_abs, config_path);
-    WizardDraft::from_scan(scan, root_value, root_abs)
+    SetupDraft::from_scan(scan, root_value, root_abs)
 }
 
 #[cfg(test)]
@@ -829,10 +828,12 @@ mod tests {
         // `[remote] concurrency` (the cap) — the tuned knee is surfaced in the provision log and
         // the host cache, never baked back over the cap.
         let mut w = headless(test_scan(), None);
-        w.state.draft.remote = Some(draft::RemoteDraft {
+        w.state.draft.remote = Some(rag_rat_setup::draft::RemoteDraft {
             model: "all-minilm".to_string(),
             backend: rag_rat_base::config::RemoteBackend::Ollama,
-            mode: draft::RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
+            mode: rag_rat_setup::draft::RemoteMode::Ephemeral(
+                "@rag-rat/cookbook modal".to_string(),
+            ),
             query_endpoint: None,
             gpu: None,
             num_ctx: None,
@@ -869,10 +870,10 @@ mod tests {
     fn opening_review_refreshes_stale_embedding_check() {
         let mut w = headless(test_scan(), None);
         w.state.draft.model = "none".to_string();
-        w.state.draft.remote = Some(draft::RemoteDraft {
+        w.state.draft.remote = Some(rag_rat_setup::draft::RemoteDraft {
             model: "all-minilm".to_string(),
             backend: rag_rat_base::config::RemoteBackend::Ollama,
-            mode: draft::RemoteMode::Connect("http://localhost:11434".to_string()),
+            mode: rag_rat_setup::draft::RemoteMode::Connect("http://localhost:11434".to_string()),
             query_endpoint: None,
             gpu: None,
             num_ctx: None,
@@ -929,10 +930,12 @@ mod tests {
             .draft
             .bindings
             .insert(rag_rat_base::language::Language::Rust, vec![Path::new(".").to_path_buf()]);
-        w.state.draft.remote = Some(draft::RemoteDraft {
+        w.state.draft.remote = Some(rag_rat_setup::draft::RemoteDraft {
             model: "all-minilm".to_string(),
             backend: rag_rat_base::config::RemoteBackend::Ollama,
-            mode: draft::RemoteMode::Ephemeral("@rag-rat/cookbook modal".to_string()),
+            mode: rag_rat_setup::draft::RemoteMode::Ephemeral(
+                "@rag-rat/cookbook modal".to_string(),
+            ),
             query_endpoint: None,
             gpu: None,
             num_ctx: None,
@@ -964,12 +967,12 @@ mod tests {
     fn headless(scan: RepoScan, existing: Option<(String, Config)>) -> Wizard {
         let (draft, original, cookbooks) = match existing {
             Some((raw, cfg)) => (
-                WizardDraft::from_existing(&raw, &cfg, Path::new("rag-rat.toml")),
+                SetupDraft::from_existing(&raw, &cfg, Path::new("rag-rat.toml")),
                 Some(raw.clone()),
                 CookbookCatalog::from_raw(&raw),
             ),
             None => (
-                WizardDraft::from_scan(&scan, ".".to_string(), Path::new(".").to_path_buf()),
+                SetupDraft::from_scan(&scan, ".".to_string(), Path::new(".").to_path_buf()),
                 None,
                 CookbookCatalog::default(),
             ),
@@ -997,10 +1000,10 @@ mod tests {
         // Distillation enabled in the draft, but no tracker resolves: the write path must normalize
         // it off regardless of how review was reached (no Distill handler ever runs here).
         let mut w = headless(test_scan(), None);
-        w.state.draft.tracker.mode = super::draft::TrackerMode::AutoDetect;
+        w.state.draft.tracker.mode = rag_rat_setup::draft::TrackerMode::AutoDetect;
         w.state.detected_origin = None;
         w.state.detected_configured = None;
-        w.state.draft.distill.mode = super::draft::DistillMode::ValidatedBox;
+        w.state.draft.distill.mode = rag_rat_setup::draft::DistillMode::ValidatedBox;
         let result = w.build_result().unwrap();
         let doc: toml_edit::DocumentMut = result.toml.parse().unwrap();
         assert_eq!(

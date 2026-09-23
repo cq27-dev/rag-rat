@@ -34,7 +34,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
     let git = git_paths(&config.root)?;
     match args.action {
         HookAction::Install => {
-            let installed = crate::hooks_support::install_managed_hooks(git.hooks_dir())?
+            let installed = rag_rat_setup::hooks::install_managed_hooks(git.hooks_dir())?
                 .into_iter()
                 .map(|hook| hook.as_trigger())
                 .collect::<Vec<_>>();
@@ -82,7 +82,7 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
                         "managed": managed,
                         // A managed hook written by another rag-rat version (or before hooks ran
                         // through npx) is not current; `hooks install` rewrites it.
-                        "current": managed && crate::hooks_support::hook_is_current(&path, *hook),
+                        "current": managed && rag_rat_setup::hooks::hook_is_current(&path, *hook),
                     })
                 })
                 .collect::<Vec<_>>();

@@ -9,7 +9,7 @@ use std::path::Path;
 /// Used for files we must never clobber on a partial write — the user-authored, non-regenerable
 /// `.claude/settings.json`, and the managed git hook scripts. See #52: the previous `fs::write`
 /// truncates first, so an interrupted write destroyed the original.
-pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+pub fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
     if let Some(parent) = parent {
         fs::create_dir_all(parent)?;

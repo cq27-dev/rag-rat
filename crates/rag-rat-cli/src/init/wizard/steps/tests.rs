@@ -3,12 +3,14 @@ use std::path::PathBuf;
 use rag_rat_base::config::{DEFAULT_QUERY_ENDPOINT, RemoteBackend, RemoteEmbeddingConfig};
 use rag_rat_base::embedding_models::{Backend, EMBEDDING_MODELS};
 use rag_rat_base::language::Language;
+use rag_rat_setup::RepoScan;
+use rag_rat_setup::draft::{MODAL_GPUS, RemoteDraft, RemoteMode, SetupDraft};
+use rag_rat_setup::scan::scan_repo;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tempfile::TempDir;
 
-use super::super::draft::{MODAL_GPUS, RemoteDraft, RemoteMode, WizardDraft};
 use super::super::probe::{ProbeKind, ProbeMsg, ProbeStatus};
 use super::super::state::{PROVISION_CONFIRM_WORD, WizardState, provision_confirm_satisfied};
 use super::dispatch::{init_step, render_step, step_handle_key, validate_step};
@@ -23,8 +25,6 @@ use super::oracle::{handle_oracle, render_oracle};
 use super::types::{
     BACKENDS_BY_EFFICIENCY, CheckResult, EmbedFocus, IndexZone, Outcome, Sev, StepId, StepState,
 };
-use crate::init::RepoScan;
-use crate::init::scan::scan_repo;
 use crate::init::wizard::catalog::CookbookCatalog;
 use crate::{MANAGED_HOOKS, git_paths};
 
@@ -34,13 +34,13 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn empty_state() -> WizardState {
     let scan = RepoScan::default();
-    let draft = WizardDraft::from_scan(&scan, ".".to_string(), PathBuf::from("."));
+    let draft = SetupDraft::from_scan(&scan, ".".to_string(), PathBuf::from("."));
     WizardState::new(draft, scan)
 }
 
 fn state_with_catalog(raw: &str) -> WizardState {
     let scan = RepoScan::default();
-    let draft = WizardDraft::from_scan(&scan, ".".to_string(), PathBuf::from("."));
+    let draft = SetupDraft::from_scan(&scan, ".".to_string(), PathBuf::from("."));
     WizardState::with_cookbooks(draft, scan, CookbookCatalog::from_raw(raw))
 }
 
@@ -89,7 +89,7 @@ fn rust_state(dir_count: usize) -> (TempDir, WizardState) {
         std::fs::write(path.join("lib.rs"), "").unwrap();
     }
     let scan = scan_repo(dir.path()).unwrap();
-    let draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
+    let draft = SetupDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     let mut state = WizardState::new(draft, scan);
     state.step = Some(init_step(StepId::Indexing, &state));
     (dir, state)
@@ -198,7 +198,7 @@ fn indexing_reentry_preserves_disabled_detected_languages() {
     std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
     std::fs::write(dir.path().join("py/app.py"), "").unwrap();
     let scan = scan_repo(dir.path()).unwrap();
-    let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
+    let mut draft = SetupDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     assert!(draft.bindings.contains_key(&Language::Python));
     draft.bindings.remove(&Language::Python);
     let mut state = WizardState::new(draft, scan);
@@ -216,7 +216,7 @@ fn indexing_exposes_and_preselects_detected_swiftpm_sources() {
     std::fs::create_dir_all(dir.path().join("Sources/App")).unwrap();
     std::fs::write(dir.path().join("Sources/App/App.swift"), "struct App {}\n").unwrap();
     let scan = scan_repo(dir.path()).unwrap();
-    let draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
+    let draft = SetupDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     let mut state = WizardState::new(draft, scan);
 
     state.step = Some(init_step(StepId::Indexing, &state));
@@ -1281,7 +1281,7 @@ fn integration_warns_about_foreign_hooks_without_blocking() {
     let hook = MANAGED_HOOKS[0].as_trigger();
     std::fs::write(gp.hooks_dir().join(hook), "#!/bin/sh\necho custom\n").unwrap();
     let scan = scan_repo(dir.path()).unwrap();
-    let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
+    let mut draft = SetupDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     draft.hooks.git = true;
     let state = WizardState::new(draft, scan);
 
@@ -1297,7 +1297,7 @@ fn integration_warns_about_foreign_hooks_without_blocking() {
 fn integration_blocks_git_hooks_outside_worktrees() {
     let dir = tempfile::tempdir().unwrap();
     let scan = scan_repo(dir.path()).unwrap();
-    let mut draft = WizardDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
+    let mut draft = SetupDraft::from_scan(&scan, ".".to_string(), dir.path().to_path_buf());
     draft.hooks.git = true;
     let state = WizardState::new(draft, scan);
 

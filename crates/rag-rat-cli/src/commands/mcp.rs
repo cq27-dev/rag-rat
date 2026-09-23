@@ -30,7 +30,7 @@ pub(crate) fn run_mcp(explicit: Option<&str>, json: bool) -> anyhow::Result<()> 
         // A plugin update moves this server to a new release; carry the hooks along with it.
         // Fail-open: hooks are a freshness aid, never a reason not to serve.
         match crate::git_paths(&config.root)
-            .and_then(|git| crate::hooks_support::refresh_managed_hooks(git.hooks_dir()))
+            .and_then(|git| rag_rat_setup::hooks::refresh_managed_hooks(git.hooks_dir()))
         {
             Ok(refreshed) if !refreshed.is_empty() =>
                 tracing::info!(?refreshed, "refreshed git hooks to this rag-rat version"),

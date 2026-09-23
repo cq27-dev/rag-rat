@@ -15,6 +15,10 @@ use rag_rat_llm::providers::Model2VecEmbedder;
 use rag_rat_llm::providers::{
     Embedder, HashEmbedder, OpenAiEmbedder, verify_ephemeral_remote_cancellable,
 };
+use rag_rat_setup::draft::{
+    OLLAMA_EMBEDDING_MODELS, RemoteDraft, RemoteMode, default_backend_endpoint,
+    is_default_backend_endpoint, ollama_model_dim, ollama_model_for, wizard_query_endpoint,
+};
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -23,10 +27,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use super::super::catalog::CookbookEntry;
-use super::super::draft::{
-    OLLAMA_EMBEDDING_MODELS, RemoteDraft, RemoteMode, default_backend_endpoint,
-    is_default_backend_endpoint, ollama_model_dim, ollama_model_for, wizard_query_endpoint,
-};
 use super::super::probe::{ProbeKind, ProbeStatus};
 use super::super::state::{PROVISION_CONFIRM_WORD, WizardState, provision_confirm_satisfied};
 use super::super::theme;

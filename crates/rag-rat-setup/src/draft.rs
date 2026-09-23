@@ -1,4 +1,4 @@
-//! `WizardDraft` — the persistable model for the init wizard.
+//! `SetupDraft` — the persistable model for the init wizard.
 //!
 //! This is the ONLY thing that renders to TOML. UI-only state (focused step, scroll, help
 //! visibility) lives in `WizardUiState` (see `state.rs`) and never leaks in here.
@@ -14,23 +14,23 @@ use rag_rat_base::config::{
 use rag_rat_base::language::Language;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table};
 
-use crate::init::render::{config_root_value, display_rel, render_config};
-use crate::init::scan::{estimated_chunks, recommend_backend, resolved_bindings};
-use crate::init::{InitPlan, RepoScan};
+use crate::plan::{InitPlan, RepoScan};
+use crate::render::{config_root_value, display_rel, render_config};
+use crate::scan::{estimated_chunks, recommend_backend, resolved_bindings};
 
 /// The embedding remote connection mode, derived from `RemoteEmbeddingConfig`.
 ///
 /// CONNECT: an already-running Ollama endpoint (the `endpoint` field was set).
 /// EPHEMERAL: provision an on-demand box via a cookbook recipe (the `cookbook` field was set).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RemoteMode {
+pub enum RemoteMode {
     Connect(String),
     Ephemeral(String),
 }
 
 /// The remote-embedding draft block — mirrors `RemoteEmbeddingConfig` with the mode explicit.
 #[derive(Clone, Debug)]
-pub(crate) struct RemoteDraft {
+pub struct RemoteDraft {
     /// The server-side embedding model name (an ollama name for `backend = ollama`, the
     /// HuggingFace id for infinity/vLLM).
     pub model: String,
@@ -63,7 +63,7 @@ pub(crate) struct RemoteDraft {
 /// `origin` remote at index time (zero-config, the product default). `Configure` writes an explicit
 /// `[[tracker]]` block, which *replaces* auto-detection.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TrackerMode {
+pub enum TrackerMode {
     AutoDetect,
     Configure,
 }
@@ -71,7 +71,7 @@ pub(crate) enum TrackerMode {
 /// The auth source for an explicit tracker binding — exactly one of `env` / `token_command`, or
 /// none (anonymous), mirroring `TrackerAuth`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TrackerAuthMode {
+pub enum TrackerAuthMode {
     Anonymous,
     Env,
     Command,
@@ -79,7 +79,7 @@ pub(crate) enum TrackerAuthMode {
 
 /// The issue-tracker draft — written as a `[[tracker]]` binding only in `Configure` mode.
 #[derive(Clone, Debug)]
-pub(crate) struct TrackerDraft {
+pub struct TrackerDraft {
     pub mode: TrackerMode,
     /// Provider for an explicit binding (unused in `AutoDetect`).
     pub provider: Tracker,
@@ -120,7 +120,7 @@ impl Default for TrackerDraft {
 /// serving block ([`RemoteDreamConfig::distill_default`]). `Connect` writes a connect
 /// `[llm.distill.remote]` pointing at an already-running server.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum DistillMode {
+pub enum DistillMode {
     Off,
     ValidatedBox,
     Connect,
@@ -129,7 +129,7 @@ pub(crate) enum DistillMode {
 /// The distillation draft — off by default. The pass is gated in the UI on a resolvable issue
 /// tracker (nothing to distill without one); the emitted config is a plain `[llm.distill]` block.
 #[derive(Clone, Debug)]
-pub(crate) struct DistillDraft {
+pub struct DistillDraft {
     pub mode: DistillMode,
     /// Connect-mode server URL (ignored otherwise).
     pub endpoint: String,
@@ -156,7 +156,7 @@ impl Default for DistillDraft {
 // ── Cookbook + GPU constants ────────────────────────────────────────────────────
 
 /// GPUs available when provisioning via Modal.
-pub(crate) const MODAL_GPUS: &[&str] = &[
+pub const MODAL_GPUS: &[&str] = &[
     "T4",
     "L4",
     "A10",
@@ -173,7 +173,7 @@ pub(crate) const MODAL_GPUS: &[&str] = &[
 ];
 
 /// Current RunPod `gpuTypeId` values that are suitable for the NVIDIA Ollama image.
-pub(crate) const RUNPOD_GPUS: &[&str] = &[
+pub const RUNPOD_GPUS: &[&str] = &[
     "NVIDIA RTX A4000",
     "NVIDIA RTX A4500",
     "NVIDIA RTX A5000",
@@ -215,7 +215,7 @@ pub(crate) const RUNPOD_GPUS: &[&str] = &[
 
 /// Common Ollama server-side embedding model names, with their dimension and size.
 /// These are all real, pullable models on Ollama Hub (verified June 2026).
-pub(crate) const OLLAMA_EMBEDDING_MODELS: &[&str] = &[
+pub const OLLAMA_EMBEDDING_MODELS: &[&str] = &[
     "all-minilm",                         // 384-dim · 46MB  — all-MiniLM-L6-v2
     "qllama/bge-small-en-v1.5:f16",       // 384-dim · 68MB  — BGE-small exact family
     "ordis/jina-embeddings-v2-base-code", // 768-dim · 323MB — Jina code exact family
@@ -227,7 +227,7 @@ pub(crate) const OLLAMA_EMBEDDING_MODELS: &[&str] = &[
 ];
 
 /// Known output dimension for curated Ollama embedding models.
-pub(crate) fn ollama_model_dim(model: &str) -> Option<usize> {
+pub fn ollama_model_dim(model: &str) -> Option<usize> {
     match model {
         "all-minilm" | "qllama/bge-small-en-v1.5:f16" => Some(384),
         "ordis/jina-embeddings-v2-base-code" | "nomic-embed-text" => Some(768),
@@ -239,7 +239,7 @@ pub(crate) fn ollama_model_dim(model: &str) -> Option<usize> {
 
 /// Best-effort mapping from the local embedding model_id to a commonly-available
 /// Ollama model name. Returns `None` for selectors the wizard cannot serve remotely.
-pub(crate) fn ollama_model_for(embedding_model_id: &str) -> Option<&'static str> {
+pub fn ollama_model_for(embedding_model_id: &str) -> Option<&'static str> {
     match embedding_model_id {
         // Prefer same-family Ollama builds; dimension-only alternatives stay selectable manually.
         "sentence-transformers/all-MiniLM-L6-v2" => Some("all-minilm"),
@@ -256,10 +256,7 @@ pub(crate) fn ollama_model_for(embedding_model_id: &str) -> Option<&'static str>
 /// ephemeral config would otherwise fail to load. Defaults to the backend's standard local port.
 /// `None` when the config default already suffices: ollama (11434) and connect mode (queries hit
 /// the endpoint).
-pub(crate) fn wizard_query_endpoint(
-    mode: &RemoteMode,
-    backend: RemoteBackend,
-) -> Option<&'static str> {
+pub fn wizard_query_endpoint(mode: &RemoteMode, backend: RemoteBackend) -> Option<&'static str> {
     match (mode, backend) {
         (RemoteMode::Ephemeral(_), RemoteBackend::Infinity | RemoteBackend::Vllm) =>
             Some(default_backend_endpoint(backend)),
@@ -270,7 +267,7 @@ pub(crate) fn wizard_query_endpoint(
 /// The default LOCAL endpoint the wizard uses for a backend: ollama 11434, infinity 7997, vLLM
 /// 8000. The single source for BOTH the connect `endpoint` default and the ephemeral
 /// `query_endpoint` default, so the endpoint always matches the selected backend's route + port.
-pub(crate) fn default_backend_endpoint(backend: RemoteBackend) -> &'static str {
+pub fn default_backend_endpoint(backend: RemoteBackend) -> &'static str {
     match backend {
         RemoteBackend::Ollama => DEFAULT_QUERY_ENDPOINT,
         RemoteBackend::Infinity => "http://localhost:7997",
@@ -281,7 +278,7 @@ pub(crate) fn default_backend_endpoint(backend: RemoteBackend) -> &'static str {
 /// Whether `url` is one of the wizard's known default LOCAL endpoints (any backend's) — a value the
 /// wizard itself wrote, so it is safe to REPLACE when the backend or mode changes. A URL outside
 /// this set is a user customization and is preserved.
-pub(crate) fn is_default_backend_endpoint(url: &str) -> bool {
+pub fn is_default_backend_endpoint(url: &str) -> bool {
     [RemoteBackend::Ollama, RemoteBackend::Infinity, RemoteBackend::Vllm]
         .into_iter()
         .any(|b| default_backend_endpoint(b) == url)
@@ -289,7 +286,7 @@ pub(crate) fn is_default_backend_endpoint(url: &str) -> bool {
 
 /// Hook installation selections.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct HooksDraft {
+pub struct HooksDraft {
     /// Whether to install the rag-rat git maintenance hooks (post-checkout/merge/rewrite/commit).
     pub git: bool,
 }
@@ -299,7 +296,7 @@ pub(crate) struct HooksDraft {
 /// Built either from a fresh `RepoScan` (`from_scan`) or by loading an existing `Config`
 /// (`from_config`). The writer reads ONLY this struct; no UI concept leaks in here.
 #[derive(Clone, Debug)]
-pub(crate) struct WizardDraft {
+pub struct SetupDraft {
     /// The `[index] root` value (a relative path such as `"."` or `".."`).
     ///
     /// ALWAYS a relative path — exactly what gets written to `[index] root` in the TOML.
@@ -350,7 +347,7 @@ pub(crate) struct WizardDraft {
     pub distill: DistillDraft,
 }
 
-impl WizardDraft {
+impl SetupDraft {
     /// Build a fresh draft from a `RepoScan`, mirroring `init::run::default_plan` logic:
     ///
     /// - Languages: those with a non-zero file count in `scan`.
@@ -365,7 +362,7 @@ impl WizardDraft {
     ///
     /// `root_value` is the relative `[index] root` string (e.g. `"."`) already computed by the
     /// caller. `root_abs` is the absolute canonical repo root used for dir-existence validation.
-    pub(crate) fn from_scan(scan: &RepoScan, root_value: String, root_abs: PathBuf) -> Self {
+    pub fn from_scan(scan: &RepoScan, root_value: String, root_abs: PathBuf) -> Self {
         let mut bindings: BTreeMap<Language, Vec<PathBuf>> = BTreeMap::new();
 
         for &lang in Language::all() {
@@ -423,7 +420,7 @@ impl WizardDraft {
     /// - `cfg.oracle.*` → oracle fields.
     /// - `cfg.version_check.enabled` → `version_check`.
     /// - Hook status: Task 16 fills `git`; defaulted to `false` here.
-    pub(crate) fn from_config(cfg: &Config, config_path: &std::path::Path) -> Self {
+    pub fn from_config(cfg: &Config, config_path: &std::path::Path) -> Self {
         // Group target directories by language. Config preserves TOML order; BTreeMap gives a
         // stable language-sorted order for the wizard display.
         let mut bindings: BTreeMap<Language, Vec<PathBuf>> = BTreeMap::new();
@@ -465,7 +462,7 @@ impl WizardDraft {
     /// `Config::load` intentionally resolves rich targets and relative cookbook paths for runtime
     /// use. The wizard writer owns only `[target_bindings]` and the literal remote fields, so the
     /// reconfigure path must recover those literals from the raw document before patching.
-    pub(crate) fn from_existing(raw: &str, cfg: &Config, config_path: &std::path::Path) -> Self {
+    pub fn from_existing(raw: &str, cfg: &Config, config_path: &std::path::Path) -> Self {
         let mut draft = Self::from_config(cfg, config_path);
         let Ok(doc) = raw.parse::<DocumentMut>() else {
             return draft;
@@ -490,7 +487,7 @@ impl WizardDraft {
         draft
     }
 
-    pub(crate) fn conflicting_rich_target_names(&self) -> Vec<String> {
+    pub fn conflicting_rich_target_names(&self) -> Vec<String> {
         self.bindings
             .keys()
             .map(|lang| lang.as_db_str())
@@ -503,7 +500,7 @@ impl WizardDraft {
     ///
     /// Language order follows the `BTreeMap` key order (alphabetical by `Language::as_db_str`),
     /// which is stable and matches the insertion order the wizard and `from_scan` use.
-    pub(crate) fn to_init_plan(&self) -> InitPlan {
+    pub fn to_init_plan(&self) -> InitPlan {
         let languages: Vec<Language> = self.bindings.keys().copied().collect();
         let backend =
             EmbeddingBackend::from_str(&self.model).unwrap_or(EmbeddingBackend::fast_embed());
@@ -519,7 +516,7 @@ impl WizardDraft {
 
     /// Render a fresh `rag-rat.toml` by starting with the canonical legacy renderer, then applying
     /// the wizard-owned fields that `InitPlan` cannot carry.
-    pub(crate) fn write_fresh(&self) -> String {
+    pub fn write_fresh(&self) -> String {
         let base = render_config(&self.to_init_plan());
         self.patch_existing(&base).unwrap_or(base)
     }
@@ -535,7 +532,7 @@ impl WizardDraft {
     /// - `[version_check] enabled`
     ///
     /// All other tables, keys, and comments are left intact.
-    pub(crate) fn patch_existing(&self, original: &str) -> anyhow::Result<String> {
+    pub fn patch_existing(&self, original: &str) -> anyhow::Result<String> {
         let mut doc: DocumentMut = original.parse()?;
 
         // [index] root
@@ -1081,7 +1078,7 @@ mod tests {
         std::fs::write(&config_path, raw).unwrap();
         let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
 
-        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let d = SetupDraft::from_existing(raw, &cfg, &config_path);
         // The display seam shows the RESOLVED path (the explicit key, made absolute by load).
         // Normalize separators: the display path uses `\` on Windows (correct for the user), but
         // the suffix check is separator-agnostic.
@@ -1117,7 +1114,7 @@ mod tests {
         )
         .unwrap();
         let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
-        let d = WizardDraft::from_config(&cfg, &config_path);
+        let d = SetupDraft::from_config(&cfg, &config_path);
         assert_eq!(d.model, "none");
         assert_eq!(d.bindings.get(&Language::Rust).unwrap(), &vec![std::path::PathBuf::from(
             "src"
@@ -1149,7 +1146,7 @@ mod tests {
         )
         .unwrap();
         let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
-        let d = WizardDraft::from_config(&cfg, &config_path);
+        let d = SetupDraft::from_config(&cfg, &config_path);
         let remote = d.remote.expect("remote block should be present");
         assert_eq!(remote.model, "all-minilm");
         assert_eq!(remote.num_ctx, Some(4096));
@@ -1173,7 +1170,7 @@ mod tests {
         )
         .unwrap();
         let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
-        let d = WizardDraft::from_config(&cfg, &config_path);
+        let d = SetupDraft::from_config(&cfg, &config_path);
         assert!(d.oracle_auto_run);
         assert_eq!(d.oracle_quiet_secs, 300);
         assert_eq!(d.oracle_min_interval_secs, 7200);
@@ -1185,7 +1182,7 @@ mod tests {
         let original = "# my notes\n[index]\nroot = \".\"\n[future]\nthing = \
                         1\n[target_bindings]\nrust = [\"src\"]\n";
         let mut d =
-            WizardDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
+            SetupDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
         d.bindings.insert(rag_rat_base::language::Language::Rust, vec!["crates".into()]);
         let out = d.patch_existing(original).unwrap();
         assert!(out.contains("# my notes"), "comment must be kept");
@@ -1201,7 +1198,7 @@ mod tests {
                         = \"garbage\"\n[oracle]\nauto_run = false\n[version_check]\nenabled = \
                         true\n";
         let mut d =
-            WizardDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
+            SetupDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
         d.bindings.insert(Language::Rust, vec!["src".into()]);
         let out = d.patch_existing(original).unwrap();
         let patched: toml_edit::DocumentMut = out.parse().expect("output must be valid TOML");
@@ -1221,7 +1218,7 @@ mod tests {
     #[test]
     fn fresh_write_persists_remote_and_version_check() {
         let mut d =
-            WizardDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
+            SetupDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
         d.bindings.insert(Language::Rust, vec!["src".into()]);
         d.model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
         d.version_check = false;
@@ -1257,7 +1254,7 @@ mod tests {
                         [llm.embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\n\
                         remote = { model = \"old\", endpoint = \"http://old:11434\" }\n";
         let mut d =
-            WizardDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
+            SetupDraft::from_scan(&RepoScan::default(), ".".into(), std::path::PathBuf::from("."));
         d.bindings.insert(Language::Rust, vec!["src".into()]);
         d.model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
         d.remote = Some(RemoteDraft {
@@ -1294,7 +1291,7 @@ mod tests {
             (RemoteBackend::Infinity, "infinity"),
             (RemoteBackend::Vllm, "vllm"),
         ] {
-            let mut d = WizardDraft::from_scan(
+            let mut d = SetupDraft::from_scan(
                 &RepoScan::default(),
                 ".".into(),
                 std::path::PathBuf::from("."),
@@ -1352,7 +1349,7 @@ mod tests {
         )
         .unwrap();
         let cfg = rag_rat_base::config::Config::load(&config_path).unwrap();
-        let d = WizardDraft::from_existing(
+        let d = SetupDraft::from_existing(
             &std::fs::read_to_string(&config_path).unwrap(),
             &cfg,
             &config_path,
@@ -1369,7 +1366,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         let config_path = dir.path().join("rag-rat.toml");
         let mut d =
-            WizardDraft::from_scan(&RepoScan::default(), ".".into(), dir.path().to_path_buf());
+            SetupDraft::from_scan(&RepoScan::default(), ".".into(), dir.path().to_path_buf());
         d.bindings.insert(Language::Rust, vec!["src".into()]);
         d.model = "sentence-transformers/all-MiniLM-L6-v2".to_string();
         d.remote = Some(RemoteDraft {
@@ -1419,7 +1416,7 @@ mod tests {
         std::fs::write(&config_path, raw).unwrap();
         let cfg = Config::load(&config_path).unwrap();
 
-        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let d = SetupDraft::from_existing(raw, &cfg, &config_path);
         let remote = d.remote.expect("remote present");
         assert_eq!(remote.backend, RemoteBackend::Infinity);
         assert_eq!(remote.query_endpoint.as_deref(), Some("http://gpu-box.local:9999"));
@@ -1435,7 +1432,7 @@ mod tests {
                    [llm.embedding]\nmodel = \"sentence-transformers/all-MiniLM-L6-v2\"\n\
                    [llm.embedding.remote]\nmodel = \"x\"\nbackend = \"infinity\"\ncookbook = \
                    \"@rag-rat/cookbook modal\"\nquery_endpoint = \"http://stale:1234\"\n";
-        let mut d = WizardDraft::from_scan(&RepoScan::default(), ".".into(), PathBuf::from("."));
+        let mut d = SetupDraft::from_scan(&RepoScan::default(), ".".into(), PathBuf::from("."));
         d.bindings.insert(Language::Rust, vec!["src".into()]);
         let mut remote = RemoteDraft {
             model: "x".to_string(),
@@ -1485,7 +1482,7 @@ mod tests {
         std::fs::write(&config_path, raw).unwrap();
         let cfg = Config::load(&config_path).unwrap();
 
-        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let d = SetupDraft::from_existing(raw, &cfg, &config_path);
         let out = d.patch_existing(raw).unwrap();
 
         assert!(d.bindings.is_empty());
@@ -1505,7 +1502,7 @@ mod tests {
         std::fs::write(&config_path, raw).unwrap();
         let cfg = Config::load(&config_path).unwrap();
 
-        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let d = SetupDraft::from_existing(raw, &cfg, &config_path);
         let out = d.patch_existing(raw).unwrap();
         let doc: DocumentMut = out.parse().unwrap();
 
@@ -1528,7 +1525,7 @@ mod tests {
         let resolved = cfg.llm.embedding.remote.as_ref().unwrap().cookbook.as_deref().unwrap();
         assert!(PathBuf::from(resolved).is_absolute());
 
-        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let d = SetupDraft::from_existing(raw, &cfg, &config_path);
         let out = d.patch_existing(raw).unwrap();
         let doc: DocumentMut = out.parse().unwrap();
         let remote = doc["llm"]["embedding"]["remote"].as_table_like().unwrap();
@@ -1555,7 +1552,7 @@ mod tests {
         let cfg = Config::load(&config_path).unwrap();
         assert_eq!(cfg.llm.embedding.remote.as_ref().unwrap().concurrency, 1);
 
-        let d = WizardDraft::from_existing(raw, &cfg, &config_path);
+        let d = SetupDraft::from_existing(raw, &cfg, &config_path);
         let out = d.patch_existing(raw).unwrap();
         let doc: DocumentMut = out.parse().unwrap();
         let remote = doc["llm"]["embedding"]["remote"].as_table_like().unwrap();
@@ -1571,7 +1568,7 @@ mod tests {
 
     #[test]
     fn from_scan_selects_default_dirs_and_backend() {
-        use crate::init::scan::add_file_to_dir_counts;
+        use crate::scan::add_file_to_dir_counts;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
@@ -1587,7 +1584,7 @@ mod tests {
         scan.set_total_source_bytes(1_000);
 
         let root_abs = root.to_path_buf();
-        let d = WizardDraft::from_scan(&scan, ".".to_string(), root_abs.clone());
+        let d = SetupDraft::from_scan(&scan, ".".to_string(), root_abs.clone());
         assert!(d.bindings.contains_key(&Language::Rust));
         assert_eq!(d.bindings[&Language::Rust], vec![PathBuf::from("src")]);
         // Small repo (1 KB) → fast_embed (MiniLM).
@@ -1600,7 +1597,7 @@ mod tests {
     }
 
     /// BIND-03 (task 11, `complete-default-bindings-coverage`): the interactive wizard path
-    /// (`WizardDraft::from_scan`) and the non-interactive path (`init::run::default_plan`) must
+    /// (`SetupDraft::from_scan`) and the non-interactive path (`init::run::default_plan`) must
     /// resolve *byte-for-byte identical* bindings when driven against the same real on-disk
     /// fixture — root `go.mod`, no root-level `.go` file, >32 leaf package dirs, the same
     /// fixture shape the black-box CLI integration test in
@@ -1610,8 +1607,8 @@ mod tests {
     /// call site.
     #[test]
     fn from_scan_matches_default_plan_for_a_large_go_module() {
-        use crate::init::run::default_plan;
-        use crate::init::scan::scan_repo;
+        use crate::plan::default_plan;
+        use crate::scan::scan_repo;
 
         let root = rag_rat_base::test_scratch::ScratchDir::new("go-from-scan-big");
         std::fs::write(root.join("go.mod"), "module example.com/big\n\ngo 1.22\n").unwrap();
@@ -1623,7 +1620,7 @@ mod tests {
 
         let scan = scan_repo(&root).unwrap();
         let plan = default_plan(".".to_string(), &scan);
-        let draft = WizardDraft::from_scan(&scan, ".".to_string(), root.to_path_buf());
+        let draft = SetupDraft::from_scan(&scan, ".".to_string(), root.to_path_buf());
 
         assert_eq!(draft.bindings.get(&Language::Go), Some(&vec![PathBuf::from(".")]));
         // Full binding-map parity, not just Go — the two call sites must never diverge for any
@@ -1637,8 +1634,8 @@ mod tests {
 
     // ── Distill + tracker emission ──────────────────────────────────────────────
 
-    fn fresh_draft() -> WizardDraft {
-        let mut d = WizardDraft::from_scan(&RepoScan::default(), ".".into(), PathBuf::from("."));
+    fn fresh_draft() -> SetupDraft {
+        let mut d = SetupDraft::from_scan(&RepoScan::default(), ".".into(), PathBuf::from("."));
         d.bindings.insert(Language::Rust, vec!["src".into()]);
         d
     }

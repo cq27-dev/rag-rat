@@ -4986,6 +4986,7 @@ dependencies = [
  "rag-rat-oracle",
  "rag-rat-papertrail",
  "rag-rat-query",
+ "rag-rat-setup",
  "rag-rat-sync",
  "ratatui",
  "rusqlite",
@@ -5279,6 +5280,20 @@ dependencies = [
  "sha2",
  "strum",
  "tempfile",
+]
+
+[[package]]
+name = "rag-rat-setup"
+version = "0.23.2"
+dependencies = [
+ "anyhow",
+ "gix",
+ "rag-rat-base",
+ "rag-rat-core",
+ "strum",
+ "tempfile",
+ "toml_edit",
+ "tracing",
 ]
 
 [[package]]

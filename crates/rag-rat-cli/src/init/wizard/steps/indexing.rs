@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use rag_rat_base::language::Language;
+use rag_rat_setup::DirCandidate;
+use rag_rat_setup::scan::candidate_dirs;
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -14,8 +16,6 @@ use tui_tree_widget::{Tree, TreeItem, TreeState};
 use super::super::state::WizardState;
 use super::super::theme;
 use super::types::{CheckResult, IndexZone, Outcome, StepState};
-use crate::init::DirCandidate;
-use crate::init::scan::candidate_dirs;
 
 fn checked_langs(state: &WizardState) -> Vec<Language> {
     match &state.step {
@@ -36,7 +36,7 @@ fn active_tree_lang(state: &WizardState) -> Option<Language> {
 }
 
 pub(super) fn base_candidates_for(
-    scan: &crate::init::RepoScan,
+    scan: &rag_rat_setup::RepoScan,
     lang: Language,
 ) -> Vec<DirCandidate> {
     let mut cs = candidate_dirs(scan, lang);
@@ -46,7 +46,7 @@ pub(super) fn base_candidates_for(
     // BIND-06: `candidate_dirs` is capped (32 entries) for display, but a default can fall
     // outside that cap. Union in any such default so the wizard UI always shows it, even
     // though it never made the capped/browsable list.
-    for path in crate::init::scan::default_dirs(scan, lang) {
+    for path in rag_rat_setup::scan::default_dirs(scan, lang) {
         if !cs.iter().any(|c| c.path == path) {
             cs.push(DirCandidate { path, count: 0, default: true });
         }
@@ -546,8 +546,9 @@ fn has_effective_simple_bindings(state: &WizardState) -> bool {
 mod base_candidates_for_tests {
     use std::fs;
 
+    use rag_rat_setup::scan::{default_dirs, scan_repo};
+
     use super::*;
-    use crate::init::scan::{default_dirs, scan_repo};
 
     #[test]
     fn defaults_outside_top_32_are_unioned_in_and_tagged_default() {
