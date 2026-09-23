@@ -8,7 +8,7 @@ use rag_rat_core::index::papertrail_autosync as autosync;
 
 use crate::cli::{HookAction, HooksArgs, PapertrailArgs, PapertrailCommand};
 use crate::render::print_output;
-use crate::{MANAGED_HOOKS, ensure_index_exists, git_paths, install_hook, is_rag_rat_hook};
+use crate::{MANAGED_HOOKS, ensure_index_exists, git_paths, is_rag_rat_hook};
 
 pub(crate) fn papertrail(config: &Config, args: &PapertrailArgs) -> anyhow::Result<()> {
     match &args.command {
@@ -34,12 +34,10 @@ pub(crate) fn hooks(config: &Config, args: &HooksArgs) -> anyhow::Result<()> {
     let git = git_paths(&config.root)?;
     match args.action {
         HookAction::Install => {
-            fs::create_dir_all(git.hooks_dir())?;
-            let mut installed = Vec::new();
-            for &hook in MANAGED_HOOKS {
-                install_hook(git.hooks_dir(), hook)?;
-                installed.push(hook.as_trigger());
-            }
+            let installed = crate::hooks_support::install_managed_hooks(git.hooks_dir())?
+                .into_iter()
+                .map(|hook| hook.as_trigger())
+                .collect::<Vec<_>>();
             print_output(&serde_json::json!({
                 "status": "installed",
                 "repo_root": git.worktree_root(),

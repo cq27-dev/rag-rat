@@ -97,17 +97,22 @@ pub(super) fn validate_hooks(state: &WizardState) -> CheckResult {
             "git hooks require a git worktree; disable git hooks or choose a git repo root",
         );
     };
-    for &hook in MANAGED_HOOKS {
-        let path = gp.hooks_dir().join(hook.as_trigger());
-        if path.exists()
-            && !is_rag_rat_hook(&path).unwrap_or(false)
-            && !state.hook_conflicts.contains_key(hook.as_trigger())
-        {
-            return CheckResult::block(format!(
-                "resolve foreign hook `{}` before saving or disable git hooks",
-                hook.as_trigger()
-            ));
-        }
+    // A hook rag-rat does not manage never blocks saving: the config is worth writing either way,
+    // and hooks install all or nothing, so none are written until the slot is cleared.
+    let foreign = MANAGED_HOOKS
+        .iter()
+        .map(|hook| hook.as_trigger())
+        .filter(|name| {
+            let path = gp.hooks_dir().join(name);
+            path.exists() && !is_rag_rat_hook(&path).unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    if foreign.is_empty() {
+        return CheckResult::ok();
     }
-    CheckResult::ok()
+    CheckResult::warn(format!(
+        "`{}` is not managed by rag-rat, so no hooks will be installed; move it aside, then run \
+         `rag-rat hooks install`",
+        foreign.join("`, `")
+    ))
 }

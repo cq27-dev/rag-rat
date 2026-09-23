@@ -435,3 +435,51 @@ fn init_yes_does_not_truncate_more_than_32_rust_defaults() {
         "all 40 rust package dirs must be bound, none silently dropped by the 32-entry UI cap"
     );
 }
+
+/// Run `rag-rat <args>` in `root` with every store sandboxed; stdin is `/dev/null` and stdout a
+/// pipe, which is what an agent's shell gives it.
+fn run_in(root: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_rag-rat"))
+        .args(args)
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .env("RAG_RAT_HOOK_DISABLE", "1")
+        .env("RAG_RAT_NO_WATCH", "1")
+        .env("RAG_RAT_MODEL_CACHE", root.join("model-cache"))
+        .env("RAG_RAT_DATA_DIR", root.join("data"))
+        .env("HOME", root)
+        .env("XDG_CACHE_HOME", root.join("model-cache"))
+        .output()
+        .unwrap()
+}
+
+/// `init --yes` asks nothing, so it must not replace a config someone customised with defaults.
+#[test]
+fn init_yes_refuses_to_replace_an_existing_config_without_force() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn alpha() -> u32 {\n    1\n}\n").unwrap();
+    let custom = "[index]\nroot = \".\"\n# customised\n[target_bindings]\nrust = [\"src\"]\n";
+    std::fs::write(root.join("rag-rat.toml"), custom).unwrap();
+
+    let output = run_in(&root, &["init", "--yes", "--no-hooks"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "init --yes replaced an existing config");
+    assert!(stderr.contains("--force"), "the refusal names the way through: {stderr}");
+    assert_eq!(std::fs::read_to_string(root.join("rag-rat.toml")).unwrap(), custom);
+}
+
+/// Plain `init` is the full-screen wizard. Without a terminal it must fail fast with the command
+/// to run instead, not fail on the tty open or draw into a pipe and hang.
+#[test]
+fn init_without_a_terminal_points_at_yes() {
+    let root = unique_temp_root();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/lib.rs"), "pub fn alpha() -> u32 {\n    1\n}\n").unwrap();
+
+    let output = run_in(&root, &["init"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("rag-rat init --yes"), "{stderr}");
+    assert!(!root.join("rag-rat.toml").exists());
+}

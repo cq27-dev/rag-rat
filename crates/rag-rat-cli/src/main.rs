@@ -22,9 +22,7 @@ pub(crate) use commands::{
 #[cfg(feature = "eval")]
 pub(crate) use commands::{benchmark_embedding, dump_memory_input_hashes, dump_verify_packs, eval};
 pub(crate) use fs_atomic::write_atomic;
-pub(crate) use hooks_support::{
-    ManagedHook, git_paths, hook_script, install_hook, is_rag_rat_hook, make_executable,
-};
+pub(crate) use hooks_support::{ManagedHook, git_paths, is_rag_rat_hook};
 use rag_rat_base::config::Config;
 use rag_rat_core::IndexDatabase;
 pub(crate) use render::print_output;

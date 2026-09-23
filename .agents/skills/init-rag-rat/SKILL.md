@@ -31,7 +31,9 @@ hand-write a config blind, and let a real config load re-check it before indexin
    match the version the rag-rat MCP server runs, so the index you create is one the server can read —
    do **not** use `@latest`, and **don't blindly trust an on-`PATH` `rag-rat`**:
    - If `rag-rat` is on `PATH`, check `rag-rat --version` and use it **only if it matches** the
-     plugin/MCP version — a stale global install would build the index with the wrong binary.
+     plugin/MCP version — a stale global install would build the index with the wrong binary. With
+     the plugin, `~/.local/bin/rag-rat` is its version-matched binary (the MCP server links it when
+     it starts), so try that path too if `rag-rat` alone is not found.
    - Otherwise (or on a version mismatch) use `npx -y @rag-rat/bin@0.23.2 …` — the plugin pins
      `@rag-rat/bin` to its own version and caches the binary privately, so this is the
      version-matched CLI; `npx` runs it in the current directory.
@@ -63,7 +65,12 @@ hand-write a config blind, and let a real config load re-check it before indexin
      model, and builds the initial index **and embeddings** in one step. `--no-hooks` is what keeps
      hook install a separate ask — plain `init --yes` would install the git hooks immediately. Preview
      first with `<rag-rat> init --yes --dry-run` if the user wants to see the config. No hand-editing,
-     and **no separate index/reconcile step** for this path.
+     and **no separate index/reconcile step** for this path. It downloads the model and indexes and
+     embeds the whole repo, so on anything but a small repo **run it in the background** (or with
+     your longest command timeout) and poll until it exits — a foreground call can time out partway.
+     Its closing "connect your coding agent … `claude mcp add` / `codex mcp add`" hint is for users
+     **without** the plugin: **do not run those commands** — the plugin already registered the
+     server, and a second registration runs two servers against one index.
    - **Custom remote backend:** take the base from `<rag-rat> init --yes --dry-run` (which writes
      nothing), add the `[llm.embedding.remote]` block from step 5, show the final config, and write
      `rag-rat.toml` only after the user confirms.
@@ -83,10 +90,12 @@ hand-write a config blind, and let a real config load re-check it before indexin
      `post-checkout` / `post-merge` / `post-rewrite` / `post-commit` hooks that keep the index fresh as
      the repo changes. They modify `.git/hooks`, so **ask the user** — nothing above installed them
      (the FastEmbed path ran with `--no-hooks`). If they agree: `<rag-rat> hooks install` — idempotent,
-     and it **never clobbers a foreign hook** (if a non-rag-rat hook occupies a slot it errors "move
-     it aside or merge manually"; surface that and move on). If they decline, or it isn't a git
-     worktree, skip it — nothing to undo.
-   - **Then restart the rag-rat MCP server** in the agent. A dormant server does not self-activate
+     and **all or nothing**: if a hook rag-rat does not manage occupies any slot, it installs none and
+     names each one. Tell the user which hooks are in the way and that they can move them aside and
+     re-run `hooks install`; don't leave them thinking the index will stay fresh. If they decline, or
+     it isn't a git worktree, skip it — nothing to undo.
+   - **Then restart the rag-rat MCP server** in the agent — in Claude Code the user runs `/mcp` and
+     reconnects `rag-rat`; in Codex and opencode, a new session. A dormant server does not self-activate
      (that would be a half-active server without the watcher and hook listener). After restart it
      discovers `rag-rat.toml`, starts fully active, and ordinary tools work against the new index.
 

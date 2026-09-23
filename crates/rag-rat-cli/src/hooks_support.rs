@@ -95,6 +95,30 @@ pub(crate) fn install_hook(hooks_dir: &Path, hook: ManagedHook) -> anyhow::Resul
     make_executable(&path)?;
     Ok(())
 }
+/// Install every managed hook, or none. Refuses before writing anything when any slot holds a hook
+/// rag-rat does not manage, naming every such slot: installing hook by hook stopped at the first
+/// conflict and left a partial set that kept some git operations fresh and not others.
+pub(crate) fn install_managed_hooks(hooks_dir: &Path) -> anyhow::Result<Vec<ManagedHook>> {
+    let mut foreign = Vec::new();
+    for &hook in ManagedHook::ALL {
+        let path = hooks_dir.join(hook.as_trigger());
+        if path.exists() && !is_rag_rat_hook(&path)? {
+            foreign.push(path.display().to_string());
+        }
+    }
+    anyhow::ensure!(
+        foreign.is_empty(),
+        "no hooks were installed: {} already exist and are not managed by rag-rat; move them \
+         aside or merge them manually, then re-run",
+        foreign.join(", ")
+    );
+    fs::create_dir_all(hooks_dir)?;
+    for &hook in ManagedHook::ALL {
+        install_hook(hooks_dir, hook)?;
+    }
+    Ok(ManagedHook::ALL.to_vec())
+}
+
 pub(crate) fn is_rag_rat_hook(path: &Path) -> anyhow::Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -129,7 +153,7 @@ pub(crate) fn hook_is_current(path: &Path, hook: ManagedHook) -> bool {
 }
 
 /// A release version as comparable numbers. `None` for anything that is not plain `X.Y.Z`.
-fn release_version(version: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn release_version(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
     let version = (parts.next()??, parts.next()??, parts.next()??);
     parts.next().is_none().then_some(version)
@@ -287,6 +311,32 @@ mod current_tests {
         fs::write(&path, bare).unwrap();
         assert!(is_rag_rat_hook(&path).unwrap(), "still managed");
         assert!(!hook_is_current(&path, ManagedHook::PostCommit), "but not current");
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    /// One foreign hook blocks the whole install, and nothing is written: a partial set would keep
+    /// some git operations fresh and silently not others.
+    #[test]
+    fn a_foreign_hook_in_any_slot_installs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let foreign = dir.path().join(ManagedHook::PostRewrite.as_trigger());
+        fs::write(&foreign, "#!/bin/sh\necho mine\n").unwrap();
+
+        let err = install_managed_hooks(dir.path()).expect_err("a foreign hook refuses");
+        assert!(err.to_string().contains("post-rewrite"), "names the slot: {err}");
+        for &hook in ManagedHook::ALL {
+            if hook != ManagedHook::PostRewrite {
+                assert!(!dir.path().join(hook.as_trigger()).exists(), "{hook:?} was written");
+            }
+        }
+        assert_eq!(fs::read_to_string(&foreign).unwrap(), "#!/bin/sh\necho mine\n");
+
+        fs::remove_file(&foreign).unwrap();
+        assert_eq!(install_managed_hooks(dir.path()).unwrap(), ManagedHook::ALL.to_vec());
     }
 }
 

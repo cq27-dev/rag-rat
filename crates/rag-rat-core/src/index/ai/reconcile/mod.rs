@@ -23,5 +23,5 @@ mod status;
 pub(crate) use embed_loop::*;
 pub(crate) use manifest::*;
 pub(crate) use model_lifecycle::*;
-pub(crate) use policy_scan::embedding_policy_skip_summary;
+pub(crate) use policy_scan::{embedding_policy_skip_summary, policy_skip_summary_from_column};
 pub(crate) use status::*;

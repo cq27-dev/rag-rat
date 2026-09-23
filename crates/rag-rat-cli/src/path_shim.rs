@@ -82,9 +82,10 @@ fn status(path_var: &OsStr, shim_dir: Option<&Path>) -> serde_json::Value {
             ))
         },
         (None, None) => Some(
-            "`rag-rat` is not on PATH. Run commands as `npx -y @rag-rat/bin <command>`, or \
-             install it with `npm install -g @rag-rat/bin` (the agent plugins add a shim in \
-             ~/.local/bin on their next launch)."
+            "`rag-rat` is not on PATH. With an agent plugin it appears in ~/.local/bin once the \
+             plugin's MCP server starts; otherwise install it with `npm install -g @rag-rat/bin`. \
+             As a last resort run `npx -y @rag-rat/bin@<version> <command>`, pinned to your MCP \
+             server's version (an unpinned run can migrate the index past what it can open)."
                 .to_string(),
         ),
     };
@@ -94,6 +95,145 @@ fn status(path_var: &OsStr, shim_dir: Option<&Path>) -> serde_json::Value {
         "shim_dir_on_path": shim_dir_on_path,
         "warning": warning,
     })
+}
+
+/// The marker line of a Windows `rag-rat.cmd` shim. Plain words only: cmd.exe parses redirection
+/// even on a `rem` line, so a `>` here could truncate a file every time the shim runs.
+const CMD_MARKER: &str = "rem rag-rat plugin shim";
+
+/// Where the plugins cache the binary: the launcher's managed cache and npm's `npx` cache.
+struct Caches {
+    /// `<XDG_CACHE_HOME|~/.cache>/rag-rat/bin`, whose children are named by version — in both its
+    /// lexical and its symlink-resolved form. `current_exe()` reports the resolved path, while a
+    /// shim the plugin launcher once wrote may name the lexical one; a cache reached through a
+    /// symlink must be recognised either way.
+    managed: Vec<PathBuf>,
+}
+
+impl Caches {
+    fn from_env() -> Option<Self> {
+        let cache_home = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|home| home.join(".cache")))?;
+        Self::at(cache_home)
+    }
+
+    fn at(cache_home: PathBuf) -> Option<Self> {
+        let lexical = std::path::absolute(&cache_home).ok()?.join("rag-rat").join("bin");
+        let mut managed = vec![lexical.clone()];
+        // The cache root, not `rag-rat/bin` under it: that may not exist yet on a first run.
+        if let Ok(root) = rag_rat_base::paths::canonicalize(&cache_home)
+            && root.join("rag-rat").join("bin") != lexical
+        {
+            managed.push(root.join("rag-rat").join("bin"));
+        }
+        Some(Self { managed })
+    }
+
+    /// A binary the plugins put there — the only kind the shim ever points at, or replaces.
+    fn holds(&self, binary: &Path) -> bool {
+        let name = if cfg!(windows) { "rag-rat.exe" } else { "rag-rat" };
+        let npx = Path::new("@rag-rat").join("bin").join("node_modules").join(".bin_real");
+        binary.file_name() == Some(OsStr::new(name))
+            && (self.managed.iter().any(|root| binary.starts_with(root))
+                || binary.parent().is_some_and(|dir| dir.ends_with(&npx)))
+    }
+
+    /// The release a cached binary is: its managed-cache directory names it; an npx one is asked.
+    /// `None` for a binary that is gone or does not answer.
+    fn version_of(&self, binary: &Path) -> Option<String> {
+        if !binary.is_file() {
+            return None;
+        }
+        if let Some(rest) = self.managed.iter().find_map(|root| binary.strip_prefix(root).ok()) {
+            return rest.iter().next().map(|v| v.to_string_lossy().into_owned());
+        }
+        let out = std::process::Command::new(binary).arg("--version").output().ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        text.split_whitespace().nth(1).map(str::to_owned)
+    }
+}
+
+/// What the shim at `shim` points at: `Ok(None)` when there is no shim, `Err(())` when something
+/// is there that the plugins did not create (a user's own install, a foreign link).
+fn shim_target(shim: &Path, caches: &Caches) -> Result<Option<PathBuf>, ()> {
+    let Ok(meta) = shim.symlink_metadata() else {
+        return Ok(None);
+    };
+    let target = if cfg!(windows) {
+        let text = std::fs::read_to_string(shim).map_err(|_| ())?;
+        let mut lines = text.lines();
+        if !lines.any(|line| line.trim() == CMD_MARKER) {
+            return Err(());
+        }
+        let exec = text.lines().find_map(|line| line.strip_suffix(" %*")).ok_or(())?;
+        PathBuf::from(exec.trim_matches('"'))
+    } else {
+        if !meta.file_type().is_symlink() {
+            return Err(());
+        }
+        std::fs::read_link(shim).map_err(|_| ())?
+    };
+    if caches.holds(&target) { Ok(Some(target)) } else { Err(()) }
+}
+
+/// Point the PATH shim at `binary` when it is a plugin-cached binary and the shim is missing,
+/// dangling, or pointing at an older release. `Ok(true)` when the shim was (re)written.
+///
+/// The plugins cache their binary in a private per-version directory, so without this the
+/// documented `rag-rat <command>` does not work for anyone who installed only a plugin. Every
+/// harness starts `rag-rat mcp`, so doing it here covers them all, from the first session. Like
+/// Claude Code's native installer it never edits a shell profile or the Windows user PATH —
+/// `doctor` says when the directory is not on PATH. It never replaces something it did not create,
+/// and only moves forward, so plugins for two agents on different versions do not fight over it; a
+/// dev build or a `cargo install` binary is never linked.
+fn refresh_at(binary: &Path, version: &str, caches: &Caches, dir: &Path) -> anyhow::Result<bool> {
+    if !caches.holds(binary) {
+        return Ok(false);
+    }
+    let shim = dir.join(SHIM_NAME);
+    let current = match shim_target(&shim, caches) {
+        Err(()) => return Ok(false),
+        Ok(current) => current,
+    };
+    if current.as_deref() == Some(binary) {
+        return Ok(false);
+    }
+    if let Some(current) = &current {
+        let newer = match (
+            crate::hooks_support::release_version(version),
+            caches.version_of(current).as_deref().and_then(crate::hooks_support::release_version),
+        ) {
+            (Some(ours), Some(theirs)) => ours > theirs,
+            (Some(_), None) => true, // dangling or unreadable: anything replaces it
+            (None, _) => false,
+        };
+        if !newer {
+            return Ok(false);
+        }
+    }
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".rag-rat-shim-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(binary, &tmp)?;
+    #[cfg(not(unix))]
+    std::fs::write(&tmp, format!("@echo off\r\n{CMD_MARKER}\r\n\"{}\" %*\r\n", binary.display()))?;
+    std::fs::rename(&tmp, &shim)?; // atomic replace
+    Ok(true)
+}
+
+/// [`refresh_at`] for this process: the running binary, this release, the default caches and
+/// shim directory. `RAG_RAT_NO_PATH_SHIM=1` turns it off.
+pub(crate) fn refresh_path_shim() -> anyhow::Result<Option<PathBuf>> {
+    if std::env::var_os("RAG_RAT_NO_PATH_SHIM").is_some_and(|v| v == "1") {
+        return Ok(None);
+    }
+    let (Some(caches), Some(dir)) = (Caches::from_env(), shim_dir()) else {
+        return Ok(None);
+    };
+    let binary = std::env::current_exe()?;
+    Ok(refresh_at(&binary, env!("CARGO_PKG_VERSION"), &caches, &dir)?.then(|| dir.join(SHIM_NAME)))
 }
 
 /// The `cli` section of `doctor` for this process's environment.
@@ -180,6 +320,119 @@ mod tests {
             Some(&dir.path().join("none")),
         );
         assert_eq!(report["on_path"], serde_json::json!(working));
+    }
+
+    /// The shim cases, against stub binaries in a scratch cache (Unix: the shim is a symlink
+    /// there).
+    #[cfg(unix)]
+    mod shim {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+
+        struct Fixture {
+            _dir: tempfile::TempDir,
+            caches: Caches,
+            shims: PathBuf,
+            npx: PathBuf,
+        }
+
+        fn fixture() -> Fixture {
+            let dir = tempfile::tempdir().unwrap();
+            let caches = Caches { managed: vec![dir.path().join("cache/rag-rat/bin")] };
+            let shims = dir.path().join("shims");
+            let npx =
+                dir.path().join("npm/_npx/abc/node_modules/@rag-rat/bin/node_modules/.bin_real");
+            Fixture { caches, shims, npx, _dir: dir }
+        }
+
+        /// A stub `rag-rat` at `dir` that reports `version`.
+        fn stub(dir: &Path, version: &str) -> PathBuf {
+            fs::create_dir_all(dir).unwrap();
+            let bin = dir.join("rag-rat");
+            fs::write(&bin, format!("#!/bin/sh\necho \"rag-rat {version}\"\n")).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            bin
+        }
+
+        impl Fixture {
+            fn managed(&self, version: &str) -> PathBuf {
+                stub(&self.caches.managed[0].join(version), version)
+            }
+            fn refresh(&self, binary: &Path, version: &str) -> bool {
+                refresh_at(binary, version, &self.caches, &self.shims).unwrap()
+            }
+            fn target(&self) -> Option<PathBuf> {
+                fs::read_link(self.shims.join(SHIM_NAME)).ok()
+            }
+        }
+
+        #[test]
+        fn created_then_moved_forward_never_back() {
+            let f = fixture();
+            let (v1, v2) = (f.managed("1.2.0"), f.managed("1.3.0"));
+            assert!(f.refresh(&v1, "1.2.0"), "created");
+            assert_eq!(f.target(), Some(v1.clone()));
+            assert!(!f.refresh(&v1, "1.2.0"), "already right: untouched");
+            assert!(f.refresh(&v2, "1.3.0"), "a newer release moves it");
+            assert!(!f.refresh(&v1, "1.2.0"), "an older one does not");
+            assert_eq!(f.target(), Some(v2.clone()));
+
+            fs::remove_file(&v2).unwrap();
+            assert!(f.refresh(&v1, "1.2.0"), "a dangling link is replaced by anything");
+            assert_eq!(f.target(), Some(v1));
+        }
+
+        /// `current_exe()` reports the resolved path; a cache reached through a symlink must still
+        /// be recognised as the plugin's.
+        #[test]
+        fn a_cache_reached_through_a_symlink_is_still_ours() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = dir.path().join("real-cache");
+            fs::create_dir_all(&real).unwrap();
+            let link = dir.path().join("cache-link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let caches = Caches::at(link).unwrap();
+            let resolved =
+                rag_rat_base::paths::canonicalize(&real).unwrap().join("rag-rat/bin/1.0.0");
+            let binary = stub(&resolved, "1.0.0");
+            assert!(caches.holds(&binary), "the resolved path of a symlinked cache is ours");
+            assert_eq!(caches.version_of(&binary).as_deref(), Some("1.0.0"));
+        }
+
+        #[test]
+        fn links_an_npx_cached_binary() {
+            let f = fixture();
+            let bin = stub(&f.npx, "1.5.0");
+            assert!(f.refresh(&bin, "1.5.0"));
+            assert_eq!(f.target(), Some(bin));
+        }
+
+        /// A dev build or a `cargo install` binary is not the plugin's to expose.
+        #[test]
+        fn never_links_a_binary_outside_the_plugin_caches() {
+            let f = fixture();
+            let dev = stub(&f._dir.path().join("target/debug"), "9.9.9");
+            assert!(!f.refresh(&dev, "9.9.9"));
+            assert_eq!(f.target(), None);
+        }
+
+        #[test]
+        fn never_replaces_what_it_did_not_create() {
+            let f = fixture();
+            let ours = f.managed("2.0.0");
+            fs::create_dir_all(&f.shims).unwrap();
+            let shim = f.shims.join(SHIM_NAME);
+
+            std::os::unix::fs::symlink("/usr/bin/true", &shim).unwrap();
+            assert!(!f.refresh(&ours, "2.0.0"), "a foreign symlink stays");
+            assert_eq!(f.target(), Some(PathBuf::from("/usr/bin/true")));
+
+            fs::remove_file(&shim).unwrap();
+            fs::write(&shim, "#!/bin/sh\necho mine\n").unwrap();
+            assert!(!f.refresh(&ours, "2.0.0"), "a user's own file stays");
+            assert_eq!(fs::read_to_string(&shim).unwrap(), "#!/bin/sh\necho mine\n");
+        }
     }
 
     #[test]

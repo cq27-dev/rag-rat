@@ -106,7 +106,7 @@ pub(crate) enum Command {
     /// pass that fills root-cause/decision/outcome runs separately.
     Distill(DistillArgs),
 
-    /// Install / uninstall / inspect git hooks and Claude Code hooks.
+    /// Install / uninstall / inspect the git maintenance hooks (agent hooks come with the plugin).
     Hooks(HooksArgs),
 
     /// Bounded post-git-operation index maintenance (invoked by hooks).
