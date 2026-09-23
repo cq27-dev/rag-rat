@@ -138,7 +138,7 @@ pub fn mint_invite(conn: &Connection, spec: InviteSpec<'_>) -> Result<InviteTick
     let expires_at_ms = now_ms
         .checked_add(ttl_ms)
         .ok_or_else(|| InviteError::Malformed("invite expiry overflows i64".into()))?;
-    require_founder_enrollment_authority(&tx, account_id)?;
+    require_owner_enrollment_authority(&tx, account_id)?;
     // The candidate store is grow-only — capacity never drains — so if it cannot fit THIS
     // redemption's DeviceAdd plus its stream-key wraps, the ticket would be permanently
     // unusable: a deterministic failure that must gate the invite-issuance boundary (#945),
@@ -250,14 +250,14 @@ fn require_mint_time_pin_unchanged(
     Ok(())
 }
 
-/// Founder-only on purpose, although any owner can author a `DeviceAdd`: what this gate admits must
-/// match exactly what the JOINER accepts, and the joiner's `verify_enrollment_device_add` accepts
-/// only a DeviceAdd that cites the genesis and carries the founder's signature. Redemption consumes
-/// the nonce and stores the receipt before the joiner ever checks it, so an invite this gate
-/// admitted and the joiner then refused would fail after the irreversible boundary — identically on
-/// every replay. That covers a founder that was demoted and re-promoted, too: its DeviceAdd cites
-/// the promotion's incarnation, not the genesis. Widen this and that verifier together (#1416).
-fn require_founder_enrollment_authority(
+/// Any owner may mint, pairing and writer invites alike. The joiner accepts a DeviceAdd from
+/// whichever owner signed it — its fold, not a founder check, decides who was entitled — so this
+/// gate only has to establish that the local device is an owner now.
+///
+/// Both boundaries must be `Open`, not merely `Effective`: an incarnation already bounded by a cut
+/// admits nothing beyond it, and the DeviceAdd a redemption authors would lie beyond. Admitting
+/// that here would mint a ticket every redemption refuses.
+fn require_owner_enrollment_authority(
     conn: &Connection,
     account_id: AccountId,
 ) -> Result<(), InviteError> {
@@ -275,18 +275,17 @@ fn require_founder_enrollment_authority(
     let local_device = load_local_device(conn)
         .map_err(InviteError::from)?
         .ok_or_else(|| InviteError::Storage(anyhow::anyhow!("local device identity is missing")))?;
-    let genesis_bytes: Vec<u8> = conn
-        .query_row("SELECT genesis_entry_hash FROM oplog_local_account WHERE id = 0", [], |row| {
-            row.get(0)
-        })
-        .map_err(|error| InviteError::Storage(error.into()))?;
-    let genesis_hash = genesis_bytes.try_into().map_err(|_| {
-        InviteError::Storage(anyhow::anyhow!("local account genesis hash is not 32 bytes"))
-    })?;
+    let incarnation = rag_rat_oplog::local_owner_incarnation(conn, account_id)
+        .map_err(InviteError::from)?
+        .ok_or_else(|| {
+            InviteError::Storage(anyhow::anyhow!(
+                "local device is not an owner of the account, so it cannot enroll devices"
+            ))
+        })?;
     let authority = owner_control_authority_in_snapshot(
         conn,
         account_id,
-        genesis_hash,
+        incarnation,
         local_device.fingerprint(),
     )
     .map_err(InviteError::from)?;
@@ -297,7 +296,7 @@ fn require_founder_enrollment_authority(
                 && authority.incarnation_boundary == AuthorityBoundary::Open
     ) {
         return Err(InviteError::Storage(anyhow::anyhow!(
-            "local device lacks open founder authority to enroll devices"
+            "local device lacks open owner authority to enroll devices"
         )));
     }
     Ok(())
@@ -347,7 +346,7 @@ pub fn mint_writer_invite(
     let expires_at_ms = now_ms
         .checked_add(ttl_ms)
         .ok_or_else(|| InviteError::Malformed("invite expiry overflows i64".into()))?;
-    require_founder_enrollment_authority(&tx, account_id)?;
+    require_owner_enrollment_authority(&tx, account_id)?;
     prune_expired_invites_in_tx(&tx, now_ms)?;
     // Stamped on a writer row too, though no writer screen compares it and the writer TICKET
     // carries no digest. The column's meaning has to be one thing across the table: leaving it

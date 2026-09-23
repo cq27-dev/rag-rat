@@ -199,6 +199,328 @@ fn device_add(dev: &Dev, role: DeviceRole) -> AccountOp {
     }
 }
 
+/// Run the joiner's adoption over `bootstrap` into a fresh store, returning the result and whether
+/// the store ended up holding the account.
+fn adopt_into_fresh_store(
+    bootstrap: &[Vec<u8>],
+    account: AccountId,
+    genesis_hash: [u8; 32],
+    joiner: &Dev,
+    device_add_hash: [u8; 32],
+) -> (anyhow::Result<()>, Option<AccountId>) {
+    use super::super::bootstrap::{
+        EnrollmentBootstrap, adopt_enrollment_bootstrap, read_local_account,
+    };
+
+    let joiner_db = db();
+    let result = adopt_enrollment_bootstrap(&joiner_db, EnrollmentBootstrap {
+        account_entries: bootstrap,
+        account_id: account,
+        genesis_hash: AccountEntryHash::from_bytes(genesis_hash),
+        device_fingerprint: joiner.fp,
+        device_add_hash: AccountEntryHash::from_bytes(device_add_hash),
+        now_ms: NOW,
+    });
+    (result, read_local_account(&joiner_db).unwrap())
+}
+
+/// The pre-adoption verifier is structural, not the authorization boundary: anyone can make a key
+/// "certified" by signing a DeviceAdd that adds itself. An attacker controlling the inviter serves
+/// the victim's real genesis, a self-signed DeviceAdd making itself an Owner, and the acknowledged
+/// DeviceAdd citing that. The verifier passes. Adoption's fold refuses, because the attacker holds
+/// no live owner incarnation — and the joiner's store never takes the account. This is the test
+/// that proves the boundary holds, so it is the one mutation-proved against the fold's authority
+/// guards.
+#[test]
+fn a_self_certified_attacker_passes_the_verifier_and_fails_adoption() {
+    let founder = Dev::new(0x61);
+    let attacker = Dev::new(0x62);
+    let joiner = Dev::new(0x63);
+    let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+    let (self_add, self_add_hash) = op(
+        account,
+        &attacker,
+        0,
+        None,
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_add(&attacker, DeviceRole::Owner),
+    );
+    let (acknowledged, acknowledged_hash) = op(
+        account,
+        &attacker,
+        1,
+        Some(self_add_hash),
+        Some(OwnerId::from_bytes(self_add_hash)),
+        &device_add(&joiner, DeviceRole::Member),
+    );
+    let bootstrap = vec![genesis_bytes, self_add, acknowledged.clone()];
+
+    verify_enrollment_device_add(
+        &bootstrap,
+        account,
+        AccountEntryHash::from_bytes(acknowledged_hash),
+        &acknowledged,
+        joiner.ed,
+        joiner.x,
+    )
+    .expect("the verifier authenticates; it does not authorize");
+    let (result, adopted) =
+        adopt_into_fresh_store(&bootstrap, account, genesis_hash, &joiner, acknowledged_hash);
+    let error = result.expect_err("the fold refuses a DeviceAdd its signer was not entitled to");
+    assert!(
+        error.to_string().contains("did not make the acknowledged DeviceAdd effective"),
+        "refused by the fold, not earlier: {error}",
+    );
+    assert_eq!(adopted, None, "the joiner's store never takes the account");
+}
+
+/// A Member's key is genuinely certified by the founder, but a Member holds no owner incarnation,
+/// so its DeviceAdd authorizes nothing. The verifier passes; adoption refuses.
+#[test]
+fn a_member_signed_device_add_passes_the_verifier_and_fails_adoption() {
+    let founder = Dev::new(0x64);
+    let member = Dev::new(0x65);
+    let joiner = Dev::new(0x66);
+    let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+    let (member_add, member_add_hash) = op(
+        account,
+        &founder,
+        1,
+        Some(genesis_hash),
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_add(&member, DeviceRole::Member),
+    );
+    let (acknowledged, acknowledged_hash) = op(
+        account,
+        &member,
+        0,
+        None,
+        Some(OwnerId::from_bytes(member_add_hash)),
+        &device_add(&joiner, DeviceRole::Member),
+    );
+    let bootstrap = vec![genesis_bytes, member_add, acknowledged.clone()];
+
+    verify_enrollment_device_add(
+        &bootstrap,
+        account,
+        AccountEntryHash::from_bytes(acknowledged_hash),
+        &acknowledged,
+        joiner.ed,
+        joiner.x,
+    )
+    .expect("the Member's key is certified, so the verifier passes");
+    let (result, adopted) =
+        adopt_into_fresh_store(&bootstrap, account, genesis_hash, &joiner, acknowledged_hash);
+    let error = result.expect_err("a Member cannot enroll a device");
+    assert!(
+        error.to_string().contains("did not make the acknowledged DeviceAdd effective"),
+        "refused by the fold: {error}",
+    );
+    assert_eq!(adopted, None);
+}
+
+/// The second impostor shape: the victim's REAL genesis, plus the impostor's own genesis stamped
+/// with the victim's account id, whose key then signs the acknowledged DeviceAdd. Genesis selection
+/// picks the real one and would pass it; the per-entry storability check refuses the bootstrap for
+/// carrying a genesis whose payload hashes to another account.
+#[test]
+fn a_second_impostor_genesis_beside_the_real_one_is_refused() {
+    let founder = Dev::new(0x67);
+    let impostor = Dev::new(0x68);
+    let joiner = Dev::new(0x69);
+    let (account, genesis_bytes, _) = genesis(&founder);
+    let (_, impostor_genesis_bytes, _) = genesis(&impostor);
+    // Restamp the impostor's genesis with the victim's account id and re-sign it.
+    let impostor_genesis = {
+        let decoded = envelope::decode_account_signed(&impostor_genesis_bytes).unwrap();
+        let mut header = decoded.header.clone();
+        header.account_id = account;
+        sign_account_entry(&impostor.secret, &header, &decoded.payload).unwrap()
+    };
+    let (acknowledged, acknowledged_hash) = op(
+        account,
+        &impostor,
+        1,
+        Some(impostor_genesis.entry_hash.into()),
+        Some(impostor_genesis.entry_hash.into()),
+        &device_add(&joiner, DeviceRole::Member),
+    );
+    let bootstrap = vec![genesis_bytes, impostor_genesis.signed_bytes, acknowledged.clone()];
+
+    let error = verify_enrollment_device_add(
+        &bootstrap,
+        account,
+        AccountEntryHash::from_bytes(acknowledged_hash),
+        &acknowledged,
+        joiner.ed,
+        joiner.x,
+    )
+    .expect_err("a genesis for another account in the bootstrap is refused");
+    assert!(
+        error.to_string().contains("does not hash to its account_id"),
+        "refused by storability: {error}",
+    );
+}
+
+/// An owner removed in the history the joiner is served cannot enroll a device afterwards. Its key
+/// is certified and its cited mint is its own, genuine and still effective — so neither the
+/// verifier nor dependency settling stops it. What does is that the removal closed its incarnation
+/// and cut its chain. This is the case the truncated-history exposure turns on: serve the removal
+/// and the enrollment fails; omit it and the joiner is condemned once it syncs the real history.
+#[test]
+fn an_owner_removed_in_the_served_history_cannot_enroll() {
+    let founder = Dev::new(0x6d);
+    let owner = Dev::new(0x6e);
+    let joiner = Dev::new(0x6f);
+    let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+    let (owner_add, owner_add_hash) = op(
+        account,
+        &founder,
+        1,
+        Some(genesis_hash),
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_add(&owner, DeviceRole::Owner),
+    );
+    let (removal, _) = op(
+        account,
+        &founder,
+        2,
+        Some(owner_add_hash),
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_remove(&owner, super::super::cut::Cut::Empty),
+    );
+    let (acknowledged, acknowledged_hash) = op(
+        account,
+        &owner,
+        0,
+        None,
+        Some(OwnerId::from_bytes(owner_add_hash)),
+        &device_add(&joiner, DeviceRole::Member),
+    );
+    let bootstrap = vec![genesis_bytes, owner_add, removal, acknowledged.clone()];
+
+    verify_enrollment_device_add(
+        &bootstrap,
+        account,
+        AccountEntryHash::from_bytes(acknowledged_hash),
+        &acknowledged,
+        joiner.ed,
+        joiner.x,
+    )
+    .expect("the removed owner's key is still genuinely certified");
+    let (result, adopted) =
+        adopt_into_fresh_store(&bootstrap, account, genesis_hash, &joiner, acknowledged_hash);
+    let error = result.expect_err("a removed owner cannot enroll a device");
+    assert!(
+        error.to_string().contains("did not make the acknowledged DeviceAdd effective"),
+        "refused by the fold: {error}",
+    );
+    assert_eq!(adopted, None);
+}
+
+/// An honest snapshot can carry a self-adding DeviceAdd that any peer planted over sync — ingest
+/// stores it, and enrollment serves every held candidate. The planter here is an OUTSIDER: nothing
+/// in the snapshot introduces its key, so the only thing that resolves its entry is that it
+/// certifies its own signer. A verifier requiring every signer to chain from the genesis, or a root
+/// predicate that excluded self-adds, would refuse this receipt after the nonce was spent. It must
+/// verify and adopt.
+#[test]
+fn an_honest_snapshot_carrying_a_planted_self_add_still_enrolls() {
+    let founder = Dev::new(0x6a);
+    let outsider = Dev::new(0x6b);
+    let joiner = Dev::new(0x6c);
+    let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+    // The outsider adds ITSELF as an Owner, citing the founder's incarnation. The fold rejects it;
+    // storage still holds it, and nothing else names the outsider's key.
+    let (planted, _) = op(
+        account,
+        &outsider,
+        0,
+        None,
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_add(&outsider, DeviceRole::Owner),
+    );
+    let (acknowledged, acknowledged_hash) = op(
+        account,
+        &founder,
+        1,
+        Some(genesis_hash),
+        Some(OwnerId::from_bytes(genesis_hash)),
+        &device_add(&joiner, DeviceRole::Member),
+    );
+    let bootstrap = vec![genesis_bytes, planted, acknowledged.clone()];
+
+    verify_enrollment_device_add(
+        &bootstrap,
+        account,
+        AccountEntryHash::from_bytes(acknowledged_hash),
+        &acknowledged,
+        joiner.ed,
+        joiner.x,
+    )
+    .expect("a planted entry does not stop an honest receipt verifying");
+    let (result, adopted) =
+        adopt_into_fresh_store(&bootstrap, account, genesis_hash, &joiner, acknowledged_hash);
+    result.expect("and adopting");
+    assert_eq!(adopted, Some(account));
+}
+
+/// A DeviceAdd-shaped payload that is not a current plaintext control-log entry is not an
+/// enrollment — the fold would never make it roster-effective — so the verifier refuses it rather
+/// than let it answer the joiner's request. All three conditions are exercised, each signed by the
+/// genuine founder, so a guard that checked only one of them would fail here.
+#[test]
+fn an_acknowledged_entry_that_is_not_a_current_control_entry_is_refused() {
+    let founder = Dev::new(0x70);
+    let joiner = Dev::new(0x71);
+    let (account, genesis_bytes, genesis_hash) = genesis(&founder);
+    let op = device_add(&joiner, DeviceRole::Member);
+    let payload = ops::encode(&op).unwrap();
+    let base = AccountEntryHeader {
+        account_id: account,
+        log_id: 0,
+        device_fingerprint: founder.fp,
+        seq: 1,
+        prev_hash: Some(genesis_hash.into()),
+        parent_ref: None,
+        entry_type: ops::entry_type_of(&op),
+        op_version: 1,
+        crypto_suite: 0,
+        auth_len: 1,
+        key_id: None,
+        authority_ref: Some(OwnerId::from_bytes(genesis_hash)),
+    };
+    for (name, header) in [
+        // Control v2 is what a PINNED account signs, and enrollment is refused under every pin
+        // before a nonce is spent. When pinned enrollment opens, this case must flip with the
+        // guard.
+        ("control v2", AccountEntryHeader { op_version: 2, ..base.clone() }),
+        ("the secrets log", AccountEntryHeader { log_id: 1, ..base.clone() }),
+        // A sealed header must name its key, or the envelope refuses it before the verifier looks.
+        ("a sealed suite", AccountEntryHeader {
+            crypto_suite: 1,
+            key_id: Some([0x33; 32]),
+            ..base.clone()
+        }),
+    ] {
+        let signed = sign_account_entry(&founder.secret, &header, &payload).unwrap();
+        let bootstrap = vec![genesis_bytes.clone(), signed.signed_bytes.clone()];
+        let error = verify_enrollment_device_add(
+            &bootstrap,
+            account,
+            signed.entry_hash,
+            &signed.signed_bytes,
+            joiner.ed,
+            joiner.x,
+        )
+        .expect_err(&format!("{name}: not an enrollment the fold would make effective"));
+        assert!(
+            error.to_string().contains("not a current plaintext control-log entry"),
+            "{name}: refused by that check, not an earlier one: {error}",
+        );
+    }
+}
+
 #[test]
 fn enrollment_verification_requires_the_genesis_to_commit_to_the_account() {
     let founder = Dev::new(0x51);
@@ -272,7 +594,12 @@ fn enrollment_verification_requires_the_genesis_to_commit_to_the_account() {
         joiner.x,
     )
     .expect_err("a genesis that does not self-hash to the expected account is rejected");
-    assert!(error.to_string().contains("no accepted account genesis"), "unexpected error: {error}");
+    // Refused by the per-entry storability validation, before genesis selection is reached — the
+    // same check adoption applies first, so the two stages refuse this bootstrap for one reason.
+    assert!(
+        error.to_string().contains("does not hash to its account_id"),
+        "unexpected error: {error}",
+    );
 }
 
 #[test]

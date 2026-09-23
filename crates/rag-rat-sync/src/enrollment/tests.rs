@@ -180,7 +180,7 @@ fn ticket_bytes(
 /// this green — the assertions pin the OUTCOME, not any one guard.
 #[test]
 fn the_optional_digest_admits_no_other_spelling() {
-    let v3 = "rag-rat/invite-ticket/3";
+    let current = "rag-rat/invite-ticket/4";
     // Each case names the reason it must be refused FOR. The three classes are genuinely distinct —
     // a wrong datatype never reaches the length check — so one blanket substring would be asserting
     // something the decoder does not do, and an `||` chain over all three is barely stronger than
@@ -189,52 +189,52 @@ fn the_optional_digest_admits_no_other_spelling() {
         (
             "undefined",
             "expected bytes",
-            ticket_bytes(v3, 8, |e| {
+            ticket_bytes(current, 8, |e| {
                 e.undefined().unwrap();
             }),
         ),
         (
             "a bool",
             "expected bytes",
-            ticket_bytes(v3, 8, |e| {
+            ticket_bytes(current, 8, |e| {
                 e.bool(false).unwrap();
             }),
         ),
         (
             "an integer",
             "expected bytes",
-            ticket_bytes(v3, 8, |e| {
+            ticket_bytes(current, 8, |e| {
                 e.u8(0).unwrap();
             }),
         ),
         (
             "a text string",
             "expected bytes",
-            ticket_bytes(v3, 8, |e| {
+            ticket_bytes(current, 8, |e| {
                 e.str("no").unwrap();
             }),
         ),
         (
             "a short digest",
             "digest",
-            ticket_bytes(v3, 8, |e| {
+            ticket_bytes(current, 8, |e| {
                 e.bytes(&[0; 31]).unwrap();
             }),
         ),
         (
             "a long digest",
             "digest",
-            ticket_bytes(v3, 8, |e| {
+            ticket_bytes(current, 8, |e| {
                 e.bytes(&[0; 33]).unwrap();
             }),
         ),
-        ("the field omitted", "arity", ticket_bytes(v3, 7, |_| {})),
+        ("the field omitted", "arity", ticket_bytes(current, 7, |_| {})),
     ] {
         let err = InviteTicket::decode(&bytes).unwrap_err().to_string();
         assert!(err.contains(expected), "{name} must be refused naming `{expected}`: {err}");
     }
     assert_eq!(
-        InviteTicket::decode(&ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+        InviteTicket::decode(&ticket_bytes("rag-rat/invite-ticket/4", 8, |e| {
             e.null().unwrap();
         }))
         .unwrap(),
@@ -248,18 +248,20 @@ fn the_optional_digest_admits_no_other_spelling() {
 /// release's ticket — telling that operator to upgrade a machine that is already current.
 #[test]
 fn the_ticket_domain_and_version_constant_agree() {
-    assert_eq!(
-        super::ticket::TICKET_DOMAIN,
-        format!("{}{}", super::ticket::TICKET_DOMAIN_STEM, super::ticket::TICKET_VERSION),
-    );
+    use super::ticket::{
+        OLDEST_DECODED_DOMAIN, OLDEST_DECODED_VERSION, TICKET_DOMAIN, TICKET_DOMAIN_STEM,
+        TICKET_VERSION,
+    };
+    assert_eq!(TICKET_DOMAIN, format!("{TICKET_DOMAIN_STEM}{TICKET_VERSION}"));
+    assert_eq!(OLDEST_DECODED_DOMAIN, format!("{TICKET_DOMAIN_STEM}{OLDEST_DECODED_VERSION}"));
 }
 
 /// Version skew is diagnosed on the path an OPERATOR takes, at the shapes releases actually mint.
 ///
-/// `/1` was a 6-element array, `/2` a 7-element one, `/3` is 8. Asserting arity before reading the
-/// domain would make every one of these die on arity and never reach the message written for it —
-/// and a fixture that spells an old domain at the CURRENT arity would not notice, because that
-/// shape has never been minted by anything.
+/// `/1` was a 6-element array, `/2` a 7-element one, `/3` and `/4` are 8. Asserting arity before
+/// reading the domain would make every one of these die on arity and never reach the message
+/// written for it — and a fixture that spells an old domain at the CURRENT arity would not notice,
+/// because that shape has never been minted by anything.
 #[test]
 fn version_skew_names_the_action_that_can_work() {
     // Exactly what the `/2` release emitted: seven elements, no digest field.
@@ -268,9 +270,21 @@ fn version_skew_names_the_action_that_can_work() {
     assert!(err.contains("older rag-rat"), "{err}");
     assert!(err.contains("re-mint"), "and names the owner's action: {err}");
 
+    // `/3` is NOT a skew for this binary: same layout, and every `/3` ticket was minted under the
+    // founder-only gate, so its DeviceAdd is one this verifier accepts. Refusing it would strand a
+    // joiner that upgraded while holding a `/3` ticket whose enrollment was already committed.
+    let previous = ticket_bytes("rag-rat/invite-ticket/3", 8, |e| {
+        e.null().unwrap();
+    });
+    assert_eq!(
+        InviteTicket::from_ticket_string(&ticket_string(&previous)).unwrap(),
+        sample_ticket(),
+        "a `/3` ticket still decodes",
+    );
+
     // The common direction: the owner runs `sync init`, so the MINTING side upgrades first.
     // "Ask for a re-mint" is the one action that cannot help here.
-    let newer = ticket_bytes("rag-rat/invite-ticket/4", 8, |e| {
+    let newer = ticket_bytes("rag-rat/invite-ticket/5", 8, |e| {
         e.null().unwrap();
     });
     let err = InviteTicket::from_ticket_string(&ticket_string(&newer)).unwrap_err().to_string();
@@ -284,9 +298,15 @@ fn version_skew_names_the_action_that_can_work() {
     let err = InviteTicket::decode(&junk).unwrap_err().to_string();
     assert!(!err.contains("rag-rat —"), "arbitrary bytes are not a version skew: {err}");
 
-    // `03` parses as this very revision. Corrupt, not skewed: sending the operator to upgrade or
-    // to ask for a re-mint would both be wrong, since neither release is at fault.
-    for spelling in ["rag-rat/invite-ticket/03", "rag-rat/invite-ticket/+3"] {
+    // `04` and `03` parse as revisions this binary decodes. Corrupt, not skewed: sending the
+    // operator to upgrade or to ask for a re-mint would both be wrong, since neither release is
+    // at fault.
+    for spelling in [
+        "rag-rat/invite-ticket/04",
+        "rag-rat/invite-ticket/+4",
+        "rag-rat/invite-ticket/03",
+        "rag-rat/invite-ticket/+3",
+    ] {
         let bytes = ticket_bytes(spelling, 8, |e| {
             e.null().unwrap();
         });
@@ -295,14 +315,15 @@ fn version_skew_names_the_action_that_can_work() {
     }
 }
 
-/// The `/3` bytes are frozen in BOTH directions: a ticket minted by one release must decode in the
-/// next. Asserting only `encode` would let a future stricter `decode` reject the frozen bytes while
-/// the round-trip stayed green, since a round trip moves with whatever `encode` emits.
+/// The `/4` bytes are frozen in BOTH directions: a ticket minted by one build of this revision must
+/// decode in the next. Asserting only `encode` would let a future stricter `decode` reject the
+/// frozen bytes while the round-trip stayed green, since a round trip moves with whatever `encode`
+/// emits.
 #[test]
-fn golden_invite_ticket_v3() {
+fn golden_invite_ticket_v4() {
     let pinned = InviteTicket { checkpoint_digest: Some([0x5a; 32]), ..sample_ticket() };
-    let pinned_hex = "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687b58205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
-    let unpinned_hex = "88777261672d7261742f696e766974652d7469636b65742f3300582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687bf6";
+    let pinned_hex = "88777261672d7261742f696e766974652d7469636b65742f3400582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687b58205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    let unpinned_hex = "88777261672d7261742f696e766974652d7469636b65742f3400582009090909090909090909090909090909090909090909090909090909090909095820ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c7568747470733a2f2f72656c61792e6578616d706c65582003030303030303030303030303030303030303030303030303030303030303031b0000018bcfe5687bf6";
     assert_eq!(rag_rat_base::hash::hex_lower(&pinned.encode()), pinned_hex);
     assert_eq!(rag_rat_base::hash::hex_lower(&sample_ticket().encode()), unpinned_hex);
     assert_eq!(
@@ -314,6 +335,21 @@ fn golden_invite_ticket_v3() {
         InviteTicket::decode(&rag_rat_base::hash::hex_decode(unpinned_hex).unwrap()).unwrap(),
         sample_ticket(),
     );
+    // The same bytes under the `/3` domain still decode, to the same ticket. Only the unpinned
+    // shape was ever minted as `/3` — every `/3` release refused to mint under a pin — but the
+    // decoder does not depend on that, so both are pinned here.
+    for (hex, expected) in [(pinned_hex, &pinned), (unpinned_hex, &sample_ticket())] {
+        let v3 = hex.replacen("7469636b65742f34", "7469636b65742f33", 1);
+        assert_ne!(
+            v3, hex,
+            "the `/4` domain bytes must be present to rewrite, or this retests `/4`"
+        );
+        assert_eq!(
+            InviteTicket::decode(&rag_rat_base::hash::hex_decode(&v3).unwrap()).unwrap(),
+            *expected,
+            "a `/3` ticket from the previous release still decodes",
+        );
+    }
 }
 
 #[test]
@@ -2555,85 +2591,79 @@ fn joined_store(founder: &Connection, account: AccountId, role: DeviceRole) -> C
     joined
 }
 
-/// A second owner can author a `DeviceAdd`, but it must not be able to MINT an invite yet. The
-/// joiner verifies a receipt's DeviceAdd against the founder's key alone, and redemption consumes
-/// the nonce before the joiner checks anything — so an invite a second owner minted would be spent
-/// on an enrollment the joiner then refuses, identically on every replay. The gate has to widen
-/// together with that verifier, not ahead of it.
+/// The recovery RFC 9420 §16.12 prescribes for a member that cannot continue, end to end: the
+/// founder device is lost, another owner removes it and enrolls a replacement, and the replacement
+/// verifies the receipt and adopts the account. Before, only the founder could mint, only a
+/// founder-signed DeviceAdd verified, and an account that lost its founder device had no path back.
 #[test]
-fn a_second_owner_cannot_mint_until_the_joiner_accepts_its_device_add() {
+fn another_owner_removes_a_lost_founder_and_enrolls_its_replacement() {
     let founder = db();
     let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let founder_fp = rag_rat_oplog::local_device(&founder, NOW).unwrap().fingerprint();
     let owner = joined_store(&founder, account, DeviceRole::Owner);
 
-    let refused = mint_invite(&owner, InviteSpec {
-        account_id: account,
-        inviter_node_id: crate::endpoint::node_id_from_secret([2; 32]),
-        relay_url: "https://relay.example".into(),
-        role: DeviceRole::Member,
-        label: Some("laptop"),
-        now_ms: &|| NOW,
-        ttl: Duration::from_secs(60),
-    });
-    // Never `{:?}` the `Ok` side: an invite ticket's Debug output carries its one-time nonce, which
-    // is a bearer secret for the enrollment it grants.
-    match refused {
-        Err(InviteError::Storage(error)) => assert!(
-            error.to_string().contains("founder authority"),
-            "refused at the gate, before any nonce exists: {error}",
-        ),
-        Err(error) => panic!("refused for the wrong reason: {error}"),
-        Ok(_) => panic!("a second owner must not mint an invite yet"),
-    }
-    let invites: i64 =
-        owner.query_row("SELECT COUNT(*) FROM sync_invites", [], |row| row.get(0)).unwrap();
-    assert_eq!(invites, 0, "the refusal left no invite behind");
-
-    // Why the gate stays closed: the second owner CAN author the DeviceAdd, and the joiner refuses
-    // it. When the verifier learns to accept a non-founder DeviceAdd, this half fails — which is
-    // the signal that the gate above may now widen with it.
-    let joiner = rag_rat_oplog::local_device(&db(), NOW).unwrap();
     let tx = Transaction::new_unchecked(&owner, TransactionBehavior::Immediate).unwrap();
-    let device_add = rag_rat_oplog::author_device_add_in_tx(
-        &tx,
-        rag_rat_oplog::EnrollingDevice {
-            ed25519_pubkey: joiner.ed25519_public_key(),
-            x25519_pubkey: joiner.x25519_public_key(),
-            label: None,
-        },
-        DeviceRole::Member,
-        NOW + 2,
-    )
-    .expect("a second owner authors the DeviceAdd itself");
+    rag_rat_oplog::author_device_remove_in_tx(&tx, founder_fp, "lost", NOW + 2).unwrap();
     tx.commit().unwrap();
-    let entries = rag_rat_oplog::account_entries_for_enrollment(&owner, account).unwrap();
-    let device_add_signed = entries
-        .iter()
-        .find(|entry| entry.entry_hash == device_add)
-        .expect("the authored DeviceAdd is held")
-        .signed_bytes
-        .clone();
-    let bootstrap: Vec<Vec<u8>> = entries.into_iter().map(|entry| entry.signed_bytes).collect();
-    let error = rag_rat_oplog::verify_enrollment_device_add(
-        &bootstrap,
+
+    let ticket = ticket(&owner, account, DeviceRole::Owner);
+    let replacement = db();
+    let device = rag_rat_oplog::local_device(&replacement, NOW).unwrap();
+    let (ed25519_pubkey, x25519_pubkey) = (device.ed25519_public_key(), device.x25519_public_key());
+    let request = EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey,
+        x25519_pubkey,
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+    let (receipt, _) = redeem_invite(&owner, request, [9; 32], &|| NOW + 3).unwrap();
+    let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
+        &receipt.account_entries,
         account,
-        device_add,
-        &device_add_signed,
-        joiner.ed25519_public_key(),
-        joiner.x25519_public_key(),
+        receipt.device_add_hash.into(),
+        &receipt.device_add_signed,
+        ed25519_pubkey,
+        x25519_pubkey,
     )
-    .expect_err("the joiner does not yet accept a DeviceAdd a non-founder signed");
-    assert!(
-        error.to_string().contains("founder"),
-        "refused for citing a non-founder authority: {error}",
+    .expect("the replacement verifies a DeviceAdd the second owner signed");
+    rag_rat_oplog::adopt_enrollment_bootstrap(&replacement, rag_rat_oplog::EnrollmentBootstrap {
+        account_entries: &receipt.account_entries,
+        account_id: account,
+        genesis_hash,
+        device_fingerprint: device.fingerprint(),
+        device_add_hash: receipt.device_add_hash.into(),
+        now_ms: NOW + 4,
+    })
+    .expect("and adopts the account");
+
+    assert_eq!(
+        rag_rat_oplog::read_local_account(&replacement).unwrap(),
+        Some(account),
+        "the replacement now holds the account",
     );
+    let (founder_enrolled, replacement_enrolled): (bool, bool) = replacement
+        .query_row(
+            "SELECT
+                 EXISTS(SELECT 1 FROM account_roster_history
+                         WHERE device_fingerprint = ?1 AND closed_at IS NULL),
+                 EXISTS(SELECT 1 FROM account_roster_history
+                         WHERE device_fingerprint = ?2 AND closed_at IS NULL)",
+            [founder_fp.to_bytes().as_slice(), device.fingerprint().to_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(replacement_enrolled, "the replacement is on the roster");
+    assert!(!founder_enrolled, "and the lost founder device is not");
 }
 
-/// A redemption that cannot author an enrollment the joiner accepts rolls back with the nonce
-/// unspent. Here the founder minted the invite and was then removed by another owner, so by
-/// redemption time it can no longer author the DeviceAdd. The refusal must come from inside the
-/// redemption transaction, before `used_at_ms` is written — moving the authoring below the
-/// consume would spend the invite on nothing.
+/// A redemption whose inviter can no longer author the DeviceAdd rolls back with the nonce unspent.
+/// Here the founder minted the invite and was then removed by another owner, so by redemption time
+/// it holds no owner incarnation. The refusal must come from inside the redemption transaction,
+/// before `used_at_ms` is written — moving the authoring below the consume would spend the invite
+/// on nothing.
 #[test]
 fn an_enrollment_the_founder_can_no_longer_author_leaves_the_nonce_unspent() {
     let founder = db();
@@ -2662,8 +2692,8 @@ fn an_enrollment_the_founder_can_no_longer_author_leaves_the_nonce_unspent() {
     let error = redeem_invite(&founder, request, [9; 32], &|| NOW + 4)
         .expect_err("a removed founder cannot complete an enrollment");
     assert!(
-        error.to_string().contains("only the founder"),
-        "refused by the enrollment seam, not by something that ran before it: {error}",
+        error.to_string().contains("author a control op"),
+        "refused as a non-owner when authoring, not by something that ran before it: {error}",
     );
     let used: Option<i64> = founder
         .query_row(
@@ -2673,4 +2703,57 @@ fn an_enrollment_the_founder_can_no_longer_author_leaves_the_nonce_unspent() {
         )
         .unwrap();
     assert_eq!(used, None, "the refusal rolled back with the one-time nonce unspent");
+}
+
+/// A second owner mints a WRITER invite and redeems it: it authors the StreamGrant under its own
+/// incarnation, and the grant folds effective. Writer redemption authors and checks the grant
+/// before it spends the nonce, and the contributor applies no founder check, so this path had no
+/// joiner half to widen — only the gate.
+#[tokio::test]
+async fn a_second_owner_mints_and_redeems_a_writer_invite() {
+    let founder = db();
+    let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let stream = {
+        let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+        let stream = rag_rat_oplog::ensure_owned_stream_v2_with_mode_in_tx(
+            &tx,
+            "repo-w",
+            rag_rat_oplog::AccessMode::PublicRead,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        stream.to_bytes()
+    };
+    let owner = joined_store(&founder, account, DeviceRole::Owner);
+    let ticket = mint_writer_invite(&owner, WriterInviteSpec {
+        account_id: account,
+        stream_id: stream,
+        inviter_node_id: crate::endpoint::node_id_from_secret([2; 32]),
+        relay_url: "https://relay.example".into(),
+        now_ms: &|| NOW + 2,
+        ttl: Duration::from_secs(60),
+    })
+    .expect("a second owner mints a writer invite");
+    let contributor = AccountId::from_bytes([0x78; 32]);
+
+    let (mut dial_send, mut accept_recv) = tokio::io::duplex(4096);
+    let (mut accept_send, mut dial_recv) = tokio::io::duplex(4096);
+    let (dial, accept) = tokio::join!(
+        run_writer_grant_dialer(&mut dial_recv, &mut dial_send, &ticket, contributor),
+        run_enrollment_acceptor(&mut accept_recv, &mut accept_send, &owner, [9; 32], || NOW + 3),
+    );
+    let receipt = dial.expect("the redemption grants");
+    assert!(matches!(accept, Ok(EnrollmentAcceptorOutcome::WriterGranted(_))));
+    assert_eq!(
+        rag_rat_oplog::effective_writer_grant(
+            &owner,
+            account,
+            rag_rat_oplog::StreamId::from_bytes(stream),
+            contributor,
+        )
+        .unwrap(),
+        Some(Into::into(receipt.grant_id)),
+        "the grant a second owner authored folds effective",
+    );
 }

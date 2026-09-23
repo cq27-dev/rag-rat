@@ -11,19 +11,34 @@ use super::wire::{decode, ensure_consumed, fixed32};
 
 // `/2` added the kind discriminator (arity 6 -> 7) when the pairing ticket and the writer
 // invite merged into one struct; a `/1` binary rejects the new domain legibly. `/3` appends the
-// checkpoint digest (arity 8).
+// checkpoint digest (arity 8). `/4` changes no byte of the layout: it fences a change in what the
+// JOINER accepts. From `/4` any owner may mint, and the DeviceAdd a redemption authors is signed by
+// whichever owner redeemed it. A `/3` joiner verifies only a founder-signed DeviceAdd, and it would
+// refuse the receipt after the owner had already spent the nonce — identically on every replay. A
+// joiner that cannot decode the ticket never dials, so it is told to upgrade before any nonce
+// exists.
+//
+// The fence runs one way only. This binary still DECODES `/3`: the layout is identical, and every
+// `/3` ticket was minted under the founder-only gate, so its DeviceAdd is one this verifier accepts
+// too. Refusing it would strand a joiner that upgraded while holding a `/3` ticket whose enrollment
+// the owner had already committed — its lost response is recovered only by replaying that ticket,
+// and a fresh one cannot re-add a device the owner already enrolled.
 //
 // A domain bump rather than the additive-by-omission trick `StreamSpecV2` uses: that exists there
 // because `stream_id = sha256(spec)` and changing bytes would move identities, while a ticket is
-// content-addressed by nothing, is TTL'd and single-use, so no ticket outlives a release. And for a
+// content-addressed by nothing and is TTL'd and single-use, so a revision needs decoding only as
+// long as its tickets can still be outstanding — which is why `/3` still decodes. And for a
 // SECURITY field silent compatibility is the wrong default — an old binary that ignored the digest
 // would enrol into a pinned account without installing its pin. Legible rejection is correct.
-pub(super) const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/3";
+pub(super) const TICKET_DOMAIN: &str = "rag-rat/invite-ticket/4";
 /// Shared by every revision of the domain, so a ticket from another release is told apart from
 /// arbitrary bytes that merely decoded as a string in that position.
 pub(super) const TICKET_DOMAIN_STEM: &str = "rag-rat/invite-ticket/";
-/// This binary's revision of the ticket format.
-pub(super) const TICKET_VERSION: u32 = 3;
+/// This binary's revision of the ticket format — the one it mints.
+pub(super) const TICKET_VERSION: u32 = 4;
+/// The oldest revision this binary still decodes; `/3` shares `/4`'s layout exactly.
+pub(super) const OLDEST_DECODED_VERSION: u32 = 3;
+pub(super) const OLDEST_DECODED_DOMAIN: &str = "rag-rat/invite-ticket/3";
 
 /// Which way the version skews, so the operator is told the action that can actually work.
 ///
@@ -36,16 +51,18 @@ fn version_skew(domain: &str) -> InviteError {
     else {
         return InviteError::Malformed("ticket domain mismatch".into());
     };
-    match revision.cmp(&TICKET_VERSION) {
-        std::cmp::Ordering::Less => InviteError::TicketVersionSkew(
+    if revision < OLDEST_DECODED_VERSION {
+        InviteError::TicketVersionSkew(
             "this ticket was minted by an older rag-rat — ask the owner to re-mint it",
-        ),
-        std::cmp::Ordering::Greater => InviteError::TicketVersionSkew(
+        )
+    } else if revision > TICKET_VERSION {
+        InviteError::TicketVersionSkew(
             "this ticket was minted by a newer rag-rat — upgrade rag-rat on this machine",
-        ),
-        // `03`, `+3`: this revision, spelled in a way nothing mints. Corrupt, not skewed — and
-        // blaming a release the operator cannot change sends them nowhere.
-        std::cmp::Ordering::Equal => InviteError::Malformed("ticket domain mismatch".into()),
+        )
+    } else {
+        // `04`, `+3`: a revision this binary decodes, spelled in a way nothing mints. Corrupt, not
+        // skewed — and blaming a release the operator cannot change sends them nowhere.
+        InviteError::Malformed("ticket domain mismatch".into())
     }
 }
 
@@ -106,11 +123,23 @@ pub struct InviteTicket {
 }
 
 impl InviteTicket {
+    /// The canonical bytes, always under THIS binary's revision. A ticket decoded from `/3`
+    /// therefore re-encodes as `/4`: the struct does not remember which revision it came from.
+    // ponytail: nothing re-emits a decoded ticket — the one production `to_ticket_string` prints a
+    // freshly minted one — so relaying a decoded `/3` ticket to a `/3` reader is unsupported. Carry
+    // the decoded revision in the struct if a relay path ever appears.
     pub fn encode(&self) -> Vec<u8> {
+        self.encode_as(TICKET_DOMAIN)
+    }
+
+    /// The canonical bytes under `domain`. Only a revision sharing this layout may be named here;
+    /// the decoder uses it to check a `/3` ticket's canonicality against its OWN domain, since
+    /// re-encoding it as `/4` would make every valid `/3` ticket look non-canonical.
+    fn encode_as(&self, domain: &str) -> Vec<u8> {
         let mut out = Vec::new();
         let mut enc = Encoder::new(&mut out);
         enc.array(8).expect("owned Vec");
-        enc.str(TICKET_DOMAIN).expect("owned Vec");
+        enc.str(domain).expect("owned Vec");
         enc.u8(self.kind.wire_tag()).expect("owned Vec");
         enc.bytes(&self.account_id.to_bytes()).expect("owned Vec");
         enc.bytes(&self.inviter_node_id).expect("owned Vec");
@@ -127,12 +156,13 @@ impl InviteTicket {
     pub fn decode(bytes: &[u8]) -> Result<Self, InviteError> {
         let mut dec = Decoder::new(bytes);
         // Read the array header WITHOUT asserting its length, and diagnose the domain first: every
-        // revision of this format has its own arity (`/1` was 6, `/2` was 7, `/3` is 8), so
-        // asserting arity up front means a genuinely older ticket dies on arity and never reaches
-        // the message written for it. Which is the only input that message exists to serve.
+        // revision of this format has its own arity (`/1` was 6, `/2` was 7, `/3` and `/4` are 8),
+        // so asserting arity up front means a genuinely older ticket dies on arity and
+        // never reaches the message written for it. Which is the only input that message
+        // exists to serve.
         let arity = dec.array().map_err(decode)?;
         let domain = dec.str().map_err(decode)?;
-        if domain != TICKET_DOMAIN {
+        if domain != TICKET_DOMAIN && domain != OLDEST_DECODED_DOMAIN {
             return Err(version_skew(domain));
         }
         if arity != Some(8) {
@@ -167,7 +197,7 @@ impl InviteTicket {
             expires_at_ms,
             checkpoint_digest,
         };
-        if ticket.encode() != bytes {
+        if ticket.encode_as(domain) != bytes {
             return Err(InviteError::Malformed("ticket is not canonical CBOR".into()));
         }
         Ok(ticket)
