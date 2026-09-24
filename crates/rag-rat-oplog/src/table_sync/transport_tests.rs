@@ -634,6 +634,18 @@ fn a_purge_restored_chain_answers_a_lower_tip_with_nothing_and_advertises_no_flo
         .is_empty(),
         "a tip below the restored holdings is answered with nothing, not an error",
     );
+    assert!(
+        accepted_chain_entries(
+            &restored,
+            route.stream_id,
+            device,
+            TableSyncEntryStart::At(lagging_tip),
+            16,
+        )
+        .unwrap()
+        .is_empty(),
+        "so is a purge-restored peer's older witness",
+    );
     sync_chains(&source, &lagging, account);
     assert_eq!(live_rows(&lagging), live_rows(&source), "the lagging peer fills from the source");
 

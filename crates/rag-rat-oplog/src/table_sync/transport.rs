@@ -905,6 +905,13 @@ fn accepted_chain_entries(
                 (Some(cursor.lamport), true)
             } else {
                 let successor = direct_successor_lamport(conn, stream, device, cursor.to_store())?;
+                // The receiver was purge-restored at a witness below everything a purge-restored
+                // chain holds here: the same honest shape as a tip below it (#1481).
+                if successor.is_none()
+                    && below_rootless_holdings(conn, stream, device, cursor.lamport)?
+                {
+                    return Ok(Vec::new());
+                }
                 let Some(successor) = successor else {
                     anyhow::bail!(
                         "table-sync restore cursor has neither its tip nor a direct successor"
