@@ -178,7 +178,7 @@ pub use content_projection::{
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
 pub use identity::{
-    LocalDevice, load_local_device, local_device, pending_identity_keys,
+    LocalDevice, discard_staged_identity, load_local_device, local_device, pending_identity_keys,
     stage_reenrollment_identity,
 };
 // The byte-canonical op encoding, for a consumer that needs a stable identity for an op's

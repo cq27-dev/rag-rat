@@ -173,6 +173,14 @@ pub fn stage_reenrollment_identity(
     pending_identity_keys(conn)?.context("staged identity missing immediately after insert")
 }
 
+/// Drop the staged re-enrollment identity, if any. A stage is only trusted while the live
+/// identity is known removed; the caller discards a stale one (the live identity is still
+/// enrolled, or the staged one was itself refused as removed) before staging afresh.
+pub fn discard_staged_identity(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM oplog_pending_identity WHERE id = 0", [])?;
+    Ok(())
+}
+
 /// The public keys of the staged re-enrollment identity, `(ed25519, x25519)`, if one is staged.
 pub fn pending_identity_keys(conn: &Connection) -> anyhow::Result<Option<([u8; 32], [u8; 32])>> {
     Ok(read_pending(conn)?.map(|(ed, x)| (ed.public().to_bytes(), x.public().to_bytes())))

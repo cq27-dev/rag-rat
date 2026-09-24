@@ -2749,6 +2749,52 @@ fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_staged_identity() 
     assert!(roster.iter().all(|device| device.fingerprint != old.fingerprint()));
 }
 
+/// A stage is not proof of removal: the refusal that starts a re-enrollment is unauthenticated,
+/// so a stage can outlive a hostile or failed retry. Adoption swaps it in only if the owner-signed
+/// log it folds shows the live identity removed; otherwise the whole adoption rolls back and the
+/// device keeps the identity that still holds its seat (#1417).
+#[test]
+fn a_stale_stage_never_retires_an_identity_the_account_still_enrolls() {
+    let founder = db();
+    let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let member = joined_store(&founder, account, DeviceRole::Member);
+    let live = rag_rat_oplog::local_device(&member, NOW).unwrap().fingerprint();
+    let staged = rag_rat_oplog::stage_reenrollment_identity(&member, NOW + 1).unwrap();
+    let ticket = ticket(&founder, account, DeviceRole::Member);
+    let (receipt, _) = redeem_invite(
+        &founder,
+        EnrollmentRequest {
+            nonce: ticket.nonce,
+            expected_account: account,
+            ed25519_pubkey: staged.0,
+            x25519_pubkey: staged.1,
+            transport_node_id: [9; 32],
+            budget: generous_budget(),
+            held_entry_hashes: Vec::new(),
+        },
+        [9; 32],
+        &|| NOW + 2,
+    )
+    .unwrap();
+    let error =
+        rag_rat_oplog::adopt_enrollment_bootstrap(&member, rag_rat_oplog::EnrollmentBootstrap {
+            account_entries: &receipt.account_entries,
+            account_id: account,
+            genesis_hash: rag_rat_oplog::read_local_account_genesis(&founder).unwrap().unwrap(),
+            device_fingerprint: DeviceFingerprint::from_bytes(Sha256::digest(staged.0).into()),
+            device_add_hash: receipt.device_add_hash.into(),
+            now_ms: NOW + 3,
+        })
+        .expect_err("the live identity was never removed");
+    assert!(error.to_string().contains("does not show this device removed"), "{error}");
+    assert_eq!(
+        rag_rat_oplog::local_device(&member, NOW + 4).unwrap().fingerprint(),
+        live,
+        "the failed adoption rolled the swap back",
+    );
+    assert_eq!(rag_rat_oplog::pending_identity_keys(&member).unwrap(), Some(staged));
+}
+
 /// A redemption whose inviter can no longer author the DeviceAdd rolls back with the nonce unspent.
 /// Here the founder minted the invite and was then removed by another owner, so by redemption time
 /// it holds no owner incarnation. The refusal must come from inside the redemption transaction,

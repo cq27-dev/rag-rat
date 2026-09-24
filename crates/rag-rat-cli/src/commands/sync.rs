@@ -878,8 +878,13 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         // This store's device was removed from the account (and it has synced the removal): that
         // fingerprint can never enroll again, so re-enroll under a fresh identity. A store that
         // never learned of its removal finds out from the owner's `DeviceRemoved` refusal below.
+        // A stage is trusted only while the live identity is known removed: a stale one (left by
+        // a refusal whose retry never completed) would otherwise enroll a second seat for a device
+        // that still holds its own.
         if rag_rat_oplog::device_was_removed(conn, ticket.account_id, device.fingerprint())? {
             stage_reenrollment(conn, device.fingerprint())?;
+        } else {
+            rag_rat_oplog::discard_staged_identity(conn)?;
         }
         node_secret(conn)?
     };
@@ -950,12 +955,13 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
             time::now_ms(),
         )
         .await;
-        // The owner's log records a removal this store never received. The refusal consumed
-        // nothing, so re-enroll under a staged identity with the same ticket — once: a fresh
-        // fingerprint cannot have been removed. The refusal is unauthenticated, but staging
-        // costs nothing: the live identity is replaced only when an owner's signed receipt
-        // enrolls the staged one.
+        // The owner's log records a removal this store never received — of the live identity, or
+        // of a staged one an owner enrolled and later removed. The refusal consumed nothing, so
+        // re-enroll under a freshly staged identity with the same ticket, once. The refusal is
+        // unauthenticated, but staging costs nothing: adoption replaces the live identity only
+        // when the owner-signed log it folds shows that identity removed.
         if matches!(outcome, Err(rag_rat_sync::InviteError::DeviceRemoved)) {
+            rag_rat_oplog::discard_staged_identity(conn)?;
             stage_reenrollment(
                 conn,
                 rag_rat_oplog::local_device(conn, time::now_ms())?.fingerprint(),

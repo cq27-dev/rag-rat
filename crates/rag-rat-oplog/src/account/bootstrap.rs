@@ -261,8 +261,8 @@ pub fn adopt_enrollment_bootstrap(
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     super::control_policy::require_supported_account_control(&tx, bootstrap.account_id)?;
     // A re-enrollment (#1417) swaps the staged identity in here, so the store's live identity
-    // changes only if this adoption commits; the enrolled check below rolls it back otherwise.
-    crate::identity::adopt_pending_identity_in_tx(
+    // changes only if this adoption commits; the checks below roll it back otherwise.
+    let retired = crate::identity::adopt_pending_identity_in_tx(
         &tx,
         bootstrap.device_fingerprint,
         bootstrap.now_ms,
@@ -324,6 +324,16 @@ pub fn adopt_enrollment_bootstrap(
     // resolvable parked sibling can no longer roll the one-time bootstrap back, and its later
     // promotion is ordinary best-effort queue work.
     storage::finish_enrollment_bootstrap_in_tx(&tx, bootstrap.account_id, bootstrap.now_ms)?;
+    // The owner's refusal that started a re-enrollment is unauthenticated; the owner-signed log
+    // this adoption just folded is not. Retire the live identity only if that log removed it —
+    // otherwise a stale stage would retire an identity that still holds a seat.
+    if let Some(retired) = retired {
+        anyhow::ensure!(
+            super::roster::device_was_removed(&tx, bootstrap.account_id, retired)?,
+            "the account log does not show this device removed, so its identity is not replaced; \
+             discard the staged identity and join again"
+        );
+    }
     let enrolled: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM account_roster_history
