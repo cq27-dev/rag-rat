@@ -481,3 +481,201 @@ fn a_renaming_import_resolves_to_the_type_it_renames() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// A C++ type reference binds only a type, whatever shape wrote it: a namespace segment (`a`,
+/// `b`), a namespace-scoped function pointer (`&a::b::free_fn`) and a qualified call
+/// (`a::b::free_fn()`) never become a `references_type` edge to a namespace or function, and a
+/// path that reached a function is no fallback to a same-named type elsewhere (`other::free_fn`).
+/// A class scope still binds its class, in a use (`Outer::Inner`, `a::b::Widget::create()`) and
+/// in an out-of-line definition (`void Outer::run() {}`, `struct Outer::Fwd {}`), and no
+/// declaration references itself. A same-named constructor the path never reached (`fs::Path` via
+/// a namespace alias) does not block the class.
+///
+/// Not pinned: a bare namespace segment (`b`) and a path to a value that is not a symbol
+/// (`a::b::kVal`) carry no evidence of the scope they meant, so they still fall back to a
+/// same-named type (`other::b`, `other::kVal`), as they did before the type-binding rule. Which
+/// segment a C++ scope edge names is tracked by #1476.
+#[test]
+fn cpp_type_references_bind_only_types_and_never_their_own_declaration() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/main.cpp"),
+        "namespace a { namespace b {
+    const int kVal = 1;
+    void free_fn() {}
+    class Widget { public: static void create(); };
+    int local = a::b::kVal;
+} }
+namespace other { struct b {}; struct kVal {}; struct free_fn {}; }
+struct Outer { struct Inner {}; struct Fwd; void run(); };
+void Outer::run() {}
+struct Outer::Fwd {};
+namespace lib { namespace files { class Path { public: Path(); }; Path::Path() {} } }
+namespace fs = lib::files;
+enum Color { Red };
+void g() {
+    int v = a::b::kVal;
+    auto p = &a::b::free_fn;
+    a::b::free_fn();
+    a::b::Widget w;
+    Outer::Inner oi;
+    Color c = Color::Red;
+    fs::Path path;
+}
+void h() { a::b::Widget::create(); }
+",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Cpp);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let conn = db.storage.connection();
+    let bound = conn
+        .prepare(
+            "SELECT COALESCE(f.name, '?'), t.scope_path, t.kind, e.from_symbol_id = e.to_symbol_id
+               FROM edges e
+               JOIN symbols t ON t.id = e.to_symbol_id
+               LEFT JOIN symbols f ON f.id = e.from_symbol_id
+              WHERE e.edge_kind = 'references_type'
+              ORDER BY 1, 2",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<bool>>(3)?.unwrap_or(false),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (from, to, kind, is_self) in &bound {
+        assert!(
+            !matches!(kind.as_str(), "namespace" | "function"),
+            "{from} references {to}, a {kind}: {bound:?}"
+        );
+        assert!(!is_self, "{from} references itself: {bound:?}");
+        assert_ne!(to, "other::free_fn", "{from} fell back past a function: {bound:?}");
+    }
+    let binds_from = |from: &str, to: &str| {
+        bound.iter().any(|(source, target, ..)| source == from && target == to)
+    };
+    let binds = |to: &str| binds_from("g", to);
+    assert!(binds("a::b::Widget") && binds("Color"), "a class or enum still binds: {bound:?}");
+    assert!(binds("Outer") && binds("Outer::Inner"), "a class-scoped type binds both: {bound:?}");
+    assert!(
+        binds_from("run", "Outer") && binds_from("Outer::Fwd", "Outer"),
+        "an out-of-line definition binds its class: {bound:?}"
+    );
+    // The call edge to a declared-only static member stays unresolved; the scope edge still ties
+    // the caller to the class.
+    assert!(binds_from("h", "a::b::Widget"), "a qualified static call binds its class: {bound:?}");
+    // A constructor shares its class's name but sits off the `fs::Path` alias path: it is no
+    // negative evidence, so the reference still falls back to the class.
+    assert!(binds("lib::files::Path"), "a class with a constructor still binds: {bound:?}");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A Rust inherent impl written through a path (`impl super::inner::Foo`) references the struct it
+/// names. The impl symbol the path reaches first is a use of that type, not a non-type
+/// declaration, so it neither binds the edge (a self-edge) nor vetoes the fallback to the struct,
+/// and no type reference leaves the qualified header edge unresolved.
+#[test]
+fn rust_path_qualified_impl_header_references_its_struct_not_itself() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/lib.rs"),
+        "mod inner { pub struct Foo; }
+pub mod api {
+    impl super::inner::Foo {
+        pub fn make() -> u8 { 0 }
+    }
+}
+",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::Rust);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let conn = db.storage.connection();
+    let edges = conn
+        .prepare(
+            "SELECT e.target_qualified_name, t.scope_path, t.kind,
+                    e.from_symbol_id = e.to_symbol_id
+               FROM edges e
+               LEFT JOIN symbols t ON t.id = e.to_symbol_id
+              WHERE e.edge_kind = 'references_type'
+              ORDER BY 1, 2",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<bool>>(3)?.unwrap_or(false),
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    for (_, to, kind, is_self) in &edges {
+        assert!(!is_self, "a type reference binds its own declaration: {edges:?}");
+        assert_eq!(kind.as_deref(), Some("struct"), "{to:?} is not the struct: {edges:?}");
+    }
+    assert!(
+        edges.iter().any(|(target, to, ..)| target.as_deref() == Some("super::inner::Foo")
+            && to.as_deref() == Some("inner::Foo")),
+        "the qualified impl header binds the struct: {edges:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// An out-of-line C++ constructor shares its class's scope path (`ns::Foo`), so a path that also
+/// reaches two same-scoped classes in different files is ambiguous among types, not evidence of a
+/// non-type: the reference still falls back to the class in its own file.
+#[test]
+fn a_cpp_path_ambiguous_among_classes_is_not_vetoed_by_their_constructor() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/a.cpp"),
+        "namespace ns { class Foo { public: Foo(); int x; }; Foo::Foo() {} }\nvoid use1() { \
+         ns::Foo f; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src/b.cpp"), "namespace ns { class Foo { public: int y; }; }\n").unwrap();
+    let config = source_config(root.clone(), Language::Cpp);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+
+    let conn = db.storage.connection();
+    let bound = conn
+        .prepare(
+            "SELECT t.kind, tf.path
+               FROM edges e
+               JOIN symbols f ON f.id = e.from_symbol_id
+               JOIN symbols t ON t.id = e.to_symbol_id
+               JOIN files tf ON tf.id = t.file_id
+              WHERE e.edge_kind = 'references_type' AND f.name = 'use1'",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        bound.iter().any(|(kind, path)| kind == "class" && path.ends_with("a.cpp")),
+        "use1 binds the class in its own file: {bound:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

@@ -437,7 +437,13 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // fields and member chains instead of every identifier under a subtree, so arguments, lambdas and
 // template arguments no longer leak into `to_name` / qualified targets / receivers (TS, Python,
 // Kotlin, C/C++), and Rust `Implements` reads the impl's `trait` field; re-extract every edge.
-const GRAPH_INDEX_VERSION: &str = "19";
+// 20: #1464 — a declaration's own name (for a qualified C++ out-of-line definition, its path's
+// last segment) and its type-parameter binders no longer emit a `references_type` edge to
+// themselves, a token references a given target once, a recursive call keeps its self-edge in
+// every language, and under `TypeBinding::DefinitionsOnly` a type reference binds only a type kind
+// (`union` included) in every resolution stage, staying unresolved rather than falling back when
+// its written path reaches only a definitely-non-type symbol; re-extract every edge.
+const GRAPH_INDEX_VERSION: &str = "20";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —

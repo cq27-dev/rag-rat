@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use super::*;
 
 pub(crate) fn index_file_edges(
@@ -200,9 +202,10 @@ fn collect_edges_with_error_policy(
     let Some(extract) = crate::index::languages::edge_extractor(language) else {
         return;
     };
+    let backend = crate::index::languages::parser_backend(language);
     let context =
         EdgeExtractionContext { text, symbols, path, locator: SymbolLocator::new(symbols) };
-    let mut emit = EdgeEmitter { out };
+    let mut emit = EdgeEmitter::new(out);
     let mut stack = vec![root];
     let mut cursor = root.walk();
     let mut named_children = Vec::new();
@@ -215,6 +218,9 @@ fn collect_edges_with_error_policy(
                 continue;
             }
         } else {
+            // Pre-order: a declaration is visited before its name, so the name is known to be
+            // declared by the time any extractor spells a reference with it.
+            backend.for_each_declared_name(node, text, &mut |name| emit.declare_name(name));
             extract(context.visit(node), &mut emit);
         }
         named_children.clear();
@@ -231,6 +237,10 @@ pub(crate) struct EdgeExtractionContext<'source> {
     path: &'source Path,
     locator: SymbolLocator<'source>,
 }
+
+#[cfg(test)]
+#[path = "declared_name_tests.rs"]
+mod declared_name_tests;
 
 #[cfg(test)]
 mod recovered_descendant_tests {
@@ -318,15 +328,36 @@ pub(crate) struct EdgeVisit<'tree, 'source, 'context> {
 
 pub(crate) struct EdgeEmitter<'out> {
     out: &'out mut Vec<EdgeCandidate>,
+    /// Name nodes of the declarations and type-parameter binders walked so far.
+    declared_names: HashSet<CalleeRange>,
+    /// Type references already emitted, by callee token and target.
+    type_references: HashSet<(CalleeRange, String)>,
 }
 
 impl EdgeEmitter<'_> {
-    #[cfg(test)]
     pub(crate) fn new(out: &mut Vec<EdgeCandidate>) -> EdgeEmitter<'_> {
-        EdgeEmitter { out }
+        EdgeEmitter { out, declared_names: HashSet::new(), type_references: HashSet::new() }
     }
 
+    pub(crate) fn declare_name(&mut self, name: Node<'_>) {
+        self.declared_names.insert(CalleeRange::of_node(name));
+    }
+
+    /// The one gate for type references, whichever language and arm produced them. A reference
+    /// spelled by a declaration's own name or binder is the declaration, not a use of it. And one
+    /// token references one type once: nested type nodes (`Vec::<u8>::new()`'s call receiver and
+    /// its `type_identifier`; C++ `std::vector`'s `qualified_identifier` and its tail) each spell
+    /// the same token, and the first — the outermost, in pre-order — carries the fullest context.
+    /// A different spelling of the same token is kept: Rust's `Self::Err` path and its bare `Err`
+    /// tail resolve differently, and dropping either loses a binding.
     pub(crate) fn push(&mut self, candidate: EdgeCandidate) {
+        if candidate.edge_kind == EdgeKind::ReferencesType
+            && let Some(callee) = candidate.callee_span
+            && (self.declared_names.contains(&callee)
+                || !self.type_references.insert((callee, candidate.to_name.clone())))
+        {
+            return;
+        }
         self.out.push(candidate);
     }
 

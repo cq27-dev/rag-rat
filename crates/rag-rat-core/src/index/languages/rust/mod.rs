@@ -59,6 +59,20 @@ impl ParserBackend for Rust {
         }
     }
 
+    fn for_each_declared_name<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+        emit: &mut dyn FnMut(Node<'tree>),
+    ) {
+        match node.kind() {
+            // A union and a trait's associated type declare a type name without being symbols.
+            "type_parameter" | "union_item" | "associated_type" =>
+                node.child_by_field_name("name").into_iter().for_each(emit),
+            _ => self.for_each_declared_symbol_name(node, text, emit),
+        }
+    }
+
     /// An impl is NAMED by the same canonical renderer that gives it its scope.
     ///
     /// The default takes the name node's source text, which for `impl<T> Tr for Foo<T>` is

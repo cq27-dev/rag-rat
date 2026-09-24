@@ -120,27 +120,22 @@ fn go_call_edges(
 /// match-the-type-node strategy Rust's extractor uses, and it is strictly more complete than
 /// enumerating parent positions by hand.
 ///
-/// The one position that must be EXCLUDED is a declaration's own name: `type Server struct{…}`
-/// and `type Alias = Base` both store the declared name as a `type_identifier` under the `name`
-/// field of `type_spec` / `type_alias`. Those are definitions, not references — emitting them
-/// would give every named type a spurious self-reference. The type being aliased sits under the
-/// `type` field of the same parent and is still emitted.
+/// A declaration's own name (`type Server struct{…}`) and a generic receiver's binders
+/// (`(p Pair[K, V])`) are `type_identifier`s too; the edge emitter drops those as declarations
+/// (see `ParserBackend::for_each_declared_name`).
 ///
-/// Type-parameter BINDERS (`T` in `[T any]`) need no exclusion: the grammar makes the binding
-/// occurrence a plain `identifier`, so it never reaches this arm. Their USES (`[]T`, `k K`) are
-/// `type_identifier`s and are emitted like any other type mention — extraction stays syntactic
-/// and lets resolution decide the target is a local binder. Constraints (`any`, `comparable`)
-/// arrive as `type_identifier`s too and are likewise emitted, consistent with how other backends
-/// treat builtin type names — resolution simply finds no target and drops them.
+/// A type-parameter list's BINDERS (`T` in `[T any]`) are plain `identifier`s, so they never reach
+/// this arm. Their USES (`[]T`, `k K`) are `type_identifier`s and are emitted like any other type
+/// mention — extraction stays syntactic and lets resolution decide the target is a local binder.
+/// Constraints (`any`, `comparable`) arrive as `type_identifier`s too and are likewise emitted,
+/// consistent with how other backends treat builtin type names — resolution simply finds no target
+/// and drops them.
 fn go_type_reference_edges(
     text: &str,
     node: Node<'_>,
     locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    if go_is_declaration_name(node) {
-        return;
-    }
     let name = node_text(node, text);
     if name.is_empty() {
         return;
@@ -152,20 +147,6 @@ fn go_type_reference_edges(
         EdgeKind::ReferencesType,
         Some(CalleeRange::of_node(node)),
     ));
-}
-
-/// Whether this `type_identifier` IS the name being declared rather than a type being referenced.
-///
-/// Checked by node identity against the parent's `name` field, so a declaration whose name and
-/// referenced type share spelling (`type Server Server`) still excludes only the declared side.
-fn go_is_declaration_name(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
-        return false;
-    };
-    if !matches!(parent.kind(), "type_spec" | "type_alias") {
-        return false;
-    }
-    parent.child_by_field_name("name").is_some_and(|name| name.id() == node.id())
 }
 
 /// `s.Start()` on `func (s *Server) Start()` resolves through the RECEIVER'S DECLARED TYPE

@@ -44,6 +44,10 @@ pub(super) fn emit_bindings<'tree>(
     }
 }
 
+/// The symbol kinds named after the type they extend (a Rust `impl Widget`, a Swift
+/// `extension Widget`): the name is a use of that type, not a declaration.
+const NAMED_AFTER_ANOTHER_TYPE: &[&str] = &["impl", "extension"];
+
 /// Grammar-specific declaration and scope recognition for one node visited by the shared parser
 /// walk.
 pub(super) trait ParserBackend: Sync {
@@ -74,6 +78,37 @@ pub(super) trait ParserBackend: Sync {
         if let Some(symbol) = self.symbol_node(node, text) {
             emit(node, symbol);
         }
+    }
+
+    /// Every node at `node` that DECLARES a name: a symbol's own name, and a type-parameter
+    /// binder. The edge walk drops a type reference spelled by one of these nodes, because it is
+    /// the declaration itself and not a use (`struct S` does not reference `S`; `<T>` does not
+    /// reference `T`, though a later `x: T` does).
+    ///
+    /// Defaults to [`Self::for_each_declared_symbol_name`]. A backend overrides it to add its
+    /// binders.
+    fn for_each_declared_name<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+        emit: &mut dyn FnMut(Node<'tree>),
+    ) {
+        self.for_each_declared_symbol_name(node, text, emit);
+    }
+
+    /// Each symbol's name node at `node`, leaving out a kind named after another type (a Rust
+    /// `impl Foo`, a Swift `extension Foo`): that name is a use of `Foo`, not a declaration.
+    fn for_each_declared_symbol_name<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+        emit: &mut dyn FnMut(Node<'tree>),
+    ) {
+        self.for_each_symbol(node, text, &mut |_, (symbol_kind, name)| {
+            if !NAMED_AFTER_ANOTHER_TYPE.contains(&symbol_kind) {
+                emit(name);
+            }
+        });
     }
 
     fn for_each_recovered_symbol<'tree>(

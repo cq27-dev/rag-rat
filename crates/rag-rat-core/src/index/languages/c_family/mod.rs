@@ -3,6 +3,7 @@ use std::path::Path;
 use tree_sitter::Node;
 
 use super::{ParserBackend, ResolutionPolicy, SymbolMatch, TypeBinding};
+use crate::index::edges::IdentifierPath;
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -87,6 +88,37 @@ impl ParserBackend for Cpp {
             "namespace_definition" => Some(("namespace", node.child_by_field_name("name")?)),
             "preproc_function_def" => Some(("macro", parser::child_name(node, NAME_KINDS)?)),
             _ => None,
+        }
+    }
+
+    fn for_each_declared_name<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+        emit: &mut dyn FnMut(Node<'tree>),
+    ) {
+        match node.kind() {
+            // `template<typename T>` / `template<class... Ts>`: the binder has no field.
+            "type_parameter_declaration" | "variadic_type_parameter_declaration" =>
+                crate::index::edges::named_children(node)
+                    .filter(|child| child.kind() == "type_identifier")
+                    .for_each(emit),
+            "optional_type_parameter_declaration" =>
+                node.child_by_field_name("name").into_iter().for_each(emit),
+            // An out-of-line definition (`struct Outer::Fwd {}`) names itself by its path's last
+            // segment, the token its type reference is spelled by. A specialization
+            // (`template<> struct ns::Box<int> {}`) does not: its `Box` is a use of the primary
+            // template, as the unqualified spelling `Box<int>` already is.
+            _ => self.for_each_declared_symbol_name(node, text, &mut |name| {
+                emit(name);
+                if name.kind() == "qualified_identifier"
+                    && let Some(tail) =
+                        IdentifierPath::member_chain(name, text, IDENTIFIER_KINDS).last_node()
+                    && tail.parent().is_none_or(|parent| parent.kind() != "template_type")
+                {
+                    emit(tail);
+                }
+            }),
         }
     }
 

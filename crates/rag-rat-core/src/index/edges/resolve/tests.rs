@@ -1462,6 +1462,157 @@ fn projected_self_path_never_falls_back_to_the_impl_owner() {
     assert!(resolved.is_none(), "an unresolved associated type must not become Factory::run");
 }
 
+/// A C++ type reference to a scope (`std::cout`, `a::b::kVal`) is emitted syntactically because a
+/// namespace scope looks like a class scope; the C-family `DefinitionsOnly` type binding is what
+/// keeps it from binding a namespace or a function in EVERY resolution stage — the written path's
+/// scope-exact, scope-suffix and file-qualified stages as well as the bare name — while a class of
+/// the same name still binds.
+#[test]
+fn cpp_type_references_never_bind_a_namespace_or_function() {
+    let resolve = |kind: &str, target_qualified_name: Option<&str>| {
+        let mut target = preferred_candidate(1, Language::Cpp, kind);
+        target.scope_path = "a::Target".to_string();
+        let symbols = [target];
+        let index = SymbolIndex::build(&symbols);
+        resolve_symbol(
+            ResolveSymbolRequest {
+                name: "Target",
+                target_qualified_name,
+                edge_kind: EdgeKind::ReferencesType,
+                evidence: Some("Target::value"),
+                receiver_hint: None,
+                receiver_type: None,
+                source_file_id: 2,
+                source_language: Some(Language::Cpp.as_db_str()),
+                imported_external: false,
+                receiver_package: None,
+                file_package: no_packages(),
+            },
+            &index,
+        )
+        .map(|resolved| resolved.0.id)
+    };
+    // Bare, scope-exact, scope-suffix, and file-qualified (`target-1::Target`) spellings.
+    let shapes = [None, Some("a::Target"), Some("Target"), Some("target-1::Target")];
+    for shape in shapes {
+        for kind in ["namespace", "function", "method"] {
+            assert_eq!(resolve(kind, shape), None, "a {kind} is not a type ({shape:?})");
+        }
+        assert_eq!(resolve("class", shape), Some(1), "a class scope is a type use ({shape:?})");
+    }
+}
+
+/// A written path that reaches a namespace or function is negative evidence for a type edge: it
+/// stays unresolved instead of falling back to a same-named type in an unrelated scope
+/// (`a::b::kVal` must not bind `other::b`, `&a::f` must not bind `other::f`).
+#[test]
+fn cpp_type_reference_whose_path_names_a_non_type_never_falls_back_to_a_decoy_type() {
+    for kind in ["namespace", "function", "method"] {
+        let mut target = preferred_candidate(1, Language::Cpp, kind);
+        target.scope_path = "a::Target".to_string();
+        let mut decoy = preferred_candidate(3, Language::Cpp, "class");
+        decoy.scope_path = "other::Target".to_string();
+        let symbols = [target, decoy];
+        let index = SymbolIndex::build(&symbols);
+        for written in ["a::Target", "target-1::Target"] {
+            let resolved = resolve_symbol(
+                ResolveSymbolRequest {
+                    name: "Target",
+                    target_qualified_name: Some(written),
+                    edge_kind: EdgeKind::ReferencesType,
+                    evidence: Some("a::Target::value"),
+                    receiver_hint: None,
+                    receiver_type: None,
+                    source_file_id: 2,
+                    source_language: Some(Language::Cpp.as_db_str()),
+                    imported_external: false,
+                    receiver_package: None,
+                    file_package: no_packages(),
+                },
+                &index,
+            )
+            .map(|resolved| resolved.0.id);
+            assert_eq!(resolved, None, "`{written}` names a {kind}, not the decoy class");
+        }
+    }
+}
+
+/// Only a non-type the written path REACHED is negative evidence. A C++ constructor is a function
+/// named after its class (`lib::Target::Target`); a path that misses both (`fs::Target` through a
+/// namespace alias) must still fall back to the class, not be vetoed by the constructor.
+#[test]
+fn cpp_type_reference_path_missing_a_same_named_constructor_still_falls_back_to_the_class() {
+    let mut class = preferred_candidate(1, Language::Cpp, "class");
+    class.scope_path = "lib::Target".to_string();
+    let mut constructor = preferred_candidate(2, Language::Cpp, "function");
+    constructor.scope_path = "lib::Target::Target".to_string();
+    let symbols = [class, constructor];
+    let index = SymbolIndex::build(&symbols);
+    let resolved = resolve_symbol(
+        ResolveSymbolRequest {
+            name: "Target",
+            target_qualified_name: Some("fs::Target"),
+            edge_kind: EdgeKind::ReferencesType,
+            evidence: Some("fs::Target t"),
+            receiver_hint: None,
+            receiver_type: None,
+            source_file_id: 3,
+            source_language: Some(Language::Cpp.as_db_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    )
+    .map(|resolved| resolved.0.id);
+    assert_eq!(resolved, Some(1), "the constructor was never on the `fs::Target` path");
+}
+
+/// Resolve a Rust type reference to `Target` written as `written` against `symbols`.
+fn resolve_rust_type_path(symbols: &[IndexedSymbol], written: &str) -> Option<i64> {
+    let index = SymbolIndex::build(symbols);
+    resolve_symbol(
+        ResolveSymbolRequest {
+            name: "Target",
+            target_qualified_name: Some(written),
+            edge_kind: EdgeKind::ReferencesType,
+            evidence: Some(written),
+            receiver_hint: None,
+            receiver_type: None,
+            source_file_id: 9,
+            source_language: Some(Language::Rust.as_db_str()),
+            imported_external: false,
+            receiver_package: None,
+            file_package: no_packages(),
+        },
+        &index,
+    )
+    .map(|resolved| resolved.0.id)
+}
+
+/// A Rust inherent impl is named after its self type: `b::Target` reaching only `impl Target` in
+/// module `b` is a use of the struct, not negative evidence, so the reference still falls back to
+/// the struct defined in `b::types` and re-exported from `b`.
+#[test]
+fn rust_type_path_reaching_an_inherent_impl_still_binds_the_reexported_struct() {
+    let mut inherent = preferred_candidate(1, Language::Rust, "impl");
+    inherent.scope_path = "b::Target".to_string();
+    let mut strukt = preferred_candidate(2, Language::Rust, "struct");
+    strukt.scope_path = "b::types::Target".to_string();
+    assert_eq!(resolve_rust_type_path(&[inherent, strukt], "b::Target"), Some(2));
+}
+
+/// A Rust type path that reaches a function is negative evidence: it stays unresolved rather than
+/// falling back to a same-named type in another module.
+#[test]
+fn rust_type_path_reaching_a_function_never_falls_back_to_a_decoy_type() {
+    let mut function = preferred_candidate(1, Language::Rust, "function");
+    function.scope_path = "b::Target".to_string();
+    let mut decoy = preferred_candidate(2, Language::Rust, "struct");
+    decoy.scope_path = "c::Target".to_string();
+    assert_eq!(resolve_rust_type_path(&[function, decoy], "b::Target"), None);
+}
+
 #[test]
 fn cpp_operator_scopes_are_never_rust_degenericized() {
     let mut less = preferred_candidate(1, Language::Cpp, "function");
@@ -3048,4 +3199,47 @@ fn unknown_stored_confidence_remains_tolerant_when_unresolved() {
     crate::index::install_scope_view(&conn, NEW_SCOPE).unwrap();
     resolve_all_edges(&conn).unwrap();
     assert_eq!(edge_state(&conn, edge), (None, "NameOnly".into(), "unresolved".into()));
+}
+
+/// A top-level C function's qualified name is its bare name, so a recursive call spells
+/// `from_name == to_name`. That is a real self-call, and both insert drivers keep it: a
+/// declaration's reference to its OWN NAME is dropped at extraction, by span, not here by name.
+#[test]
+fn a_recursive_call_keeps_its_self_edge_under_both_drivers() {
+    let candidate = EdgeCandidate {
+        from_symbol_id: None,
+        from_name: Some("walk".to_string()),
+        to_name: "walk".to_string(),
+        target_qualified_name: None,
+        evidence: Some("walk(n)".to_string()),
+        receiver_hint: None,
+        receiver_type_hint: None,
+        source_span: EdgeSpan { start_line: 1, end_line: 1, start_byte: 30, end_byte: 37 },
+        callee_span: Some(CalleeRange { start_byte: 30, end_byte: 34 }),
+        import_scope: None,
+        edge_kind: EdgeKind::CallsName,
+        confidence: EdgeConfidence::NameOnly,
+    };
+    let self_edges = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM edges WHERE from_name = 'walk' AND to_name = 'walk'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+
+    let inline = seeded_conn();
+    let file = add_file(&inline, "walk.c", NEW);
+    crate::index::install_scope_view(&inline, NEW_SCOPE).unwrap();
+    insert_candidates(&inline, file, vec![candidate.clone()]).unwrap();
+    assert_eq!(self_edges(&inline), 1, "the inline driver keeps the recursive call");
+
+    let rebuild = seeded_conn();
+    let file = add_file(&rebuild, "walk.c", NEW);
+    let mut graph = FullRebuildGraph::default();
+    graph.push_edge(file, &candidate, &[]);
+    crate::index::install_scope_view(&rebuild, NEW_SCOPE).unwrap();
+    resolve_and_insert_edges(&rebuild, graph).unwrap();
+    assert_eq!(self_edges(&rebuild), 1, "the rebuild driver keeps the recursive call");
 }

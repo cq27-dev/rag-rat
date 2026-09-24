@@ -82,12 +82,10 @@ fn a_type_reference_names_the_template_not_its_argument() {
     assert_eq!(types("std::vector<Gadget> v;"), vec![
         ty("Gadget", None),
         ty("std", None),
-        ty("vector", None),
         ty("vector", Some("std::vector")),
     ]);
     assert_eq!(types("auto t = new ns::Thing<Item>(q);"), vec![
         ty("Item", None),
-        ty("Thing", None),
         ty("Thing", Some("ns::Thing")),
         ty("ns", None),
     ]);
