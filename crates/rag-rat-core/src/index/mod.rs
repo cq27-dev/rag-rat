@@ -472,7 +472,10 @@ const GENERATED_FLAGS_VERSION_KEY: &str = "generated_flags_version";
 // function pointer was named after its parameter), and an aggregate or namespace with no `name`
 // field declares no symbol and no scope segment instead of borrowing a member's name. The heal
 // re-extracts every C/C++ file row derived before it (`symbol_set_changed_at`).
-const LOGICAL_KEY_VERSION: &str = "4";
+// 5: #1465 — TypeScript, Kotlin, C and C++ recover whole declarations found beneath an ERROR node
+// (`parser::recovered_declarations`), so a malformed file declares symbols it used to drop; the
+// heal re-extracts those languages' file rows derived before it.
+const LOGICAL_KEY_VERSION: &str = "5";
 const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
 
 /// The `LOGICAL_KEY_VERSION` at which `language`'s extractor last changed WHICH symbols a file
@@ -482,8 +485,8 @@ const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
 /// version is re-extracted whole instead.
 fn symbol_set_changed_at(language: Language) -> Option<i64> {
     match language {
-        // 4: the C/C++ function-declarator and name-field changes above.
-        Language::C | Language::Cpp => Some(4),
+        // 4: the C/C++ function-declarator and name-field changes above; 5: ERROR recovery.
+        Language::C | Language::Cpp | Language::TypeScript | Language::Kotlin => Some(5),
         _ => None,
     }
 }

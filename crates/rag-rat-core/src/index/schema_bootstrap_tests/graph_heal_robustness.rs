@@ -987,11 +987,10 @@ fn file_symbol_names(db: &IndexDatabase, path: &str) -> Vec<String> {
     names
 }
 
-/// The C/C++ extractor changed WHICH symbols a file declares at logical-key version 4: a function
-/// returning a function pointer was named after its parameter, and an anonymous aggregate took a
-/// member's name. The span-matched scope refresh can neither rename the first nor drop the second,
-/// so an index derived before that version must come out of the upgrade heal with exactly the
-/// symbols a fresh index has.
+/// The previous C/C++ extractor named a function returning a function pointer after its
+/// parameter, and gave an anonymous aggregate a member's name. The span-matched scope refresh can
+/// neither rename the first nor drop the second, so a C row stamped with the previous logical-key
+/// version must come out of the upgrade heal with exactly the symbols a fresh index has.
 #[test]
 fn a_c_file_derived_before_the_symbol_change_is_re_extracted_on_upgrade() {
     let root = unique_temp_root();
@@ -1053,6 +1052,56 @@ fn a_c_file_derived_before_the_symbol_change_is_re_extracted_on_upgrade() {
     );
 
     let _ = fs::remove_dir_all(&root);
+}
+
+/// TypeScript and Kotlin recover whole declarations beneath an ERROR node that the previous
+/// extractor dropped. The span-matched scope refresh cannot add a symbol, so a row stamped with the
+/// previous logical-key version must come out of the upgrade heal with the recovered symbols back.
+#[test]
+fn a_file_derived_before_error_recovery_is_re_extracted_on_upgrade() {
+    for (language, dropped) in [(Language::TypeScript, &["K", "m"][..]), (Language::Kotlin, &["f"])]
+    {
+        let fixture = crate::index::languages::test_support::fixture(language).expect("fixture");
+        let path = format!("src/{}", fixture.path);
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(&path), fixture.broken_declaration).unwrap();
+        let config = source_config(root.to_path_buf(), language);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let fresh = file_symbol_names(&db, &path);
+        assert!(
+            dropped.iter().all(|name| fresh.contains(&name.to_string())),
+            "{language}: {fresh:?}"
+        );
+
+        // What the previous extractor persisted: the file without its recovered declarations.
+        let file_id = scoped_file_id(&db, &path, &db.active_worktree_id.clone());
+        for name in dropped {
+            db.storage
+                .connection()
+                .execute("DELETE FROM main.symbols WHERE file_id = ?1 AND name = ?2", params![
+                    file_id, name
+                ])
+                .unwrap();
+        }
+        owe_both_heals(&db);
+        let previous_key_version = LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1;
+        db.storage
+            .connection()
+            .execute("UPDATE main.files SET scope_version = ?1 WHERE id = ?2", [
+                previous_key_version,
+                file_id,
+            ])
+            .unwrap();
+        db.set_repo_meta(LOGICAL_KEY_VERSION_KEY, &previous_key_version.to_string()).unwrap();
+        drop(db);
+
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert_eq!(file_symbol_names(&db, &path), fresh, "{language}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 fn scoped_symbol_names(db: &IndexDatabase, file_id: i64) -> Vec<String> {

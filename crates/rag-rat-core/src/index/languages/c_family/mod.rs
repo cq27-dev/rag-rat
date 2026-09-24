@@ -2,7 +2,9 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{ParserBackend, ResolutionPolicy, SymbolMatch, TypeBinding};
+use super::{
+    ErrorRecovery, ParserBackend, RecoveryContext, ResolutionPolicy, SymbolMatch, TypeBinding,
+};
 use crate::index::edges::IdentifierPath;
 use crate::index::parser::{self, ParserKind};
 
@@ -24,6 +26,74 @@ pub(super) static CPP_SUPPORT: Cpp = Cpp;
 
 pub(super) struct C;
 pub(super) struct Cpp;
+
+/// A conditional that splits one definition across its branches (`#ifdef X` / `int f(int a) {` /
+/// `#else` / `int f(int a, int b) {` / `#endif` / shared body) leaves the parser one unbalanced
+/// run of text, and the rest of the file becomes one ERROR. The definitions after it still parse
+/// whole; the split one is rejected by [`is_stray_conditional_directive`].
+static C_ERROR_RECOVERY: ErrorRecovery = ErrorRecovery {
+    file_root: "translation_unit",
+    contexts: &[RecoveryContext {
+        kind: "translation_unit",
+        within: &[],
+        legal: &[
+            "function_definition",
+            "type_definition",
+            "struct_specifier",
+            "union_specifier",
+            "enum_specifier",
+            "preproc_function_def",
+        ],
+    }],
+    container_keywords: &["struct", "union"],
+};
+
+const CPP_TOP_LEVEL_DECLARATIONS: &[&str] = &[
+    "function_definition",
+    "template_declaration",
+    "type_definition",
+    "alias_declaration",
+    "namespace_definition",
+    "class_specifier",
+    "struct_specifier",
+    "union_specifier",
+    "enum_specifier",
+    "preproc_function_def",
+];
+const CPP_MEMBER_DECLARATIONS: &[&str] = &[
+    "function_definition",
+    "template_declaration",
+    "type_definition",
+    "alias_declaration",
+    "class_specifier",
+    "struct_specifier",
+    "union_specifier",
+    "enum_specifier",
+];
+
+/// As for C. `declaration_list` is a namespace or `extern "C"` body, where top-level declarations
+/// are legal; `field_declaration_list` is a class, struct or union body.
+static CPP_ERROR_RECOVERY: ErrorRecovery = ErrorRecovery {
+    file_root: "translation_unit",
+    contexts: &[
+        RecoveryContext {
+            kind: "translation_unit",
+            within: &[],
+            legal: CPP_TOP_LEVEL_DECLARATIONS,
+        },
+        RecoveryContext {
+            kind: "declaration_list",
+            within: &[],
+            legal: CPP_TOP_LEVEL_DECLARATIONS,
+        },
+        RecoveryContext {
+            kind: "field_declaration_list",
+            within: &[],
+            legal: CPP_MEMBER_DECLARATIONS,
+        },
+    ],
+    container_keywords: &["namespace", "class", "struct", "union"],
+};
 
 impl ParserBackend for C {
     fn symbol_kinds(&self) -> &'static [&'static str] {
@@ -48,6 +118,14 @@ impl ParserBackend for C {
             "preproc_function_def" => Some(("macro", parser::child_name(node, NAME_KINDS)?)),
             _ => None,
         }
+    }
+
+    fn error_recovery(&self) -> Option<&'static ErrorRecovery> {
+        Some(&C_ERROR_RECOVERY)
+    }
+
+    fn marks_split_declaration(&self, node: Node<'_>, text: &str) -> bool {
+        is_stray_conditional_directive(node, text)
     }
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
@@ -122,6 +200,14 @@ impl ParserBackend for Cpp {
         }
     }
 
+    fn error_recovery(&self) -> Option<&'static ErrorRecovery> {
+        Some(&CPP_ERROR_RECOVERY)
+    }
+
+    fn marks_split_declaration(&self, node: Node<'_>, text: &str) -> bool {
+        is_stray_conditional_directive(node, text)
+    }
+
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         let name = match node.kind() {
             "namespace_definition" => node.child_by_field_name("name")?,
@@ -135,6 +221,23 @@ impl ParserBackend for Cpp {
     fn is_plumbing_node(&self, node: Node<'_>) -> bool {
         node.kind().contains("comment") || node.kind() == "preproc_include"
     }
+}
+
+/// A conditional-continuation directive (`#else`, `#elif…`, `#endif`) parsed as a lone
+/// `preproc_call`. Inside a well-formed conditional the grammar folds these into the
+/// `preproc_if`/`preproc_ifdef` node, so a stray one means the parser read the conditional's
+/// branches as one run of text — a function whose header comes from one branch and whose body
+/// closes another.
+fn is_stray_conditional_directive(node: Node<'_>, text: &str) -> bool {
+    node.kind() == "preproc_call"
+        && node
+            .child_by_field_name("directive")
+            .and_then(|directive| parser::node_text(directive, text))
+            .is_some_and(|directive| {
+                // `# endif` is the same directive: whitespace may follow the `#`.
+                let name = directive.trim_start().trim_start_matches('#').trim();
+                matches!(name, "else" | "elif" | "elifdef" | "elifndef" | "endif")
+            })
 }
 
 fn has_body(node: Node<'_>) -> bool {
