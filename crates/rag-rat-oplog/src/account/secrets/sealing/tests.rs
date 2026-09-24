@@ -637,6 +637,41 @@ fn historical_keyring_tolerates_a_corrupt_accepted_wrap() {
     assert!(keyring.get(key.key_id()).is_none(), "a corrupt wrap recovers no key");
 }
 
+#[test]
+fn a_retired_identity_still_opens_history_but_never_seals() {
+    let conn = db();
+    let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+    let old = local_device(&conn, NOW).unwrap();
+    let key = ContentKey::from_seed(&[0x21; 32]);
+    let wrap = honest_wrap(account, stream_id, old.fingerprint(), &old.x25519_public(), &key, 0);
+    let (bytes, _) =
+        wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
+    ingest(&conn, &bytes);
+
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let (retired, fresh) = crate::retire_local_identity_in_tx(&tx, NOW + 1).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(retired, old.fingerprint());
+    assert_ne!(fresh.fingerprint(), old.fingerprint());
+    assert_ne!(fresh.x25519_public_key(), old.x25519_public_key(), "the X25519 key is fresh too");
+    let reloaded = local_device(&conn, NOW + 2).unwrap();
+    assert_eq!(reloaded.fingerprint(), fresh.fingerprint(), "the re-mint is what persists");
+
+    let keyring = historical_content_keyring(&conn, account, stream_id, &reloaded).unwrap();
+    assert_eq!(
+        keyring.get(key.key_id()).expect("history sealed to the retired identity").as_slice(),
+        key.as_slice(),
+    );
+    assert!(
+        matches!(
+            current_sealing_key(&conn, account, stream_id, &reloaded, NOW + 2).unwrap(),
+            SealingKeyOutcome::NotRecipient
+        ),
+        "a key only the retired identity can open never selects what new content seals under",
+    );
+}
+
 // ── The adoption cross-check ──
 
 #[test]

@@ -2418,6 +2418,7 @@ fn every_refusal_code_survives_the_wire_and_names_its_error() {
             RefusalCode::JoinerCapacity => "joiner_capacity",
             RefusalCode::HeldStateConflict => "held_state_conflict",
             RefusalCode::CheckpointPinMoved => "checkpoint_pin_moved",
+            RefusalCode::DeviceRemoved => "device_removed",
         };
         let bytes = EnrollmentResponse::Refused(code).encode();
         let mut frame = minicbor::Decoder::new(&bytes);
@@ -2657,6 +2658,73 @@ fn another_owner_removes_a_lost_founder_and_enrolls_its_replacement() {
         .unwrap();
     assert!(replacement_enrolled, "the replacement is on the roster");
     assert!(!founder_enrolled, "and the lost founder device is not");
+}
+
+/// A removed device's store re-enrolls under a fresh identity (#1417). Its old fingerprint is
+/// refused by name with the nonce unspent — the store may never have learned of its removal — and
+/// the same ticket then enrolls the re-minted identity, which the store adopts over the account it
+/// already holds.
+#[test]
+fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_fresh_identity() {
+    let founder = db();
+    let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let member = joined_store(&founder, account, DeviceRole::Member);
+    let old = rag_rat_oplog::local_device(&member, NOW).unwrap();
+    let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::author_device_remove_in_tx(&tx, old.fingerprint(), "forked", NOW + 2).unwrap();
+    tx.commit().unwrap();
+    let ticket = ticket(&founder, account, DeviceRole::Member);
+    let request_for = |device: &rag_rat_oplog::LocalDevice| EnrollmentRequest {
+        nonce: ticket.nonce,
+        expected_account: account,
+        ed25519_pubkey: device.ed25519_public_key(),
+        x25519_pubkey: device.x25519_public_key(),
+        transport_node_id: [9; 32],
+        budget: generous_budget(),
+        held_entry_hashes: Vec::new(),
+    };
+
+    let refused = redeem_invite(&founder, request_for(&old), [9; 32], &|| NOW + 3);
+    assert!(matches!(refused, Err(InviteError::DeviceRemoved)), "{:?}", refused.err());
+    let used: Option<i64> = founder
+        .query_row(
+            "SELECT used_at_ms FROM sync_invites WHERE nonce = ?1",
+            [ticket.nonce.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(used, None, "the refusal leaves the ticket spendable");
+
+    let tx = Transaction::new_unchecked(&member, TransactionBehavior::Immediate).unwrap();
+    let (retired, fresh) = rag_rat_oplog::retire_local_identity_in_tx(&tx, NOW + 4).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(retired, old.fingerprint());
+    let (receipt, _) = redeem_invite(&founder, request_for(&fresh), [9; 32], &|| NOW + 5)
+        .expect("the same ticket enrolls the fresh identity");
+    let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
+        &receipt.account_entries,
+        account,
+        receipt.device_add_hash.into(),
+        &receipt.device_add_signed,
+        fresh.ed25519_public_key(),
+        fresh.x25519_public_key(),
+    )
+    .unwrap();
+    rag_rat_oplog::adopt_enrollment_bootstrap(&member, rag_rat_oplog::EnrollmentBootstrap {
+        account_entries: &receipt.account_entries,
+        account_id: account,
+        genesis_hash,
+        device_fingerprint: fresh.fingerprint(),
+        device_add_hash: receipt.device_add_hash.into(),
+        now_ms: NOW + 6,
+    })
+    .expect("the store adopts the account it already belonged to under its new identity");
+    let roster = rag_rat_oplog::local_account_roster(&member).unwrap();
+    assert!(
+        roster.iter().any(|device| device.fingerprint == fresh.fingerprint() && device.this_device),
+        "the fresh identity is this store's seat",
+    );
+    assert!(roster.iter().all(|device| device.fingerprint != old.fingerprint()));
 }
 
 /// A redemption whose inviter can no longer author the DeviceAdd rolls back with the nonce unspent.

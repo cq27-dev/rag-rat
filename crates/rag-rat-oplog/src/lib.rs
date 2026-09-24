@@ -128,7 +128,7 @@ pub use account::{
     content_entry_ref, content_ingest, content_op_is_authorable, content_op_is_sealed_authorable,
     content_signed_entry_exists, content_signed_hash, content_stream_has_pending_refold,
     content_stream_has_sealed_ratchet, content_stream_is_empty, current_sealing_key,
-    decode_content_signed, effective_writer_grant, effective_writer_grantees,
+    decode_content_signed, device_was_removed, effective_writer_grant, effective_writer_grantees,
     enroll_stream_keys_for_device_in_tx, enrollment_authoring_fits,
     enrollment_authoring_requirements, enrollment_budget, ensure_owned_stream_v2_in_tx,
     ensure_owned_stream_v2_with_mode_in_tx, ensure_repo_incarnation,
@@ -177,7 +177,7 @@ pub use content_projection::{
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
-pub use identity::{LocalDevice, load_local_device, local_device};
+pub use identity::{LocalDevice, load_local_device, local_device, retire_local_identity_in_tx};
 // The byte-canonical op encoding, for a consumer that needs a stable identity for an op's
 // payload: the memory drain digests an anchor set to record which one it applied.
 pub use op::encode as encode_op;

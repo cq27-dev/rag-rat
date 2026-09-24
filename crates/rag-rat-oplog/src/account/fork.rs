@@ -58,8 +58,8 @@ impl std::fmt::Display for ForkedChain {
         f.write_str(
             ". Its store was restored from an older copy or copied to another machine, so it \
              cannot author on that chain again: another owner must remove this device (`rag-rat \
-             sync remove-device`), and it must enroll again as a new device (a sole owner first \
-             promotes another device with `rag-rat sync promote`)",
+             sync remove-device`), and it must enroll again with `rag-rat sync join` (a sole \
+             owner first promotes another device with `rag-rat sync promote`)",
         )
     }
 }

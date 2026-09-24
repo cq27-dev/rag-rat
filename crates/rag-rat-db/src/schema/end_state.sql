@@ -2224,6 +2224,12 @@ CREATE TRIGGER account_control_evidence_no_delete BEFORE DELETE ON account_contr
 CREATE INDEX account_entry_view_citations
              ON account_entries(account_id, cited_view_digest)
              WHERE cited_view_digest IS NOT NULL;
+CREATE TABLE oplog_retired_identities(
+             fingerprint   BLOB PRIMARY KEY CHECK (length(fingerprint) = 32),
+             x25519_secret BLOB NOT NULL CHECK (length(x25519_secret) = 32),
+             x25519_public BLOB NOT NULL CHECK (length(x25519_public) = 32),
+             retired_at_ms INTEGER NOT NULL
+         ) STRICT;
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('001_sqlite_storage_baseline',1789841199646,'sha256:rag-rat-sqlite-baseline-v1','SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('002_embedding_vector_metadata',1789841199646,'sha256:rag-rat-embedding-vector-metadata-v2','Add embedding model dimension metadata and per-vector dimensions for hybrid vector search');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('003_derived_artifact_reconcile_metadata',1789841199646,'sha256:rag-rat-derived-artifact-reconcile-metadata-v3','Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation');
@@ -2356,5 +2362,6 @@ INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALU
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('130_account_control_pins',1789841199858,'sha256:rag-rat-account-control-pins-v130','Retain permanent external account checkpoint pins and signed evidence (#1311)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('131_account_view_citations',1789841199859,'sha256:rag-rat-account-view-citations-v131','Record the pre-cut view a control-v2 cut names, so candidate admission grants the view-manifest reserve only to a manifest some stored cut cites; backfilled from the stored signed control payloads so cuts admitted before this migration still name their evidence (#1367)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('132_invite_checkpoint_digest',1789841199860,'sha256:rag-rat-invite-checkpoint-digest-v132','Record which control-log pin an invite was minted under, so a pin installed between mint and redemption is refused before the one-time nonce is consumed rather than after (#1311)');
+INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('133_oplog_retired_identities',1789841199861,'sha256:rag-rat-oplog-retired-identities-v133','Add oplog_retired_identities: the fingerprint and X25519 key of a device identity this store replaced when it re-enrolled after removal, kept so content sealed to the old identity stays readable (#1417)');
 INSERT INTO "repos"("repo_id","display_name","registered_at_ms") VALUES('__unassigned__','',0);
 INSERT INTO "content_digest_state"("id","state","rows_folded") VALUES(1,'0000000000000000000000000000000000000000000000000000000000000000',0);

@@ -147,6 +147,28 @@ pub fn apply_oplog_device_identity(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// V133 (#1417): the device identities this store retired. A removed device's fingerprint can never
+/// be enrolled again (the fold rejects a tombstoned re-add), so a store whose device was removed
+/// re-enrolls under a fresh ed25519 AND X25519 key. Content keys wrapped to the old identity under
+/// epochs that rotated out before the re-enrollment are never re-wrapped to the new one, so the old
+/// X25519 secret is kept here to open them. No ed25519 material: nothing may sign under a retired
+/// identity. Purely additive and idempotent.
+pub fn apply_oplog_retired_identities(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+
+         CREATE TABLE IF NOT EXISTS oplog_retired_identities(
+             fingerprint   BLOB PRIMARY KEY CHECK (length(fingerprint) = 32),
+             x25519_secret BLOB NOT NULL CHECK (length(x25519_secret) = 32),
+             x25519_public BLOB NOT NULL CHECK (length(x25519_public) = 32),
+             retired_at_ms INTEGER NOT NULL
+         ) STRICT;
+
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 /// V058 (sync phase C, §5): give the single device identity an X25519 ENCRYPTION keypair beside its
 /// ed25519 signing key. Two nullable `BLOB` columns — `x25519_secret` (the 32-byte scalar, the sole
 /// durable copy, D4) and `x25519_public` — added to the STRICT `oplog_device_identity` table

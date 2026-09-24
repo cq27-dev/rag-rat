@@ -175,6 +175,7 @@ pub(super) enum RefusalCode {
     JoinerCapacity,
     HeldStateConflict,
     CheckpointPinMoved,
+    DeviceRemoved,
 }
 
 impl EnrollmentReceipt {
@@ -268,6 +269,7 @@ impl RefusalCode {
             Self::JoinerCapacity => "joiner_capacity",
             Self::HeldStateConflict => "held_state_conflict",
             Self::CheckpointPinMoved => "checkpoint_pin_moved",
+            Self::DeviceRemoved => "device_removed",
         }
     }
 
@@ -282,6 +284,7 @@ impl RefusalCode {
             "joiner_capacity" => Ok(Self::JoinerCapacity),
             "held_state_conflict" => Ok(Self::HeldStateConflict),
             "checkpoint_pin_moved" => Ok(Self::CheckpointPinMoved),
+            "device_removed" => Ok(Self::DeviceRemoved),
             _ => Err(InviteError::Malformed(format!("unknown enrollment refusal {value}"))),
         }
     }
@@ -297,6 +300,7 @@ impl RefusalCode {
             Self::JoinerCapacity => InviteError::JoinerCapacity,
             Self::HeldStateConflict => InviteError::HeldStateConflict,
             Self::CheckpointPinMoved => InviteError::CheckpointPinMoved,
+            Self::DeviceRemoved => InviteError::DeviceRemoved,
         }
     }
 }
@@ -434,6 +438,8 @@ pub(super) fn refusal_code(error: &InviteError) -> Option<RefusalCode> {
         // The owner holds the pin state, so only the owner can see this; the joiner has to be told
         // or it cannot tell a terminal ticket from a retryable transport failure.
         InviteError::CheckpointPinMoved => Some(RefusalCode::CheckpointPinMoved),
+        // Only the owner's log records the removal; the joiner may never have learned of it.
+        InviteError::DeviceRemoved => Some(RefusalCode::DeviceRemoved),
         // A transport failure never reached a redemption and has never produced a wire
         // refusal; it is named here rather than left to a wildcard so it cannot start to.
         // Version skew is decided reading a ticket string, before any connection exists, so it

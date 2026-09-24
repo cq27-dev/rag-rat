@@ -143,7 +143,7 @@ pub use keywrap::{ContentKey, KeyId};
 // account-device binding. Consumed by the transport crate's auth handshake.
 pub use node_binding::{NodeAuthError, sign_local_node_binding, verify_node_binding};
 pub use ops::{DeviceCut, DeviceRole, GrantRole};
-pub use roster::{RosterDevice, local_account_roster, resolve_roster_device};
+pub use roster::{RosterDevice, device_was_removed, local_account_roster, resolve_roster_device};
 // The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a), the C4.3b READ
 // side (derive-on-read sealing-key selection + the key_id adoption cross-check), and the C4.4
 // lazy rotation-on-removal entry points (#607).

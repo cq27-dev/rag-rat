@@ -2,7 +2,10 @@
 //!
 //! Exactly ONE ed25519 keypair per store, minted from OS entropy on first use and persisted so it
 //! is stable for the life of the index — every entry this install authors (live or backfilled)
-//! signs under the same fingerprint instead of a fresh per-process key. Store-global, NOT
+//! signs under the same fingerprint instead of a fresh per-process key. The one exception is
+//! [`retire_local_identity_in_tx`]: a store whose device was removed from its account re-enrolls
+//! under a fresh identity, keeping only the old X25519 key (`oplog_retired_identities`) to read
+//! history sealed to it. Store-global, NOT
 //! repo-scoped: a device is a machine identity, orthogonal to the per-repo owner streams it signs.
 //!
 //! [`local_device`] is the single accessor: it returns the persisted identity, minting-and-storing
@@ -79,12 +82,124 @@ impl LocalDevice {
         &self.x25519_secret
     }
 
+    /// The unwrap side of this identity, for content-key recovery.
+    pub(super) fn recipient(&self) -> Recipient<'_> {
+        Recipient {
+            fingerprint: self.fingerprint,
+            x25519_secret: &self.x25519_secret,
+            x25519_public: self.x25519_public,
+        }
+    }
+
     /// Consume the identity for its X25519 secret alone, dropping the signing key with the rest.
     /// For a caller that decrypts but never signs and outlives the load — holding the whole
     /// identity there would keep the ed25519 secret alive for no reason.
     pub(super) fn into_x25519_secret(self) -> DeviceX25519Secret {
         self.x25519_secret
     }
+}
+
+/// A key content-key wraps are addressed to: a fingerprint and the X25519 keypair that opens wraps
+/// naming it. It carries no signing key, so it cannot reach an authoring seam.
+pub(super) struct Recipient<'a> {
+    pub(super) fingerprint: DeviceFingerprint,
+    pub(super) x25519_secret: &'a DeviceX25519Secret,
+    pub(super) x25519_public: DeviceX25519Public,
+}
+
+/// A device identity this store replaced when it re-enrolled after removal (#1417): only the
+/// fingerprint and X25519 key, kept to open content keys wrapped to it before the re-enrollment.
+pub(super) struct RetiredIdentity {
+    fingerprint: DeviceFingerprint,
+    x25519_secret: DeviceX25519Secret,
+    x25519_public: DeviceX25519Public,
+}
+
+impl RetiredIdentity {
+    pub(super) fn recipient(&self) -> Recipient<'_> {
+        Recipient {
+            fingerprint: self.fingerprint,
+            x25519_secret: &self.x25519_secret,
+            x25519_public: self.x25519_public,
+        }
+    }
+}
+
+/// Every identity this store retired, oldest first. Read-only: decryption paths call it.
+pub(super) fn retired_identities(conn: &Connection) -> anyhow::Result<Vec<RetiredIdentity>> {
+    let mut stmt = conn.prepare(
+        "SELECT fingerprint, x25519_secret, x25519_public FROM oplog_retired_identities
+          ORDER BY retired_at_ms, fingerprint",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Vec<u8>>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(|(fingerprint, secret, public)| {
+            let fingerprint: [u8; 32] = fingerprint
+                .as_slice()
+                .try_into()
+                .context("retired fingerprint is not exactly 32 bytes")?;
+            let (x25519_secret, x25519_public) = read_x25519(Some(secret), Some(public))?
+                .context("a retired identity always carries its X25519 key")?;
+            Ok(RetiredIdentity {
+                fingerprint: DeviceFingerprint::from_bytes(fingerprint),
+                x25519_secret,
+                x25519_public,
+            })
+        })
+        .collect()
+}
+
+/// Retire this store's device identity and replace it with a fresh one, in the caller's
+/// transaction (#1417). The old fingerprint and X25519 key move to `oplog_retired_identities`; the
+/// identity row gets a fresh ed25519 seed AND a fresh X25519 key. Both are fresh because a forked
+/// copy of this store elsewhere holds the old X25519 secret, and must not open what is wrapped to
+/// the new identity. The old signing seed is dropped: nothing may sign under it again. Returns the
+/// retired fingerprint and the new identity.
+pub fn retire_local_identity_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    now_ms: i64,
+) -> anyhow::Result<(DeviceFingerprint, LocalDevice)> {
+    let old = read_identity(tx)?
+        .and_then(StoredIdentity::into_local)
+        .context("this store has no complete device identity to retire")?;
+    tx.execute(
+        "INSERT INTO oplog_retired_identities(
+             fingerprint, x25519_secret, x25519_public, retired_at_ms)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            old.fingerprint.to_bytes().as_slice(),
+            old.x25519_secret.secret_bytes().as_slice(),
+            old.x25519_public.to_bytes().as_slice(),
+            now_ms,
+        ],
+    )?;
+    let ed = DeviceSecret::generate()?;
+    let x = DeviceX25519Secret::generate()?;
+    let public = ed.public();
+    let changed = tx.execute(
+        "UPDATE oplog_device_identity
+            SET seed = ?1, public_key = ?2, fingerprint = ?3, created_at_ms = ?4,
+                x25519_secret = ?5, x25519_public = ?6
+          WHERE id = 0 AND fingerprint = ?7",
+        params![
+            ed.seed().as_slice(),
+            public.to_bytes().as_slice(),
+            public.fingerprint().to_bytes().as_slice(),
+            now_ms,
+            x.secret_bytes().as_slice(),
+            x.public().to_bytes().as_slice(),
+            old.fingerprint.to_bytes().as_slice(),
+        ],
+    )?;
+    anyhow::ensure!(changed == 1, "the device identity changed while it was being retired");
+    let fresh = read_identity(tx)?
+        .and_then(StoredIdentity::into_local)
+        .context("device identity missing immediately after the re-mint")?;
+    Ok((old.fingerprint, fresh))
 }
 
 /// Read this store's local device fingerprint WITHOUT minting one — `None` when no identity has

@@ -73,7 +73,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
             print_output(&serde_json::json!({
                 "status": "removed",
                 "device": device_json(&removed),
-                "note": "stream keys it held rotate at the next write; to enroll that machine again, `sync join` from a fresh store",
+                "note": "stream keys it held rotate at the next write; to enroll that machine again, mint it an invite and run `sync join` there: it enrolls under a new identity and keeps reading what it could before",
             }))
         }),
         SyncCommand::Promote { device } => with_repo_db(config, |db| {
@@ -831,6 +831,19 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
 /// database-scoped session lock for the whole exchange — enrollment + restore consume candidate
 /// capacity, which must be serialized against any colocated `serve`/device sync (the requirement
 /// `connect_and_enroll` documents).
+/// Replace a removed device identity with a fresh one before re-enrolling (#1417). The old
+/// fingerprint's X25519 key is kept so content sealed to it stays readable.
+fn retire_removed_identity(conn: &rusqlite::Connection) -> anyhow::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let (retired, fresh) = rag_rat_oplog::retire_local_identity_in_tx(&tx, time::now_ms())?;
+    tx.commit()?;
+    eprintln!(
+        "this device ({retired}) was removed from the account; enrolling under a new identity ({})",
+        fresh.fingerprint()
+    );
+    Ok(())
+}
+
 fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
     let ticket = rag_rat_sync::InviteTicket::from_ticket_string(ticket)
         .map_err(|e| anyhow!("invalid enrollment ticket: {e}"))?;
@@ -861,7 +874,13 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         }
         // Mint the account device identity if absent (NOT a genesis) so the enrollment request can
         // present the joiner's keys. `local_device` is idempotent on an existing identity.
-        rag_rat_oplog::local_device(conn, time::now_ms())?;
+        let device = rag_rat_oplog::local_device(conn, time::now_ms())?;
+        // This store's device was removed from the account (and it has synced the removal): that
+        // fingerprint can never enroll again, so re-enroll under a fresh identity. A store that
+        // never learned of its removal finds out from the owner's `DeviceRemoved` refusal below.
+        if rag_rat_oplog::device_was_removed(conn, ticket.account_id, device.fingerprint())? {
+            retire_removed_identity(conn)?;
+        }
         node_secret(conn)?
     };
     drop(repo_lock);
@@ -880,7 +899,8 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         // Whether this device is ALREADY a roster member — a resumed join whose enrollment
         // committed on an earlier run. It decides only whether restore may still proceed if
         // redemption fails.
-        let already_effective = device_roster_capability(conn, account_id, &local_node)?.is_some();
+        let mut already_effective =
+            device_roster_capability(conn, account_id, &local_node)?.is_some();
 
         // 1) Enrollment — dial the owner over the enroll ALPN. The owner authors this device's
         //    DeviceAdd and returns the account bootstrap, which `connect_and_enroll` adopts,
@@ -895,31 +915,49 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         //    nonce on a device that is ALREADY enrolled falls back to restore (a resume past the
         //    replay window, where enrollment is unnecessary); every other failure — and any failure
         //    on a not-yet-enrolled device — is a real error.
-        let local = rag_rat_oplog::local_device(conn, time::now_ms())?;
-        let request = rag_rat_sync::EnrollmentRequest {
-            nonce: ticket.nonce,
-            expected_account: account_id,
-            ed25519_pubkey: local.ed25519_public_key(),
-            x25519_pubkey: local.x25519_public_key(),
-            transport_node_id: [0u8; 32],
-            budget: rag_rat_oplog::EnrollmentBudget {
-                account_entries_remaining: 0,
-                account_bytes_remaining: 0,
-                global_entries_remaining: 0,
-                global_bytes_remaining: 0,
-            },
-            held_entry_hashes: Vec::new(),
+        let request = || -> anyhow::Result<rag_rat_sync::EnrollmentRequest> {
+            let local = rag_rat_oplog::local_device(conn, time::now_ms())?;
+            Ok(rag_rat_sync::EnrollmentRequest {
+                nonce: ticket.nonce,
+                expected_account: account_id,
+                ed25519_pubkey: local.ed25519_public_key(),
+                x25519_pubkey: local.x25519_public_key(),
+                transport_node_id: [0u8; 32],
+                budget: rag_rat_oplog::EnrollmentBudget {
+                    account_entries_remaining: 0,
+                    account_bytes_remaining: 0,
+                    global_entries_remaining: 0,
+                    global_bytes_remaining: 0,
+                },
+                held_entry_hashes: Vec::new(),
+            })
         };
-        match rag_rat_sync::connect_and_enroll(
+        let mut outcome = rag_rat_sync::connect_and_enroll(
             &endpoint,
             peer.clone(),
             conn,
             account_id,
-            &request,
+            &request()?,
             time::now_ms(),
         )
-        .await
-        {
+        .await;
+        // The owner's log records a removal this store never received. The refusal consumed
+        // nothing, so re-enroll under a fresh identity with the same ticket — once: a fresh
+        // fingerprint cannot have been removed.
+        if matches!(outcome, Err(rag_rat_sync::InviteError::DeviceRemoved)) {
+            retire_removed_identity(conn)?;
+            already_effective = false;
+            outcome = rag_rat_sync::connect_and_enroll(
+                &endpoint,
+                peer.clone(),
+                conn,
+                account_id,
+                &request()?,
+                time::now_ms(),
+            )
+            .await;
+        }
+        match outcome {
             Ok(_) => {},
             Err(error)
                 if already_effective
