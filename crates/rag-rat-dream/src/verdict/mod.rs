@@ -1254,9 +1254,14 @@ mod tests {
         let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
 
         // Run 1: diverged verdict → memory_divergence finding opens.
-        let r1 =
-            dream_run_with_passes(&c, opts, Some(VerdictPass { model: &model, budget: 10 }), None)
-                .unwrap();
+        let r1 = dream_run_with_passes(
+            &c,
+            opts,
+            Some(VerdictPass { model: &model, budget: 10 }),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(divergence_subjects(&r1.findings), vec!["m1".to_string()], "divergence opens");
         assert_eq!(model.calls(), 1);
 
@@ -1264,9 +1269,14 @@ mod tests {
         // is derived from the STORED diverged row, so it stays open (the resolve-trap
         // regression).
         let opts2 = DreamOptions { now_ms: 2000, ..opts };
-        let r2 =
-            dream_run_with_passes(&c, opts2, Some(VerdictPass { model: &model, budget: 10 }), None)
-                .unwrap();
+        let r2 = dream_run_with_passes(
+            &c,
+            opts2,
+            Some(VerdictPass { model: &model, budget: 10 }),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.calls(), 1, "run 2 churn-skips the model");
         assert_eq!(
             divergence_subjects(&r2.findings),
@@ -1283,9 +1293,14 @@ mod tests {
         )
         .unwrap();
         let opts3 = DreamOptions { now_ms: 3000, ..opts };
-        let r3 =
-            dream_run_with_passes(&c, opts3, Some(VerdictPass { model: &model, budget: 10 }), None)
-                .unwrap();
+        let r3 = dream_run_with_passes(
+            &c,
+            opts3,
+            Some(VerdictPass { model: &model, budget: 10 }),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(model.calls(), 2, "the body edit re-invokes the model");
         assert!(
             divergence_subjects(&r3.findings).is_empty(),
@@ -1317,6 +1332,7 @@ mod tests {
             &c,
             verify_opts,
             Some(VerdictPass { model: &model, budget: 10 }),
+            None,
             None,
         )
         .unwrap();
@@ -1359,6 +1375,7 @@ mod tests {
             &c,
             verify_opts,
             Some(VerdictPass { model: &model, budget: 10 }),
+            None,
             None,
         )
         .unwrap();
@@ -1410,6 +1427,7 @@ mod tests {
             DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false },
             Some(VerdictPass { model: &model, budget: 10 }),
             None,
+            None,
         )
         .unwrap();
 
@@ -1459,8 +1477,14 @@ mod tests {
         let before = snap(&c);
         let model = MockChatModel::new([diverged_citing()]);
         let opts = DreamOptions { now_ms: 1000, limit: 10, verify: true, include_reviewed: false };
-        dream_run_with_passes(&c, opts, Some(VerdictPass { model: &model, budget: 10 }), None)
-            .unwrap();
+        dream_run_with_passes(
+            &c,
+            opts,
+            Some(VerdictPass { model: &model, budget: 10 }),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(before, snap(&c), "the model verdict pass leaves repo_memories byte-identical");
         // ...but it DID write a diverged verdict into the sibling table.
         let verdict: String = c
@@ -1513,6 +1537,7 @@ mod tests {
             &c,
             opts,
             Some(VerdictPass { model: &model_r2, budget: 10 }),
+            None,
             None,
         )
         .unwrap();

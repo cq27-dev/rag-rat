@@ -97,6 +97,18 @@ verify before acting.**
   code (a "note-ahead" case): `dream_review` with `verdict: "accept"`.
 - **Dismiss** if the model is wrong (false positive): `dream_review` with `verdict: "dismiss"`.
 
+### `memory_duplicate` — `subject = "<memory id>|<memory id>"`
+Two live memories whose vectors sit close enough to be the same note under other words (only with an
+embedding model that has a measured threshold). Fewer than half of such pairs are true restatements;
+the rest are closely related but distinct rules.
+- Read both (`memory_get`). Do they state the same rule? If one is newer or more precise, which is
+  true of current code?
+- **Root fix:** merge — `memory_update` the better note to carry anything the other adds, then retire
+  the other with `status: "obsolete"`. If one replaced the other, keep the newer and retire the older.
+  The finding resolves once only one of them is live.
+- **Dismiss** when both are needed (related but distinct rules): `dream_review` with
+  `verdict: "dismiss"`. The dismissal holds until either note's title changes.
+
 ## 4. Verdict semantics (quick reference)
 
 Each is a **`dream_review`** call, `{ "finding": "<id>", "verdict": … }`:

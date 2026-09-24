@@ -23,6 +23,7 @@
 //! preserves dream's "never mutates a `repo_memories` row" invariant even as verification lands.
 
 mod compact;
+mod duplicates;
 mod failure;
 mod findings;
 #[cfg(test)]
@@ -30,6 +31,7 @@ mod mock_chat;
 mod verdict;
 
 pub use compact::CompactPass;
+pub use duplicates::{NearDuplicate, NearDuplicates};
 // Curated crate-facing surface (mod.rs is the index, not the junk drawer): the migration
 // ladder and `register_repo` adoption re-derive persisted finding ids after re-stamping
 // `repo_id`.
@@ -139,6 +141,18 @@ fn effective_rank(base_rank: f64, first_seen_at_ms: i64, now_ms: i64) -> f64 {
 /// BEFORE this reads it. With no model ever run, the `memory_reality` verdict rows are absent, so
 /// the divergence set is empty — a harmless no-op.
 pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamReport> {
+    dream_run_with_near_duplicates(conn, opts, None)
+}
+
+/// [`dream_run`] plus `memory_duplicate` findings for `near_duplicates` — the pairs the caller
+/// found close in meaning and the memories it compared. `None` means nothing was compared (no
+/// embedding model, or one without a measured threshold), so the run leaves existing duplicate
+/// findings as they are.
+pub fn dream_run_with_near_duplicates(
+    conn: &Connection,
+    opts: DreamOptions,
+    near_duplicates: Option<&NearDuplicates>,
+) -> anyhow::Result<DreamReport> {
     let mut findings = findings::coverage_gap(conn, opts.limit)?;
     findings.extend(findings::stale_reference(conn)?);
     // The verification finding kinds emit over ALL active memories / ALL stored verdict rows
@@ -156,8 +170,12 @@ pub fn dream_run(conn: &Connection, opts: DreamOptions) -> anyhow::Result<DreamR
         findings.extend(findings::unverifiable_findings(conn)?);
         findings.extend(verdict::divergence_findings(conn)?);
     }
+    if let Some(near) = near_duplicates {
+        findings.extend(duplicates::near_duplicate_findings(conn, near)?);
+    }
+    let computed = FindingKind::computed_by(opts.verify, near_duplicates.is_some());
     let (opened, refreshed, superseded, resolved) =
-        findings::sync(conn, &findings, opts.now_ms, FindingKind::computed_by(opts.verify))?;
+        findings::sync(conn, &findings, opts.now_ms, &computed)?;
 
     // emit the OPEN worklist from the store (post-sync); each finding's exposed rank is its
     // base_rank DECAYED by age since first_seen (effective_rank) — a stale unreviewed finding
@@ -227,6 +245,7 @@ pub fn dream_run_with_passes(
     opts: DreamOptions,
     verdict_pass: Option<VerdictPass<'_>>,
     compact_pass: Option<CompactPass<'_>>,
+    near_duplicates: Option<&NearDuplicates>,
 ) -> anyhow::Result<DreamReport> {
     // The verdict pass writes `memory_reality`, which `dream_run` then reads to derive
     // `memory_divergence` findings — so it runs before the finding computation.
@@ -241,7 +260,7 @@ pub fn dream_run_with_passes(
     if let Some(pass) = compact_pass {
         compact::run_compact_pass(conn, pass, opts.now_ms)?;
     }
-    dream_run(conn, opts)
+    dream_run_with_near_duplicates(conn, opts, near_duplicates)
 }
 
 /// #767 review: run ONE model-pass entry's writes in ONE IMMEDIATE transaction with the `rag-rat

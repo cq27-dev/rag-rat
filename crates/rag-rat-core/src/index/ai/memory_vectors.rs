@@ -327,10 +327,7 @@ pub(crate) fn similar_memories(
     let Some((model_id, dim)) = active_model(conn)? else {
         return Ok(None);
     };
-    let Some(threshold) = rag_rat_base::embedding_models::spec(&model_id)
-        .and_then(|spec| spec.near_duplicate_permille)
-        .map(|permille| f32::from(permille) / 1000.0)
-    else {
+    let Some(threshold) = near_duplicate_threshold(&model_id) else {
         return Ok(None);
     };
     let vectors = MemoryVectors::load(conn, &model_id, dim)?;
@@ -363,4 +360,56 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let norms =
         a.iter().map(|x| x * x).sum::<f32>().sqrt() * b.iter().map(|y| y * y).sum::<f32>().sqrt();
     if norms > 0.0 { dot / norms } else { 0.0 }
+}
+
+/// The model's measured near-duplicate cosine, or `None` when it has none.
+fn near_duplicate_threshold(model_id: &str) -> Option<f32> {
+    rag_rat_base::embedding_models::spec(model_id)
+        .and_then(|spec| spec.near_duplicate_permille)
+        .map(|permille| f32::from(permille) / 1000.0)
+}
+
+/// Every pair of the active repo's embedded live memories at or above the active model's
+/// near-duplicate cosine (each pair lower id first, in id order), with the ids of every memory that
+/// was compared. `None` when there is no model or it has no measured threshold. Memories not yet
+/// embedded are not compared, and are absent from the compared ids.
+// ponytail: all-pairs O(n²·dim) over unit vectors — 0.23 s for 816 memories × 768 dims in a release
+// build, loading included; bucket by anchor or use an ANN index if memory sets grow past a few
+// thousand.
+pub(crate) fn near_duplicate_pairs(
+    conn: &Connection,
+) -> anyhow::Result<Option<rag_rat_dream::NearDuplicates>> {
+    let Some((model_id, dim)) = active_model(conn)? else {
+        return Ok(None);
+    };
+    let Some(threshold) = near_duplicate_threshold(&model_id) else {
+        return Ok(None);
+    };
+    let vectors = MemoryVectors::load(conn, &model_id, dim)?;
+    let embedded = vectors
+        .memories
+        .iter()
+        .filter_map(|memory| {
+            let vector = decode_vector(&vectors.cached.get(&memory.input_hash)?.blob, dim)?;
+            // Normalize once, so each of the O(n²) comparisons is a bare dot product.
+            let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            (norm > 0.0).then(|| {
+                (memory.memory_id.as_str(), vector.iter().map(|x| x / norm).collect::<Vec<_>>())
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut pairs = Vec::new();
+    for (i, (a, va)) in embedded.iter().enumerate() {
+        for (b, vb) in &embedded[i + 1..] {
+            if va.iter().zip(vb).map(|(x, y)| x * y).sum::<f32>() >= threshold {
+                let (low, high) = if a <= b { (a, b) } else { (b, a) };
+                pairs.push(rag_rat_dream::NearDuplicate {
+                    memory_a: low.to_string(),
+                    memory_b: high.to_string(),
+                });
+            }
+        }
+    }
+    let compared = embedded.iter().map(|(id, _)| (*id).to_string()).collect();
+    Ok(Some(rag_rat_dream::NearDuplicates { pairs, compared }))
 }

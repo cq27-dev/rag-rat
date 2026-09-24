@@ -1,6 +1,7 @@
 use super::*;
 
 mod diagnostics;
+mod duplicate_findings;
 mod hybrid_search;
 mod key_drift;
 mod nodes;
