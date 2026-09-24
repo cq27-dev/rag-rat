@@ -887,10 +887,17 @@ fn accepted_chain_entries(
     let (minimum_lamport, inclusive) = match start {
         TableSyncEntryStart::Beginning => (None, false),
         TableSyncEntryStart::After(cursor) => {
-            anyhow::ensure!(
-                cursor_matches(conn, stream, device, cursor.to_store())?,
-                "table-sync accepted chain cursor is not present locally"
-            );
+            if !cursor_matches(conn, stream, device, cursor.to_store())? {
+                // A chain restored after a repository purge starts at its witness: nothing below
+                // it is held here, and the witness is not a floor this store may advertise (it was
+                // never checked against the rows' carriers, and floors propagate). A peer whose
+                // tip sits below it is honest; answer with nothing so the session survives and it
+                // fills the prefix from a peer that still holds it (#1481).
+                if below_rootless_holdings(conn, stream, device, cursor.lamport)? {
+                    return Ok(Vec::new());
+                }
+                anyhow::bail!("table-sync accepted chain cursor is not present locally");
+            }
             (Some(cursor.lamport), false)
         },
         TableSyncEntryStart::At(cursor) => {
@@ -932,6 +939,30 @@ fn accepted_chain_entries(
         })
     })
     .collect::<anyhow::Result<_>>()
+}
+
+/// Whether `lamport` sits below everything this store holds of the chain, and the lowest held
+/// entry has a predecessor — which is then not held here: the chain was restored at a witness
+/// after a purge, or re-rooted past compacted history, rather than held from its first entry. A
+/// chain held from its first entry holds everything its signer put below its tip, so a cursor
+/// below that is no honest shape and stays an error.
+fn below_rootless_holdings(
+    conn: &Connection,
+    stream: StreamId,
+    device: crate::op::DeviceFingerprint,
+    lamport: u64,
+) -> anyhow::Result<bool> {
+    let lowest: Option<(i64, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT lamport, prev_hash FROM table_sync_entries
+              WHERE stream_id = ?1 AND device_fingerprint = ?2
+              ORDER BY lamport LIMIT 1",
+            params![stream.to_bytes().as_slice(), device.to_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((lowest, Some(_))) = lowest else { return Ok(false) };
+    Ok(lamport < u64::try_from(lowest)?)
 }
 
 fn direct_successor_lamport(

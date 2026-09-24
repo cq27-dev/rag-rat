@@ -553,8 +553,20 @@ fn chain_plan(local: &ChainHead, frontier: FrontierState) -> Result<ChainPlan, T
             Ok(ChainPlan::Send(ChainStart::After { lamport, entry_hash }))
         },
         FrontierState::Restore { lamport, .. } if lamport > local.lamport => Ok(ChainPlan::Pending),
-        FrontierState::Restore { lamport, entry_hash } =>
-            Ok(ChainPlan::Send(ChainStart::At { lamport, entry_hash })),
+        FrontierState::Restore { lamport, entry_hash } => {
+            // A witness below our retained floor has neither its entry nor its direct successor
+            // here any more: re-root the restored receiver onto the floor, as the accepted arm
+            // does (#1481). The floor is above the witness, so the receiver adopts it.
+            if let Some((floor_lamport, floor_hash)) = local.floor
+                && lamport < floor_lamport
+            {
+                return Ok(ChainPlan::Send(ChainStart::At {
+                    lamport: floor_lamport,
+                    entry_hash: floor_hash,
+                }));
+            }
+            Ok(ChainPlan::Send(ChainStart::At { lamport, entry_hash }))
+        },
     }
 }
 

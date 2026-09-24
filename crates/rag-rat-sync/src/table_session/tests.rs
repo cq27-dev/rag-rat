@@ -224,6 +224,28 @@ fn a_tip_below_the_sender_floor_plans_a_reroot_not_a_suffix() {
     );
 }
 
+/// A purge-restored receiver asks for its witness. A sender that compacted past the witness no
+/// longer holds it or its direct successor, so it re-roots the receiver onto its floor, exactly
+/// as it does for an accepted tip below the floor (#1481).
+#[test]
+fn a_restore_witness_below_the_sender_floor_plans_a_reroot() {
+    let local = ChainHead {
+        device_fingerprint: [1; 32],
+        lamport: 8,
+        entry_hash: [8; 32],
+        floor: Some((4, [4; 32])),
+    };
+    assert_eq!(
+        chain_plan(&local, FrontierState::Restore { lamport: 2, entry_hash: [2; 32] }).unwrap(),
+        ChainPlan::Send(ChainStart::At { lamport: 4, entry_hash: [4; 32] }),
+    );
+    // A witness at or above the floor is still served from the witness itself.
+    assert_eq!(
+        chain_plan(&local, FrontierState::Restore { lamport: 6, entry_hash: [6; 32] }).unwrap(),
+        ChainPlan::Send(ChainStart::At { lamport: 6, entry_hash: [6; 32] }),
+    );
+}
+
 #[tokio::test]
 async fn local_chain_inventory_enforces_the_exact_session_ceiling() {
     let shared = item("repo-a", 1);
