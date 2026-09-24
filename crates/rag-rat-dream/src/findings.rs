@@ -35,6 +35,7 @@ pub enum FindingKind {
     StaleReference,
     MemoryUnverifiable,
     MemoryDivergence,
+    MemoryDuplicate,
 }
 
 impl FindingKind {
@@ -57,24 +58,25 @@ impl FindingKind {
             Self::MemoryUnverifiable => 0.9,
             // High, but below a broken anchor's pass-0 `memory_unverifiable` signal.
             Self::MemoryDivergence => 0.8,
+            // Redundancy costs attention, not correctness: below the kinds that flag a wrong note.
+            Self::MemoryDuplicate => 0.6,
         }
     }
 
     /// The kinds a run computes, and so the only kinds its resolve sweep may close. The base kinds
     /// run always — the sweep may close a stale one even when the run produced zero of them. The
-    /// verify kinds join only on a `--verify` run: a plain `dream` did not evaluate them, so
-    /// resolving would drop findings a prior verify run opened.
-    pub(crate) fn computed_by(verify: bool) -> &'static [Self] {
+    /// verify kinds join only on a `--verify` run, and `memory_duplicate` only when the caller
+    /// supplied near-duplicate pairs: a run that did not evaluate a kind must not resolve the
+    /// findings an earlier run opened for it.
+    pub(crate) fn computed_by(verify: bool, duplicates: bool) -> Vec<Self> {
+        let mut kinds = vec![Self::CoverageGap, Self::StaleReference];
         if verify {
-            &[
-                Self::CoverageGap,
-                Self::StaleReference,
-                Self::MemoryUnverifiable,
-                Self::MemoryDivergence,
-            ]
-        } else {
-            &[Self::CoverageGap, Self::StaleReference]
+            kinds.extend([Self::MemoryUnverifiable, Self::MemoryDivergence]);
         }
+        if duplicates {
+            kinds.push(Self::MemoryDuplicate);
+        }
+        kinds
     }
 }
 
@@ -803,13 +805,18 @@ mod tests {
             (FindingKind::StaleReference, "stale_reference"),
             (FindingKind::MemoryUnverifiable, "memory_unverifiable"),
             (FindingKind::MemoryDivergence, "memory_divergence"),
+            (FindingKind::MemoryDuplicate, "memory_duplicate"),
         ];
         for (kind, token) in kinds {
             assert_eq!(kind.as_db_str(), token);
             assert_eq!(FindingKind::from_db_str(token), Some(kind));
             assert_eq!(serde_json::to_value(kind).unwrap(), token, "serialized as the same token");
         }
-        assert_eq!(FindingKind::computed_by(true).len(), kinds.len(), "a verify run computes all");
+        assert_eq!(
+            FindingKind::computed_by(true, true).len(),
+            kinds.len(),
+            "a verify run with near-duplicate pairs computes all"
+        );
     }
 
     #[test]
@@ -847,7 +854,7 @@ mod tests {
             evidence: "7 callers".into(),
             rank: 0.5,
         }];
-        sync(c, &f, now_ms, FindingKind::computed_by(false)).unwrap();
+        sync(c, &f, now_ms, &FindingKind::computed_by(false, false)).unwrap();
         // By subject alone (not status): a re-sync after a review leaves the row non-'open', and
         // the caller still needs its id.
         c.query_row("SELECT id FROM dream_findings WHERE subject = ?1", [subject], |r| r.get(0))
@@ -906,7 +913,7 @@ mod tests {
         set_repo(&c, "r");
         let id = seed_one_finding(&c, "x::F", 1000);
         // A run that reports nothing resolves the open finding.
-        sync(&c, &[], 2000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &[], 2000, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!(status_and_reviewed(&c, &id).0, "resolved");
         let err = review_dream_finding(&c, &id, ReviewVerdict::Accept, 3000).unwrap_err();
         assert!(err.to_string().contains("not reviewable"), "got: {err}");
@@ -989,11 +996,11 @@ mod tests {
             }]
         };
         set_repo(&c, "repo-a");
-        sync(&c, &finding(), 1000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &finding(), 1000, &FindingKind::computed_by(false, false)).unwrap();
         set_repo(&c, "repo-b");
         // Pre-fix this is a PK violation, not an UPDATE: the scoped lookup misses repo-a's row and
         // the insert derives the same repo-blind id.
-        sync(&c, &finding(), 2000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &finding(), 2000, &FindingKind::computed_by(false, false)).unwrap();
 
         let rows: Vec<(String, String)> = c
             .prepare(
@@ -1065,9 +1072,9 @@ mod tests {
             evidence: "10 callers".into(),
             rank: 1.0,
         }];
-        let (o, r, s, res) = sync(&c, &f1, 1000, FindingKind::computed_by(false)).unwrap();
+        let (o, r, s, res) = sync(&c, &f1, 1000, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!((o, r, s, res), (1, 0, 0, 0), "first run opens");
-        let (o, r, _, _) = sync(&c, &f1, 2000, FindingKind::computed_by(false)).unwrap();
+        let (o, r, _, _) = sync(&c, &f1, 2000, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!((o, r), (0, 1), "same finding refreshes, no duplicate");
         // material change -> supersede prior, open fresh
         let f2 = vec![DreamFinding {
@@ -1076,14 +1083,14 @@ mod tests {
             evidence: "40 callers".into(),
             rank: 1.0,
         }];
-        let (o, _, s, _) = sync(&c, &f2, 3000, FindingKind::computed_by(false)).unwrap();
+        let (o, _, s, _) = sync(&c, &f2, 3000, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!((o, s), (1, 1), "changed evidence supersedes + opens fresh");
         let opened: i64 = c
             .query_row("SELECT COUNT(*) FROM dream_findings WHERE status='open'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(opened, 1, "exactly one open finding for the (kind,subject)");
         // run with no findings -> the (kind,subject) resolves
-        let (_, _, _, res) = sync(&c, &[], 4000, FindingKind::computed_by(false)).unwrap();
+        let (_, _, _, res) = sync(&c, &[], 4000, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!(res, 1, "absent finding resolves");
     }
 
@@ -1113,9 +1120,9 @@ mod tests {
             .unwrap()
         };
         // A -> B -> A: the flip-back must leave A current with A's evidence, NOT strand B as open.
-        sync(&c, &cg("10 callers", 0.1), 1000, FindingKind::computed_by(false)).unwrap();
-        sync(&c, &cg("40 callers", 0.9), 2000, FindingKind::computed_by(false)).unwrap();
-        sync(&c, &cg("10 callers", 0.1), 3000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 1000, &FindingKind::computed_by(false, false)).unwrap();
+        sync(&c, &cg("40 callers", 0.9), 2000, &FindingKind::computed_by(false, false)).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 3000, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!(count(&c, "open"), 1, "exactly one open row after flip-back");
         assert_eq!(
             open_evidence(&c),
@@ -1123,9 +1130,9 @@ mod tests {
             "current (A) is open, not stale B"
         );
         // resolve, then reappear with the SAME evidence: must revive to open, not stay resolved.
-        sync(&c, &[], 4000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &[], 4000, &FindingKind::computed_by(false, false)).unwrap();
         assert!(count(&c, "resolved") >= 1, "absent finding resolves");
-        sync(&c, &cg("10 callers", 0.1), 5000, FindingKind::computed_by(false)).unwrap();
+        sync(&c, &cg("10 callers", 0.1), 5000, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!(count(&c, "open"), 1, "reappearing resolved finding is revived to open");
     }
 
@@ -1297,7 +1304,7 @@ mod tests {
             },
         ];
         let (opened, _refreshed, superseded, _resolved) =
-            sync(&c, &findings, 100, FindingKind::computed_by(false)).unwrap();
+            sync(&c, &findings, 100, &FindingKind::computed_by(false, false)).unwrap();
         assert_eq!(opened, 1, "exactly one finding opens for the (kind, subject)");
         assert_eq!(superseded, 0, "no within-run supersede race");
         let rows: Vec<(String, String)> = c
@@ -1332,7 +1339,7 @@ mod tests {
         b.busy_timeout(std::time::Duration::ZERO).unwrap();
         b.execute_batch("BEGIN IMMEDIATE").unwrap(); // hold the write lock
 
-        let err = sync(&a, &[], 1, FindingKind::computed_by(false)).unwrap_err();
+        let err = sync(&a, &[], 1, &FindingKind::computed_by(false, false)).unwrap_err();
         assert!(
             rag_rat_db::storage::is_busy(&anyhow::Error::new(err)),
             "an empty sync under a concurrently-held writer must fail busy — proving BEGIN \

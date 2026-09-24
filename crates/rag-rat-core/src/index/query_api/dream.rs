@@ -17,7 +17,26 @@ impl IndexDatabase {
         // serializes with rm's purge on the SQLite write lock so a removal landing mid-run cannot
         // let the sync re-insert `dream_findings` rows for the removed `repo_id`.
         self.assert_active_repo_not_removed()?;
-        rag_rat_dream::dream_run(conn, opts)
+        let near_duplicates = self.near_duplicate_pairs();
+        rag_rat_dream::dream_run_with_near_duplicates(conn, opts, near_duplicates.as_ref())
+    }
+
+    /// The memory pairs close enough in meaning for a `memory_duplicate` finding (#1445), or `None`
+    /// when they could not be computed — no model, no measured threshold, or a failed read. `None`
+    /// keeps the run from resolving existing duplicate findings it did not re-evaluate, so a
+    /// failure here never costs a reviewer's verdicts and never fails the run.
+    fn near_duplicate_pairs(&self) -> Option<rag_rat_dream::NearDuplicates> {
+        match crate::index::ai::near_duplicate_pairs(self.storage.connection()) {
+            Ok(computed) => computed,
+            Err(err) => {
+                tracing::warn!(
+                    target: "rag_rat_core::dream",
+                    error = %err,
+                    "near-duplicate pairs unavailable; memory_duplicate findings left as they are"
+                );
+                None
+            },
+        }
     }
 
     /// [`Self::dream_run`] plus the phase-B model verdict pass and the phase-C model compaction
@@ -55,7 +74,14 @@ impl IndexDatabase {
                 preflight.deferred
             );
         }
-        rag_rat_dream::dream_run_with_passes(conn, opts, verdict_pass, compact_pass)
+        let near_duplicates = self.near_duplicate_pairs();
+        rag_rat_dream::dream_run_with_passes(
+            conn,
+            opts,
+            verdict_pass,
+            compact_pass,
+            near_duplicates.as_ref(),
+        )
     }
 
     /// Whether the model passes have pending work (the zero-work guard for ephemeral

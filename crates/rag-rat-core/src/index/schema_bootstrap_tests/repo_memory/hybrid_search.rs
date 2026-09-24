@@ -2,7 +2,9 @@ use super::*;
 
 /// An indexed markdown repo with the hash embedder active and one memory per `(title, body)`,
 /// reconciled so each memory's vector is in `embedding_cache`.
-fn db_with_memories(notes: &[(&str, &str)]) -> (ScratchRoot, IndexDatabase, Vec<String>) {
+pub(super) fn db_with_memories(
+    notes: &[(&str, &str)],
+) -> (ScratchRoot, IndexDatabase, Vec<String>) {
     let (root, _config, db, ids) = db_and_config_with_memories(notes);
     (root, db, ids)
 }

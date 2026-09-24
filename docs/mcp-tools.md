@@ -624,6 +624,9 @@ with a stable `id`:
 - **coverage gaps** — load-bearing symbols (by the same PageRank as `important_symbols`) that carry no
   memory, so the next agent editing them gets nothing.
 - **stale references** — a memory citing a path or anchor that no longer resolves.
+- **near-duplicate memories** (`memory_duplicate`) — two live memories close enough in meaning to be
+  one note under other words: merge them, or dismiss the pair when both rules are needed. Needs an
+  embedding model with a measured threshold, like `memory_create`'s `similar_memories`.
 - **model-verdict findings** (e.g. `memory_divergence`) that a prior opt-in model pass persisted — see
   below.
 
