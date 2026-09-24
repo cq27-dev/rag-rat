@@ -80,6 +80,11 @@ pub struct EmbeddingModelSpec {
     /// model (e.g. CodeRankEmbed) would set this; `embed_query_with` would prepend it on the
     /// query path only.
     pub query_prefix: &'static str,
+    /// Cosine similarity, in thousandths, at which `memory_create` reports an existing memory as a
+    /// possible restatement of the new one, or `None` to skip that check. Cosine scales differ per
+    /// model — a threshold that separates restatements from merely related notes on one model
+    /// floods or goes silent on another — so only a model measured on a real memory set has one.
+    pub near_duplicate_permille: Option<u16>,
 }
 
 /// Rough UPPER-BOUND chars-per-token for deriving a char cap from a token limit. Deliberately an
@@ -154,6 +159,8 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         version: "hash-v1",
         backend: Backend::Hash,
         query_prefix: "",
+        // Token-overlap vectors: 0.86 flags only near-verbatim restatements.
+        near_duplicate_permille: Some(860),
     },
     EmbeddingModelSpec {
         model_id: FASTEMBED_MODEL_ID,
@@ -164,6 +171,7 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         version: "sentence-transformers/all-MiniLM-L6-v2-v1",
         backend: Backend::FastEmbed,
         query_prefix: "",
+        near_duplicate_permille: None,
     },
     EmbeddingModelSpec {
         model_id: BGE_SMALL_MODEL_ID,
@@ -174,6 +182,7 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         version: "BAAI/bge-small-en-v1.5-v1",
         backend: Backend::FastEmbed,
         query_prefix: "",
+        near_duplicate_permille: None,
     },
     EmbeddingModelSpec {
         model_id: JINA_CODE_MODEL_ID,
@@ -184,6 +193,9 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         version: "jinaai/jina-embeddings-v2-base-code-v1",
         backend: Backend::FastEmbed,
         query_prefix: "",
+        // Measured on 816 memories: the closest pair scored 0.908, restatements of one rule
+        // 0.865-0.91, and 0.86 flagged 13 pairs.
+        near_duplicate_permille: Some(860),
     },
     EmbeddingModelSpec {
         model_id: MODEL2VEC_MODEL_ID,
@@ -194,6 +206,7 @@ pub const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
         version: "minishlab/potion-retrieval-32M-v1",
         backend: Backend::Model2Vec,
         query_prefix: "",
+        near_duplicate_permille: None,
     },
 ];
 
@@ -271,6 +284,15 @@ mod tests {
         // `[remote]` block on a real model, not a model selector.
         assert_eq!(spec("ollama"), None);
         assert_eq!(spec("ollama-all-minilm"), None);
+    }
+
+    #[test]
+    fn near_duplicate_thresholds_are_cosines() {
+        // Thousandths of a cosine: a value past 1000 (a slipped digit) could never be reached and
+        // would silently switch the `memory_create` near-duplicate warning off.
+        for s in EMBEDDING_MODELS {
+            assert!(s.near_duplicate_permille.is_none_or(|p| p <= 1000), "{}", s.model_id);
+        }
     }
 
     #[test]

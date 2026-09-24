@@ -56,7 +56,7 @@ pub(crate) fn create_memory(
     )? {
         let memory = memory_by_id(conn, &existing_id)?
             .ok_or_else(|| anyhow::anyhow!("duplicate memory `{existing_id}` disappeared"))?;
-        return Ok(RepoMemoryCreateResult { memory, duplicate: true });
+        return Ok(RepoMemoryCreateResult { memory, duplicate: true, similar_memories: None });
     }
 
     let now = now_ms();
@@ -121,7 +121,7 @@ pub(crate) fn create_memory(
     // Author the NodeCreate in the SAME txn; an authoring error drops `tx` → the INSERT rolls back.
     authoring::author_create(&write.tx, &memory, write.prepared.as_ref(), now)?;
     write.commit()?;
-    Ok(RepoMemoryCreateResult { memory, duplicate: false })
+    Ok(RepoMemoryCreateResult { memory, duplicate: false, similar_memories: None })
 }
 
 pub(crate) fn update_memory(

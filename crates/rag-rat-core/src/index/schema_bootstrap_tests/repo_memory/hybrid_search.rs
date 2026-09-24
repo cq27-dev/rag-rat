@@ -386,3 +386,168 @@ fn a_failed_vector_read_falls_back_to_bm25() {
     db.storage.connection().execute_batch("DROP TABLE embedding_cache").unwrap();
     assert_eq!(search_ids(&db, "lock"), [ids[0].clone()]);
 }
+
+fn create(
+    db: &IndexDatabase,
+    title: &str,
+    body: &str,
+) -> rag_rat_query::memory::RepoMemoryCreateResult {
+    db.memory_create(rag_rat_query::memory::RepoMemoryCreate {
+        kind: "Decision".to_string(),
+        title: title.to_string(),
+        body: body.to_string(),
+        confidence: "high".to_string(),
+        created_by: Some("test".to_string()),
+        source: Some("agent".to_string()),
+        tags: vec![],
+        payload_json: None,
+        bind: rag_rat_query::memory::RepoMemoryBindTarget {
+            path: Some("README.md".to_string()),
+            ..Default::default()
+        },
+    })
+    .unwrap()
+}
+
+#[test]
+fn creating_a_restatement_reports_the_existing_memory() {
+    let body = "Retries stop after three attempts, and the backoff doubles between them.";
+    let (_root, db, ids) = db_with_memories(&[("Retry budget", body)]);
+    let created = create(&db, "Retry budget rule", body);
+    assert!(!created.duplicate);
+    let similar = created.similar_memories.expect("the check ran");
+    assert_eq!(similar.len(), 1, "{similar:?}");
+    assert_eq!(similar[0].memory_id, ids[0]);
+    assert_eq!(similar[0].title, "Retry budget");
+    assert!(similar[0].similarity >= 0.86, "{}", similar[0].similarity);
+}
+
+#[test]
+fn creating_an_unrelated_memory_reports_a_clean_check() {
+    let (_root, db, _ids) =
+        db_with_memories(&[("Retry budget", "Retries stop after three attempts.")]);
+    let created = create(&db, "Lock order", "Take the index lock before the meta lock.");
+    assert_eq!(created.similar_memories.map(|s| s.len()), Some(0), "checked, none found");
+}
+
+#[test]
+fn an_exact_duplicate_is_reported_as_such_not_as_similar() {
+    // The second memory restates the first, so a lookup for the first would report it: the exact
+    // duplicate must come back flagged `duplicate` instead of carrying a similar-memory warning.
+    let body = "Retries stop after three attempts, and the backoff doubles between them.";
+    let (_root, db, _ids) =
+        db_with_memories(&[("Retry budget", body), ("Retry budget rule", body)]);
+    let created = create(&db, "Retry budget", body);
+    assert!(created.duplicate);
+    assert!(created.similar_memories.is_none(), "{:?}", created.similar_memories);
+}
+
+#[test]
+fn the_threshold_is_the_models_measured_cosine() {
+    let (_root, db, ids) = db_with_memories(&[
+        ("Alpha note", "First ordinary note."),
+        ("Beta note", "Second ordinary note."),
+    ]);
+    set_memory_vector(&db, "Alpha note", &ai::hash_query_embedding("zebra quokka").unwrap().vector);
+    let similar_to_alpha = || {
+        ai::similar_memories(db.storage.connection(), &ids[0], 3)
+            .unwrap()
+            .expect("checked")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>()
+    };
+    set_memory_vector(&db, "Beta note", &vector_at_similarity("zebra quokka", 0.87));
+    assert_eq!(similar_to_alpha(), [ids[1].clone()], "0.87 clears the hash model's 0.86");
+    set_memory_vector(&db, "Beta note", &vector_at_similarity("zebra quokka", 0.85));
+    assert!(similar_to_alpha().is_empty(), "0.85 does not");
+}
+
+#[test]
+fn an_obsolete_memory_is_never_reported_as_similar() {
+    let body = "Retries stop after three attempts, and the backoff doubles between them.";
+    let (_root, db, ids) = db_with_memories(&[("Retry budget", body), ("Retry budget rule", body)]);
+    db.memory_mark_obsolete(&ids[1]).unwrap();
+    let similar = ai::similar_memories(db.storage.connection(), &ids[0], 3).unwrap();
+    assert_eq!(similar, Some(Vec::new()));
+}
+
+#[test]
+fn a_failed_embed_reports_not_checked_and_keeps_the_write() {
+    let (_root, db, _ids) =
+        db_with_memories(&[("Retry budget", "Retries stop after three attempts.")]);
+    db.storage.connection().execute_batch("DROP TABLE embedding_cache").unwrap();
+    let created = create(&db, "Lock order", "Take the index lock before the meta lock.");
+    assert!(!created.memory.memory_id.is_empty(), "the write succeeded");
+    assert!(created.similar_memories.is_none(), "not checked is not 'none found'");
+}
+
+#[test]
+fn without_a_model_the_check_reports_not_checked() {
+    let (_root, config) = markdown_config("# Notes\nplain markdown so the index is not empty\n");
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let created = create(&db, "Lock order", "Take the index lock before the meta lock.");
+    assert!(created.similar_memories.is_none());
+}
+
+#[test]
+fn similarity_is_cosine_even_for_vectors_that_are_not_unit_length() {
+    let (_root, db, ids) = db_with_memories(&[
+        ("Alpha note", "First ordinary note."),
+        ("Beta note", "Second ordinary note."),
+    ]);
+    set_memory_vector(&db, "Alpha note", &ai::hash_query_embedding("zebra quokka").unwrap().vector);
+    // Cosine 0.95, but half length: a bare dot product would read 0.475 and miss it.
+    let half =
+        vector_at_similarity("zebra quokka", 0.95).iter().map(|x| x * 0.5).collect::<Vec<_>>();
+    set_memory_vector(&db, "Beta note", &half);
+    let similar =
+        ai::similar_memories(db.storage.connection(), &ids[0], 3).unwrap().expect("checked");
+    assert_eq!(similar.len(), 1);
+    assert!((similar[0].1 - 0.95).abs() < 0.02, "{}", similar[0].1);
+}
+
+#[test]
+fn a_memory_without_a_cached_vector_is_not_checked() {
+    let (_root, db, ids) = db_with_memories(&[
+        ("Alpha note", "First ordinary note."),
+        ("Beta note", "Second ordinary note."),
+    ]);
+    set_memory_vector(&db, "Beta note", &ai::hash_query_embedding("anything").unwrap().vector);
+    db.storage
+        .connection()
+        .execute("DELETE FROM embedding_cache WHERE vector_blob != ?1", [ai::encode_vector(
+            &ai::hash_query_embedding("anything").unwrap().vector,
+        )])
+        .unwrap();
+    assert_eq!(ai::similar_memories(db.storage.connection(), &ids[0], 3).unwrap(), None);
+}
+
+#[test]
+fn a_model_without_a_measured_threshold_is_not_checked() {
+    use rag_rat_base::embedding_models::{FASTEMBED_MODEL_ID, spec};
+    let body = "Retries stop after three attempts, and the backoff doubles between them.";
+    let (_root, db, ids) = db_with_memories(&[("Retry budget", body), ("Retry budget rule", body)]);
+    let conn = db.storage.connection();
+    // Switch to all-MiniLM and cache an identical vector for both memories under ITS key, so the
+    // pair is a perfect match and only the missing threshold can keep the check from running.
+    ai::set_repo_meta(conn, "active_embedding_model", FASTEMBED_MODEL_ID).unwrap();
+    let dim = spec(FASTEMBED_MODEL_ID).unwrap().dim;
+    let version = ai::active_embedding_model_version(conn, FASTEMBED_MODEL_ID).unwrap();
+    let mut unit = vec![0.0_f32; dim];
+    unit[0] = 1.0;
+    for source in rag_rat_query::memory::memory_embedding_sources(conn).unwrap() {
+        conn.execute(
+            "INSERT INTO embedding_cache(input_hash, model_id, embedding_dim, vector_blob,
+                 computed_at_ms, last_used_at_ms) VALUES (?1, ?2, ?3, ?4, 0, 0)",
+            rusqlite::params![
+                ai::embedding_input_hash(FASTEMBED_MODEL_ID, &version, &source.text),
+                FASTEMBED_MODEL_ID,
+                i64::try_from(dim).unwrap(),
+                ai::encode_vector(&unit)
+            ],
+        )
+        .unwrap();
+    }
+    assert_eq!(ai::similar_memories(conn, &ids[0], 3).unwrap(), None);
+}

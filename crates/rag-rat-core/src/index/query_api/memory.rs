@@ -10,14 +10,59 @@ use rag_rat_query::symbol::SymbolHit;
 
 use super::*;
 
+/// Near-duplicates reported per create.
+const SIMILAR_MEMORY_LIMIT: usize = 3;
+
 impl IndexDatabase {
     pub fn memory_create(
         &self,
         request: RepoMemoryCreate,
     ) -> anyhow::Result<RepoMemoryCreateResult> {
-        let created = crate::memory_write::create_memory(self.storage.connection(), request)?;
+        let mut created = crate::memory_write::create_memory(self.storage.connection(), request)?;
         self.embed_written_memory(&created.memory.memory_id);
+        // An exact duplicate is already flagged `duplicate`; the neighbour list is for new notes.
+        if !created.duplicate {
+            created.similar_memories = self.similar_memories(&created.memory.memory_id);
+        }
         Ok(created)
+    }
+
+    /// The near-duplicates to warn about for a just-created memory (#1445), or `None` when the
+    /// check could not run. Best effort, like the embed before it: a failure is logged and reported
+    /// as "not checked", never as a failed write.
+    fn similar_memories(
+        &self,
+        memory_id: &str,
+    ) -> Option<Vec<rag_rat_query::memory::SimilarMemory>> {
+        let conn = self.storage.connection();
+        let lookup = || -> anyhow::Result<Option<Vec<rag_rat_query::memory::SimilarMemory>>> {
+            let Some(similar) =
+                crate::index::ai::similar_memories(conn, memory_id, SIMILAR_MEMORY_LIMIT)?
+            else {
+                return Ok(None);
+            };
+            let mut hydrated = Vec::new();
+            for (id, similarity) in similar {
+                if let Some(memory) = memory::memory_by_id(conn, &id)? {
+                    hydrated.push(rag_rat_query::memory::SimilarMemory {
+                        memory_id: memory.memory_id,
+                        kind: memory.kind,
+                        title: memory.title,
+                        similarity,
+                    });
+                }
+            }
+            Ok(Some(hydrated))
+        };
+        lookup().unwrap_or_else(|err| {
+            tracing::warn!(
+                target: "rag_rat_core::index::ai::reconcile",
+                error = %err,
+                memory_id,
+                "near-duplicate lookup failed"
+            );
+            None
+        })
     }
 
     pub fn memory_update(&self, update: RepoMemoryUpdate) -> anyhow::Result<RepoMemory> {

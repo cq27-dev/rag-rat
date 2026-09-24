@@ -313,3 +313,54 @@ pub(crate) fn memory_vector_similarities(
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     Ok(scored)
 }
+
+/// Live memories of the active repo whose cosine similarity to `memory_id`'s vector reaches the
+/// active model's `near_duplicate_permille`, best first (ties by id), at most `limit`. `None` means
+/// the check could not run — no model, a model with no measured threshold, or no cached vector for
+/// `memory_id` (call it after [`embed_written_memory`]) — as distinct from `Some` of an empty list.
+/// Memories not yet embedded (a backfill in progress) are not compared.
+pub(crate) fn similar_memories(
+    conn: &Connection,
+    memory_id: &str,
+    limit: usize,
+) -> anyhow::Result<Option<Vec<(String, f32)>>> {
+    let Some((model_id, dim)) = active_model(conn)? else {
+        return Ok(None);
+    };
+    let Some(threshold) = rag_rat_base::embedding_models::spec(&model_id)
+        .and_then(|spec| spec.near_duplicate_permille)
+        .map(|permille| f32::from(permille) / 1000.0)
+    else {
+        return Ok(None);
+    };
+    let vectors = MemoryVectors::load(conn, &model_id, dim)?;
+    let vector_of = |memory: &KeyedMemory| {
+        vectors.cached.get(&memory.input_hash).and_then(|cached| decode_vector(&cached.blob, dim))
+    };
+    let Some(target) =
+        vectors.memories.iter().find(|m| m.memory_id == memory_id).and_then(vector_of)
+    else {
+        return Ok(None);
+    };
+    let mut similar = vectors
+        .memories
+        .iter()
+        .filter(|memory| memory.memory_id != memory_id)
+        .filter_map(|memory| {
+            let similarity = cosine(&vector_of(memory)?, &target);
+            (similarity >= threshold).then(|| (memory.memory_id.clone(), similarity))
+        })
+        .collect::<Vec<_>>();
+    similar.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    similar.truncate(limit);
+    Ok(Some(similar))
+}
+
+/// Cosine similarity. An absolute threshold needs true cosine: a remote backend is not guaranteed
+/// to return unit vectors, and a bare dot product would move with their norms.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norms =
+        a.iter().map(|x| x * x).sum::<f32>().sqrt() * b.iter().map(|y| y * y).sum::<f32>().sqrt();
+    if norms > 0.0 { dot / norms } else { 0.0 }
+}

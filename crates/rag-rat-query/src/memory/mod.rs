@@ -536,6 +536,23 @@ pub struct RepoMemoryCallPath {
 pub struct RepoMemoryCreateResult {
     pub memory: RepoMemory,
     pub duplicate: bool,
+    /// Live memories whose vectors sit close to the new one — likely the same note under other
+    /// words (#1445). A warning, not a refusal: the caller decides whether to `memory_update` one
+    /// of them or supersede it instead. `None` (omitted) when the check did not run — an exact
+    /// `duplicate`, no embedding model, a model with no measured threshold, or a failed embed — so
+    /// a caller never reads "not checked" as "no duplicates"; `Some([])` when it ran and found
+    /// none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub similar_memories: Option<Vec<SimilarMemory>>,
+}
+
+/// A live memory close in meaning to one just written.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimilarMemory {
+    pub memory_id: String,
+    pub kind: String,
+    pub title: String,
+    pub similarity: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
