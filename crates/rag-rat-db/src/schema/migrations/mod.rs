@@ -72,7 +72,8 @@ pub use steps::sync_substrate::{
     apply_account_candidate_dag, apply_chunk_symbol_id, apply_content_candidate_dag,
     apply_content_projected_tables, apply_content_refold_queue_and_stats,
     apply_content_streams_pending_refold, apply_oplog_device_identity, apply_oplog_device_x25519,
-    apply_oplog_local_account, apply_oplog_storage, apply_oplog_stream_scoping,
+    apply_oplog_local_account, apply_oplog_retired_identities, apply_oplog_storage,
+    apply_oplog_stream_scoping,
 };
 pub(crate) use steps::sync_substrate::{
     apply_binding_downgrade_marker, apply_sync_security_events,

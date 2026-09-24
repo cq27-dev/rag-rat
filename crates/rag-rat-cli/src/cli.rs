@@ -480,10 +480,10 @@ pub(crate) enum SyncCommand {
     #[command(long_about = "Authors a device removal on this account, run from ANOTHER owner \
                             device: a device cannot remove itself. Use it for a lost device, or \
                             for one whose store forked (`sync whoami` lists forked chains) so \
-                            its store can enroll again as a new device. The removed device loses \
-                            access to keys rotated after this; the stream keys it held rotate at \
-                            the next write. A sole owner promotes another device first (`sync \
-                            promote`).")]
+                            its store can enroll again (`sync join` with a new invite enrolls it \
+                            under a new identity). The removed device loses access to keys \
+                            rotated after this; the stream keys it held rotate at the next \
+                            write. A sole owner promotes another device first (`sync promote`).")]
     RemoveDevice {
         /// The device's fingerprint, or at least its first 8 hex digits (see `sync devices`).
         #[arg(value_name = "DEVICE")]

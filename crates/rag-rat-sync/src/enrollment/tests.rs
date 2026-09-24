@@ -2418,6 +2418,7 @@ fn every_refusal_code_survives_the_wire_and_names_its_error() {
             RefusalCode::JoinerCapacity => "joiner_capacity",
             RefusalCode::HeldStateConflict => "held_state_conflict",
             RefusalCode::CheckpointPinMoved => "checkpoint_pin_moved",
+            RefusalCode::DeviceRemoved => "device_removed",
         };
         let bytes = EnrollmentResponse::Refused(code).encode();
         let mut frame = minicbor::Decoder::new(&bytes);
@@ -2657,6 +2658,161 @@ fn another_owner_removes_a_lost_founder_and_enrolls_its_replacement() {
         .unwrap();
     assert!(replacement_enrolled, "the replacement is on the roster");
     assert!(!founder_enrolled, "and the lost founder device is not");
+}
+
+/// A removed device's store re-enrolls under a fresh identity (#1417). Its old fingerprint is
+/// refused by name with the nonce unspent — the store may never have learned of its removal — and
+/// the same ticket then enrolls a staged identity, which adoption swaps in over the account the
+/// store already holds. The removed device was an owner that authored an account entry the
+/// inviter never received: the re-enrolling store leaves its own identity's entries out of its
+/// held-state claim, or the redemption would refuse as unreconcilable.
+#[test]
+fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_staged_identity() {
+    let founder = db();
+    let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let removed = joined_store(&founder, account, DeviceRole::Owner);
+    let old = rag_rat_oplog::local_device(&removed, NOW).unwrap();
+    let tx = Transaction::new_unchecked(&removed, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, "unsynced-repo", NOW + 1).unwrap();
+    tx.commit().unwrap();
+    let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::author_device_remove_in_tx(&tx, old.fingerprint(), "forked", NOW + 2).unwrap();
+    tx.commit().unwrap();
+    let ticket = ticket(&founder, account, DeviceRole::Member);
+    let request_for = |(ed25519_pubkey, x25519_pubkey): ([u8; 32], [u8; 32]), reenrolling: bool| {
+        EnrollmentRequest {
+            nonce: ticket.nonce,
+            expected_account: account,
+            ed25519_pubkey,
+            x25519_pubkey,
+            transport_node_id: [9; 32],
+            budget: generous_budget(),
+            held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(
+                &removed,
+                account,
+                reenrolling,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|hash| hash.to_bytes())
+            .collect(),
+        }
+    };
+
+    let refused = redeem_invite(
+        &founder,
+        request_for((old.ed25519_public_key(), old.x25519_public_key()), false),
+        [9; 32],
+        &|| NOW + 3,
+    );
+    assert!(matches!(refused, Err(InviteError::DeviceRemoved)), "{:?}", refused.err());
+    let used: Option<i64> = founder
+        .query_row(
+            "SELECT used_at_ms FROM sync_invites WHERE nonce = ?1",
+            [ticket.nonce.as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(used, None, "the refusal leaves the ticket spendable");
+
+    let staged = rag_rat_oplog::stage_reenrollment_identity(&removed, NOW + 4).unwrap();
+    assert_eq!(
+        rag_rat_oplog::stage_reenrollment_identity(&removed, NOW + 4).unwrap(),
+        staged,
+        "a retry presents the same staged keys, so an owner's exact replay still matches",
+    );
+    assert_eq!(
+        rag_rat_oplog::local_device(&removed, NOW + 4).unwrap().fingerprint(),
+        old.fingerprint(),
+        "staging leaves the live identity alone",
+    );
+    let (lost, _) = redeem_invite(&founder, request_for(staged, true), [9; 32], &|| NOW + 5)
+        .expect("the same ticket enrolls the staged identity");
+    // The response is lost before the store adopts it. A resumed join that presents the live
+    // identity finds the ticket spent; asking again as the staged identity replays the receipt.
+    assert!(matches!(
+        redeem_invite(
+            &founder,
+            request_for((old.ed25519_public_key(), old.x25519_public_key()), false),
+            [9; 32],
+            &|| NOW + 5,
+        ),
+        Err(InviteError::Used)
+    ));
+    let (receipt, _) = redeem_invite(&founder, request_for(staged, true), [9; 32], &|| NOW + 5)
+        .expect("the staged identity's request replays the receipt");
+    assert_eq!(receipt, lost, "the replay is the receipt the owner already acknowledged");
+    let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
+        &receipt.account_entries,
+        account,
+        receipt.device_add_hash.into(),
+        &receipt.device_add_signed,
+        staged.0,
+        staged.1,
+    )
+    .unwrap();
+    let fresh = DeviceFingerprint::from_bytes(Sha256::digest(staged.0).into());
+    rag_rat_oplog::adopt_enrollment_bootstrap(&removed, rag_rat_oplog::EnrollmentBootstrap {
+        account_entries: &receipt.account_entries,
+        account_id: account,
+        genesis_hash,
+        device_fingerprint: fresh,
+        device_add_hash: receipt.device_add_hash.into(),
+        now_ms: NOW + 6,
+    })
+    .expect("the store adopts the account it already belonged to under its new identity");
+    let live = rag_rat_oplog::local_device(&removed, NOW + 7).unwrap();
+    assert_eq!(live.fingerprint(), fresh, "adoption swapped the staged identity in");
+    assert_eq!(rag_rat_oplog::pending_identity_keys(&removed).unwrap(), None);
+    let roster = rag_rat_oplog::local_account_roster(&removed).unwrap();
+    assert!(roster.iter().any(|device| device.fingerprint == fresh && device.this_device));
+    assert!(roster.iter().all(|device| device.fingerprint != old.fingerprint()));
+}
+
+/// A stage is not proof of removal: the refusal that starts a re-enrollment is unauthenticated,
+/// so a stage can outlive a hostile or failed retry. Adoption swaps it in only if the owner-signed
+/// log it folds shows the live identity removed; otherwise the whole adoption rolls back and the
+/// device keeps the identity that still holds its seat (#1417).
+#[test]
+fn a_stale_stage_never_retires_an_identity_the_account_still_enrolls() {
+    let founder = db();
+    let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
+    let member = joined_store(&founder, account, DeviceRole::Member);
+    let live = rag_rat_oplog::local_device(&member, NOW).unwrap().fingerprint();
+    let staged = rag_rat_oplog::stage_reenrollment_identity(&member, NOW + 1).unwrap();
+    let ticket = ticket(&founder, account, DeviceRole::Member);
+    let (receipt, _) = redeem_invite(
+        &founder,
+        EnrollmentRequest {
+            nonce: ticket.nonce,
+            expected_account: account,
+            ed25519_pubkey: staged.0,
+            x25519_pubkey: staged.1,
+            transport_node_id: [9; 32],
+            budget: generous_budget(),
+            held_entry_hashes: Vec::new(),
+        },
+        [9; 32],
+        &|| NOW + 2,
+    )
+    .unwrap();
+    let error =
+        rag_rat_oplog::adopt_enrollment_bootstrap(&member, rag_rat_oplog::EnrollmentBootstrap {
+            account_entries: &receipt.account_entries,
+            account_id: account,
+            genesis_hash: rag_rat_oplog::read_local_account_genesis(&founder).unwrap().unwrap(),
+            device_fingerprint: DeviceFingerprint::from_bytes(Sha256::digest(staged.0).into()),
+            device_add_hash: receipt.device_add_hash.into(),
+            now_ms: NOW + 3,
+        })
+        .expect_err("the live identity was never removed");
+    assert!(error.to_string().contains("does not show this device removed"), "{error}");
+    assert_eq!(
+        rag_rat_oplog::local_device(&member, NOW + 4).unwrap().fingerprint(),
+        live,
+        "the failed adoption rolled the swap back",
+    );
+    assert_eq!(rag_rat_oplog::pending_identity_keys(&member).unwrap(), Some(staged));
 }
 
 /// A redemption whose inviter can no longer author the DeviceAdd rolls back with the nonce unspent.

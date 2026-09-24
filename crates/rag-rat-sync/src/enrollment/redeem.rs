@@ -532,6 +532,13 @@ pub fn redeem_invite(
         StoredInviteKind::Writer => return Err(InviteError::Unknown),
     };
     let fingerprint = DeviceFingerprint::from_bytes(Sha256::digest(request.ed25519_pubkey).into());
+    // A removed fingerprint folds `TombstoneReAdd` forever. Refuse by name before anything is
+    // authored or consumed: the joiner may never have learned of its removal (hosts that folded it
+    // stop syncing with it), and this refusal is how it finds out and re-enrolls under a fresh
+    // identity with the same ticket (#1417).
+    if rag_rat_oplog::device_was_removed(tx, account_id, fingerprint)? {
+        return Err(InviteError::DeviceRemoved);
+    }
     // Release THIS invite's reservation under the writer lock, then RE-MEASURE the mandatory
     // requirement against current state: key targets may have grown since minting, and the
     // reservation covered only the mint-time set. The fits check runs with our reservation

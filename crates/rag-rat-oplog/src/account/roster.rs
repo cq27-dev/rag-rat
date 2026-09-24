@@ -6,7 +6,7 @@ use rusqlite::{Connection, params};
 
 use super::bootstrap::{self, LocalAccountRef};
 use super::ops::{self, AccountOp, DecodedAccountOp, DeviceRole};
-use super::{envelope, id};
+use super::{AccountId, envelope, id};
 use crate::op::DeviceFingerprint;
 
 /// One roster-effective device of the local account.
@@ -68,6 +68,26 @@ pub fn local_account_roster(conn: &Connection) -> anyhow::Result<Vec<RosterDevic
         });
     }
     Ok(roster)
+}
+
+/// Whether `device` was removed from `account_id`: it held a roster seat and holds none now. A
+/// removed fingerprint can never be enrolled again (the fold rejects a tombstoned re-add), so
+/// enrollment refuses it up front and the joiner re-enrolls under a fresh identity (#1417).
+pub fn device_was_removed(
+    conn: &Connection,
+    account_id: AccountId,
+    device: DeviceFingerprint,
+) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM account_roster_history
+                        WHERE account_id = ?1 AND device_fingerprint = ?2
+                          AND closed_at IS NOT NULL)
+            AND NOT EXISTS(SELECT 1 FROM account_roster_history
+                            WHERE account_id = ?1 AND device_fingerprint = ?2
+                              AND closed_at IS NULL)",
+        params![account_id.to_bytes().as_slice(), device.to_bytes().as_slice()],
+        |row| row.get(0),
+    )?)
 }
 
 /// The label the enrolling entry — a `DeviceAdd`, or the founder's genesis — carried. `None` for

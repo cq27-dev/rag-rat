@@ -1811,7 +1811,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 132, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 133, "move this pin with the next schema migration");
 
     let conn = fresh_conn();
     conn.execute_batch(
@@ -2630,4 +2630,44 @@ fn migration_132_invite_checkpoint_digest() {
     }
     bare.execute("UPDATE sync_invites SET checkpoint_digest = ?1", [vec![7u8; 32]])
         .expect("a 32-byte pin is what the screen compares against");
+}
+
+/// V133 (#1417) keeps a retired identity's decryption key and stages the replacement identity.
+/// Every column is exactly 32 bytes (the fingerprint, the X25519 secret and its public half), so a
+/// truncated key is refused at the schema rather than failing every unwrap it is tried on.
+#[test]
+fn migration_133_oplog_retired_identities() {
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    schema::migrations::apply_oplog_retired_identities(&bare).unwrap();
+    schema::migrations::apply_oplog_retired_identities(&bare).expect("replay is a no-op");
+
+    let insert = |fingerprint: Vec<u8>, secret: Vec<u8>, public: Vec<u8>| {
+        bare.execute(
+            "INSERT INTO oplog_retired_identities(
+                 fingerprint, x25519_secret, x25519_public, retired_at_ms)
+             VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![fingerprint, secret, public],
+        )
+    };
+    for (name, row) in [
+        ("a short fingerprint", (vec![1; 31], vec![2; 32], vec![3; 32])),
+        ("a short secret", (vec![1; 32], vec![2; 31], vec![3; 32])),
+        ("a short public key", (vec![1; 32], vec![2; 32], vec![3; 33])),
+    ] {
+        let error = insert(row.0, row.1, row.2).expect_err(&format!("{name} must be refused"));
+        assert!(error.to_string().contains("CHECK constraint failed"), "{name}: {error}");
+    }
+    insert(vec![1; 32], vec![2; 32], vec![3; 32]).expect("a well-formed retired identity");
+    insert(vec![1; 32], vec![4; 32], vec![5; 32]).expect_err("one row per retired fingerprint");
+
+    let stage = |id: i64, seed: Vec<u8>| {
+        bare.execute(
+            "INSERT INTO oplog_pending_identity(id, seed, x25519_secret, created_at_ms)
+             VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![id, seed, vec![6u8; 32]],
+        )
+    };
+    stage(0, vec![7; 31]).expect_err("a short staged seed is refused");
+    stage(1, vec![7; 32]).expect_err("the staged identity is a single row, like the live one");
+    stage(0, vec![7; 32]).expect("a well-formed staged identity");
 }

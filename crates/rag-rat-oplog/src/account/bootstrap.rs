@@ -193,16 +193,28 @@ pub fn prune_account_candidate_reservations_in_tx(
 
 /// Every authenticated candidate hash this store holds for `account_id`, sorted for canonical
 /// enrollment encoding. Parked unauthenticated envelopes are normal-sync work, not bootstrap data.
+/// The store leaves out entries its retired identities signed, and — when `reenrolling` (the
+/// request presents the staged identity) — its live one's too (`unclaimed_own_fingerprints`): the
+/// inviter may never have received them, and they are condemned by the removal's cut.
 pub fn held_account_entry_hashes(
     conn: &Connection,
     account_id: AccountId,
+    reenrolling: bool,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
+    let unclaimed = crate::identity::unclaimed_own_fingerprints(conn, reenrolling)?;
     let mut stmt = conn.prepare(
-        "SELECT entry_hash FROM account_entries WHERE account_id = ?1 ORDER BY entry_hash",
+        "SELECT entry_hash, device_fingerprint FROM account_entries WHERE account_id = ?1
+          ORDER BY entry_hash",
     )?;
     let hashes = stmt
-        .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .query_map([account_id.to_bytes().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, signer)| !unclaimed.iter().any(|fp| fp.to_bytes().as_slice() == signer))
+        .map(|(hash, _)| hash)
+        .collect::<Vec<_>>();
     anyhow::ensure!(
         hashes.len() <= ENROLLMENT_HELD_ENTRY_HASHES_MAX,
         "account held-proof inventory exceeds the enrollment wire bound"
@@ -249,6 +261,13 @@ pub fn adopt_enrollment_bootstrap(
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     super::control_policy::require_supported_account_control(&tx, bootstrap.account_id)?;
+    // A re-enrollment (#1417) swaps the staged identity in here, so the store's live identity
+    // changes only if this adoption commits; the checks below roll it back otherwise.
+    let retired = crate::identity::adopt_pending_identity_in_tx(
+        &tx,
+        bootstrap.device_fingerprint,
+        bootstrap.now_ms,
+    )?;
     // Ingest in CAUSAL order — an entry only after the entry introducing its signer's key. The
     // receipt's raw `(log_id, seq, entry_hash)` order puts EVERY promoted device's seq-0 control
     // entry before the founder-chain DeviceAdd introducing its key, so raw-order ingestion parks
@@ -306,6 +325,16 @@ pub fn adopt_enrollment_bootstrap(
     // resolvable parked sibling can no longer roll the one-time bootstrap back, and its later
     // promotion is ordinary best-effort queue work.
     storage::finish_enrollment_bootstrap_in_tx(&tx, bootstrap.account_id, bootstrap.now_ms)?;
+    // The owner's refusal that started a re-enrollment is unauthenticated; the owner-signed log
+    // this adoption just folded is not. Retire the live identity only if that log removed it —
+    // otherwise a stale stage would retire an identity that still holds a seat.
+    if let Some(retired) = retired {
+        anyhow::ensure!(
+            super::roster::device_was_removed(&tx, bootstrap.account_id, retired)?,
+            "the account log does not show this device removed, so its identity is not replaced; \
+             discard the staged identity and join again"
+        );
+    }
     let enrolled: bool = tx.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM account_roster_history
@@ -716,7 +745,7 @@ mod tests {
         )
         .unwrap();
 
-        let hashes = held_account_entry_hashes(&conn, account).unwrap();
+        let hashes = held_account_entry_hashes(&conn, account, false).unwrap();
         assert_eq!(hashes.len(), 121, "genesis and every authenticated candidate are advertised");
         assert!(!hashes.contains(&AccountEntryHash::from_bytes(parked_signed_hash)));
         assert!(!hashes.contains(&AccountEntryHash::from_bytes(parked_entry_hash)));

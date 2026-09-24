@@ -21,7 +21,7 @@ use super::super::keywrap::{self, ContentKey, KeyId, WrapContext};
 use super::super::{AccountId, bootstrap, content, envelope, fold, storage};
 use super::ops::{self, DecodedSecretsOp, StreamKeyWrap};
 use super::security_event::{self, SyncSecurityEvent, SyncSecurityEventKind};
-use crate::identity::{LocalDevice, load_local_device};
+use crate::identity::{self, LocalDevice, Recipient, load_local_device};
 use crate::stream::StreamId;
 
 /// The current sealing selection for a stream — the winning `(epoch, key_id)` over the accepted
@@ -354,7 +354,15 @@ pub fn current_sealing_key(
         return Ok(SealingKeyOutcome::NoCurrentKey);
     };
 
-    match recover_key(&wraps, account_id, stream_id, selected.key_epoch, selected.key_id, device) {
+    // Live identity only: a retired key must never select what new content is sealed under.
+    match recover_key(
+        &wraps,
+        account_id,
+        stream_id,
+        selected.key_epoch,
+        selected.key_id,
+        device.recipient(),
+    ) {
         KeyRecovery::Ready(key) => Ok(SealingKeyOutcome::Ready(key)),
         KeyRecovery::NotRecipient => Ok(SealingKeyOutcome::NotRecipient),
         KeyRecovery::Failed(failures) => {
@@ -390,6 +398,7 @@ pub fn historical_content_keyring(
     device: &LocalDevice,
 ) -> anyhow::Result<ContentKeyring> {
     let wraps = list_accepted_stream_key_wraps(conn, account_id, stream_id)?;
+    let retired = identity::retired_identities(conn)?;
     let mut groups = Vec::new();
     for accepted in &wraps {
         let group = (accepted.wrap.key_epoch, KeyId::from_bytes(accepted.wrap.key_id));
@@ -402,9 +411,9 @@ pub fn historical_content_keyring(
         if keys.iter().any(|(recovered_id, _)| *recovered_id == key_id) {
             continue;
         }
-        if let KeyRecovery::Ready(key) =
-            recover_key(&wraps, account_id, stream_id, key_epoch, key_id, device)
-        {
+        if let Some(key) = recover_historical_key(
+            &wraps, account_id, stream_id, key_epoch, key_id, device, &retired,
+        ) {
             keys.push((key_id, key));
         }
     }
@@ -421,10 +430,38 @@ pub(super) fn recover_exact_historical_content_key(
     device: &LocalDevice,
 ) -> anyhow::Result<Option<ContentKey>> {
     let wraps = list_accepted_stream_key_wraps(conn, account_id, live.stream_id)?;
-    Ok(match recover_key(&wraps, account_id, live.stream_id, live.key_epoch, live.key_id, device) {
-        KeyRecovery::Ready(key) => Some(key),
-        KeyRecovery::NotRecipient | KeyRecovery::Failed(_) => None,
-    })
+    let retired = identity::retired_identities(conn)?;
+    Ok(recover_historical_key(
+        &wraps,
+        account_id,
+        live.stream_id,
+        live.key_epoch,
+        live.key_id,
+        device,
+        &retired,
+    ))
+}
+
+/// Recover a historical key as this store's live identity, then as each identity it retired when
+/// it re-enrolled (#1417): epochs that rotated out before the re-enrollment were wrapped only to
+/// the retired identity and are never re-wrapped to the new one.
+fn recover_historical_key(
+    wraps: &[AcceptedStreamWrap],
+    account_id: AccountId,
+    stream_id: StreamId,
+    key_epoch: u64,
+    key_id: KeyId,
+    device: &LocalDevice,
+    retired: &[identity::RetiredIdentity],
+) -> Option<ContentKey> {
+    std::iter::once(device.recipient())
+        .chain(retired.iter().map(identity::RetiredIdentity::recipient))
+        .find_map(|recipient| {
+            match recover_key(wraps, account_id, stream_id, key_epoch, key_id, recipient) {
+                KeyRecovery::Ready(key) => Some(key),
+                KeyRecovery::NotRecipient | KeyRecovery::Failed(_) => None,
+            }
+        })
 }
 
 /// Shared cryptographic recovery for current sealing and historical projection reads.
@@ -434,9 +471,9 @@ fn recover_key(
     stream_id: StreamId,
     key_epoch: u64,
     key_id: KeyId,
-    device: &LocalDevice,
+    recipient: Recipient<'_>,
 ) -> KeyRecovery {
-    let my_fingerprint = device.fingerprint();
+    let my_fingerprint = recipient.fingerprint;
     let my_wraps: Vec<_> = wraps
         .iter()
         .filter(|accepted| {
@@ -459,11 +496,11 @@ fn recover_key(
         account_id: account_id.to_bytes(),
         stream_id: stream_id.to_bytes(),
         key_epoch,
-        recipient_pub: device.x25519_public().to_bytes(),
+        recipient_pub: recipient.x25519_public.to_bytes(),
     };
     let mut failures = Vec::new();
     for (entry_hash, sealed) in my_wraps {
-        let Ok(recovered) = keywrap::unwrap_content_key(sealed, device.x25519_secret(), &ctx)
+        let Ok(recovered) = keywrap::unwrap_content_key(sealed, recipient.x25519_secret, &ctx)
         else {
             failures.push(WrapRecoveryFailure { entry_hash, observed_key_id: None });
             continue;

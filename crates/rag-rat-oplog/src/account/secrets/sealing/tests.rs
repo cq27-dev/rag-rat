@@ -637,6 +637,43 @@ fn historical_keyring_tolerates_a_corrupt_accepted_wrap() {
     assert!(keyring.get(key.key_id()).is_none(), "a corrupt wrap recovers no key");
 }
 
+#[test]
+fn a_retired_identity_still_opens_history_but_never_seals() {
+    let conn = db();
+    let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+    let old = local_device(&conn, NOW).unwrap();
+    let key = ContentKey::from_seed(&[0x21; 32]);
+    let wrap = honest_wrap(account, stream_id, old.fingerprint(), &old.x25519_public(), &key, 0);
+    let (bytes, _) =
+        wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
+    ingest(&conn, &bytes);
+
+    let (staged_ed, staged_x) = crate::stage_reenrollment_identity(&conn, NOW + 1).unwrap();
+    let staged = crate::device::DevicePublic::from_bytes(&staged_ed).unwrap().fingerprint();
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let retired = crate::identity::adopt_pending_identity_in_tx(&tx, staged, NOW + 1).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(retired, Some(old.fingerprint()));
+    let reloaded = local_device(&conn, NOW + 2).unwrap();
+    assert_eq!(reloaded.fingerprint(), staged, "the swap is what persists");
+    assert_eq!(reloaded.x25519_public_key(), staged_x);
+    assert_ne!(staged_x, old.x25519_public_key(), "the X25519 key is fresh too");
+
+    let keyring = historical_content_keyring(&conn, account, stream_id, &reloaded).unwrap();
+    assert_eq!(
+        keyring.get(key.key_id()).expect("history sealed to the retired identity").as_slice(),
+        key.as_slice(),
+    );
+    assert!(
+        matches!(
+            current_sealing_key(&conn, account, stream_id, &reloaded, NOW + 2).unwrap(),
+            SealingKeyOutcome::NotRecipient
+        ),
+        "a key only the retired identity can open never selects what new content seals under",
+    );
+}
+
 // ── The adoption cross-check ──
 
 #[test]

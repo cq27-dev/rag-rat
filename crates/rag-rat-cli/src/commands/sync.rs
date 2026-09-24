@@ -73,7 +73,7 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
             print_output(&serde_json::json!({
                 "status": "removed",
                 "device": device_json(&removed),
-                "note": "stream keys it held rotate at the next write; to enroll that machine again, `sync join` from a fresh store",
+                "note": "stream keys it held rotate at the next write; to enroll that machine again, mint it an invite and run `sync join` there: it enrolls under a new identity and keeps reading what it could before",
             }))
         }),
         SyncCommand::Promote { device } => with_repo_db(config, |db| {
@@ -826,6 +826,19 @@ fn serve_with(config: &Config, once: bool, mint: Option<ServeMint>) -> anyhow::R
     })
 }
 
+/// Stage the identity a removed device re-enrolls under (#1417). Nothing about the live identity
+/// changes until an owner's signed receipt enrolls the staged one and adoption swaps it in.
+fn stage_reenrollment(
+    conn: &Connection,
+    removed: rag_rat_oplog::DeviceFingerprint,
+) -> anyhow::Result<()> {
+    rag_rat_oplog::stage_reenrollment_identity(conn, time::now_ms())?;
+    eprintln!(
+        "this device ({removed}) was removed from the account; enrolling under a new identity"
+    );
+    Ok(())
+}
+
 /// Joiner-side pairing (`sync join`): redeem an invite ticket, enrolling THIS device into the
 /// account, then restore its state (account log then `/3` content) from the inviter. Holds the
 /// database-scoped session lock for the whole exchange — enrollment + restore consume candidate
@@ -861,9 +874,18 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         }
         // Mint the account device identity if absent (NOT a genesis) so the enrollment request can
         // present the joiner's keys. `local_device` is idempotent on an existing identity.
-        rag_rat_oplog::local_device(conn, time::now_ms())?;
-        node_secret(conn)?
+        let device = rag_rat_oplog::local_device(conn, time::now_ms())?;
+        // This store's device was removed from the account (and it has synced the removal): that
+        // fingerprint can never enroll again, so re-enroll under a fresh identity. A store that
+        // never learned of its removal finds out from the owner's `DeviceRemoved` refusal below.
+        let known_removed =
+            rag_rat_oplog::device_was_removed(conn, ticket.account_id, device.fingerprint())?;
+        if known_removed {
+            stage_reenrollment(conn, device.fingerprint())?;
+        }
+        (node_secret(conn)?, known_removed)
     };
+    let (node_key, known_removed) = node_key;
     drop(repo_lock);
 
     let account_id = ticket.account_id;
@@ -880,7 +902,8 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         // Whether this device is ALREADY a roster member — a resumed join whose enrollment
         // committed on an earlier run. It decides only whether restore may still proceed if
         // redemption fails.
-        let already_effective = device_roster_capability(conn, account_id, &local_node)?.is_some();
+        let mut already_effective =
+            device_roster_capability(conn, account_id, &local_node)?.is_some();
 
         // 1) Enrollment — dial the owner over the enroll ALPN. The owner authors this device's
         //    DeviceAdd and returns the account bootstrap, which `connect_and_enroll` adopts,
@@ -895,32 +918,95 @@ fn join(config: &Config, ticket: &str) -> anyhow::Result<()> {
         //    nonce on a device that is ALREADY enrolled falls back to restore (a resume past the
         //    replay window, where enrollment is unnecessary); every other failure — and any failure
         //    on a not-yet-enrolled device — is a real error.
-        let local = rag_rat_oplog::local_device(conn, time::now_ms())?;
-        let request = rag_rat_sync::EnrollmentRequest {
-            nonce: ticket.nonce,
-            expected_account: account_id,
-            ed25519_pubkey: local.ed25519_public_key(),
-            x25519_pubkey: local.x25519_public_key(),
-            transport_node_id: [0u8; 32],
-            budget: rag_rat_oplog::EnrollmentBudget {
-                account_entries_remaining: 0,
-                account_bytes_remaining: 0,
-                global_entries_remaining: 0,
-                global_bytes_remaining: 0,
-            },
-            held_entry_hashes: Vec::new(),
+        // A re-enrollment (#1417) presents a staged identity; adoption swaps it in only when the
+        // owner-signed log it folds shows the live identity removed. The live identity is presented
+        // first unless it is already known removed: a stage can be stale (left by an
+        // unauthenticated refusal whose retry never completed), and presenting it on a device that
+        // still holds its seat would enroll a second one.
+        let request = |staged: bool| -> anyhow::Result<rag_rat_sync::EnrollmentRequest> {
+            let (ed25519_pubkey, x25519_pubkey) = if staged {
+                rag_rat_oplog::pending_identity_keys(conn)?
+                    .context("no staged identity to enroll")?
+            } else {
+                let local = rag_rat_oplog::local_device(conn, time::now_ms())?;
+                (local.ed25519_public_key(), local.x25519_public_key())
+            };
+            Ok(rag_rat_sync::EnrollmentRequest {
+                nonce: ticket.nonce,
+                expected_account: account_id,
+                ed25519_pubkey,
+                x25519_pubkey,
+                transport_node_id: [0u8; 32],
+                budget: rag_rat_oplog::EnrollmentBudget {
+                    account_entries_remaining: 0,
+                    account_bytes_remaining: 0,
+                    global_entries_remaining: 0,
+                    global_bytes_remaining: 0,
+                },
+                held_entry_hashes: Vec::new(),
+            })
         };
-        match rag_rat_sync::connect_and_enroll(
-            &endpoint,
-            peer.clone(),
-            conn,
-            account_id,
-            &request,
-            time::now_ms(),
-        )
-        .await
-        {
-            Ok(_) => {},
+        let enroll = |staged: bool| {
+            let request = request(staged);
+            let peer = peer.clone();
+            let endpoint = &endpoint;
+            async move {
+                match request {
+                    Ok(request) => Ok(rag_rat_sync::connect_and_enroll(
+                        endpoint,
+                        peer,
+                        conn,
+                        account_id,
+                        &request,
+                        time::now_ms(),
+                    )
+                    .await),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+        let mut presented_staged = known_removed;
+        let mut outcome = enroll(presented_staged).await?;
+        match &outcome {
+            // The owner's log records a removal this store never received — of the live identity,
+            // or of a staged one an owner enrolled and later removed. The refusal consumed nothing,
+            // so re-enroll under a freshly staged identity with the same ticket, once. Staging
+            // costs nothing even though the refusal is unauthenticated: see `request` above.
+            Err(rag_rat_sync::InviteError::DeviceRemoved) => {
+                rag_rat_oplog::discard_staged_identity(conn)?;
+                stage_reenrollment(
+                    conn,
+                    rag_rat_oplog::local_device(conn, time::now_ms())?.fingerprint(),
+                )?;
+                already_effective = false;
+                presented_staged = true;
+                outcome = enroll(true).await?;
+            },
+            // A spent ticket while a stage exists: an earlier run's re-enrollment may have been
+            // redeemed with the response lost. The owner replays only for the exact keys it
+            // enrolled, so ask again as the staged identity.
+            Err(
+                rag_rat_sync::InviteError::Used
+                | rag_rat_sync::InviteError::Expired
+                | rag_rat_sync::InviteError::Unknown,
+            ) if !presented_staged && rag_rat_oplog::pending_identity_keys(conn)?.is_some() => {
+                let replay = enroll(true).await?;
+                if replay.is_ok() {
+                    presented_staged = true;
+                    outcome = replay;
+                }
+            },
+            _ => {},
+        }
+        match outcome {
+            Ok(_) => {
+                // Adoption swapped the staged identity in. The transport node key is the other
+                // secret a forked copy of this store shares; drop it so the next start mints a new
+                // node id (this run keeps the endpoint it is already bound to).
+                if presented_staged && rag_rat_oplog::pending_identity_keys(conn)?.is_none() {
+                    conn.execute("DELETE FROM index_meta WHERE key = ?1", [NODE_SECRET_META_KEY])?;
+                }
+            },
             Err(error)
                 if already_effective
                     && matches!(

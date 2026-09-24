@@ -286,7 +286,9 @@ fingerprint or its first 8+ hex digits, and must run on an owner device:
 
 - `rag-rat sync remove-device <device> [--reason <text>]` removes a lost device, or one whose store
   forked (`sync whoami` lists forked chains: the store was restored from an older copy or copied to
-  another machine). A device cannot remove itself.
+  another machine). A device cannot remove itself. To bring that machine back, mint it an invite
+  and run `rag-rat sync join` there: it enrolls under a new identity and keeps a copy of its old
+  decryption key, so content it could read before stays readable.
 - `rag-rat sync promote <device>` gives an enrolled member device owner authority, so a sole owner
   can hand over before its own device is removed. A read-only device cannot be promoted.
 

@@ -16,6 +16,11 @@ pub enum InviteError {
          a new invite"
     )]
     CheckpointPinMoved,
+    /// The joining device's fingerprint was removed from the account and can never be enrolled
+    /// again. Refused before the nonce is consumed, so the joiner re-enrolls under a fresh identity
+    /// with the same ticket (#1417).
+    #[error("this device was removed from the account; it must enroll under a fresh identity")]
+    DeviceRemoved,
     #[error("enrollment invite expired")]
     Expired,
     #[error("enrollment invite was already used")]
