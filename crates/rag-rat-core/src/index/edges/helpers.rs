@@ -153,23 +153,23 @@ pub(crate) fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
     }
 }
 
-pub(crate) fn call_target_name(node: Node<'_>, text: &str) -> Option<String> {
+pub(crate) fn call_target_name(node: Node<'_>, text: &str, kinds: &[&str]) -> Option<String> {
     node.child_by_field_name("function")
         .map(unwrap_generic_function)
-        .and_then(|child| last_identifier_text(child, text))
+        .and_then(|child| last_identifier_text(child, text, kinds))
         .map(|name| short_name(&name).to_string())
-        .or_else(|| first_identifier_text(node, text))
+        .or_else(|| first_identifier_text(node, text, kinds))
 }
 /// The callee identifier node for a call expression — the same token [`call_target_name`] names,
 /// returned as a node so its byte range can be recorded (SCIP occurrences key on the identifier's
 /// position, #67). Points at the FINAL `::`/`.` segment (the callee name itself), matching how
 /// `call_target_name`'s `short_name` collapses a path to its tail. `None` when no clean identifier
 /// node is available — never guess a wrong range.
-pub(crate) fn call_target_node(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn call_target_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
     node.child_by_field_name("function")
         .map(unwrap_generic_function)
-        .and_then(last_identifier_node)
-        .or_else(|| first_identifier_node(node))
+        .and_then(|function| last_identifier_node(function, kinds))
+        .or_else(|| first_identifier_node(node, kinds))
         .map(final_segment_node)
 }
 /// The name a call hangs off — the head of `Type::method` / `receiver.method`.
@@ -195,23 +195,26 @@ pub(crate) fn child_name_text(node: Node<'_>, text: &str) -> Option<String> {
         .and_then(|child| child.utf8_text(text.as_bytes()).ok())
         .map(ToOwned::to_owned)
 }
-pub(crate) fn first_identifier_text(node: Node<'_>, text: &str) -> Option<String> {
+/// The first identifier under `node`, in document order. `kinds` is the calling backend's
+/// identifier node kinds (its `IDENTIFIER_KINDS`), as in every identifier helper here: each
+/// grammar names its identifiers differently, so the backend states them.
+pub(crate) fn first_identifier_text(node: Node<'_>, text: &str, kinds: &[&str]) -> Option<String> {
     // grow_stack: this recurses to full subtree depth; a hostile deeply-nested callee must grow
     // the stack, not overflow it (#543).
     rag_rat_base::stack::grow_stack(|| {
         for child in named_children(node) {
-            if is_identifier_kind(child.kind()) {
+            if kinds.contains(&child.kind()) {
                 return child.utf8_text(text.as_bytes()).ok().map(ToOwned::to_owned);
             }
-            if let Some(value) = first_identifier_text(child, text) {
+            if let Some(value) = first_identifier_text(child, text, kinds) {
                 return Some(value);
             }
         }
         None
     })
 }
-pub(crate) fn last_identifier_text(node: Node<'_>, text: &str) -> Option<String> {
-    identifiers_under(node, text).into_iter().last()
+pub(crate) fn last_identifier_text(node: Node<'_>, text: &str, kinds: &[&str]) -> Option<String> {
+    identifiers_under(node, text, kinds).into_iter().last()
 }
 
 /// An identifier token captured together with the source text at that exact node.
@@ -229,9 +232,9 @@ pub(crate) struct IdentifierPath<'tree> {
 }
 
 impl<'tree> IdentifierPath<'tree> {
-    pub(crate) fn under(node: Node<'tree>, text: &str) -> Self {
+    pub(crate) fn under(node: Node<'tree>, text: &str, kinds: &[&str]) -> Self {
         let mut segments = Vec::new();
-        collect_identifier_segments(node, text, &mut segments);
+        collect_identifier_segments(node, text, kinds, &mut segments);
         Self { segments }
     }
 
@@ -268,18 +271,15 @@ impl<'tree> IdentifierPath<'tree> {
             self.segments.iter().map(|segment| segment.text.as_str()).collect::<Vec<_>>().join("::")
         })
     }
-
-    fn into_texts(self) -> Vec<String> {
-        self.segments.into_iter().map(|segment| segment.text).collect()
-    }
 }
 
 fn collect_identifier_segments<'tree>(
     node: Node<'tree>,
     text: &str,
+    kinds: &[&str],
     out: &mut Vec<IdentifierSegment<'tree>>,
 ) {
-    if is_identifier_kind(node.kind()) {
+    if kinds.contains(&node.kind()) {
         if let Ok(value) = node.utf8_text(text.as_bytes())
             && !value.is_empty()
         {
@@ -291,7 +291,7 @@ fn collect_identifier_segments<'tree>(
     // text-only and node-only collectors.
     rag_rat_base::stack::grow_stack(|| {
         for child in named_children(node) {
-            collect_identifier_segments(child, text, out);
+            collect_identifier_segments(child, text, kinds, out);
         }
     });
 }
@@ -310,7 +310,7 @@ mod identifier_path_tests {
         let call = statement.named_child(0).unwrap();
         let callee = call.child_by_field_name("function").unwrap();
 
-        let path = IdentifierPath::under(callee, source);
+        let path = IdentifierPath::under(callee, source, &["identifier", "property_identifier"]);
 
         assert_eq!(path.len(), 3);
         assert_eq!(path.first_text(), Some("client"));
@@ -321,19 +321,24 @@ mod identifier_path_tests {
     }
 }
 
-pub(crate) fn identifiers_under(node: Node<'_>, text: &str) -> Vec<String> {
-    IdentifierPath::under(node, text).into_texts()
+pub(crate) fn identifiers_under(node: Node<'_>, text: &str, kinds: &[&str]) -> Vec<String> {
+    let mut segments = Vec::new();
+    collect_identifier_segments(node, text, kinds, &mut segments);
+    segments.into_iter().map(|segment| segment.text).collect()
 }
 /// Node-returning twin of [`first_identifier_text`]: the first identifier-kind node in document
 /// order, so its byte range can be recorded for the SCIP join (#67). Same traversal, so the node it
 /// returns is exactly the token whose text [`first_identifier_text`] would have produced.
-pub(crate) fn first_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
+pub(crate) fn first_identifier_node<'tree>(
+    node: Node<'tree>,
+    kinds: &[&str],
+) -> Option<Node<'tree>> {
     rag_rat_base::stack::grow_stack(|| {
         for child in named_children(node) {
-            if is_identifier_kind(child.kind()) {
+            if kinds.contains(&child.kind()) {
                 return Some(child);
             }
-            if let Some(found) = first_identifier_node(child) {
+            if let Some(found) = first_identifier_node(child, kinds) {
                 return Some(found);
             }
         }
@@ -341,26 +346,29 @@ pub(crate) fn first_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
     })
 }
 /// Node-returning twin of [`last_identifier_text`]: the last identifier-kind node under `node`.
-pub(crate) fn last_identifier_node(node: Node<'_>) -> Option<Node<'_>> {
-    identifier_nodes_under(node).into_iter().last()
+pub(crate) fn last_identifier_node<'tree>(
+    node: Node<'tree>,
+    kinds: &[&str],
+) -> Option<Node<'tree>> {
+    identifier_nodes_under(node, kinds).into_iter().last()
 }
 /// Node-returning twin of [`identifiers_under`]: every identifier-kind node under `node`, in the
 /// same document order, so the callee (`.last()`) and receiver (`.first()`) nodes line up 1:1 with
 /// the strings the TS/Kotlin/C extractors already pick out of [`identifiers_under`]. The byte range
 /// of the matching node is what the SCIP join keys on (#67).
-pub(crate) fn identifier_nodes_under<'tree>(node: Node<'tree>) -> Vec<Node<'tree>> {
+pub(crate) fn identifier_nodes_under<'tree>(node: Node<'tree>, kinds: &[&str]) -> Vec<Node<'tree>> {
     let mut out = Vec::new();
-    collect_identifier_nodes(node, &mut out);
+    collect_identifier_nodes(node, kinds, &mut out);
     out
 }
-fn collect_identifier_nodes<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
-    if is_identifier_kind(node.kind()) {
+fn collect_identifier_nodes<'tree>(node: Node<'tree>, kinds: &[&str], out: &mut Vec<Node<'tree>>) {
+    if kinds.contains(&node.kind()) {
         out.push(node);
         return;
     }
     rag_rat_base::stack::grow_stack(|| {
         for child in named_children(node) {
-            collect_identifier_nodes(child, out);
+            collect_identifier_nodes(child, kinds, out);
         }
     });
 }
@@ -372,21 +380,6 @@ fn collect_identifier_nodes<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>
 /// SCIP keys the occurrence.
 pub(crate) fn final_segment_node(node: Node<'_>) -> Node<'_> {
     node.child_by_field_name("name").unwrap_or(node)
-}
-pub(crate) fn is_identifier_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "identifier"
-            | "type_identifier"
-            | "scoped_identifier"
-            | "scoped_type_identifier"
-            | "field_identifier"
-            | "property_identifier"
-            | "shorthand_property_identifier"
-            | "simple_identifier"
-            | "package_identifier"
-            | "namespace_identifier"
-    )
 }
 pub(crate) fn is_rust_path_keyword(value: &str) -> bool {
     matches!(value, "self" | "super" | "crate")

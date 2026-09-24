@@ -183,9 +183,10 @@ pub enum CloneIneligibilityReason {
     /// clone recall by policy; checked FIRST because a generated file's symbols are never
     /// fingerprinted regardless of kind/size.
     Generated,
-    /// The symbol is not a function-shaped declaration: its `kind` is neither `"function"` nor a
-    /// function-valued declarator (`const f = () => …`, a class-field arrow — #232 #5). Only
-    /// function-shaped symbols are fingerprinted, so this can never be a clone-class member.
+    /// The symbol is not a function-shaped declaration: its `kind` is not a fingerprinted one
+    /// (`"function"`, `"constructor"`, `"method"`) nor a function-valued declarator (`const f = ()
+    /// => …`, a class-field arrow — #232 #5). Only function-shaped symbols are fingerprinted,
+    /// so this can never be a clone-class member.
     NonFunctionKind,
     /// A baseline fingerprint row EXISTS for this symbol but at a `normalizer_version` other than
     /// the current [`NORM_VERSION`] — the index was last fingerprinted by an older binary and
@@ -243,9 +244,9 @@ pub struct ClonesForSymbolResult {
     /// The selector matched a scoped symbol.
     pub symbol_resolved: bool,
     /// That symbol has a current-version baseline fingerprint loaded into the candidate set
-    /// (eligible: a `kind="function"` symbol OR a function-valued declarator — `const f = () =>
-    /// …`, a class-field arrow handler, #232 #5 — ≥ `MIN_TOKENS` in a non-generated, in-scope
-    /// file).
+    /// (eligible: a `function` / `constructor` / `method` symbol OR a function-valued declarator —
+    /// `const f = () => …`, a class-field arrow handler, #232 #5 — ≥ `MIN_TOKENS` in a
+    /// non-generated, in-scope file).
     pub symbol_fingerprinted: bool,
     /// The richer eligibility verdict (#274 item 3a): when `symbol_fingerprinted = false` this
     /// names WHY the symbol is not clone-eligible (generated file / non-function kind / stale

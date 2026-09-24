@@ -9,6 +9,9 @@ use crate::index::parser::{self, ParserKind};
 mod edges;
 pub(super) use edges::{RESOLVER_POLICY, go_edges};
 
+/// The node kinds that name a declaration when it has no `name` field (`parser::child_name`).
+const NAME_KINDS: &[&str] = &["identifier", "type_identifier", "field_identifier"];
+
 pub(super) static SUPPORT: Go = Go;
 
 pub(super) struct Go;
@@ -94,11 +97,11 @@ impl ParserBackend for Go {
 /// by `for_each_symbol` above. Everything here binds exactly one name.
 fn symbol_node(node: Node<'_>) -> Option<SymbolMatch<'_>> {
     match node.kind() {
-        "function_declaration" => Some(("function", parser::child_name(node)?)),
+        "function_declaration" => Some(("function", parser::child_name(node, NAME_KINDS)?)),
         // The grammar makes `receiver` a REQUIRED field of `method_declaration`, so the node kind
         // alone already means "func with a receiver" — no extra receiver check is needed to
         // separate it from a plain `function_declaration`.
-        "method_declaration" => Some(("method", parser::child_name(node)?)),
+        "method_declaration" => Some(("method", parser::child_name(node, NAME_KINDS)?)),
         // `type Foo struct{...}` / `type Foo interface{...}` / `type Foo Bar` all parse as
         // `type_spec`; only the `type` field says which. `type Foo = Bar` is a DIFFERENT node kind
         // (`type_alias`) in tree-sitter-go and is always a plain type.
@@ -108,9 +111,9 @@ fn symbol_node(node: Node<'_>) -> Option<SymbolMatch<'_>> {
                 Some("interface_type") => "interface",
                 _ => "type",
             };
-            Some((kind, parser::child_name(node)?))
+            Some((kind, parser::child_name(node, NAME_KINDS)?))
         },
-        "type_alias" => Some(("type", parser::child_name(node)?)),
+        "type_alias" => Some(("type", parser::child_name(node, NAME_KINDS)?)),
         _ => None,
     }
 }

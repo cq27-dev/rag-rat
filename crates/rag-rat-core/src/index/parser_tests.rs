@@ -675,23 +675,24 @@ fn assert_no_symbol_fact(
 
 #[test]
 fn deeply_nested_input_does_not_overflow_the_symbol_walk() {
-    // A pathological deeply-nested file (thousands of `{` blocks) parses fine, but the resulting
-    // tree is thousands of nodes deep. The symbol walk must not recurse per node — that overflows
-    // the stack on a real worker thread (#520). Run on a deliberately small stack so a per-node
-    // recursive walk would overflow HERE; the iterative walk uses O(1) stack and completes.
-    let depth = 8_000;
-    let src = format!("fn deep_marker_fn() {}{}\n", "{".repeat(depth), "}".repeat(depth));
-    let symbols = std::thread::Builder::new()
-        .stack_size(256 * 1024)
-        .spawn(move || parser::parse_symbols(Path::new("deep.rs"), Language::Rust, &src))
-        .expect("spawn walk thread")
-        .join()
-        .expect("the symbol walk must not overflow the stack on deeply-nested input")
-        .expect("parse");
-    assert!(
-        symbols.iter().any(|symbol| symbol.name == "deep_marker_fn"),
-        "the function symbol survives the deep walk",
-    );
+    // A pathological deeply-nested file parses fine, but the resulting tree is thousands of nodes
+    // deep. The symbol walk must not recurse per node — that overflows the stack on a real worker
+    // thread (#520). Run on a deliberately small stack so a per-node recursive walk would overflow
+    // HERE, in every language; the iterative walk uses O(1) stack and completes.
+    for (language, fixture) in crate::index::languages::test_support::fixtures() {
+        let src = fixture.deep_call(8_000);
+        let symbols = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || parser::parse_symbols(Path::new(fixture.path), language, &src))
+            .expect("spawn walk thread")
+            .join()
+            .unwrap_or_else(|_| panic!("{language}: the symbol walk overflowed the stack"))
+            .expect("parse");
+        assert!(
+            symbols.iter().any(|symbol| symbol.name == "deep_marker_fn"),
+            "{language}: the function symbol survives the deep walk: {symbols:?}",
+        );
+    }
 }
 
 /// #543 tripwire: EVERY function under `src/index/` that both recurses (references its own name)

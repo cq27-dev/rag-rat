@@ -28,7 +28,7 @@ pub(in crate::index::languages) fn rust_edges(
 }
 
 fn rust_use_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter<'_>) {
-    let names = identifiers_under(node, text);
+    let names = identifiers_under(node, text, super::IDENTIFIER_KINDS);
     let is_reexport = node_text(node, text).trim_start().starts_with("pub use ");
     // Module-aware import scope (#61): a Rust `use` is scoped to its enclosing module body
     // (or block, for a block-local `use`), not the whole file. Record that scope + the
@@ -58,7 +58,7 @@ fn rust_use_edges(text: &str, node: Node<'_>, path: &Path, out: &mut EdgeEmitter
         }
     }
     if is_reexport {
-        for name in identifiers_under(node, text) {
+        for name in identifiers_under(node, text, super::IDENTIFIER_KINDS) {
             if !is_rust_path_keyword(&name) {
                 out.push(file_edge(path, node, text, name, EdgeKind::Exports));
             }
@@ -91,7 +91,7 @@ fn rust_call_edges(
     locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    if let Some(name) = call_target_name(node, text) {
+    if let Some(name) = call_target_name(node, text, super::IDENTIFIER_KINDS) {
         out.push(symbol_edge_with_context(
             locator,
             node,
@@ -103,7 +103,7 @@ fn rust_call_edges(
                 receiver_hint: scoped_receiver_name(node, text),
                 receiver_type_hint: infer_rust_receiver_type_hint(node, text),
             },
-            call_target_node(node).map(CalleeRange::of_node),
+            call_target_node(node, super::IDENTIFIER_KINDS).map(CalleeRange::of_node),
         ));
     }
     // A scoped call receiver is a type reference only when it names a type. By Rust
@@ -123,7 +123,7 @@ fn rust_call_edges(
             // — so anchor the range on the function path's first
             // identifier, not its tail.
             node.child_by_field_name("function")
-                .and_then(first_identifier_node)
+                .and_then(|node| first_identifier_node(node, super::IDENTIFIER_KINDS))
                 .map(CalleeRange::of_node),
         ));
     }
@@ -198,7 +198,7 @@ fn rust_macro_edges(
     locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    if let Some(name) = first_identifier_text(node, text) {
+    if let Some(name) = first_identifier_text(node, text, super::IDENTIFIER_KINDS) {
         out.push(symbol_edge_with_context(
             locator,
             node,
@@ -206,7 +206,7 @@ fn rust_macro_edges(
             name,
             EdgeKind::UsesMacro,
             EdgeContext::default(),
-            first_identifier_node(node).map(CalleeRange::of_node),
+            first_identifier_node(node, super::IDENTIFIER_KINDS).map(CalleeRange::of_node),
         ));
     }
 }
@@ -217,13 +217,15 @@ fn rust_type_reference_edges(
     locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    if let Some(name) = last_identifier_text(node, text) {
+    if let Some(name) = last_identifier_text(node, text, super::IDENTIFIER_KINDS) {
         out.push(symbol_edge(
             locator,
             node,
             name,
             EdgeKind::ReferencesType,
-            last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
+            last_identifier_node(node, super::IDENTIFIER_KINDS)
+                .map(final_segment_node)
+                .map(CalleeRange::of_node),
         ));
     }
 }

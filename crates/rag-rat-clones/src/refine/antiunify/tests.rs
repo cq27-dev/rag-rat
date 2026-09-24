@@ -1227,9 +1227,9 @@ fn value_position_local_not_reopened_as_callee() {
 
 #[test]
 fn custom_type_hole_is_type_param() {
-    // P2a: a differing CUSTOM type in type position. A `type_identifier` normalizes to `ID<n>`
-    // (is_identifier_kind matches `*identifier`), so without the type-position guard it would
-    // be promoted to a value_param leaf in classify_run's step (2) BEFORE the
+    // P2a: a differing CUSTOM type in type position. A `type_identifier` the grammar's
+    // `is_identifier` accepts normalizes to `ID<n>`, so without the type-position guard
+    // it would be promoted to a value_param leaf in classify_run's step (2) BEFORE the
     // type_param check (3). The fix gates step (2) on `!is_type_position(anchor_kind)`
     // so a type-position leaf falls through to type_param.
     //

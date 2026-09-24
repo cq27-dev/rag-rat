@@ -9,6 +9,13 @@ use crate::index::parser::{self, ParserKind};
 mod edges;
 pub(super) use edges::kotlin_edges;
 
+/// The node kinds that name a declaration when it has no `name` field (`parser::child_name`).
+const NAME_KINDS: &[&str] = &["identifier"];
+
+/// The node kinds the identifier helpers ([`crate::index::edges::identifiers_under`] and friends)
+/// collect.
+const IDENTIFIER_KINDS: &[&str] = NAME_KINDS;
+
 pub(super) static SUPPORT: Kotlin = Kotlin;
 
 pub(super) struct Kotlin;
@@ -24,9 +31,9 @@ impl ParserBackend for Kotlin {
 
     fn symbol_node<'tree>(&self, node: Node<'tree>, _text: &str) -> Option<SymbolMatch<'tree>> {
         match node.kind() {
-            "class_declaration" => Some(("class", parser::child_name(node)?)),
-            "object_declaration" => Some(("object", parser::child_name(node)?)),
-            "function_declaration" => Some(("function", parser::child_name(node)?)),
+            "class_declaration" => Some(("class", parser::child_name(node, NAME_KINDS)?)),
+            "object_declaration" => Some(("object", parser::child_name(node, NAME_KINDS)?)),
+            "function_declaration" => Some(("function", parser::child_name(node, NAME_KINDS)?)),
             "property_declaration" => Some(("property", property_name(node)?)),
             "companion_object" => Some(("object", companion_name(node).unwrap_or(node))),
             _ => None,
@@ -36,7 +43,7 @@ impl ParserBackend for Kotlin {
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         match node.kind() {
             "class_declaration" | "object_declaration" =>
-                parser::node_text(parser::child_name(node)?, text),
+                parser::node_text(parser::child_name(node, NAME_KINDS)?, text),
             _ => None,
         }
     }
@@ -75,7 +82,7 @@ fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
 }
 
 fn property_name(node: Node<'_>) -> Option<Node<'_>> {
-    parser::child_name(variable_declaration(node).unwrap_or(node))
+    parser::child_name(variable_declaration(node).unwrap_or(node), NAME_KINDS)
 }
 
 fn variable_declaration(node: Node<'_>) -> Option<Node<'_>> {

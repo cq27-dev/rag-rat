@@ -35,6 +35,7 @@ pub enum Language {
 /// extensions each detection mode claims.
 #[derive(Debug, Clone, Copy)]
 struct LanguageSpec {
+    display_name: &'static str,
     aliases: &'static [&'static str],
     simple_extensions: &'static [&'static str],
     target_extensions: &'static [&'static str],
@@ -56,6 +57,11 @@ impl Language {
     /// are config spellings, never stored).
     pub fn from_db_str(token: &str) -> Option<Self> {
         Self::all().iter().copied().find(|language| language.as_db_str() == token)
+    }
+
+    /// The language's human-facing name (`C++`, `TypeScript`), for descriptions and messages.
+    pub fn display_name(self) -> &'static str {
+        self.spec().display_name
     }
 
     /// Extensions used for **bare** language detection ([`Self::from_path`]) — the unambiguous
@@ -114,46 +120,55 @@ impl Language {
     fn spec(self) -> &'static LanguageSpec {
         match self {
             Self::Rust => &LanguageSpec {
+                display_name: "Rust",
                 aliases: &["rs"],
                 simple_extensions: &["rs"],
                 target_extensions: &["rs"],
             },
             Self::TypeScript => &LanguageSpec {
+                display_name: "TypeScript",
                 aliases: &["ts", "tsx"],
                 simple_extensions: &["ts", "tsx"],
                 target_extensions: &["ts", "tsx"],
             },
             Self::Kotlin => &LanguageSpec {
+                display_name: "Kotlin",
                 aliases: &["kt"],
                 simple_extensions: &["kt", "kts"],
                 target_extensions: &["kt", "kts"],
             },
             Self::C => &LanguageSpec {
+                display_name: "C",
                 aliases: &[],
                 simple_extensions: &["c", "h"],
                 target_extensions: &["c", "h"],
             },
             Self::Cpp => &LanguageSpec {
+                display_name: "C++",
                 aliases: &["c++", "cc", "cxx"],
                 simple_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++"],
                 target_extensions: &["cc", "cpp", "cxx", "c++", "hh", "hpp", "hxx", "h++", "h"],
             },
             Self::Python => &LanguageSpec {
+                display_name: "Python",
                 aliases: &["py"],
                 simple_extensions: &["py", "pyi"],
                 target_extensions: &["py", "pyi"],
             },
             Self::Swift => &LanguageSpec {
+                display_name: "Swift",
                 aliases: &[],
                 simple_extensions: &["swift"],
                 target_extensions: &["swift"],
             },
             Self::Go => &LanguageSpec {
+                display_name: "Go",
                 aliases: &["golang"],
                 simple_extensions: &["go"],
                 target_extensions: &["go"],
             },
             Self::Markdown => &LanguageSpec {
+                display_name: "Markdown",
                 aliases: &["md"],
                 simple_extensions: &["md", "markdown"],
                 target_extensions: &["md", "markdown"],
@@ -258,6 +273,20 @@ mod tests {
         assert_eq!(Language::from_path(Path::new("a/b.rs")), Some(Language::Rust));
         assert_eq!(Language::from_path(Path::new("a/b.swift")), Some(Language::Swift));
         assert_eq!(Language::from_path(Path::new("a/README")), None);
+    }
+
+    /// [`Language::from_path`] takes the FIRST language claiming an extension, so an extension two
+    /// languages both list would silently resolve to whichever is declared earlier.
+    #[test]
+    fn simple_extensions_are_disjoint_across_languages() {
+        let mut owners = std::collections::HashMap::new();
+        for &language in Language::all() {
+            for ext in language.simple_extensions() {
+                if let Some(first) = owners.insert(*ext, language) {
+                    panic!("`.{ext}` is a simple extension of both {first} and {language}");
+                }
+            }
+        }
     }
 
     #[test]

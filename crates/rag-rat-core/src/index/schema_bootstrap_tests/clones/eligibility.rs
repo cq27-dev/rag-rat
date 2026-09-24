@@ -241,3 +241,30 @@ fn clones_for_symbol_distinguishes_ineligibility_reasons() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// A below-`MIN_TOKENS` Go `method` is a fingerprinted kind, so its ineligibility reason is
+/// `BelowMinTokens`, not `NonFunctionKind`: the reason classifier and the fingerprint gate share
+/// one kind rule.
+#[test]
+fn clones_for_symbol_reports_below_min_tokens_for_a_short_go_method() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/s.go"),
+        "package s\n\ntype S struct{ v int }\n\nfunc (s S) Get() {}\n",
+    )
+    .unwrap();
+
+    let db = IndexDatabase::rebuild(&source_config(root.clone(), Language::Go)).unwrap();
+    let res = db.clones_for_symbol(CloneSymbolSelector::Ref("src/s.go::S.Get".into())).unwrap();
+    assert_eq!(
+        res.eligibility,
+        crate::index::CloneEligibility::Ineligible {
+            reason: crate::index::CloneIneligibilityReason::BelowMinTokens
+        },
+        "a short Go method reports BelowMinTokens"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}

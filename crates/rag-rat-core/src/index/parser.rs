@@ -195,15 +195,6 @@ pub struct ParsedSymbolFact {
     pub value: String,
 }
 
-pub(super) const NAME_KINDS: &[&str] = &[
-    "identifier",
-    "type_identifier",
-    "property_identifier",
-    "field_identifier",
-    "simple_identifier",
-    "namespace_identifier",
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParserKind {
     Rust,
@@ -343,16 +334,18 @@ fn collect_symbols(
     }
 }
 
-pub(super) fn child_name(node: Node<'_>) -> Option<Node<'_>> {
+/// A declaration's name node: its `name` field, else the first child — then the first descendant —
+/// whose kind is one of `kinds`, the calling backend's name kinds (its `NAME_KINDS`).
+pub(super) fn child_name<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
     if let Some(name) = node.child_by_field_name("name") {
         return Some(name);
     }
 
-    if let Some(name) = named_children(node).find(|child| NAME_KINDS.contains(&child.kind())) {
+    if let Some(name) = named_children(node).find(|child| kinds.contains(&child.kind())) {
         return Some(name);
     }
 
-    named_children(node).find_map(|child| first_descendant_node(child, NAME_KINDS))
+    named_children(node).find_map(|child| first_descendant_node(child, kinds))
 }
 
 pub(super) fn first_descendant_node<'tree>(

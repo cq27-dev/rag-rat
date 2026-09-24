@@ -277,11 +277,11 @@ pub(super) fn classify_run(
     //     leaf token to the run.
     //
     //     A custom TYPE name (`type_identifier` / `scoped_type_identifier`, and `generic_type`
-    // inner     names) normalizes to `ID<n>` — `is_identifier_kind` matches `*identifier` — so
-    // a     `let x: Foo` vs `let x: Bar` run is an `ID`-leaf that would otherwise be promoted
-    // to a     value_param HERE, before the type_param check (3) ever runs. Guard on the
-    // anchor's NODE     KIND (`is_type_position`), not the leaf token: a type-position leaf
-    // falls through to (3)     and is classified type_param, not value_param.
+    //     inner names) that the grammar's `is_identifier` accepts normalizes to `ID<n>`, so a
+    //     `let x: Foo` vs `let x: Bar` run is an `ID` leaf that would otherwise be promoted to a
+    //     value_param HERE, before the type_param check (3) ever runs. Guard on the anchor's
+    //     NODE KIND (`is_type_position`), not the leaf token: a type-position leaf falls
+    //     through to (3) and is classified type_param, not value_param.
     if run_len == 1 && anchor.node_spans[lo].is_leaf && !is_type_position(anchor_kind) {
         let anchor_tok = &anchor.seq[lo];
         if is_value_leaf_token(anchor_tok) && every_member_single_leaf(view, lo, hi) {

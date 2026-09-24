@@ -4,10 +4,52 @@ use std::sync::{Mutex, OnceLock};
 use rag_rat_base::language::Language;
 use tree_sitter::Node;
 
-/// A leaf tree-sitter kind that names a binding/reference identifier (kept language-agnostic by
-/// matching the `*identifier` suffix tree-sitter grammars use).
-fn is_identifier_kind(kind: &str) -> bool {
+/// What the baseline normalizer must know about one grammar's LEAVES: which kinds are identifiers
+/// to alpha-rename, which extra kinds carry a literal value, and which identifier-lexed words are
+/// really literals. Chosen by an exhaustive match on [`Language`] in [`leaf_grammar`], so a new
+/// language cannot compile without stating them — a grammar whose identifiers do not end in
+/// `identifier` (PHP `name`, Bash `word`) would otherwise leak every identifier verbatim into the
+/// token stream and silently cost that language its clone recall.
+struct LeafGrammar {
+    /// A leaf kind that names a binding/reference identifier.
+    is_identifier: fn(&str) -> bool,
+    /// Literal-value leaf kinds only this grammar has, on top of the shared [`is_literal_kind`]
+    /// set.
+    literal_kinds: &'static [&'static str],
+    /// The token for an identifier leaf whose TEXT is a literal keyword, or `None` to alpha-rename
+    /// it.
+    identifier_literal: fn(&str) -> Option<&'static str>,
+}
+
+/// The `*identifier` suffix every current grammar uses for its identifier leaves.
+fn ends_with_identifier(kind: &str) -> bool {
     kind.ends_with("identifier")
+}
+
+fn no_identifier_literals(_leaf: &str) -> Option<&'static str> {
+    None
+}
+
+/// The C/C++ char-literal VALUE leaf: see [`is_literal_kind`].
+const C_FAMILY_LITERAL_LEAF_KINDS: &[&str] = &["character"];
+
+fn leaf_grammar(lang: Language) -> LeafGrammar {
+    let shared = LeafGrammar {
+        is_identifier: ends_with_identifier,
+        literal_kinds: &[],
+        identifier_literal: no_identifier_literals,
+    };
+    match lang {
+        Language::Rust
+        | Language::TypeScript
+        | Language::Python
+        | Language::Swift
+        | Language::Go
+        | Language::Markdown => shared,
+        Language::C | Language::Cpp =>
+            LeafGrammar { literal_kinds: C_FAMILY_LITERAL_LEAF_KINDS, ..shared },
+        Language::Kotlin => LeafGrammar { identifier_literal: kotlin_identifier_token, ..shared },
+    }
 }
 
 /// A leaf kind that is a literal whose *value* must not drive matching.
@@ -21,9 +63,9 @@ fn is_identifier_kind(kind: &str) -> bool {
 /// `char_literal` node (which already buckets via the `ends_with("literal")` arm) wrapping a
 /// `'` / `character` / `'` leaf triple — the quotes are structural (identical for any char), but
 /// the inner `character` leaf carries the value, so `'x'` vs `'y'` would leak verbatim without it
-/// (#253). GATED to C/C++ via `lang`: `character` is a generic-enough kind name that we only bucket
-/// it where it's known to be the char-literal value leaf, never speculatively across other
-/// grammars.
+/// (#253). GATED to C/C++ through [`leaf_grammar`]: `character` is a generic-enough kind name that
+/// we only bucket it where it's known to be the char-literal value leaf, never speculatively
+/// across other grammars.
 ///
 /// `line_str_text` / `multi_line_str_text` / `raw_str_part` / `raw_str_end_part` /
 /// `str_escaped_char` are Swift's string-body leaves — the counterparts to Python's
@@ -36,7 +78,7 @@ fn is_identifier_kind(kind: &str) -> bool {
 /// segments are internal nodes and still recurse as real code.) `raw_str_end_part` carries the
 /// delimiters as well as the text — an uninterpolated `#"one"#` arrives as ONE leaf — which is why
 /// it must bucket rather than pass through as punctuation.
-fn is_literal_kind(kind: &str, lang: Language) -> bool {
+fn is_literal_kind(kind: &str, grammar: &LeafGrammar) -> bool {
     kind.ends_with("literal")
         || is_string_body_leaf_kind(kind)
         || matches!(
@@ -47,7 +89,7 @@ fn is_literal_kind(kind: &str, lang: Language) -> bool {
                 | "float"
                 | "number"
         )
-        || (matches!(lang, Language::C | Language::Cpp) && kind == "character")
+        || grammar.literal_kinds.contains(&kind)
 }
 
 /// The string-BODY leaf kinds whose value the baseline normalizer erases: Rust/Python
@@ -98,7 +140,7 @@ fn is_boolean_leaf_kind(kind: &str) -> bool {
 
 /// Kotlin-only override for an `identifier`-kind leaf whose TEXT is a boolean or null keyword.
 /// `tree-sitter-kotlin` lexes `true`/`false`/`null` as bare `identifier` leaves (not their own
-/// kinds), so the generic `is_boolean_leaf_kind`/`is_identifier_kind` path would alpha-rename them
+/// kinds), so the generic `is_boolean_leaf_kind`/identifier path would alpha-rename them
 /// to `ID<n>` and leak the value into matching (#253). Returns:
 /// - `Some("LIT_BOOL")` for `true`/`false` — value-erased to the same single bucket every other
 ///   grammar's booleans use, so a Kotlin `true`↔`false`-only diff normalizes equal.
@@ -106,8 +148,8 @@ fn is_boolean_leaf_kind(kind: &str) -> bool {
 ///   not bucketed, but also not alpha-renamed to an `ID<n>`).
 /// - `None` for any other identifier text — falls through to the normal `ID<n>` alpha-rename.
 ///
-/// GATED to Kotlin by the caller; other grammars emit these as dedicated leaf kinds and must not be
-/// matched by text here.
+/// GATED to Kotlin by [`leaf_grammar`]; other grammars emit these as dedicated leaf kinds and must
+/// not be matched by text here.
 fn kotlin_identifier_token(leaf: &str) -> Option<&'static str> {
     match leaf {
         "true" | "false" => Some("LIT_BOOL"),
@@ -200,7 +242,7 @@ pub fn normalize_baseline_spanned(
     let mut tokens = Vec::new();
     let mut spans = Vec::new();
     let mut idents: HashMap<String, usize> = HashMap::new();
-    walk_spanned(node, text.as_bytes(), lang, &mut idents, &mut tokens, &mut spans);
+    walk_spanned(node, text.as_bytes(), &leaf_grammar(lang), &mut idents, &mut tokens, &mut spans);
     (tokens, spans)
 }
 
@@ -230,7 +272,7 @@ fn static_kind(kind: &str) -> &'static str {
 fn walk_spanned(
     node: Node<'_>,
     src: &[u8],
-    lang: Language,
+    grammar: &LeafGrammar,
     idents: &mut HashMap<String, usize>,
     tokens: &mut Vec<String>,
     spans: &mut Vec<NodeSpan>,
@@ -255,14 +297,12 @@ fn walk_spanned(
     if node.child_count() == 0 {
         // Leaf: push the token and its span.
         let leaf = node.utf8_text(src).unwrap_or("");
-        let token = if is_identifier_kind(kind) {
+        let token = if (grammar.is_identifier)(kind) {
             // (#253) Kotlin lexes `true`/`false`/`null` as bare `identifier` leaves, so they reach
-            // the identifier branch FIRST. GATED to Kotlin, intercept by leaf text: `true`/`false`
+            // the identifier branch FIRST. Its grammar intercepts them by leaf text: `true`/`false`
             // value-erase to `LIT_BOOL` (same single bucket as every other grammar's booleans),
             // `null` stays verbatim (null-family policy). Every other identifier alpha-renames.
-            if let Some(tok) =
-                (lang == Language::Kotlin).then(|| kotlin_identifier_token(leaf)).flatten()
-            {
+            if let Some(tok) = (grammar.identifier_literal)(leaf) {
                 tok.to_string()
             } else {
                 let next = idents.len();
@@ -273,7 +313,7 @@ fn walk_spanned(
             // Value-erase booleans to ONE bucket (NOT `LIT_{kind.uppercased}`): `true`/`false`
             // collapse to `LIT_BOOL` so a true↔false-only diff is a clone (#232 #2b).
             "LIT_BOOL".to_string()
-        } else if is_literal_kind(kind, lang) {
+        } else if is_literal_kind(kind, grammar) {
             format!("LIT_{}", kind.to_ascii_uppercase())
         } else {
             // (#232 #2c) NULL-FAMILY out of scope (low value + wrapped-node hazard): `null` /
@@ -296,7 +336,7 @@ fn walk_spanned(
     rag_rat_base::stack::grow_stack(|| {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            walk_spanned(child, src, lang, idents, tokens, spans);
+            walk_spanned(child, src, grammar, idents, tokens, spans);
         }
     });
 }

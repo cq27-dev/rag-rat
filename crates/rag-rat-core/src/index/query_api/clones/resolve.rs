@@ -157,14 +157,16 @@ pub(crate) fn resolve_selector_to_symbol_id(
 ///    function-VALUED declarator (`const f = () => …`, #232 #5) keeps `kind = "const"` yet IS
 ///    fingerprinted, so an existing row is the authoritative "this symbol was eligible" signal —
 ///    the index is merely stale.
-/// 3. [`NonFunctionKind`](CloneIneligibilityReason::NonFunctionKind) — `kind != "function"` and no
+/// 3. [`NonFunctionKind`](CloneIneligibilityReason::NonFunctionKind) — the `kind` fails
+///    [`symbol_kind_is_fingerprinted`](rag_rat_clones::symbol_kind_is_fingerprinted) and no
 ///    fingerprint row exists. (A large function-valued declarator is caught by rule 2; a tiny one
-///    with a non-`function` kind is honestly reported here — both `NonFunctionKind` and
+///    with a non-function kind is honestly reported here — both `NonFunctionKind` and
 ///    `BelowMinTokens` are true, and the literal `kind` fact is the one the DB can attest to
 ///    without the AST.)
-/// 4. [`BelowMinTokens`](CloneIneligibilityReason::BelowMinTokens) — the residual: a `kind =
-///    "function"` symbol in a non-generated file with no current-version row, i.e. its normalized
-///    body fell below [`MIN_TOKENS`](crate::index::clones).
+/// 4. [`BelowMinTokens`](CloneIneligibilityReason::BelowMinTokens) — the residual: a symbol of a
+///    fingerprinted kind (`function` / `constructor` / `method`) in a non-generated file with no
+///    current-version row, i.e. its normalized body fell below
+///    [`MIN_TOKENS`](crate::index::clones).
 pub(crate) fn classify_ineligibility_reason(
     conn: &Connection,
     symbol_id: i64,
@@ -192,7 +194,7 @@ pub(crate) fn classify_ineligibility_reason(
         // A row exists but the current-version read missed it (the caller already established
         // `symbol_fingerprinted = false`) ⇒ the only stored row is at a stale normalizer_version.
         CloneIneligibilityReason::StaleNormalizerVersion
-    } else if kind != "function" {
+    } else if !rag_rat_clones::symbol_kind_is_fingerprinted(&kind) {
         CloneIneligibilityReason::NonFunctionKind
     } else {
         CloneIneligibilityReason::BelowMinTokens
