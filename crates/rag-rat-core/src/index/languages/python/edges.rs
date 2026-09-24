@@ -468,29 +468,25 @@ fn python_assignment_target_binds(target: Node<'_>, name: &str, text: &str) -> b
 fn python_import_binds_name(node: Node<'_>, name: &str, text: &str) -> bool {
     let from_import = node.kind() == "import_from_statement";
     let module_id = node.child_by_field_name("module_name").map(|module| module.id());
-    // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
-    // deeply today, so this is a no-op fast path.
-    rag_rat_base::stack::grow_stack(|| {
-        named_children(node).any(|child| {
-            if Some(child.id()) == module_id {
-                return false;
-            }
-            match child.kind() {
-                "aliased_import" => child
-                    .child_by_field_name("alias")
-                    .and_then(|alias| last_identifier_text(alias, text))
-                    .is_some_and(|alias| alias == name),
-                // from-import: the imported leaf (`from m import Account`). plain import: the
-                // top-level segment of the dotted module path (`import other.Account` binds
-                // `other`).
-                "dotted_name" if from_import =>
-                    last_identifier_text(child, text).is_some_and(|leaf| leaf == name),
-                "dotted_name" =>
-                    first_identifier_text(child, text).is_some_and(|root| root == name),
-                "import_list" => python_import_binds_name(child, name, text),
-                _ => false,
-            }
-        })
+    // The grammar's import list is hidden (`_import_list`), so the imported names are direct
+    // children of the statement.
+    named_children(node).any(|child| {
+        if Some(child.id()) == module_id {
+            return false;
+        }
+        match child.kind() {
+            "aliased_import" => child
+                .child_by_field_name("alias")
+                .and_then(|alias| last_identifier_text(alias, text))
+                .is_some_and(|alias| alias == name),
+            // from-import: the imported leaf (`from m import Account`). plain import: the
+            // top-level segment of the dotted module path (`import other.Account` binds
+            // `other`).
+            "dotted_name" if from_import =>
+                last_identifier_text(child, text).is_some_and(|leaf| leaf == name),
+            "dotted_name" => first_identifier_text(child, text).is_some_and(|root| root == name),
+            _ => false,
+        }
     })
 }
 
@@ -503,24 +499,6 @@ fn python_import_target(
     module_root: Option<Node<'_>>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    if child.kind() == "import_list" {
-        // grow_stack: uniform depth guard for a tree descender (#543); `import_list` doesn't nest
-        // deeply today, so this is a no-op fast path, but the invariant stays uniform.
-        rag_rat_base::stack::grow_stack(|| {
-            for clause in named_children(child) {
-                python_import_target(
-                    clause,
-                    text,
-                    path,
-                    record_alias,
-                    import_start,
-                    module_root,
-                    out,
-                );
-            }
-        });
-        return;
-    }
     // `from <module> import <target> as <alias>` — a SYMBOL alias (#174). Emit the Imports edge to
     // the target (so the in-corpus dependency is recorded) but carry the alias in `evidence` + an
     // import scope, so resolution can rebind a later `alias` reference to `target`. Recorded only

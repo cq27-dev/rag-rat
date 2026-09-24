@@ -28,8 +28,7 @@ impl ParserBackend for Kotlin {
             "object_declaration" => Some(("object", parser::child_name(node)?)),
             "function_declaration" => Some(("function", parser::child_name(node)?)),
             "property_declaration" => Some(("property", property_name(node)?)),
-            "companion_object" | "companion_object_declaration" =>
-                Some(("object", companion_name(node).unwrap_or(node))),
+            "companion_object" => Some(("object", companion_name(node).unwrap_or(node))),
             _ => None,
         }
     }
@@ -52,7 +51,7 @@ impl ParserBackend for Kotlin {
     }
 
     fn is_plumbing_node(&self, node: Node<'_>) -> bool {
-        node.kind().contains("comment") || matches!(node.kind(), "import_header" | "package_header")
+        node.kind().contains("comment") || matches!(node.kind(), "import" | "package_header")
     }
 }
 
@@ -72,8 +71,7 @@ fn companion_name(node: Node<'_>) -> Option<Node<'_>> {
             return Some(child);
         }
     }
-    named_children(node)
-        .find(|child| matches!(child.kind(), "simple_identifier" | "type_identifier"))
+    named_children(node).find(|child| child.kind() == "identifier")
 }
 
 fn property_name(node: Node<'_>) -> Option<Node<'_>> {
@@ -98,3 +96,31 @@ pub(super) const RESOLVER_POLICY: ResolutionPolicy = ResolutionPolicy {
     receiver_fallback: ReceiverFallback::TypeAndValue,
     ..ResolutionPolicy::DEFAULT
 };
+
+#[cfg(test)]
+mod tests {
+    use tree_sitter::Parser;
+
+    use super::*;
+
+    /// An import-only stretch of a Kotlin file carries no embed-worthy signal, the same as Go's
+    /// imports and Swift's. kotlin-ng names the node `import` (one per statement, directly under
+    /// the file), so that is the kind the plumbing check has to name.
+    #[test]
+    fn imports_package_header_and_comments_are_plumbing() {
+        let source =
+            "package com.example\n\n// a comment\nimport kotlin.io.println\n\nfun main() {}\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&parser::grammar_for(ParserKind::Kotlin).expect("kotlin grammar"))
+            .expect("set kotlin language");
+        let tree = parser.parse(source, None).expect("parse kotlin source");
+
+        let plumbing = named_children(tree.root_node())
+            .filter(|child| SUPPORT.is_plumbing_node(*child))
+            .map(|child| child.kind())
+            .collect::<Vec<_>>();
+
+        assert_eq!(plumbing, vec!["package_header", "line_comment", "import"]);
+    }
+}

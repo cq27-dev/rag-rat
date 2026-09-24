@@ -1396,24 +1396,24 @@ fn value_position_local_not_spuriously_type_param() {
     );
 }
 
-/// Build a synthetic `RefineMember` whose `node_spans` model a `method_call_expression`
-/// `recv.name(arg)` so the P2b guard can be exercised directly. Rust/TS tree-sitter actually
-/// emit `call_expression` + `field_expression`/`member_expression` for method calls, so the
-/// `method_call_expression` branch of `run_in_callee_position` (the over-broad one C2 widened)
-/// has no real-parse fixture — this synthesizes the node shape the branch reasons about.
-/// Columns: 0 method_call_expression, 1 recv (identifier), 2 name (field_identifier),
-/// 3 arguments, 4 arg (identifier). Bytes pin `recv.name(arg)`.
+/// Build a synthetic `RefineMember` whose `node_spans` model tree-sitter-rust's method call
+/// `recv.name(arg)` — a `call_expression` whose function is a `field_expression` — so the
+/// method-call callee guard can be exercised on exact columns. Columns: 0 call_expression, 1
+/// field_expression, 2 recv (identifier), 3 name (field_identifier), 4 arguments, 5 arg
+/// (identifier). Bytes pin `recv.name(arg)`.
 fn synthetic_method_call() -> RefineMember {
     // bytes:  recv=0..4 "recv"  .=4..5  name=5..9 "name"  (=9..10  arg=10..13 "arg"  )=13..14
     let node_spans = vec![
-        NodeSpan { start_byte: 0, end_byte: 14, kind: "method_call_expression", is_leaf: false },
+        NodeSpan { start_byte: 0, end_byte: 14, kind: "call_expression", is_leaf: false },
+        NodeSpan { start_byte: 0, end_byte: 9, kind: "field_expression", is_leaf: false },
         NodeSpan { start_byte: 0, end_byte: 4, kind: "identifier", is_leaf: true },
         NodeSpan { start_byte: 5, end_byte: 9, kind: "field_identifier", is_leaf: true },
         NodeSpan { start_byte: 9, end_byte: 14, kind: "arguments", is_leaf: false },
         NodeSpan { start_byte: 10, end_byte: 13, kind: "identifier", is_leaf: true },
     ];
     let seq = vec![
-        "method_call_expression".to_string(),
+        "call_expression".to_string(),
+        "field_expression".to_string(),
         "ID0".to_string(),
         "ID1".to_string(),
         "arguments".to_string(),
@@ -1432,27 +1432,25 @@ fn synthetic_method_call() -> RefineMember {
 
 #[test]
 fn method_call_differing_arg_is_value_param_not_closure() {
-    // P2b: the method-call callee guard was too broad — it treated ANY differing identifier
-    // inside a `method_call_expression` as a differing callee, so the ARGUMENT of `obj.map(x)`
-    // vs `obj.map(y)` was misclassified as a closure_param. The fix restricts the
-    // `method_call_expression` branch to the METHOD-NAME head.
+    // A differing identifier in a method call's ARGUMENTS is a value, not a differing callee:
+    // `obj.map(x)` vs `obj.map(y)` must not become a closure_param. The method-call callee guard
+    // fires only on the METHOD-NAME head.
 
-    // (a) Synthetic-spans unit check: the ARGUMENT leaf (column 4, inside `arguments`) is NOT a
-    // callee position; the METHOD-NAME head (column 2) IS.
+    // (a) Synthetic-spans unit check: the ARGUMENT leaf (column 5, inside `arguments`) is NOT a
+    // callee position; the METHOD-NAME head (column 3) IS.
     let m = synthetic_method_call();
     assert!(
-        !run_in_callee_position(&m, 4, 4),
+        !run_in_callee_position(&m, 5, 5),
         "a method-call ARGUMENT must NOT count as a callee position"
     );
     assert!(
-        run_in_callee_position(&m, 2, 2),
+        run_in_callee_position(&m, 3, 3),
         "the method-NAME head must count as a callee position"
     );
 
     // (b) Real-Rust end-to-end: a differing trailing method-call argument (`a.map(x, y, x)` vs
     // `a.map(x, y, y)`) classifies the differing arg as a value_param High, never a
-    // closure_param. (Rust emits `call_expression` for this, but the property — args stay
-    // value_param — is the same one the synthetic guard pins for `method_call_expression`.)
+    // closure_param — the same property the synthetic guard pins on exact columns.
     let a = member(1, "fn f() { a.map(x, y, x); }");
     let b = member(2, "fn g() { a.map(x, y, y); }");
     let (_members, template) = run(vec![a, b]);
@@ -1970,27 +1968,26 @@ fn method_call_differing_receiver_is_value_param() {
         "a differing receiver must NOT be a closure_param callee"
     );
 
-    // Synthetic-spans unit check: the RECEIVER leaf (column 1) is NOT a callee position; the
-    // METHOD-NAME head (column 2) IS.
+    // Synthetic-spans unit check: the RECEIVER leaf (column 2) is NOT a callee position; the
+    // METHOD-NAME head (column 3) IS.
     let m = synthetic_method_call();
-    assert!(!run_in_callee_position(&m, 1, 1), "the receiver must NOT count as a callee position");
+    assert!(!run_in_callee_position(&m, 2, 2), "the receiver must NOT count as a callee position");
     assert!(
-        run_in_callee_position(&m, 2, 2),
+        run_in_callee_position(&m, 3, 3),
         "the method-NAME head must count as a callee position"
     );
 }
 
 #[test]
 fn method_call_differing_method_name_is_closure_param() {
-    // P2b companion: when the METHOD NAME (not an argument) differs, the
-    // `method_call_expression` callee branch DOES fire → closure_param (the differing-callee
-    // guard, the Plan-3 SCIP seam). Synthetic spans: two members whose method-name head differs
-    // (`recv.foo(arg)` vs `recv.bar(arg)`).
+    // When the METHOD NAME (not an argument) differs, the method-call callee guard DOES fire →
+    // closure_param (a differing callee the SCIP moniker seam may later collapse). Synthetic
+    // spans: two members whose method-name head differs (`recv.foo(arg)` vs `recv.bar(arg)`).
     let head = synthetic_method_call();
     // run_in_callee_position pins the method-name head as a callee position (the structural
     // half). The full classify_run path then bands it closure_param when the values differ.
     assert!(
-        run_in_callee_position(&head, 2, 2),
+        run_in_callee_position(&head, 3, 3),
         "the differing method-NAME head must be a callee position → closure_param"
     );
 }

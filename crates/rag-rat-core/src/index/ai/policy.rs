@@ -74,7 +74,7 @@ pub(crate) fn policy_fromtext_calls() -> usize {
 /// stale-but-matching stamp would let the fast path serve mixed-code counts). A version mismatch
 /// instead correctly forces the slow recompute. See the freshness-model Risk memory bound to this
 /// file.
-pub(crate) const EMBEDDING_POLICY_VERSION: &str = "cc6a08883bce0a23";
+pub(crate) const EMBEDDING_POLICY_VERSION: &str = "b2fc1397b6b22bcf";
 
 /// `repo_meta` keys carrying the embedding-policy freshness stamp a full rebuild writes
 /// (`mark_embedding_policy_current`). PER-REPO, not the DB-global `index_meta`: one database can

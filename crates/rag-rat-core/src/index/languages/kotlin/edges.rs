@@ -7,11 +7,10 @@ pub(in crate::index::languages) fn kotlin_edges(
     out: &mut EdgeEmitter<'_>,
 ) {
     match node.kind() {
-        "import" | "import_header" | "import_directive" => {
+        "import" =>
             for name in identifiers_under(node, text) {
                 out.push(file_edge(path, node, text, name, EdgeKind::Imports));
-            }
-        },
+            },
         "call_expression" => {
             let identifiers = IdentifierPath::under(node, text);
             if let Some(name) = identifiers
@@ -68,7 +67,7 @@ pub(in crate::index::languages) fn kotlin_edges(
                 ));
             }
         },
-        "user_type" | "type_identifier" =>
+        "user_type" =>
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
                     locator,
@@ -78,7 +77,7 @@ pub(in crate::index::languages) fn kotlin_edges(
                     last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
             },
-        "delegation_specifier" | "supertype" | "super_type" => {
+        "delegation_specifier" =>
             if let Some(name) = last_identifier_text(node, text) {
                 out.push(symbol_edge(
                     locator,
@@ -87,8 +86,7 @@ pub(in crate::index::languages) fn kotlin_edges(
                     EdgeKind::Implements,
                     last_identifier_node(node).map(final_segment_node).map(CalleeRange::of_node),
                 ));
-            }
-        },
+            },
         _ => {},
     }
 }

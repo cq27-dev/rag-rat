@@ -46,7 +46,6 @@ fn is_literal_kind(kind: &str, lang: Language) -> bool {
                 | "integer"
                 | "float"
                 | "number"
-                | "char"
         )
         || (matches!(lang, Language::C | Language::Cpp) && kind == "character")
 }

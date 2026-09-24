@@ -40,11 +40,8 @@ impl ParserBackend for TypeScript {
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         let name = match node.kind() {
-            "class_declaration"
-            | "interface_declaration"
-            | "internal_module"
-            | "module"
-            | "namespace_declaration" => parser::child_name(node)?,
+            "class_declaration" | "interface_declaration" | "internal_module" | "module" =>
+                parser::child_name(node)?,
             _ => return None,
         };
         parser::node_text(name, text)
