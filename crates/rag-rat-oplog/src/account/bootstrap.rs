@@ -193,16 +193,27 @@ pub fn prune_account_candidate_reservations_in_tx(
 
 /// Every authenticated candidate hash this store holds for `account_id`, sorted for canonical
 /// enrollment encoding. Parked unauthenticated envelopes are normal-sync work, not bootstrap data.
+/// A re-enrolling store leaves out the entries its own retiring and retired identities signed
+/// (`unclaimed_own_fingerprints`): the inviter may never have received them, and they are
+/// condemned by the removal's cut.
 pub fn held_account_entry_hashes(
     conn: &Connection,
     account_id: AccountId,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
+    let unclaimed = crate::identity::unclaimed_own_fingerprints(conn)?;
     let mut stmt = conn.prepare(
-        "SELECT entry_hash FROM account_entries WHERE account_id = ?1 ORDER BY entry_hash",
+        "SELECT entry_hash, device_fingerprint FROM account_entries WHERE account_id = ?1
+          ORDER BY entry_hash",
     )?;
     let hashes = stmt
-        .query_map([account_id.to_bytes().as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .query_map([account_id.to_bytes().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, signer)| !unclaimed.iter().any(|fp| fp.to_bytes().as_slice() == signer))
+        .map(|(hash, _)| hash)
+        .collect::<Vec<_>>();
     anyhow::ensure!(
         hashes.len() <= ENROLLMENT_HELD_ENTRY_HASHES_MAX,
         "account held-proof inventory exceeds the enrollment wire bound"
@@ -249,6 +260,13 @@ pub fn adopt_enrollment_bootstrap(
     let _durability = AuthoredDurability::begin(conn)?;
     let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     super::control_policy::require_supported_account_control(&tx, bootstrap.account_id)?;
+    // A re-enrollment (#1417) swaps the staged identity in here, so the store's live identity
+    // changes only if this adoption commits; the enrolled check below rolls it back otherwise.
+    crate::identity::adopt_pending_identity_in_tx(
+        &tx,
+        bootstrap.device_fingerprint,
+        bootstrap.now_ms,
+    )?;
     // Ingest in CAUSAL order — an entry only after the entry introducing its signer's key. The
     // receipt's raw `(log_id, seq, entry_hash)` order puts EVERY promoted device's seq-0 control
     // entry before the founder-chain DeviceAdd introducing its key, so raw-order ingestion parks

@@ -177,7 +177,10 @@ pub use content_projection::{
 // vocabulary the memory subsystem needs to author + backfill entries. Every submodule above is
 // otherwise private, so this curated re-export is the ONE seam `query::memory` reaches through
 // — and the only direction of the dependency (`oplog` never depends back on `query::memory`).
-pub use identity::{LocalDevice, load_local_device, local_device, retire_local_identity_in_tx};
+pub use identity::{
+    LocalDevice, load_local_device, local_device, pending_identity_keys,
+    stage_reenrollment_identity,
+};
 // The byte-canonical op encoding, for a consumer that needs a stable identity for an op's
 // payload: the memory drain digests an anchor set to record which one it applied.
 pub use op::encode as encode_op;

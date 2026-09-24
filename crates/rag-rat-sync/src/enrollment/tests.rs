@@ -2662,29 +2662,43 @@ fn another_owner_removes_a_lost_founder_and_enrolls_its_replacement() {
 
 /// A removed device's store re-enrolls under a fresh identity (#1417). Its old fingerprint is
 /// refused by name with the nonce unspent — the store may never have learned of its removal — and
-/// the same ticket then enrolls the re-minted identity, which the store adopts over the account it
-/// already holds.
+/// the same ticket then enrolls a staged identity, which adoption swaps in over the account the
+/// store already holds. The removed device was an owner that authored an account entry the
+/// inviter never received: the re-enrolling store leaves its own identity's entries out of its
+/// held-state claim, or the redemption would refuse as unreconcilable.
 #[test]
-fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_fresh_identity() {
+fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_staged_identity() {
     let founder = db();
     let account = rag_rat_oplog::local_account(&founder, NOW).unwrap();
-    let member = joined_store(&founder, account, DeviceRole::Member);
-    let old = rag_rat_oplog::local_device(&member, NOW).unwrap();
+    let removed = joined_store(&founder, account, DeviceRole::Owner);
+    let old = rag_rat_oplog::local_device(&removed, NOW).unwrap();
+    let tx = Transaction::new_unchecked(&removed, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::ensure_owned_stream_v2_in_tx(&tx, "unsynced-repo", NOW + 1).unwrap();
+    tx.commit().unwrap();
     let tx = Transaction::new_unchecked(&founder, TransactionBehavior::Immediate).unwrap();
     rag_rat_oplog::author_device_remove_in_tx(&tx, old.fingerprint(), "forked", NOW + 2).unwrap();
     tx.commit().unwrap();
     let ticket = ticket(&founder, account, DeviceRole::Member);
-    let request_for = |device: &rag_rat_oplog::LocalDevice| EnrollmentRequest {
+    let request_for = |(ed25519_pubkey, x25519_pubkey): ([u8; 32], [u8; 32])| EnrollmentRequest {
         nonce: ticket.nonce,
         expected_account: account,
-        ed25519_pubkey: device.ed25519_public_key(),
-        x25519_pubkey: device.x25519_public_key(),
+        ed25519_pubkey,
+        x25519_pubkey,
         transport_node_id: [9; 32],
         budget: generous_budget(),
-        held_entry_hashes: Vec::new(),
+        held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(&removed, account)
+            .unwrap()
+            .into_iter()
+            .map(|hash| hash.to_bytes())
+            .collect(),
     };
 
-    let refused = redeem_invite(&founder, request_for(&old), [9; 32], &|| NOW + 3);
+    let refused = redeem_invite(
+        &founder,
+        request_for((old.ed25519_public_key(), old.x25519_public_key())),
+        [9; 32],
+        &|| NOW + 3,
+    );
     assert!(matches!(refused, Err(InviteError::DeviceRemoved)), "{:?}", refused.err());
     let used: Option<i64> = founder
         .query_row(
@@ -2695,35 +2709,43 @@ fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_fresh_identity() {
         .unwrap();
     assert_eq!(used, None, "the refusal leaves the ticket spendable");
 
-    let tx = Transaction::new_unchecked(&member, TransactionBehavior::Immediate).unwrap();
-    let (retired, fresh) = rag_rat_oplog::retire_local_identity_in_tx(&tx, NOW + 4).unwrap();
-    tx.commit().unwrap();
-    assert_eq!(retired, old.fingerprint());
-    let (receipt, _) = redeem_invite(&founder, request_for(&fresh), [9; 32], &|| NOW + 5)
-        .expect("the same ticket enrolls the fresh identity");
+    let staged = rag_rat_oplog::stage_reenrollment_identity(&removed, NOW + 4).unwrap();
+    assert_eq!(
+        rag_rat_oplog::stage_reenrollment_identity(&removed, NOW + 4).unwrap(),
+        staged,
+        "a retry presents the same staged keys, so an owner's exact replay still matches",
+    );
+    assert_eq!(
+        rag_rat_oplog::local_device(&removed, NOW + 4).unwrap().fingerprint(),
+        old.fingerprint(),
+        "staging leaves the live identity alone",
+    );
+    let (receipt, _) = redeem_invite(&founder, request_for(staged), [9; 32], &|| NOW + 5)
+        .expect("the same ticket enrolls the staged identity");
     let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
         &receipt.account_entries,
         account,
         receipt.device_add_hash.into(),
         &receipt.device_add_signed,
-        fresh.ed25519_public_key(),
-        fresh.x25519_public_key(),
+        staged.0,
+        staged.1,
     )
     .unwrap();
-    rag_rat_oplog::adopt_enrollment_bootstrap(&member, rag_rat_oplog::EnrollmentBootstrap {
+    let fresh = DeviceFingerprint::from_bytes(Sha256::digest(staged.0).into());
+    rag_rat_oplog::adopt_enrollment_bootstrap(&removed, rag_rat_oplog::EnrollmentBootstrap {
         account_entries: &receipt.account_entries,
         account_id: account,
         genesis_hash,
-        device_fingerprint: fresh.fingerprint(),
+        device_fingerprint: fresh,
         device_add_hash: receipt.device_add_hash.into(),
         now_ms: NOW + 6,
     })
     .expect("the store adopts the account it already belonged to under its new identity");
-    let roster = rag_rat_oplog::local_account_roster(&member).unwrap();
-    assert!(
-        roster.iter().any(|device| device.fingerprint == fresh.fingerprint() && device.this_device),
-        "the fresh identity is this store's seat",
-    );
+    let live = rag_rat_oplog::local_device(&removed, NOW + 7).unwrap();
+    assert_eq!(live.fingerprint(), fresh, "adoption swapped the staged identity in");
+    assert_eq!(rag_rat_oplog::pending_identity_keys(&removed).unwrap(), None);
+    let roster = rag_rat_oplog::local_account_roster(&removed).unwrap();
+    assert!(roster.iter().any(|device| device.fingerprint == fresh && device.this_device));
     assert!(roster.iter().all(|device| device.fingerprint != old.fingerprint()));
 }
 

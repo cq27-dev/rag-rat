@@ -145,13 +145,20 @@ pub(super) fn validate_enrollment_request_identity(
             "enrollment account does not match the store's existing local account".into(),
         ));
     }
-    let local = rag_rat_oplog::local_device(database, now_ms)?;
-    if request.ed25519_pubkey != local.ed25519_public_key() {
+    // A re-enrolling store presents its staged identity (#1417); adoption swaps it in.
+    let (ed25519, x25519) = match rag_rat_oplog::pending_identity_keys(database)? {
+        Some(staged) => staged,
+        None => {
+            let local = rag_rat_oplog::local_device(database, now_ms)?;
+            (local.ed25519_public_key(), local.x25519_public_key())
+        },
+    };
+    if request.ed25519_pubkey != ed25519 {
         return Err(InviteError::Malformed(
             "enrollment request ed25519 key does not match the local device identity".into(),
         ));
     }
-    if request.x25519_pubkey != local.x25519_public_key() {
+    if request.x25519_pubkey != x25519 {
         return Err(InviteError::Malformed(
             "enrollment request X25519 key does not match the local device identity".into(),
         ));

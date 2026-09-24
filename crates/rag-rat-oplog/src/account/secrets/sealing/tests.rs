@@ -648,15 +648,17 @@ fn a_retired_identity_still_opens_history_but_never_seals() {
         wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
     ingest(&conn, &bytes);
 
+    let (staged_ed, staged_x) = crate::stage_reenrollment_identity(&conn, NOW + 1).unwrap();
+    let staged = crate::device::DevicePublic::from_bytes(&staged_ed).unwrap().fingerprint();
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    let (retired, fresh) = crate::retire_local_identity_in_tx(&tx, NOW + 1).unwrap();
+    let retired = crate::identity::adopt_pending_identity_in_tx(&tx, staged, NOW + 1).unwrap();
     tx.commit().unwrap();
-    assert_eq!(retired, old.fingerprint());
-    assert_ne!(fresh.fingerprint(), old.fingerprint());
-    assert_ne!(fresh.x25519_public_key(), old.x25519_public_key(), "the X25519 key is fresh too");
+    assert_eq!(retired, Some(old.fingerprint()));
     let reloaded = local_device(&conn, NOW + 2).unwrap();
-    assert_eq!(reloaded.fingerprint(), fresh.fingerprint(), "the re-mint is what persists");
+    assert_eq!(reloaded.fingerprint(), staged, "the swap is what persists");
+    assert_eq!(reloaded.x25519_public_key(), staged_x);
+    assert_ne!(staged_x, old.x25519_public_key(), "the X25519 key is fresh too");
 
     let keyring = historical_content_keyring(&conn, account, stream_id, &reloaded).unwrap();
     assert_eq!(

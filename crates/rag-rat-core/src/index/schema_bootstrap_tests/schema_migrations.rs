@@ -2632,9 +2632,9 @@ fn migration_132_invite_checkpoint_digest() {
         .expect("a 32-byte pin is what the screen compares against");
 }
 
-/// V133 (#1417) keeps a retired identity's decryption key. Every column is exactly 32 bytes (the
-/// fingerprint, the X25519 secret and its public half), so a truncated key is refused at the
-/// schema rather than failing every unwrap it is tried on.
+/// V133 (#1417) keeps a retired identity's decryption key and stages the replacement identity.
+/// Every column is exactly 32 bytes (the fingerprint, the X25519 secret and its public half), so a
+/// truncated key is refused at the schema rather than failing every unwrap it is tried on.
 #[test]
 fn migration_133_oplog_retired_identities() {
     let bare = rusqlite::Connection::open_in_memory().unwrap();
@@ -2659,4 +2659,15 @@ fn migration_133_oplog_retired_identities() {
     }
     insert(vec![1; 32], vec![2; 32], vec![3; 32]).expect("a well-formed retired identity");
     insert(vec![1; 32], vec![4; 32], vec![5; 32]).expect_err("one row per retired fingerprint");
+
+    let stage = |id: i64, seed: Vec<u8>| {
+        bare.execute(
+            "INSERT INTO oplog_pending_identity(id, seed, x25519_secret, created_at_ms)
+             VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![id, seed, vec![6u8; 32]],
+        )
+    };
+    stage(0, vec![7; 31]).expect_err("a short staged seed is refused");
+    stage(1, vec![7; 32]).expect_err("the staged identity is a single row, like the live one");
+    stage(0, vec![7; 32]).expect("a well-formed staged identity");
 }

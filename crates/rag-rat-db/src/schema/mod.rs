@@ -1184,9 +1184,9 @@ additive_migrations! {
     MIGRATION_133_ID, MIGRATION_133_CHECKSUM, MIGRATION_133_DESCRIPTION = (
         "133_oplog_retired_identities",
         "sha256:rag-rat-oplog-retired-identities-v133",
-        "Add oplog_retired_identities: the fingerprint and X25519 key of a device identity this \
-         store replaced when it re-enrolled after removal, kept so content sealed to the old \
-         identity stays readable (#1417)",
+        "Add oplog_retired_identities and oplog_pending_identity: a removed device re-enrolls under \
+         a fresh identity that is staged until adoption swaps it in, and the replaced identity's \
+         fingerprint and X25519 key are kept so content sealed to it stays readable (#1417)",
     ) => MigrationFn::Plain(migrations::apply_oplog_retired_identities);
 }
 

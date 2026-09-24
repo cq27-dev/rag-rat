@@ -3,9 +3,9 @@
 //! Exactly ONE ed25519 keypair per store, minted from OS entropy on first use and persisted so it
 //! is stable for the life of the index — every entry this install authors (live or backfilled)
 //! signs under the same fingerprint instead of a fresh per-process key. The one exception is
-//! [`retire_local_identity_in_tx`]: a store whose device was removed from its account re-enrolls
-//! under a fresh identity, keeping only the old X25519 key (`oplog_retired_identities`) to read
-//! history sealed to it. Store-global, NOT
+//! re-enrollment: a store whose device was removed from its account stages a fresh identity
+//! ([`stage_reenrollment_identity`]) that the enrollment adoption swaps in, keeping only the old
+//! X25519 key (`oplog_retired_identities`) to read history sealed to it. Store-global, NOT
 //! repo-scoped: a device is a machine identity, orthogonal to the per-repo owner streams it signs.
 //!
 //! [`local_device`] is the single accessor: it returns the persisted identity, minting-and-storing
@@ -153,16 +153,67 @@ pub(super) fn retired_identities(conn: &Connection) -> anyhow::Result<Vec<Retire
         .collect()
 }
 
-/// Retire this store's device identity and replace it with a fresh one, in the caller's
-/// transaction (#1417). The old fingerprint and X25519 key move to `oplog_retired_identities`; the
-/// identity row gets a fresh ed25519 seed AND a fresh X25519 key. Both are fresh because a forked
-/// copy of this store elsewhere holds the old X25519 secret, and must not open what is wrapped to
-/// the new identity. The old signing seed is dropped: nothing may sign under it again. Returns the
-/// retired fingerprint and the new identity.
-pub fn retire_local_identity_in_tx(
-    tx: &rusqlite::Transaction<'_>,
+/// Stage the identity this store will re-enroll under, reusing one already staged (#1417). Both
+/// keys are fresh: a forked copy of this store elsewhere holds the old X25519 secret and must not
+/// open what is wrapped to the new identity. Nothing changes the live identity until
+/// [`adopt_pending_identity_in_tx`] runs inside a successful adoption. Returns the staged public
+/// keys, `(ed25519, x25519)`.
+pub fn stage_reenrollment_identity(
+    conn: &Connection,
     now_ms: i64,
-) -> anyhow::Result<(DeviceFingerprint, LocalDevice)> {
+) -> anyhow::Result<([u8; 32], [u8; 32])> {
+    let ed = DeviceSecret::generate()?;
+    let x = DeviceX25519Secret::generate()?;
+    conn.execute(
+        "INSERT INTO oplog_pending_identity(id, seed, x25519_secret, created_at_ms)
+         VALUES (0, ?1, ?2, ?3)
+         ON CONFLICT(id) DO NOTHING",
+        params![ed.seed().as_slice(), x.secret_bytes().as_slice(), now_ms],
+    )?;
+    pending_identity_keys(conn)?.context("staged identity missing immediately after insert")
+}
+
+/// The public keys of the staged re-enrollment identity, `(ed25519, x25519)`, if one is staged.
+pub fn pending_identity_keys(conn: &Connection) -> anyhow::Result<Option<([u8; 32], [u8; 32])>> {
+    Ok(read_pending(conn)?.map(|(ed, x)| (ed.public().to_bytes(), x.public().to_bytes())))
+}
+
+fn read_pending(conn: &Connection) -> anyhow::Result<Option<(DeviceSecret, DeviceX25519Secret)>> {
+    let row = conn
+        .query_row(
+            "SELECT seed, x25519_secret FROM oplog_pending_identity WHERE id = 0",
+            [],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    row.map(|(seed, x)| {
+        let seed: [u8; 32] =
+            seed.as_slice().try_into().context("staged seed is not exactly 32 bytes")?;
+        let x: [u8; 32] =
+            x.as_slice().try_into().context("staged x25519 secret is not exactly 32 bytes")?;
+        let (seed, x) = (Zeroizing::new(seed), Zeroizing::new(x));
+        Ok((DeviceSecret::from_seed(&seed), DeviceX25519Secret::from_seed(&x)))
+    })
+    .transpose()
+}
+
+/// Inside the adoption that enrolls `enrolled`: if it is the staged identity, retire the live one
+/// and swap the staged one in (#1417). The old fingerprint and X25519 key move to
+/// `oplog_retired_identities`; the old signing seed is dropped, so nothing signs under it again.
+/// Returns the retired fingerprint, or `None` when `enrolled` is not the staged identity (an
+/// ordinary first enrollment).
+pub(crate) fn adopt_pending_identity_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    enrolled: DeviceFingerprint,
+    now_ms: i64,
+) -> anyhow::Result<Option<DeviceFingerprint>> {
+    let Some((ed, x)) = read_pending(tx)? else {
+        return Ok(None);
+    };
+    let public = ed.public();
+    if public.fingerprint() != enrolled {
+        return Ok(None);
+    }
     let old = read_identity(tx)?
         .and_then(StoredIdentity::into_local)
         .context("this store has no complete device identity to retire")?;
@@ -177,9 +228,6 @@ pub fn retire_local_identity_in_tx(
             now_ms,
         ],
     )?;
-    let ed = DeviceSecret::generate()?;
-    let x = DeviceX25519Secret::generate()?;
-    let public = ed.public();
     let changed = tx.execute(
         "UPDATE oplog_device_identity
             SET seed = ?1, public_key = ?2, fingerprint = ?3, created_at_ms = ?4,
@@ -188,7 +236,7 @@ pub fn retire_local_identity_in_tx(
         params![
             ed.seed().as_slice(),
             public.to_bytes().as_slice(),
-            public.fingerprint().to_bytes().as_slice(),
+            enrolled.to_bytes().as_slice(),
             now_ms,
             x.secret_bytes().as_slice(),
             x.public().to_bytes().as_slice(),
@@ -196,10 +244,26 @@ pub fn retire_local_identity_in_tx(
         ],
     )?;
     anyhow::ensure!(changed == 1, "the device identity changed while it was being retired");
-    let fresh = read_identity(tx)?
-        .and_then(StoredIdentity::into_local)
-        .context("device identity missing immediately after the re-mint")?;
-    Ok((old.fingerprint, fresh))
+    tx.execute("DELETE FROM oplog_pending_identity WHERE id = 0", [])?;
+    Ok(Some(old.fingerprint))
+}
+
+/// The fingerprints whose account entries a re-enrolling store does not claim to hold: every
+/// identity it retired, plus the live one while a replacement is staged. Its own entries the
+/// inviting owner never received (a forked branch, work authored after its removal) would
+/// otherwise refuse every redemption as held-state it cannot reconcile, and they are condemned by
+/// the removal's cut in any case.
+pub(crate) fn unclaimed_own_fingerprints(
+    conn: &Connection,
+) -> anyhow::Result<Vec<DeviceFingerprint>> {
+    let mut out: Vec<DeviceFingerprint> =
+        retired_identities(conn)?.into_iter().map(|retired| retired.fingerprint).collect();
+    if pending_identity_keys(conn)?.is_some()
+        && let Some(live) = local_device_fingerprint(conn)?
+    {
+        out.push(live);
+    }
+    Ok(out)
 }
 
 /// Read this store's local device fingerprint WITHOUT minting one — `None` when no identity has
