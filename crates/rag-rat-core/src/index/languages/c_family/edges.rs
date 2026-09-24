@@ -19,32 +19,40 @@ pub(in crate::index::languages) fn c_like_edges(
             }
         },
         "call_expression" => {
-            let function = node.child_by_field_name("function").unwrap_or(node);
-            let identifiers = IdentifierPath::under(function, text, super::IDENTIFIER_KINDS);
-            if let Some(edge) = qualified_call_edge(
-                locator,
-                node,
-                text,
-                &identifiers,
-                super::IDENTIFIER_KINDS,
-                EdgeKind::CallsName,
-            ) {
+            let Some(function) = node.child_by_field_name("function") else {
+                return;
+            };
+            let identifiers = IdentifierPath::member_chain(function, text, super::IDENTIFIER_KINDS);
+            if let Some(edge) =
+                qualified_call_edge(locator, node, text, &identifiers, EdgeKind::CallsName)
+            {
                 out.push(edge);
             }
         },
         "type_identifier" | "qualified_identifier" | "namespace_identifier" => {
-            if let Some(name) = last_identifier_text(node, text, super::IDENTIFIER_KINDS) {
-                out.push(symbol_edge(
-                    locator,
-                    node,
-                    name,
-                    EdgeKind::ReferencesType,
-                    last_identifier_node(node, super::IDENTIFIER_KINDS)
-                        .map(final_segment_node)
-                        .map(CalleeRange::of_node),
-                ));
-            }
+            // Read the name along the grammar's `scope`/`name` fields, never from the whole
+            // subtree: a template argument (`ns::Thing<Item>`) is not the name it qualifies.
+            let identifiers = IdentifierPath::member_chain(node, text, super::IDENTIFIER_KINDS);
+            let Some(name) = identifiers.last_text() else {
+                return;
+            };
+            out.push(symbol_edge_with_context(
+                locator,
+                node,
+                None,
+                name.to_owned(),
+                EdgeKind::ReferencesType,
+                EdgeContext {
+                    target_qualified_name: identifiers.qualified_name(),
+                    ..Default::default()
+                },
+                identifiers.last_node().map(CalleeRange::of_node),
+            ));
         },
         _ => {},
     }
 }
+
+#[cfg(test)]
+#[path = "edges_tests.rs"]
+mod c_family_edge_tests;

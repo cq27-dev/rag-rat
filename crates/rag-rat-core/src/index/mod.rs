@@ -433,7 +433,11 @@ const MAX_AUTO_HEAL_FILES_PER_CALL: usize = 4;
 // `crate::config::BASE.to_string()` and `Handler::DEFAULT.with_body(..)` alike, since the chain's
 // ROOT decides and neither its spelling nor an intervening `?`/`.await` moves the verdict;
 // re-extract facts so existing indexes do not retain the old wrapper/delegate decision.
-const GRAPH_INDEX_VERSION: &str = "18";
+// 19: #1463 — callee, constructor, import, export and impl-trait names are read from grammar
+// fields and member chains instead of every identifier under a subtree, so arguments, lambdas and
+// template arguments no longer leak into `to_name` / qualified targets / receivers (TS, Python,
+// Kotlin, C/C++), and Rust `Implements` reads the impl's `trait` field; re-extract every edge.
+const GRAPH_INDEX_VERSION: &str = "19";
 
 // Bumped when the DEFINITION of `files.generated` changes, so an existing index re-derives the flag
 // on next open. Incremental discovery only rewrites a file row when its sha/language/kind changes —
@@ -458,8 +462,25 @@ const GENERATED_FLAGS_VERSION_KEY: &str = "generated_flags_version";
 // 2: canonical scope_path included in LogicalSymbolKey derivation (#567).
 // 3: #567 — the canonical form itself settled (see `GRAPH_INDEX_VERSION` 13), and an impl symbol's
 // qualified name now carries its trait, so every impl's key moves.
-const LOGICAL_KEY_VERSION: &str = "3";
+// 4: #1463 — a C/C++ function's name is read down its declarator chain (a function returning a
+// function pointer was named after its parameter), and an aggregate or namespace with no `name`
+// field declares no symbol and no scope segment instead of borrowing a member's name. The heal
+// re-extracts every C/C++ file row derived before it (`symbol_set_changed_at`).
+const LOGICAL_KEY_VERSION: &str = "4";
 const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
+
+/// The `LOGICAL_KEY_VERSION` at which `language`'s extractor last changed WHICH symbols a file
+/// declares or what they are named, not only their scopes. The graph heal's scope refresh patches
+/// persisted symbols in place, matched by span, and so can neither rename a symbol whose span
+/// matches nothing nor drop one the extractor no longer produces. A file row derived before this
+/// version is re-extracted whole instead.
+fn symbol_set_changed_at(language: Language) -> Option<i64> {
+    match language {
+        // 4: the C/C++ function-declarator and name-field changes above.
+        Language::C | Language::Cpp => Some(4),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -480,6 +501,11 @@ struct GraphReindexFile {
     /// Digest of the text that produced this row — the graph heal's proof that the bytes it read
     /// from the active checkout are this row's own (rows span every commit/worktree scope).
     sha256: String,
+    /// The row's own checkout scope and mtime, so a heal that re-extracts it writes the
+    /// replacement into the scope it came from.
+    checkout: CheckoutKey,
+    modified_at_ms: i64,
+    scope_version: i64,
     graph_owed: bool,
     scope_owed: bool,
 }

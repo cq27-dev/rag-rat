@@ -2,7 +2,6 @@
 //! constructions, imports, impl headers, and dispatch facts.
 use std::path::Path;
 
-use rag_rat_db::EdgeConfidence;
 use tree_sitter::Node;
 
 use super::{binders, dispatch};
@@ -21,7 +20,9 @@ pub(in crate::index::languages) fn rust_edges(
         "match_arm" => dispatch::rust_dispatch_handle_facts(text, node, locator, out),
         "macro_invocation" => rust_macro_edges(text, node, locator, out),
         "impl_item" => rust_impl_edges(text, node, locator, out),
-        "type_identifier" | "scoped_type_identifier" | "generic_type" =>
+        // Not `generic_type`: its `type` field is itself one of these and emits the edge, and
+        // the rest of it is type arguments, each its own reference.
+        "type_identifier" | "scoped_type_identifier" =>
             rust_type_reference_edges(text, node, locator, out),
         _ => {},
     }
@@ -91,7 +92,7 @@ fn rust_call_edges(
     locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    if let Some(name) = call_target_name(node, text, super::IDENTIFIER_KINDS) {
+    if let Some(name) = call_target_name(node, text) {
         out.push(symbol_edge_with_context(
             locator,
             node,
@@ -103,7 +104,7 @@ fn rust_call_edges(
                 receiver_hint: scoped_receiver_name(node, text),
                 receiver_type_hint: infer_rust_receiver_type_hint(node, text),
             },
-            call_target_node(node, super::IDENTIFIER_KINDS).map(CalleeRange::of_node),
+            call_target_node(node).map(CalleeRange::of_node),
         ));
     }
     // A scoped call receiver is a type reference only when it names a type. By Rust
@@ -230,49 +231,47 @@ fn rust_type_reference_edges(
     }
 }
 
+/// `impl Trait for Type` implements the `trait` field's trait; an inherent `impl Type` references
+/// the `type` field's type. Both are read from their fields — never from the header text, where
+/// generic binders, lifetimes, bounds and the body's own `for` loops all look like names.
 pub(super) fn rust_impl_edges(
     text: &str,
     node: Node<'_>,
     locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    let node_text = node_text(node, text);
-    let header = node_text.split('{').next().unwrap_or_default();
-    let type_names = header
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-        .filter(|part| !part.is_empty())
-        .filter(|part| !matches!(*part, "impl" | "for" | "where"))
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    if node_text.contains(" for ") && type_names.len() >= 2 {
-        let trait_name = type_names.first().cloned().unwrap_or_default();
-        let type_name = type_names.last().cloned().unwrap_or_default();
-        out.push(EdgeCandidate {
-            from_symbol_id: locator.find(node.start_byte()).map(|symbol| symbol.id),
-            from_name: Some(type_name),
-            to_name: trait_name,
-            target_qualified_name: None,
-            evidence: Some(edge_evidence(node, text)),
-            receiver_hint: None,
-            receiver_type_hint: None,
-            source_span: span_for_node(node),
-            // The trait/type names here come from string-splitting the impl header, not from a
-            // located identifier node, so there is no clean callee range to record (#67).
-            callee_span: None,
-            import_scope: None,
-            edge_kind: EdgeKind::Implements,
-            confidence: EdgeConfidence::NameOnly,
-        });
-    } else if let Some(type_name) = type_names.first() {
-        out.push(symbol_edge(
-            locator,
-            node,
-            type_name.clone(),
-            EdgeKind::ReferencesType,
-            // `type_name` is string-split from the impl header, not a located node — no range
-            // (#67).
-            None,
-        ));
+    let (field, edge_kind) = if node.child_by_field_name("trait").is_some() {
+        ("trait", EdgeKind::Implements)
+    } else {
+        ("type", EdgeKind::ReferencesType)
+    };
+    let Some(path) = node.child_by_field_name(field).and_then(impl_path) else {
+        return;
+    };
+    let name = final_segment_node(path);
+    let rendered = super::render_owner(path, text, &[]);
+    out.push(symbol_edge_with_context(
+        locator,
+        node,
+        Some(text),
+        node_text(name, text),
+        edge_kind,
+        EdgeContext {
+            target_qualified_name: rendered.contains("::").then_some(rendered),
+            ..Default::default()
+        },
+        Some(CalleeRange::of_node(name)),
+    ));
+}
+
+/// The nominal path an impl's trait or self type names — `Foo` for `&'a Foo<T>`, `a::Tr` for
+/// `a::Tr<u8>`. `None` for a non-nominal self type (`()`, `[T]`, `dyn X`).
+fn impl_path(node: Node<'_>) -> Option<Node<'_>> {
+    let nominal = super::unwrap_impl_type(node)?;
+    if nominal.kind() == "generic_type" {
+        nominal.child_by_field_name("type")
+    } else {
+        Some(nominal)
     }
 }
 

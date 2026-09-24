@@ -588,3 +588,50 @@ fn alias_scope_scan_walks_unpacking_and_expression_statements() {
     assert!(has(&e, EdgeKind::Imports, "Account"), "aliased import target: {e:?}");
     assert!(!has(&e, EdgeKind::Imports, "Acct"), "alias is not an import target: {e:?}");
 }
+
+fn facts(src: &str, kind: EdgeKind) -> Vec<crate::index::languages::test_support::EdgeFact> {
+    crate::index::languages::test_support::edge_facts("src/Main.py", Language::Python, src, kind)
+}
+
+/// A call result has no name, so a call on it has no receiver or qualified target, and the
+/// argument `bar` is never part of the path.
+#[test]
+fn a_call_on_a_call_result_has_no_receiver() {
+    use crate::index::languages::test_support::fact;
+    assert_eq!(facts("foo(bar).baz()\n", EdgeKind::CallsName), vec![
+        fact(EdgeKind::CallsName, "baz", None, None),
+        fact(EdgeKind::CallsName, "foo", None, None),
+    ]);
+    assert_eq!(facts("expect(x).toBe(1)\n", EdgeKind::CallsName), vec![
+        fact(EdgeKind::CallsName, "toBe", None, None),
+        fact(EdgeKind::CallsName, "expect", None, None),
+    ]);
+}
+
+/// A chain rooted in an unnamed value stays unrooted however deep it goes.
+#[test]
+fn a_nested_member_of_a_call_result_has_no_receiver() {
+    use crate::index::languages::test_support::fact;
+    assert_eq!(facts("foo(bar).x.baz()\n", EdgeKind::CallsName), vec![
+        fact(EdgeKind::CallsName, "baz", None, None),
+        fact(EdgeKind::CallsName, "foo", None, None),
+    ]);
+    assert_eq!(facts("self.d.e(f)\n", EdgeKind::CallsName), vec![fact(
+        EdgeKind::CallsName,
+        "e",
+        Some("self::d::e"),
+        Some("self")
+    )]);
+}
+
+/// `import os.path as osp` imports `os.path`: the root stays in the qualified target.
+#[test]
+fn a_dotted_import_keeps_its_root() {
+    use crate::index::languages::test_support::fact;
+    assert_eq!(facts("import os.path as osp\n", EdgeKind::Imports), vec![fact(
+        EdgeKind::Imports,
+        "path",
+        Some("os::path"),
+        None
+    )]);
+}

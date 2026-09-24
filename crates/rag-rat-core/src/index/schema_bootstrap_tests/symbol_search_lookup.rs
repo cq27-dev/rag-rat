@@ -1979,11 +1979,20 @@ fun unrelatedBuilderCalls(dialog: AndroidDialogBuilder) {
     .unwrap();
     let config = source_config(root.clone(), Language::Kotlin);
     let db = IndexDatabase::rebuild(&config).unwrap();
-    let target = db
-        .symbols("build", Some(Language::Kotlin), 10)
-        .unwrap()
-        .into_iter()
-        .find(|symbol| symbol.qualified_name.contains("WatchProposalBuilder"))
+    // `build` also fuzzy-matches the object `WatchProposalBuilder` itself, so pick the METHOD:
+    // the `build` declared inside the object's span.
+    let hits = db.symbols("build", Some(Language::Kotlin), 10).unwrap();
+    let object = hits
+        .iter()
+        .find(|symbol| symbol.name == "WatchProposalBuilder")
+        .expect("WatchProposalBuilder object symbol");
+    let target = hits
+        .iter()
+        .find(|symbol| {
+            symbol.name == "build"
+                && symbol.start_byte >= object.start_byte
+                && symbol.end_byte <= object.end_byte
+        })
         .expect("WatchProposalBuilder.build symbol");
     let callers = db
         .find_callers_with_options("build", 20, &rag_rat_query::graph::GraphTraversalOptions {

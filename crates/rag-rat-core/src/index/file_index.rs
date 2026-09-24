@@ -107,7 +107,7 @@ impl IndexDatabase {
         })
     }
 
-    fn index_file(
+    pub(super) fn index_file(
         &self,
         path: &Path,
         language: Language,

@@ -80,37 +80,24 @@ fn python_import_statement_edges(
     }
 }
 
-/// Function / method / constructor call. Mirror the C handler: the callee is the LAST identifier
-/// under the `function` child (`f()` → `f`, `obj.method()` → `method`), the receiver is the first
-/// (recorded only as a NameOnly hint — never claimed as exact; resolving it is the oracle's job,
-/// not the heuristic's).
+/// Function / method / constructor call. The callee is the member chain of the `function` field
+/// (`f()` → `f`, `obj.method()` → `method`), the receiver its head (recorded only as a NameOnly
+/// hint — never claimed as exact; resolving it is the oracle's job, not the heuristic's).
+/// `handlers[key]()` and `make()()` have no callee name, so they emit nothing: a wrong
+/// `calls_name key` is worse than a missing edge.
 fn python_call_edges(
     text: &str,
     node: Node<'_>,
     locator: &SymbolLocator<'_>,
     out: &mut EdgeEmitter<'_>,
 ) {
-    let function = node.child_by_field_name("function").unwrap_or(node);
-    let identifiers = IdentifierPath::under(function, text, super::IDENTIFIER_KINDS);
-    // `handlers[key]()` — the callee is the subscript RESULT, not the index variable
-    // `last()` would pick. There's no clean callee identifier, so emit nothing (a wrong
-    // `calls_name key` is worse than a missing edge).
-    if function.kind() == "subscript" {
-        // fall through to recursion without emitting a call edge
-    } else if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
-        out.push(symbol_edge_with_context(
-            locator,
-            node,
-            Some(text),
-            name,
-            EdgeKind::CallsName,
-            EdgeContext {
-                target_qualified_name: identifiers.qualified_name(),
-                receiver_hint: identifiers.receiver_text().map(ToOwned::to_owned),
-                ..Default::default()
-            },
-            identifiers.last_node().map(CalleeRange::of_node),
-        ));
+    let Some(function) = node.child_by_field_name("function") else {
+        return;
+    };
+    let identifiers = IdentifierPath::member_chain(function, text, super::IDENTIFIER_KINDS);
+    if let Some(edge) = qualified_call_edge(locator, node, text, &identifiers, EdgeKind::CallsName)
+    {
+        out.push(edge);
     }
 }
 
@@ -178,7 +165,7 @@ fn python_decorator_edges(
     if !matches!(inner.kind(), "identifier" | "attribute") {
         return;
     }
-    let identifiers = IdentifierPath::under(inner, text, super::IDENTIFIER_KINDS);
+    let identifiers = IdentifierPath::member_chain(inner, text, super::IDENTIFIER_KINDS);
     let Some(name) = identifiers.last_text().map(ToOwned::to_owned) else {
         return;
     };
@@ -247,7 +234,7 @@ fn emit_python_type_refs(
         // qualified name the rebind would have nothing to rewrite and resolution would fall
         // back to the ambiguous bare tail.
         "attribute" | "dotted_name" => {
-            let identifiers = IdentifierPath::under(node, text, super::IDENTIFIER_KINDS);
+            let identifiers = IdentifierPath::member_chain(node, text, super::IDENTIFIER_KINDS);
             if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
                 let receiver = node
                     .child_by_field_name("object")
@@ -542,10 +529,14 @@ fn python_import_target(
         "dotted_name" => Some(child),
         _ => None,
     };
-    if let Some(target) = target
-        && let Some(name) = last_identifier_text(target, text, super::IDENTIFIER_KINDS)
-    {
-        out.push(file_edge(path, target, text, name, EdgeKind::Imports));
+    // `import os.path` names `path`, and keeps the whole written path as the qualified target.
+    if let Some(target) = target {
+        let identifiers = IdentifierPath::member_chain(target, text, super::IDENTIFIER_KINDS);
+        if let Some(name) = identifiers.last_text().map(ToOwned::to_owned) {
+            let mut edge = file_edge(path, target, text, name, EdgeKind::Imports);
+            edge.target_qualified_name = identifiers.qualified_name();
+            out.push(edge);
+        }
     }
 }
 

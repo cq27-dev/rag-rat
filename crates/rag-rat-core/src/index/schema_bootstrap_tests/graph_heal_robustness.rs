@@ -442,11 +442,13 @@ fn an_older_binary_does_not_downgrade_future_row_provenance() {
     // feedback: a hard-coded stamp silently became equal to the current version and the test
     // stopped proving anything).
     let future_graph_version = GRAPH_INDEX_VERSION.parse::<i64>().unwrap() + 1;
+    // The same for the scope / logical-key stamp.
+    let future_key_version = LOGICAL_KEY_VERSION.parse::<i64>().unwrap() + 1;
     db.storage
         .connection()
         .execute(
-            "UPDATE main.files SET graph_version = ?2, scope_version = 4 WHERE id = ?1",
-            params![future_id, future_graph_version],
+            "UPDATE main.files SET graph_version = ?2, scope_version = ?3 WHERE id = ?1",
+            params![future_id, future_graph_version, future_key_version],
         )
         .unwrap();
     db.storage
@@ -456,12 +458,12 @@ fn an_older_binary_does_not_downgrade_future_row_provenance() {
         ])
         .unwrap();
     db.set_repo_meta("graph_index_version", "0").unwrap();
-    db.set_repo_meta(LOGICAL_KEY_VERSION_KEY, "4").unwrap();
+    db.set_repo_meta(LOGICAL_KEY_VERSION_KEY, &future_key_version.to_string()).unwrap();
 
     db.ensure_graph_index_current().unwrap();
 
     assert_eq!(file_graph_version(&db, future_id), future_graph_version);
-    assert_eq!(file_scope_version(&db, future_id), 4);
+    assert_eq!(file_scope_version(&db, future_id), future_key_version);
     assert_eq!(
         edge_targets_with_resolution(&db, future_id),
         future_edges,
@@ -470,8 +472,8 @@ fn an_older_binary_does_not_downgrade_future_row_provenance() {
     assert_eq!(file_graph_version(&db, owed_id), GRAPH_INDEX_VERSION.parse::<i64>().unwrap());
     assert_eq!(file_scope_version(&db, owed_id), 0, "scope healing waits for the newer binary");
     assert_eq!(
-        db.repo_meta(LOGICAL_KEY_VERSION_KEY).unwrap().as_deref(),
-        Some("4"),
+        db.repo_meta(LOGICAL_KEY_VERSION_KEY).unwrap(),
+        Some(future_key_version.to_string()),
         "the older binary preserves the future global grouping stamp"
     );
     let _ = fs::remove_dir_all(&root);
@@ -966,4 +968,181 @@ fn a_heal_that_renames_an_impl_moves_its_chunk_path_with_it() {
     );
 
     let _ = fs::remove_dir_all(&root);
+}
+
+fn file_symbol_names(db: &IndexDatabase, path: &str) -> Vec<String> {
+    let mut names = db
+        .storage
+        .connection()
+        .prepare(
+            "SELECT s.name FROM main.symbols s JOIN main.files f ON f.id = s.file_id
+             WHERE f.path = ?1 AND f.repo_id = ?2 AND f.generation = ?3",
+        )
+        .unwrap()
+        .query_map(params![path, &db.active_repo_id, db.active_generation], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    names.sort();
+    names
+}
+
+/// The C/C++ extractor changed WHICH symbols a file declares at logical-key version 4: a function
+/// returning a function pointer was named after its parameter, and an anonymous aggregate took a
+/// member's name. The span-matched scope refresh can neither rename the first nor drop the second,
+/// so an index derived before that version must come out of the upgrade heal with exactly the
+/// symbols a fresh index has.
+#[test]
+fn a_c_file_derived_before_the_symbol_change_is_re_extracted_on_upgrade() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/sig.c"),
+        "void (*get_handler(int sig))(int) { return 0; }\nstruct { int x; } anon;\n",
+    )
+    .unwrap();
+    let config = source_config(root.to_path_buf(), Language::C);
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    let fresh = file_symbol_names(&db, "src/sig.c");
+    assert!(fresh.contains(&"get_handler".to_string()), "fixture: {fresh:?}");
+
+    // What the previous extractor persisted: the function under its parameter's name, plus a
+    // symbol for the anonymous struct under its member's name.
+    let file_id = scoped_file_id(&db, "src/sig.c", &db.active_worktree_id.clone());
+    db.storage
+        .connection()
+        .execute(
+            "UPDATE main.symbols SET name = 'sig' WHERE file_id = ?1 AND name = 'get_handler'",
+            [file_id],
+        )
+        .unwrap();
+    db.storage
+        .connection()
+        .execute(
+            "INSERT INTO main.symbols(file_id, name, kind, language, qualified_name_id, \
+             scope_path,
+                 signature, start_line, end_line, start_byte, end_byte)
+             SELECT file_id, 'x', 'struct', language, qualified_name_id, '', signature, 2, 2, 49, \
+             66
+             FROM main.symbols WHERE file_id = ?1 LIMIT 1",
+            [file_id],
+        )
+        .unwrap();
+    owe_both_heals(&db);
+    let previous_key_version = LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1;
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET scope_version = ?1 WHERE id = ?2", [
+            previous_key_version,
+            file_id,
+        ])
+        .unwrap();
+    db.set_repo_meta(LOGICAL_KEY_VERSION_KEY, &previous_key_version.to_string()).unwrap();
+    drop(db);
+
+    let db = IndexDatabase::open_config(&config).unwrap();
+    assert_eq!(file_symbol_names(&db, "src/sig.c"), fresh);
+    let healed_id = scoped_file_id(&db, "src/sig.c", &db.active_worktree_id.clone());
+    assert_eq!(file_scope_version(&db, healed_id), LOGICAL_KEY_VERSION.parse::<i64>().unwrap());
+    assert_eq!(file_graph_version(&db, healed_id), current_graph_version());
+    assert_eq!(
+        db.repo_meta(LOGICAL_KEY_VERSION_KEY).unwrap().as_deref(),
+        Some(LOGICAL_KEY_VERSION),
+        "the re-extracted row leaves nothing owed, so the key version is stamped"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn scoped_symbol_names(db: &IndexDatabase, file_id: i64) -> Vec<String> {
+    let mut names = db
+        .storage
+        .connection()
+        .prepare("SELECT name FROM main.symbols WHERE file_id = ?1")
+        .unwrap()
+        .query_map([file_id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    names.sort();
+    names
+}
+
+/// Rewrite every symbol named `from` in a file row to `to` and rewind the row (and the repo
+/// summary) to the previous logical-key version — the state an index derived by the previous C
+/// extractor is in.
+fn stage_previous_c_derivation(db: &IndexDatabase, file_id: i64, from: &str, to: &str) {
+    db.storage
+        .connection()
+        .execute("UPDATE main.symbols SET name = ?3 WHERE file_id = ?1 AND name = ?2", params![
+            file_id, from, to
+        ])
+        .unwrap();
+    let previous_key_version = LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1;
+    db.storage
+        .connection()
+        .execute("UPDATE main.files SET scope_version = ?1 WHERE id = ?2", [
+            previous_key_version,
+            file_id,
+        ])
+        .unwrap();
+    db.set_repo_meta(LOGICAL_KEY_VERSION_KEY, &previous_key_version.to_string()).unwrap();
+}
+
+/// The re-extract replaces a row from its own verified bytes in its own scope: the base checkout's
+/// heal leaves a sibling worktree's C row (different bytes) owed and untouched, and the sibling's
+/// own open then re-extracts it from the branch body.
+#[test]
+fn a_c_re_extract_heals_each_checkout_from_its_own_bytes() {
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/sig.c"), "void (*base_handler(int sig))(int) { return 0; }\n")
+        .unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let config = source_config(main.clone(), Language::C);
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(linked.join("src/sig.c"), "void (*branch_handler(int sig))(int) { return 0; }\n")
+        .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch body"]);
+    db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+
+    set_base_scope(&mut db, &main);
+    let base_id = scoped_file_id(&db, "src/sig.c", "");
+    let overlay_id = scoped_file_id(&db, "src/sig.c", &worktree_id_of(&linked));
+    stage_previous_c_derivation(&db, base_id, "base_handler", "sig");
+    stage_previous_c_derivation(&db, overlay_id, "branch_handler", "sig");
+    *db.drift_snapshot.lock().expect("drift snapshot lock") = None;
+
+    db.ensure_graph_index_current().unwrap();
+    let base_id = scoped_file_id(&db, "src/sig.c", "");
+    assert_eq!(scoped_symbol_names(&db, base_id), vec!["base_handler"]);
+    assert_eq!(scoped_symbol_names(&db, overlay_id), vec!["sig"], "the sibling row is untouched");
+    assert_eq!(
+        file_scope_version(&db, overlay_id),
+        LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1
+    );
+
+    let mut linked_config = source_config(linked.to_path_buf(), Language::C);
+    linked_config.database = config.database.clone();
+    drop(db);
+    let linked_db = IndexDatabase::open_config(&linked_config).unwrap();
+    let overlay_id = scoped_file_id(&linked_db, "src/sig.c", &worktree_id_of(&linked));
+    assert_eq!(scoped_symbol_names(&linked_db, overlay_id), vec!["branch_handler"]);
+    assert_eq!(scoped_symbol_names(&linked_db, base_id), vec!["base_handler"]);
+    assert_eq!(
+        linked_db.repo_meta(LOGICAL_KEY_VERSION_KEY).unwrap().as_deref(),
+        Some(LOGICAL_KEY_VERSION)
+    );
+
+    let _ = fs::remove_dir_all(&main);
+    let _ = fs::remove_dir_all(&linked);
 }
