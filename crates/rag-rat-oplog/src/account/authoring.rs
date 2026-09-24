@@ -734,6 +734,62 @@ pub fn author_device_remove_in_tx(
     Ok(entry_hash)
 }
 
+/// Promote `subject` — an enrolled `Member` — to owner, on the local (owner) account's control log,
+/// then VERIFY THE FACT: `subject`'s open owner incarnation is the one THIS entry minted.
+///
+/// This is how an account gets a second owner, which recovery depends on (#1417): a device whose
+/// chain forked cannot sign its own removal, so another owner has to. A sole owner whose fork is
+/// not on the control chain can still sign this, promote a device it trusts, and have that device
+/// remove it.
+///
+/// Refuses up front, with the reason, what the fold would reject silently: a subject that is not
+/// roster-effective, one enrolled read-only (an enrollment role is immutable, so a read-only device
+/// never authors), and one that already holds an owner incarnation.
+pub fn author_owner_promote_in_tx(
+    tx: &Transaction<'_>,
+    subject: DeviceFingerprint,
+    now_ms: i64,
+) -> anyhow::Result<OwnerId> {
+    let LocalAccountRef { account_id, genesis_hash } = bootstrap::local_account_ref(tx)?.context(
+        "cannot promote a device before the store's local account is minted (call local_account \
+         first)",
+    )?;
+    super::control_policy::require_supported_account_control(tx, account_id)?;
+    let device = local_device(tx, now_ms)?;
+    anyhow::ensure!(
+        storage::effective_owner_incarnation_for_device(tx, account_id, device.fingerprint())?
+            .is_some(),
+        "the local device holds no effective owner incarnation on this account, so it cannot \
+         promote a device",
+    );
+    match storage::effective_roster_entry_in_snapshot(tx, account_id, subject)? {
+        None => anyhow::bail!("that device is not enrolled on this account"),
+        Some((_, ops::DeviceRole::ReadOnly)) => anyhow::bail!(
+            "that device was enrolled read-only, and an enrollment role is permanent: a read-only \
+             device can never author, so it cannot become an owner. Enroll it again as a member \
+             or owner instead"
+        ),
+        Some(_) => {},
+    }
+    anyhow::ensure!(
+        storage::effective_owner_incarnation_for_device(tx, account_id, subject)?.is_none(),
+        "that device is already an owner",
+    );
+
+    let op = AccountOp::OwnerPromote { device_fingerprint: subject };
+    let entry_hash =
+        author_account_op_in_tx(tx, &device, account_id, genesis_hash, &op, None, now_ms)?;
+    // The FACT, tied to this entry: the subject's open incarnation is the one this promote minted.
+    // Presence alone would pass on a concurrent sibling's promotion while ours folded rejected.
+    let minted = OwnerId::from_bytes(entry_hash.into());
+    anyhow::ensure!(
+        storage::effective_owner_incarnation_for_device(tx, account_id, subject)? == Some(minted),
+        "the OwnerPromote did not give that device this owner incarnation — the local device \
+         lacks effective owner authority, or a concurrent operation won the fold",
+    );
+    Ok(minted)
+}
+
 /// Author a `StreamGrant` granting `grantee_account_id` `role` on `stream_id`, on the local
 /// (owner) account's control log, then VERIFY THE FACT — the grant became effective at the
 /// requested role for that subject — not the entry status. Returns the `grant_id` (the grant
@@ -2886,5 +2942,103 @@ mod tests {
         let tx = Transaction::new_unchecked(&live, TransactionBehavior::Immediate).unwrap();
         ensure_owned_stream_v2_in_tx(&tx, "repo-e", NOW).expect("the control chain is not forked");
         tx.commit().unwrap();
+    }
+
+    fn enrol_as(
+        conn: &Connection,
+        seed: u8,
+        role: ops::DeviceRole,
+        label: Option<&str>,
+    ) -> DeviceFingerprint {
+        let joiner = DeviceSecret::from_seed(&[seed; 32]);
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        author_device_add_in_tx(
+            &tx,
+            EnrollingDevice {
+                ed25519_pubkey: joiner.public().to_bytes(),
+                x25519_pubkey: DeviceX25519Secret::from_seed(&[seed.wrapping_add(1); 32])
+                    .public()
+                    .to_bytes(),
+                label: label.map(str::to_owned),
+            },
+            role,
+            NOW,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        joiner.public().fingerprint()
+    }
+
+    fn promote(conn: &Connection, subject: DeviceFingerprint) -> anyhow::Result<OwnerId> {
+        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).unwrap();
+        let minted = author_owner_promote_in_tx(&tx, subject, NOW)?;
+        tx.commit().unwrap();
+        Ok(minted)
+    }
+
+    /// An owner promotes a member, and the member then holds the owner incarnation this promotion
+    /// minted — the second owner a forked sole owner needs to have itself removed (#1417).
+    #[test]
+    fn an_owner_promotes_a_member_to_owner() {
+        let conn = db();
+        let (account, _) = account_owning_a_public_stream(&conn);
+        let member = enrol_as(&conn, 0x61, ops::DeviceRole::Member, None);
+
+        let minted = promote(&conn, member).expect("the founder promotes a member");
+        assert_eq!(
+            storage::effective_owner_incarnation_for_device(&conn, account, member).unwrap(),
+            Some(minted),
+            "the member now holds exactly this incarnation",
+        );
+        let err = promote(&conn, member).expect_err("promoting twice is refused");
+        assert!(err.to_string().contains("already an owner"), "{err}");
+    }
+
+    #[test]
+    fn promotion_refuses_a_read_only_or_unenrolled_device_with_the_reason() {
+        let conn = db();
+        let _ = account_owning_a_public_stream(&conn);
+        let reader = enrol_as(&conn, 0x62, ops::DeviceRole::ReadOnly, None);
+        let err = promote(&conn, reader).expect_err("a read-only device cannot become an owner");
+        assert!(err.to_string().contains("read-only"), "{err}");
+
+        let stranger = DeviceSecret::from_seed(&[0x63; 32]).public().fingerprint();
+        let err = promote(&conn, stranger).expect_err("an unenrolled device cannot be promoted");
+        assert!(err.to_string().contains("not enrolled"), "{err}");
+    }
+
+    /// The roster an operator sees: roles, labels from each enrollment, owner status, and which
+    /// device is this one — and a fingerprint prefix resolves only when it names one device.
+    #[test]
+    fn the_roster_lists_devices_and_resolves_a_fingerprint_prefix() {
+        let conn = db();
+        let _ = account_owning_a_public_stream(&conn);
+        let laptop = enrol_as(&conn, 0x64, ops::DeviceRole::Member, Some("laptop"));
+        let reader = enrol_as(&conn, 0x65, ops::DeviceRole::ReadOnly, None);
+        promote(&conn, laptop).unwrap();
+
+        let roster = crate::local_account_roster(&conn).unwrap();
+        assert_eq!(roster.len(), 3);
+        let founder = &roster[0];
+        assert!(founder.this_device && founder.owner, "the founder is listed first");
+        let listed_laptop = roster.iter().find(|d| d.fingerprint == laptop).unwrap();
+        assert_eq!(listed_laptop.label.as_deref(), Some("laptop"));
+        assert!(listed_laptop.owner && !listed_laptop.this_device);
+        let listed_reader = roster.iter().find(|d| d.fingerprint == reader).unwrap();
+        assert_eq!(listed_reader.role, ops::DeviceRole::ReadOnly);
+        assert!(!listed_reader.owner);
+
+        let hex = rag_rat_base::hash::hex_lower(&laptop.to_bytes());
+        assert_eq!(crate::resolve_roster_device(&conn, &hex[..10]).unwrap().fingerprint, laptop);
+        assert!(crate::resolve_roster_device(&conn, &hex[..4]).is_err(), "too short");
+        assert!(crate::resolve_roster_device(&conn, "ffffffffff").is_err(), "no such device");
+
+        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+        author_device_remove_in_tx(&tx, reader, "lost", NOW + 1).unwrap();
+        tx.commit().unwrap();
+        let roster = crate::local_account_roster(&conn).unwrap();
+        assert!(roster.iter().all(|d| d.fingerprint != reader), "a removed device drops out");
+        let reader_hex = rag_rat_base::hash::hex_lower(&reader.to_bytes());
+        assert!(crate::resolve_roster_device(&conn, &reader_hex).is_err());
     }
 }

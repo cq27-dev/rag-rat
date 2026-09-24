@@ -473,6 +473,31 @@ pub(crate) enum SyncCommand {
     },
     /// List who holds access to this repo's shared memories.
     Grants,
+    /// List this account's enrolled devices: fingerprint, role, label, and which hold owner
+    /// authority.
+    Devices,
+    /// Remove an enrolled device from this account (owner-only).
+    #[command(long_about = "Authors a device removal on this account, run from ANOTHER owner \
+                            device: a device cannot remove itself. Use it for a lost device, or \
+                            for one whose store forked (`sync whoami` lists forked chains) so \
+                            its store can enroll again as a new device. The removed device loses \
+                            access to keys rotated after this; the stream keys it held rotate at \
+                            the next write. A sole owner promotes another device first (`sync \
+                            promote`).")]
+    RemoveDevice {
+        /// The device's fingerprint, or at least its first 8 hex digits (see `sync devices`).
+        #[arg(value_name = "DEVICE")]
+        device: String,
+        /// Why it was removed, recorded in the account log.
+        #[arg(long, default_value = "removed")]
+        reason: String,
+    },
+    /// Give an enrolled member device owner authority on this account (owner-only).
+    Promote {
+        /// The device's fingerprint, or at least its first 8 hex digits (see `sync devices`).
+        #[arg(value_name = "DEVICE")]
+        device: String,
+    },
     /// Contribute this repo's memories to another identity's shared knowledge base.
     #[command(long_about = "Configures this repo to author its memories onto ANOTHER account's \
                             owner stream (the paste flow): subsequent memory changes target that \
@@ -1372,6 +1397,30 @@ mod tests {
                 assert_eq!(account.original, "ab".repeat(32)),
             other => panic!("expected sync grant, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_device_commands_parse() {
+        let remove =
+            Cli::try_parse_from(["rag-rat", "sync", "remove-device", "abcd1234"]).expect("parse");
+        match remove.command {
+            Command::Sync(SyncArgs { command: SyncCommand::RemoveDevice { device, reason } }) => {
+                assert_eq!(device, "abcd1234");
+                assert_eq!(reason, "removed");
+            },
+            other => panic!("expected sync remove-device, got {other:?}"),
+        }
+        let promote =
+            Cli::try_parse_from(["rag-rat", "sync", "promote", "abcd1234"]).expect("parse");
+        assert!(matches!(
+            promote.command,
+            Command::Sync(SyncArgs { command: SyncCommand::Promote { .. } })
+        ));
+        let devices = Cli::try_parse_from(["rag-rat", "sync", "devices"]).expect("parse");
+        assert!(matches!(
+            devices.command,
+            Command::Sync(SyncArgs { command: SyncCommand::Devices })
+        ));
     }
 
     #[test]

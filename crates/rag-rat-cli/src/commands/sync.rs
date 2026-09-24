@@ -67,6 +67,21 @@ pub(crate) fn sync(config: &Config, args: &SyncArgs) -> anyhow::Result<()> {
         SyncCommand::Revoke { account, reason, keep_until } =>
             with_repo_db(config, |db| revoke(db, account, *reason, *keep_until)),
         SyncCommand::Grants => with_repo_db(config, grants),
+        SyncCommand::Devices => with_repo_db(config, devices),
+        SyncCommand::RemoveDevice { device, reason } => with_repo_db(config, |db| {
+            let removed = db.sync_remove_device(device, reason)?;
+            print_output(&serde_json::json!({
+                "status": "removed",
+                "device": device_json(&removed),
+                "note": "stream keys it held rotate at the next write; to enroll that machine again, `sync join` from a fresh store",
+            }))
+        }),
+        SyncCommand::Promote { device } => with_repo_db(config, |db| {
+            let promoted = db.sync_promote_device(device)?;
+            print_output(
+                &serde_json::json!({"status": "promoted", "device": device_json(&promoted)}),
+            )
+        }),
         SyncCommand::Contribute { account } => with_repo_db(config, |db| contribute(db, account)),
         SyncCommand::Subscribe { account } =>
             with_repo_db(config, |db| subscribe(config, db, account.as_deref())),
@@ -213,6 +228,23 @@ fn catch_up(db: &IndexDatabase, target: rag_rat_oplog::DeviceFingerprint) -> any
         "transport_configured": false,
         "note": "existing live keys were re-wrapped without rotation; no enrollment, pairing, or transport occurred",
     }))
+}
+
+fn devices(db: &IndexDatabase) -> anyhow::Result<()> {
+    let devices = db.sync_devices()?;
+    print_output(&serde_json::json!({
+        "devices": devices.iter().map(device_json).collect::<Vec<_>>(),
+    }))
+}
+
+fn device_json(device: &rag_rat_oplog::RosterDevice) -> serde_json::Value {
+    serde_json::json!({
+        "fingerprint": device.fingerprint.to_string(),
+        "role": device.role.as_db_str(),
+        "label": device.label,
+        "owner": device.owner,
+        "this_device": device.this_device,
+    })
 }
 
 fn whoami(db: &IndexDatabase) -> anyhow::Result<()> {

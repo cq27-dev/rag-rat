@@ -1286,6 +1286,33 @@ fn publish_access_mode_ratchet_survives_a_deleted_intent_row() {
 }
 
 #[test]
+fn promoting_a_member_reports_it_as_an_owner() {
+    let conn = scoped_conn();
+    rag_rat_oplog::local_account(&conn, 1_000).unwrap();
+    let other = scoped_conn();
+    let member = rag_rat_oplog::local_device(&other, 1_000).unwrap();
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate).unwrap();
+    rag_rat_oplog::author_device_add_in_tx(
+        &tx,
+        rag_rat_oplog::EnrollingDevice {
+            ed25519_pubkey: member.ed25519_public_key(),
+            x25519_pubkey: member.x25519_public_key(),
+            label: None,
+        },
+        rag_rat_oplog::DeviceRole::Member,
+        1_500,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let fingerprint = member.fingerprint().to_string();
+    let promoted =
+        super::super::grants::promote_account_device(&conn, &fingerprint[..12], 2_000).unwrap();
+    assert_eq!(promoted.fingerprint, member.fingerprint());
+    assert!(promoted.owner, "the result reflects the promotion");
+}
+
+#[test]
 fn catch_up_is_idempotent_for_an_already_covered_effective_device() {
     let conn = scoped_conn();
     enable_sealed_authoring(&conn, 1_000).unwrap();

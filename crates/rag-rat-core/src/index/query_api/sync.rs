@@ -153,6 +153,35 @@ impl IndexDatabase {
         rag_rat_oplog::local_forked_chains(self.storage.connection())
     }
 
+    /// The local account's enrolled devices: role, label, owner authority, and which is this one.
+    pub fn sync_devices(&self) -> anyhow::Result<Vec<rag_rat_oplog::RosterDevice>> {
+        rag_rat_oplog::local_account_roster(self.storage.connection())
+    }
+
+    /// Remove the enrolled device `device` names (a fingerprint or an 8+ hex-digit prefix of one)
+    /// from the local account. Owner-only; a device cannot remove itself.
+    pub fn sync_remove_device(
+        &self,
+        device: &str,
+        reason: &str,
+    ) -> anyhow::Result<rag_rat_oplog::RosterDevice> {
+        crate::memory_write::remove_account_device(
+            self.storage.connection(),
+            device,
+            reason,
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
+    /// Promote the enrolled member device `device` names to owner. Owner-only.
+    pub fn sync_promote_device(&self, device: &str) -> anyhow::Result<rag_rat_oplog::RosterDevice> {
+        crate::memory_write::promote_account_device(
+            self.storage.connection(),
+            device,
+            rag_rat_base::time::now_ms(),
+        )
+    }
+
     /// Grant `grantee` (the account id from its `sync whoami`) Writer authority on
     /// the active repo's owner stream (#1164), so that identity can author memories into this
     /// repo's shared set. Owner-only; requires a published repo. Returns the grant id as hex.

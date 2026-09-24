@@ -41,6 +41,7 @@ mod node_binding;
 mod ops;
 mod pre_verify;
 mod registers;
+mod roster;
 // C4.2b: the account secrets log (`log_id = 1`) — the `StreamKeyWrap` op + owner-gated acceptance
 // evaluator, consuming the control fold's authority projection (#607).
 mod annex;
@@ -63,12 +64,12 @@ mod test_support;
 pub use annex::author::{SnapshotAuthorOutcome, author_snapshot_in_tx};
 pub use authoring::{
     EnrollingDevice, RevokeReason, StreamRevocation, author_device_add_in_tx,
-    author_device_remove_in_tx, author_enrollment_device_add_in_tx, author_stream_grant_in_tx,
-    author_stream_revoke_in_tx, enrollment_authoring_fits, enrollment_authoring_requirements,
-    ensure_owned_stream_v2_in_tx, ensure_owned_stream_v2_with_mode_in_tx,
-    established_owned_stream_v2, established_owned_stream_v2_with_mode, owned_stream_v2_id,
-    owned_stream_v2_id_with_mode, owner_stream_v2_id_for_account, retry_enrollment_pre_verify,
-    validate_device_add_label,
+    author_device_remove_in_tx, author_enrollment_device_add_in_tx, author_owner_promote_in_tx,
+    author_stream_grant_in_tx, author_stream_revoke_in_tx, enrollment_authoring_fits,
+    enrollment_authoring_requirements, ensure_owned_stream_v2_in_tx,
+    ensure_owned_stream_v2_with_mode_in_tx, established_owned_stream_v2,
+    established_owned_stream_v2_with_mode, owned_stream_v2_id, owned_stream_v2_id_with_mode,
+    owner_stream_v2_id_for_account, retry_enrollment_pre_verify, validate_device_add_label,
 };
 pub use bootstrap::{
     AuthoredDurability, ENROLLMENT_HELD_ENTRY_HASHES_MAX, EnrollmentBootstrap, EnrollmentBudget,
@@ -142,6 +143,7 @@ pub use keywrap::{ContentKey, KeyId};
 // account-device binding. Consumed by the transport crate's auth handshake.
 pub use node_binding::{NodeAuthError, sign_local_node_binding, verify_node_binding};
 pub use ops::{DeviceCut, DeviceRole, GrantRole};
+pub use roster::{RosterDevice, local_account_roster, resolve_roster_device};
 // The in-tx content-key mint + owner-gated `StreamKeyWrap` author seam (C4.3a), the C4.3b READ
 // side (derive-on-read sealing-key selection + the key_id adoption cross-check), and the C4.4
 // lazy rotation-on-removal entry points (#607).
