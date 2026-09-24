@@ -603,19 +603,19 @@ fn stored_clock(
 }
 
 /// Raise `key`'s clock in `table` to `(lamport, device_hex)` under LWW — a clock that does not
-/// [`RowClock::beats`] the stored one never lowers it.
+/// [`RowClock::beats`] the stored one never lowers it. Returns whether it raised.
 fn raise_clock(
     tx: &Transaction<'_>,
     table: ClockTable,
     key: &RowKey<'_>,
     lamport: u64,
     device_hex: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let incoming = RowClock { lamport, device_hex: device_hex.to_owned() };
     if let Some(stored) = stored_clock(tx, table, key)?
         && !incoming.beats(&stored)
     {
-        return Ok(());
+        return Ok(false);
     }
     tx.execute(
         &format!(
@@ -636,7 +636,7 @@ fn raise_clock(
             device_hex,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// The row's latest-write clock, or `None` if it has never been written on this device. Recorded on
@@ -668,13 +668,9 @@ fn raise_row_clock(
     lamport: u64,
     device_hex: &str,
 ) -> anyhow::Result<()> {
-    let incoming = RowClock { lamport, device_hex: device_hex.to_owned() };
-    if let Some(stored) = stored_clock(tx, ClockTable::Rows, key)?
-        && !incoming.beats(&stored)
-    {
+    if !raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)? {
         return Ok(());
     }
-    raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)?;
     clear_row_statements(tx, key)?;
     tx.execute(
         "INSERT INTO sync_row_statements(
@@ -692,10 +688,13 @@ fn raise_row_clock(
     Ok(())
 }
 
+/// Drop the row's statements, keyed exactly as its clock is (`clear_row_clock`), so the two never
+/// part ways.
 fn clear_row_statements(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()> {
     tx.execute(
-        "DELETE FROM sync_row_statements WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3",
-        rusqlite::params![key.stream.to_bytes().as_slice(), key.table, key.row_pk],
+        "DELETE FROM sync_row_statements
+          WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
+        rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
     )?;
     Ok(())
 }

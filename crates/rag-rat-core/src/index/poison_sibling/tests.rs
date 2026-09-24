@@ -185,7 +185,7 @@ fn every_registered_scoped_table_has_a_live_tripwire() {
         .iter()
         .chain(rag_rat_db::schema::A5_PERIPHERY_DIRECT_SCOPED_TABLES)
         // Protocol metadata is deliberately excluded from adoption; pin its sentinel separately.
-        .chain(&["sync_tombstone_statements"])
+        .chain(&["sync_row_statements", "sync_tombstone_statements"])
     {
         if omitted.contains(table) {
             continue;

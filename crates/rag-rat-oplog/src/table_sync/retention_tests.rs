@@ -866,3 +866,21 @@ fn statement_backfill_keeps_chain_pins_parity() {
     rag_rat_db::schema::migrations::apply_tombstone_statements(&c).unwrap();
     assert_eq!(pins(&mut c, &device), live);
 }
+
+/// Live rows too: the V134 backfill and a live winning `Upsert` agree on what pins — one statement
+/// per clock at its own identity (#1488) — and a statement whose row has no live clock pins
+/// nothing.
+#[test]
+fn row_statement_backfill_keeps_chain_pins_parity() {
+    let mut c = conn();
+    let device = crate::local_device(&c, 0).unwrap();
+    author(&mut c, &device, &[upsert("r1", "v1"), upsert("r2", "v2"), upsert("r1", "v3")]);
+    let live = pins(&mut c, &device);
+    assert!(!live.is_empty());
+    c.execute("DELETE FROM sync_row_statements", []).unwrap();
+    rag_rat_db::schema::migrations::apply_row_statements(&c).unwrap();
+    assert_eq!(pins(&mut c, &device), live);
+
+    c.execute("DELETE FROM sync_row_clocks", []).unwrap();
+    assert!(pins(&mut c, &device).is_empty(), "a statement pins only a row with a live clock");
+}
