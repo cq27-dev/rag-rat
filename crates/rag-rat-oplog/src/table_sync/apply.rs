@@ -660,14 +660,44 @@ fn current_row_clock(
 }
 
 /// Raise the row's write clock to `(lamport, device_hex)` under LWW — a later-arriving but older
-/// write never lowers it.
+/// write never lowers it. A raise replaces the row's statements with the writing entry's own: the
+/// entry that wrote the clock is the one that carries it (#1488).
 fn raise_row_clock(
     tx: &Transaction<'_>,
     key: &RowKey<'_>,
     lamport: u64,
     device_hex: &str,
 ) -> anyhow::Result<()> {
-    raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)
+    let incoming = RowClock { lamport, device_hex: device_hex.to_owned() };
+    if let Some(stored) = stored_clock(tx, ClockTable::Rows, key)?
+        && !incoming.beats(&stored)
+    {
+        return Ok(());
+    }
+    raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)?;
+    clear_row_statements(tx, key)?;
+    tx.execute(
+        "INSERT INTO sync_row_statements(
+             stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            key.stream.to_bytes().as_slice(),
+            key.repo_id,
+            key.table,
+            key.row_pk,
+            device_hex,
+            i64::try_from(lamport)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn clear_row_statements(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()> {
+    tx.execute(
+        "DELETE FROM sync_row_statements WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3",
+        rusqlite::params![key.stream.to_bytes().as_slice(), key.table, key.row_pk],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn current_tombstone(
@@ -955,7 +985,7 @@ fn clear_row_clock(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()>
           WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
         rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
     )?;
-    Ok(())
+    clear_row_statements(tx, key)
 }
 
 /// The row's recorded anti-echo hash and the projector version whose column set it covers, or

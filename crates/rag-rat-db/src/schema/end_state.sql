@@ -2236,6 +2236,19 @@ CREATE TABLE oplog_pending_identity(
              x25519_secret BLOB NOT NULL CHECK (length(x25519_secret) = 32),
              created_at_ms INTEGER NOT NULL
          ) STRICT;
+CREATE TABLE sync_row_statements(
+             stream_id          BLOB    NOT NULL CHECK(length(stream_id) = 32),
+             repo_id            TEXT    NOT NULL,
+             table_name         TEXT    NOT NULL,
+             row_pk             TEXT    NOT NULL,
+             -- The carrying chain, in the lowercase hex the merge tables use.
+             device_fingerprint TEXT    NOT NULL,
+             -- The lamport of that chain's newest entry carrying the row's current clock.
+             lamport            INTEGER NOT NULL,
+             PRIMARY KEY(stream_id, table_name, row_pk, device_fingerprint)
+         ) STRICT;
+CREATE INDEX sync_row_statements_chain
+             ON sync_row_statements(stream_id, device_fingerprint, lamport);
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('001_sqlite_storage_baseline',1789841199646,'sha256:rag-rat-sqlite-baseline-v1','SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('002_embedding_vector_metadata',1789841199646,'sha256:rag-rat-embedding-vector-metadata-v2','Add embedding model dimension metadata and per-vector dimensions for hybrid vector search');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('003_derived_artifact_reconcile_metadata',1789841199646,'sha256:rag-rat-derived-artifact-reconcile-metadata-v3','Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation');
@@ -2369,5 +2382,6 @@ INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALU
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('131_account_view_citations',1789841199859,'sha256:rag-rat-account-view-citations-v131','Record the pre-cut view a control-v2 cut names, so candidate admission grants the view-manifest reserve only to a manifest some stored cut cites; backfilled from the stored signed control payloads so cuts admitted before this migration still name their evidence (#1367)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('132_invite_checkpoint_digest',1789841199860,'sha256:rag-rat-invite-checkpoint-digest-v132','Record which control-log pin an invite was minted under, so a pin installed between mint and redemption is refused before the one-time nonce is consumed rather than after (#1311)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('133_oplog_retired_identities',1789841199861,'sha256:rag-rat-oplog-retired-identities-v133','Add oplog_retired_identities and oplog_pending_identity: a removed device re-enrolls under a fresh identity that is staged until adoption swaps it in, and the replaced identity''s fingerprint and X25519 key are kept so content sealed to it stays readable (#1417)');
+INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('134_row_statements',1789841199862,'sha256:rag-rat-row-statements-v134','Add sync_row_statements: per chain that carries a row''s current live clock, the lamport of its newest carrying entry, so retention pins the entry a chain holds rather than keying on the clock''s device (#1488); backfilled with one statement per clock at its own identity');
 INSERT INTO "repos"("repo_id","display_name","registered_at_ms") VALUES('__unassigned__','',0);
 INSERT INTO "content_digest_state"("id","state","rows_folded") VALUES(1,'0000000000000000000000000000000000000000000000000000000000000000',0);

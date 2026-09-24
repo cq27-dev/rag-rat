@@ -1811,7 +1811,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 133, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 134, "move this pin with the next schema migration");
 
     let conn = fresh_conn();
     conn.execute_batch(
@@ -2670,4 +2670,37 @@ fn migration_133_oplog_retired_identities() {
     stage(0, vec![7; 31]).expect_err("a short staged seed is refused");
     stage(1, vec![7; 32]).expect_err("the staged identity is a single row, like the live one");
     stage(0, vec![7; 32]).expect("a well-formed staged identity");
+}
+
+/// V134 (#1488) records which chain carries each row's live clock. It is backfilled with one
+/// statement per existing clock at the clock's own identity — until now the writing entry was the
+/// only carrier — and a replay never duplicates or lowers one.
+#[test]
+fn migration_134_row_statements_backfill_one_per_clock() {
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    bare.execute_batch(
+        "CREATE TABLE sync_row_clocks(
+             stream_id BLOB NOT NULL, repo_id TEXT NOT NULL, table_name TEXT NOT NULL,
+             row_pk TEXT NOT NULL, lamport INTEGER NOT NULL, device_fingerprint TEXT NOT NULL,
+             PRIMARY KEY(stream_id, table_name, row_pk));
+         INSERT INTO sync_row_clocks VALUES
+             (zeroblob(32), 'repo', 't', 'a', 3, 'aa'),
+             (zeroblob(32), 'repo', 't', 'b', 7, 'bb');",
+    )
+    .unwrap();
+    schema::migrations::apply_row_statements(&bare).unwrap();
+    bare.execute("UPDATE sync_row_statements SET lamport = 9 WHERE row_pk = 'b'", []).unwrap();
+    schema::migrations::apply_row_statements(&bare).expect("replay is a no-op");
+    let statements: Vec<(String, String, i64)> = bare
+        .prepare("SELECT row_pk, device_fingerprint, lamport FROM sync_row_statements ORDER BY 1")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        statements,
+        [("a".into(), "aa".into(), 3), ("b".into(), "bb".into(), 9)],
+        "one statement per clock at its identity; the replay kept the advanced one",
+    );
 }

@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 133;
+pub const LATEST_SCHEMA_VERSION: u32 = 134;
 
 /// The `files.kind` token of a deletion tombstone — the row `mark_file_deleted` /
 /// `write_tombstone_in_scope` leave for a path the checkout no longer serves. It is outside
@@ -1188,6 +1188,13 @@ additive_migrations! {
          a fresh identity that is staged until adoption swaps it in, and the replaced identity's \
          fingerprint and X25519 key are kept so content sealed to it stays readable (#1417)",
     ) => MigrationFn::Plain(migrations::apply_oplog_retired_identities);
+    MIGRATION_134_ID, MIGRATION_134_CHECKSUM, MIGRATION_134_DESCRIPTION = (
+        "134_row_statements",
+        "sha256:rag-rat-row-statements-v134",
+        "Add sync_row_statements: per chain that carries a row's current live clock, the lamport of \
+         its newest carrying entry, so retention pins the entry a chain holds rather than keying on \
+         the clock's device (#1488); backfilled with one statement per clock at its own identity",
+    ) => MigrationFn::Plain(migrations::apply_row_statements);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

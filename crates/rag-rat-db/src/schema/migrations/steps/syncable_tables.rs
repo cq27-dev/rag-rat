@@ -1019,6 +1019,42 @@ pub fn apply_content_projected_superseded_anchors(conn: &Connection) -> rusqlite
     add_column_if_missing(conn, "content_projected_nodes", "superseded_anchors_json", "TEXT")
 }
 
+/// V134 — `sync_row_statements`, the delivery half of a row's live clock (#1488).
+///
+/// `sync_row_clocks` holds the row's latest write — merge state, keyed on the row. Which ENTRY
+/// carries that write is a separate, per-chain answer, exactly as `sync_tombstone_statements` is
+/// for deletes: retention pins, on every chain that carries a row's current clock, the entry at
+/// that chain's newest statement. Until now the only carrier was the writing entry itself, so
+/// retention read the clock's device directly; a live row re-stated at its original identity by
+/// another chain (re-adoption of a removed writer's rows) names a device whose entry a replica
+/// may never hold, and pinning through the clock would name an entry that is not there.
+///
+/// Backfilled with one statement per clock at the clock's own identity — today every clock is
+/// written by its own entry, so that is exactly the carrier retention already pins. Idempotent:
+/// `IF NOT EXISTS` and `OR IGNORE`, so a replay never lowers a statement since advanced.
+pub fn apply_row_statements(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_row_statements(
+             stream_id          BLOB    NOT NULL CHECK(length(stream_id) = 32),
+             repo_id            TEXT    NOT NULL,
+             table_name         TEXT    NOT NULL,
+             row_pk             TEXT    NOT NULL,
+             -- The carrying chain, in the lowercase hex the merge tables use.
+             device_fingerprint TEXT    NOT NULL,
+             -- The lamport of that chain's newest entry carrying the row's current clock.
+             lamport            INTEGER NOT NULL,
+             PRIMARY KEY(stream_id, table_name, row_pk, device_fingerprint)
+         ) STRICT;
+         -- Retention reads a chain's statements in lamport order (`chain_pins`).
+         CREATE INDEX IF NOT EXISTS sync_row_statements_chain
+             ON sync_row_statements(stream_id, device_fingerprint, lamport);
+         INSERT OR IGNORE INTO sync_row_statements(
+             stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport)
+         SELECT stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport
+           FROM sync_row_clocks;",
+    )
+}
+
 /// V127 — `sync_tombstone_statements`, the delivery half of a row tombstone (#1295).
 ///
 /// `sync_row_tombstones` holds the latest delete of a row — merge state, permanent, keyed on the

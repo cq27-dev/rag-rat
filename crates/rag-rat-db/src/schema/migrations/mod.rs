@@ -90,10 +90,11 @@ pub use steps::syncable_tables::{
     apply_memory_applied_anchor_snapshot, apply_memory_binding_resolution,
     apply_memory_note_summaries, apply_memory_parked_anchor_baselines,
     apply_readoption_audit_nullable_winner, apply_receiver_type_hint_interning,
-    apply_syncable_distill_anchors, apply_syncable_distill_edges_and_alternatives,
-    apply_syncable_distill_evidence, apply_syncable_distill_record_commits,
-    apply_syncable_distill_records, apply_syncable_memory_bindings, apply_syncable_overlay_tables,
-    apply_table_sync_readoption, apply_table_sync_retained_floors, apply_tombstone_statements,
+    apply_row_statements, apply_syncable_distill_anchors,
+    apply_syncable_distill_edges_and_alternatives, apply_syncable_distill_evidence,
+    apply_syncable_distill_record_commits, apply_syncable_distill_records,
+    apply_syncable_memory_bindings, apply_syncable_overlay_tables, apply_table_sync_readoption,
+    apply_table_sync_retained_floors, apply_tombstone_statements,
 };
 pub use steps::table_sync::{
     apply_account_candidate_reservation_targets, apply_account_candidate_reservations,
