@@ -315,7 +315,9 @@ pub fn description(name: &str) -> &'static str {
             "Record a durable, source-anchored repo memory (Invariant / Decision / Risk / \
              BugPattern / …) bound to a symbol, chunk, path, edge/call-path, commit, or tracker \
              ref — so the rationale resurfaces for the next agent editing that code. Capture \
-             non-obvious invariants and decisions as you discover them.",
+             non-obvious invariants and decisions as you discover them. A `similar_memories` list \
+             in the result names existing memories close in meaning: if one says the same thing, \
+             `memory_update` it instead of keeping both.",
         "memory_rebind" =>
             "Re-anchor an existing repo memory to a different symbol, chunk, path, or other source \
              location — use this after a symbol moves or is renamed rather than obsoleting and \

@@ -577,11 +577,17 @@ or not fingerprinted. This is the same signal the Write/Edit clone-check hook us
 
 Memory tools read and write the durable, source-anchored notes described in the
 [README](../README.md#repo-memories). `memory_create` records one (typed `kind`, `title`, `body`,
-`confidence`), `memory_search` finds them by keyword and — once an embedding model is installed and a reconcile has
-embedded them — by meaning, and `memory_for_symbol` / `memory_for_path` /
+`confidence`), `memory_search` finds them by keyword and — once an embedding model is installed — by
+meaning, and `memory_for_symbol` / `memory_for_path` /
 `memory_for_call_path` fetch the full memories bound to an anchor (the expanded form of the compact
 headers `impact_surface` attaches). `memory_show` expands one memory to its full body by
 `memory_id` — the expand path for a `[memory] surface = "summary"` compact attachment.
+`memory_create`'s result carries `similar_memories`: up to three existing notes (id, kind, title,
+cosine similarity) close in meaning to the new one — a prompt to `memory_update` the existing note
+rather than keep two versions of one rule. It warns; it never refuses the write. The field is `[]`
+when the check ran and found nothing, and absent when it did not run: an exact `duplicate`, no
+embedding model, a model without a measured threshold (today `jinaai/jina-embeddings-v2-base-code`,
+and the `hash` fallback, which only matches near-verbatim text), or a failed embed.
 
 `memory_update` edits text/status/confidence/kind/tags; `memory_mark_obsolete` retires a memory
 (kept for audit, hidden from active recall). `memory_validate` re-anchors every memory against current
