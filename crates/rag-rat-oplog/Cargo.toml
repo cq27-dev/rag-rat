@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+thiserror.workspace = true
 rag-rat-base.workspace = true
 rag-rat-db.workspace = true
 rag-rat-query.workspace = true
