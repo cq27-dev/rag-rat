@@ -46,6 +46,27 @@ impl ParserBackend for TypeScript {
         }
     }
 
+    fn for_each_declared_name<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+        emit: &mut dyn FnMut(Node<'tree>),
+    ) {
+        match node.kind() {
+            // `[K in ...]` binds `K` the way `<T>` binds `T`; an abstract class is not a symbol but
+            // still declares its name.
+            "type_parameter" | "mapped_type_clause" | "abstract_class_declaration" =>
+                node.child_by_field_name("name").into_iter().for_each(emit),
+            // `infer U [extends C]`: the binder is the first named child, the constraint follows.
+            "infer_type" => node
+                .named_child(0)
+                .filter(|binder| binder.kind() == "type_identifier")
+                .into_iter()
+                .for_each(emit),
+            _ => self.for_each_declared_symbol_name(node, text, emit),
+        }
+    }
+
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
         let name = match node.kind() {
             "class_declaration" | "interface_declaration" | "internal_module" | "module" =>

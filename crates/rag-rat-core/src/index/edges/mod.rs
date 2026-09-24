@@ -320,7 +320,7 @@ mod edge_resolution_tests {
 /// join time from the checkout bytes, so only the byte range is stored. Set only for
 /// symbol-referencing edges (built via `symbol_edge`/`symbol_edge_with_context`); `None` for
 /// file-level / `contains` edges and for constructs where a clean identifier node isn't available.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CalleeRange {
     pub(in crate::index) start_byte: usize,
     pub(in crate::index) end_byte: usize,

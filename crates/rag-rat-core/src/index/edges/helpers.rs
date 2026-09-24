@@ -710,9 +710,6 @@ pub(crate) fn insert_candidates(
         if to_name.is_empty() {
             continue;
         }
-        if candidate.from_name.as_deref() == Some(to_name) {
-            continue;
-        }
         let key = (
             candidate.from_symbol_id,
             candidate.from_name.clone(),

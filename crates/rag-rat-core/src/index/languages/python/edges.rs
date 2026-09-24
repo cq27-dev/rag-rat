@@ -20,9 +20,9 @@ pub(in crate::index::languages) fn python_edges(
         // `emit_python_type_refs` walks the whole type expression — generics (`Box[Item]`),
         // qualified generics (`typing.Optional[Api]`), unions (`A | B`), nested
         // (`Optional[list[Api]]`), `Callable` param lists — emitting a ReferencesType per
-        // referenced type. The alias NAME in a `type X = …` is skipped (it's a definition,
-        // not a reference). String forward refs (`-> "Api"`) carry no identifier → no edge.
-        "type" if !python_is_type_alias_name(node) => {
+        // referenced type. The alias NAME in a `type X = …` is a declaration, which the edge
+        // emitter drops. String forward refs (`-> "Api"`) carry no identifier → no edge.
+        "type" => {
             emit_python_type_refs(node, locator, text, out);
         },
         "decorator" => python_decorator_edges(text, node, locator, out),
@@ -257,16 +257,6 @@ fn emit_python_type_refs(
         },
         _ => {},
     }
-}
-
-/// Whether `node` is the alias NAME being DEFINED in `type X = …` (the first child of a
-/// `type_alias_statement`) — a definition, not a reference, so it must not emit a `ReferencesType`
-/// self-edge. The value side (the second `type`) is referenced normally.
-fn python_is_type_alias_name(node: Node<'_>) -> bool {
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "type_alias_statement"
-            && parent.named_child(0).map(|first| first.id()) == Some(node.id())
-    })
 }
 
 /// The STATIC head node of a Python base-class expression — a plain `identifier`, or an

@@ -14,13 +14,35 @@ use crate::index::edges::extract::{EdgeEmitter, EdgeVisit};
 use crate::index::edges::{EdgeCandidate, IndexedSymbol, SymbolLocator};
 use crate::index::parser::{self, ParserKind};
 
+// `@declaration` finds the nodes whose names the emitter must know are declarations, so a
+// declaration's own name is dropped exactly as the production walk drops it.
 const C_QUERY_SOURCE: &str = r#"
+[
+  (function_definition)
+  (struct_specifier)
+  (union_specifier)
+  (enum_specifier)
+  (type_definition)
+] @declaration
 (preproc_include) @edge
 (call_expression) @edge
 (type_identifier) @edge
 "#;
 
 const CPP_QUERY_SOURCE: &str = r#"
+[
+  (function_definition)
+  (class_specifier)
+  (struct_specifier)
+  (union_specifier)
+  (enum_specifier)
+  (type_definition)
+  (alias_declaration)
+  (namespace_definition)
+  (type_parameter_declaration)
+  (variadic_type_parameter_declaration)
+  (optional_type_parameter_declaration)
+] @declaration
 (preproc_include) @edge
 (call_expression) @edge
 [
@@ -66,10 +88,17 @@ fn query_edges_from_root(
     let locator = SymbolLocator::new(symbols);
     let mut candidates = Vec::new();
     let mut emit = EdgeEmitter::new(&mut candidates);
+    let backend = crate::index::languages::parser_backend(language);
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, text.as_bytes());
     while let Some(query_match) = matches.next() {
         for capture in query_match.captures() {
+            if query.capture_names()[capture.index as usize] == "declaration" {
+                backend.for_each_declared_name(capture.node, text, &mut |name| {
+                    emit.declare_name(name);
+                });
+                continue;
+            }
             c_like_edges(
                 EdgeVisit { text, node: capture.node, symbols, path, locator: &locator },
                 &mut emit,

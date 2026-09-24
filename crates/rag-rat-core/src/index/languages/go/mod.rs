@@ -83,6 +83,20 @@ impl ParserBackend for Go {
         super::emit_bindings(node, kind, names, emit);
     }
 
+    /// A generic method's receiver `(p Pair[K, V])` BINDS `K` and `V` for the method; it does not
+    /// reference types by those names.
+    fn for_each_declared_name<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+        emit: &mut dyn FnMut(Node<'tree>),
+    ) {
+        if node.kind() == "method_declaration" {
+            receiver_binders(node).into_iter().for_each(&mut *emit);
+        }
+        self.for_each_declared_symbol_name(node, text, emit);
+    }
+
     /// Import declarations carry no symbol a reader would search for, and Go's convention of a
     /// single grouped `import ( ... )` block at the top of every file makes them pure plumbing —
     /// the same reason the Swift backend excludes its `import_declaration`.
@@ -126,10 +140,7 @@ fn symbol_node(node: Node<'_>) -> Option<SymbolMatch<'_>> {
 /// receiver and by `generic_type` for a generic one, so both wrappers are unwrapped to reach the
 /// bare `type_identifier`.
 fn receiver_type_name(node: Node<'_>, text: &str) -> Option<String> {
-    let receiver = node.child_by_field_name("receiver")?;
-    let declaration =
-        named_children(receiver).find(|child| child.kind() == "parameter_declaration")?;
-    let mut current = declaration.child_by_field_name("type")?;
+    let mut current = receiver_type(node)?;
     // Bounded: each step strips exactly one wrapper and a receiver type nests at most a couple
     // deep (`*Server[T]`), so this cannot spin on a malformed tree.
     loop {
@@ -141,6 +152,34 @@ fn receiver_type_name(node: Node<'_>, text: &str) -> Option<String> {
         };
     }
     parser::node_text(current, text)
+}
+
+/// The written type of a `method_declaration`'s receiver, wrappers included.
+fn receiver_type(node: Node<'_>) -> Option<Node<'_>> {
+    let receiver = node.child_by_field_name("receiver")?;
+    named_children(receiver)
+        .find(|child| child.kind() == "parameter_declaration")?
+        .child_by_field_name("type")
+}
+
+/// The type-parameter names a generic receiver binds: `K` and `V` in `(p *Pair[K, V])`. Go
+/// requires a receiver's type arguments to be plain parameter names, so each is a binder.
+fn receiver_binders(node: Node<'_>) -> Vec<Node<'_>> {
+    let Some(mut receiver) = receiver_type(node) else {
+        return Vec::new();
+    };
+    if receiver.kind() == "pointer_type"
+        && let Some(pointee) = receiver.named_child(0)
+    {
+        receiver = pointee;
+    }
+    receiver
+        .child_by_field_name("type_arguments")
+        .into_iter()
+        .flat_map(named_children)
+        .flat_map(named_children)
+        .filter(|name| name.kind() == "type_identifier")
+        .collect()
 }
 
 #[cfg(test)]

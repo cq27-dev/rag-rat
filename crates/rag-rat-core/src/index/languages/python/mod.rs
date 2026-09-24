@@ -6,7 +6,7 @@ use super::{
     ImportAliasRebind, ImportAliasRequest, ImportBinding, KindPreference, ParserBackend,
     ResolutionPolicy, SymbolMatch,
 };
-use crate::index::edges::EdgeKind;
+use crate::index::edges::{EdgeKind, named_children};
 use crate::index::parser::{self, ParserKind};
 
 mod edges;
@@ -22,6 +22,15 @@ const IDENTIFIER_KINDS: &[&str] = NAME_KINDS;
 pub(super) static SUPPORT: Python = Python;
 
 pub(super) struct Python;
+
+/// The identifier a type-parameter binder declares, through the `type` / `constrained_type`
+/// (`T: int`) / `splat_type` (`*Ts`) wrappers, whose name is always the first named child.
+fn binder_name(mut node: Node<'_>) -> Option<Node<'_>> {
+    while matches!(node.kind(), "type" | "constrained_type" | "splat_type") {
+        node = node.named_child(0)?;
+    }
+    (node.kind() == "identifier").then_some(node)
+}
 
 impl ParserBackend for Python {
     fn symbol_kinds(&self) -> &'static [&'static str] {
@@ -60,6 +69,31 @@ impl ParserBackend for Python {
             },
             _ => None,
         }
+    }
+
+    fn for_each_declared_name<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+        emit: &mut dyn FnMut(Node<'tree>),
+    ) {
+        // `class Box[T]`, `def first[T]` and `type Pair[T] = …` bind `T`. The `type_parameter`
+        // kind alone is not enough: a subscripted annotation (`list[int]`) spells its arguments
+        // with it too, so only the declaration's own parameter list counts.
+        let binders = if node.kind() == "type_alias_statement" {
+            node.child_by_field_name("left")
+                .and_then(|left| left.named_child(0))
+                .filter(|left| left.kind() == "generic_type")
+                .and_then(|generic| {
+                    named_children(generic).find(|child| child.kind() == "type_parameter")
+                })
+        } else {
+            node.child_by_field_name("type_parameters")
+        };
+        // A bounded or splat binder (`T: int`, `*Ts`) wraps its name: declare the name alone, so
+        // the bound stays a reference.
+        binders.into_iter().flat_map(named_children).filter_map(binder_name).for_each(&mut *emit);
+        self.for_each_declared_symbol_name(node, text, emit);
     }
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {

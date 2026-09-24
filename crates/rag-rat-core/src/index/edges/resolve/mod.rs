@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
@@ -821,7 +822,7 @@ pub(crate) fn resolve_and_insert_edges(
         // it verbatim); `to_name` is trimmed exactly as the owned path did.
         let from_name = arena.get_opt(candidate.from_name);
         let to_name = arena.get(candidate.to_name).trim();
-        if to_name.is_empty() || from_name == Some(to_name) {
+        if to_name.is_empty() {
             continue;
         }
         let key = (
@@ -1002,6 +1003,21 @@ impl<'r, 'a> Resolution<'r, 'a> {
     }
 
     fn kind_matches(&self, symbol: &IndexedSymbol) -> bool {
+        self.kind_matches_ignoring_type_binding(symbol) && !self.type_binding_rejects(symbol)
+    }
+
+    /// Language policy decides whether a type-position reference may bind a value declaration.
+    /// Checked in every stage, not one, so a written path (`a::b::k`, `&ns::f`) can no more bind
+    /// a namespace or function than a bare name can.
+    fn type_binding_rejects(&self, symbol: &IndexedSymbol) -> bool {
+        self.request.edge_kind == EdgeKind::ReferencesType
+            && self.policy.is_some_and(|policy| {
+                policy.type_binding == crate::index::languages::TypeBinding::DefinitionsOnly
+            })
+            && !TYPE_KINDS.contains(&symbol.kind.as_str())
+    }
+
+    fn kind_matches_ignoring_type_binding(&self, symbol: &IndexedSymbol) -> bool {
         (self.request.edge_kind != EdgeKind::UsesMacro || symbol.kind == "macro")
             && crate::index::languages::target_matches_policy(
                 self.request.source_language,
@@ -1175,6 +1191,34 @@ impl<'r, 'a> Resolution<'r, 'a> {
         else {
             return ControlFlow::Continue(());
         };
+        // A written path that reaches a symbol that is definitely not a type (`a::b` naming a
+        // namespace, `ns::f` a function) under `DefinitionsOnly` did resolve, to something a type
+        // edge may not bind. That is negative evidence: the edge stays unresolved rather than
+        // falling back to a same-named type in an unrelated scope. Only a candidate the path
+        // REACHED counts, so every stage filters on its path key before `kind_matches` records a
+        // rejection: a C++ constructor (`lib::Widget::Widget`, a function) shares its class's
+        // name, and must not veto the fallback for a path (`fs::Widget` through a namespace
+        // alias) that never hit it. Any other rejected kind is no evidence: a Rust `impl` is named
+        // after its self type (`impl Widget`), a use of that type, so the fallback may still bind
+        // the struct it names. A path that ALSO reached a type is no such evidence either: an
+        // out-of-line C++ constructor carries its class's scope path (`ns::Foo`), so two
+        // same-scoped classes plus that constructor are ambiguous among types, and the fallback
+        // may still pick the class in the reference's own file.
+        let rejected_non_type = Cell::new(false);
+        let reached_type = Cell::new(false);
+        let kind_matches = |symbol: &IndexedSymbol| {
+            if !self.kind_matches_ignoring_type_binding(symbol) {
+                return false;
+            }
+            let rejected = self.type_binding_rejects(symbol);
+            if rejected && NON_TYPE_KINDS.contains(&symbol.kind.as_str()) {
+                rejected_non_type.set(true);
+            }
+            if !rejected {
+                reached_type.set(true);
+            }
+            !rejected
+        };
         // Semantic SCOPE-PATH match first (#61). An edge's `target_qualified_name` is a source-code
         // path (`Workspace::new`), which aligns with a symbol's `scope_path`
         // (`core::Workspace::new`) — NOT with the file-path `qualified_name` below, which a
@@ -1194,7 +1238,7 @@ impl<'r, 'a> Resolution<'r, 'a> {
             .into_iter()
             .flatten()
             .copied()
-            .filter(|symbol| self.kind_matches(symbol))
+            .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_exact) {
             return ControlFlow::Break(Some(
@@ -1226,7 +1270,7 @@ impl<'r, 'a> Resolution<'r, 'a> {
                     .flatten(),
             )
             .copied()
-            .filter(|symbol| self.kind_matches(symbol))
+            .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_normalized) {
             return ControlFlow::Break(Some((
@@ -1242,9 +1286,8 @@ impl<'r, 'a> Resolution<'r, 'a> {
             .into_iter()
             .flatten()
             .copied()
-            .filter(|symbol| {
-                self.kind_matches(symbol) && symbol.scope_path.ends_with(&scope_suffix)
-            })
+            .filter(|symbol| symbol.scope_path.ends_with(&scope_suffix))
+            .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&scope_matches) {
             return ControlFlow::Break(Some(
@@ -1258,7 +1301,7 @@ impl<'r, 'a> Resolution<'r, 'a> {
             .into_iter()
             .flatten()
             .copied()
-            .find(|symbol| self.kind_matches(symbol))
+            .find(|symbol| kind_matches(symbol))
         {
             return ControlFlow::Break(Some((
                 symbol,
@@ -1273,7 +1316,8 @@ impl<'r, 'a> Resolution<'r, 'a> {
             .into_iter()
             .flatten()
             .copied()
-            .filter(|symbol| self.kind_matches(symbol) && symbol.qualified_name.ends_with(&suffix))
+            .filter(|symbol| symbol.qualified_name.ends_with(&suffix))
+            .filter(|symbol| kind_matches(symbol))
             .collect::<Vec<_>>();
         if let Some(hit) = unique_or_logical(&matches) {
             return ControlFlow::Break(Some(
@@ -1295,6 +1339,9 @@ impl<'r, 'a> Resolution<'r, 'a> {
             // `Self::Assoc::run()` dispatches through the associated type, not the enclosing impl
             // owner. Until projection resolution can establish that type, a bare `run` match is
             // less evidence than the written path and must not claim an unrelated method.
+            return ControlFlow::Break(None);
+        }
+        if rejected_non_type.get() && !reached_type.get() {
             return ControlFlow::Break(None);
         }
         if !self.has_local_receiver_type()
@@ -1385,15 +1432,6 @@ impl<'r, 'a> Resolution<'r, 'a> {
             })
             .collect::<Vec<_>>();
         let preferred = preferred_matches(request.edge_kind, request.source_language, &matches);
-        // Language policy decides whether a type-position reference may bind a value declaration.
-        if preferred.is_empty()
-            && request.edge_kind == EdgeKind::ReferencesType
-            && self.policy.is_some_and(|policy| {
-                policy.type_binding == crate::index::languages::TypeBinding::DefinitionsOnly
-            })
-        {
-            return None;
-        }
         if preferred.is_empty()
             && crate::index::languages::requires_same_language_target(
                 request.source_language,
@@ -1681,6 +1719,18 @@ pub(crate) fn is_common_member_name(value: &str) -> bool {
             | "err"
     )
 }
+
+/// The symbol kinds that declare a type: what a type-position reference prefers, and all a
+/// `TypeBinding::DefinitionsOnly` language lets it bind.
+const TYPE_KINDS: &[&str] =
+    &["struct", "enum", "union", "trait", "type", "class", "interface", "object"];
+
+/// The symbol kinds that are definitely not a type: a written type path reaching one of them is
+/// negative evidence against a bare-name fallback. Anything else a type edge may not bind (a Rust
+/// `impl`, named after its self type) says nothing about which type the path meant.
+const NON_TYPE_KINDS: &[&str] =
+    &["namespace", "module", "function", "method", "const", "static", "variable"];
+
 pub(crate) fn preferred_matches<'a>(
     edge_kind: EdgeKind,
     source_language: Option<&str>,
@@ -1694,8 +1744,7 @@ pub(crate) fn preferred_matches<'a>(
         EdgeKind::Constructs => &["struct", "class", "object"],
         EdgeKind::UsesMacro => &["macro"],
         EdgeKind::Implements => &["trait", "interface"],
-        EdgeKind::ReferencesType =>
-            &["struct", "enum", "trait", "type", "class", "interface", "object"],
+        EdgeKind::ReferencesType => TYPE_KINDS,
         _ => &[],
     };
     let source_language = source_language.and_then(|name| name.parse::<Language>().ok());
