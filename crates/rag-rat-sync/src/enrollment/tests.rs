@@ -2679,23 +2679,29 @@ fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_staged_identity() 
     rag_rat_oplog::author_device_remove_in_tx(&tx, old.fingerprint(), "forked", NOW + 2).unwrap();
     tx.commit().unwrap();
     let ticket = ticket(&founder, account, DeviceRole::Member);
-    let request_for = |(ed25519_pubkey, x25519_pubkey): ([u8; 32], [u8; 32])| EnrollmentRequest {
-        nonce: ticket.nonce,
-        expected_account: account,
-        ed25519_pubkey,
-        x25519_pubkey,
-        transport_node_id: [9; 32],
-        budget: generous_budget(),
-        held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(&removed, account)
+    let request_for = |(ed25519_pubkey, x25519_pubkey): ([u8; 32], [u8; 32]), reenrolling: bool| {
+        EnrollmentRequest {
+            nonce: ticket.nonce,
+            expected_account: account,
+            ed25519_pubkey,
+            x25519_pubkey,
+            transport_node_id: [9; 32],
+            budget: generous_budget(),
+            held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(
+                &removed,
+                account,
+                reenrolling,
+            )
             .unwrap()
             .into_iter()
             .map(|hash| hash.to_bytes())
             .collect(),
+        }
     };
 
     let refused = redeem_invite(
         &founder,
-        request_for((old.ed25519_public_key(), old.x25519_public_key())),
+        request_for((old.ed25519_public_key(), old.x25519_public_key()), false),
         [9; 32],
         &|| NOW + 3,
     );
@@ -2720,8 +2726,22 @@ fn a_removed_device_is_refused_by_name_then_reenrolls_under_a_staged_identity() 
         old.fingerprint(),
         "staging leaves the live identity alone",
     );
-    let (receipt, _) = redeem_invite(&founder, request_for(staged), [9; 32], &|| NOW + 5)
+    let (lost, _) = redeem_invite(&founder, request_for(staged, true), [9; 32], &|| NOW + 5)
         .expect("the same ticket enrolls the staged identity");
+    // The response is lost before the store adopts it. A resumed join that presents the live
+    // identity finds the ticket spent; asking again as the staged identity replays the receipt.
+    assert!(matches!(
+        redeem_invite(
+            &founder,
+            request_for((old.ed25519_public_key(), old.x25519_public_key()), false),
+            [9; 32],
+            &|| NOW + 5,
+        ),
+        Err(InviteError::Used)
+    ));
+    let (receipt, _) = redeem_invite(&founder, request_for(staged, true), [9; 32], &|| NOW + 5)
+        .expect("the staged identity's request replays the receipt");
+    assert_eq!(receipt, lost, "the replay is the receipt the owner already acknowledged");
     let genesis_hash = rag_rat_oplog::verify_enrollment_device_add(
         &receipt.account_entries,
         account,

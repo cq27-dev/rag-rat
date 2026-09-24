@@ -44,8 +44,10 @@ pub async fn connect_and_enroll(
     // must name it — a caller-supplied value is either redundant or a guaranteed WrongNode.
     request.transport_node_id = *endpoint.id().as_bytes();
     request.budget = rag_rat_oplog::enrollment_budget(database, expected_account)?;
+    let reenrolling = rag_rat_oplog::pending_identity_keys(database)?
+        .is_some_and(|(ed25519, _)| ed25519 == request.ed25519_pubkey);
     request.held_entry_hashes =
-        rag_rat_oplog::held_account_entry_hashes(database, expected_account)?
+        rag_rat_oplog::held_account_entry_hashes(database, expected_account, reenrolling)?
             .into_iter()
             .map(|hash| hash.to_bytes())
             .collect();
@@ -145,13 +147,13 @@ pub(super) fn validate_enrollment_request_identity(
             "enrollment account does not match the store's existing local account".into(),
         ));
     }
-    // A re-enrolling store presents its staged identity (#1417); adoption swaps it in.
+    // The live identity, or the staged one a re-enrolling store presents (#1417); adoption swaps
+    // the staged one in only once the account log shows the live one removed.
+    let local = rag_rat_oplog::local_device(database, now_ms)?;
+    let live = (local.ed25519_public_key(), local.x25519_public_key());
     let (ed25519, x25519) = match rag_rat_oplog::pending_identity_keys(database)? {
-        Some(staged) => staged,
-        None => {
-            let local = rag_rat_oplog::local_device(database, now_ms)?;
-            (local.ed25519_public_key(), local.x25519_public_key())
-        },
+        Some(staged) if staged.0 == request.ed25519_pubkey => staged,
+        _ => live,
     };
     if request.ed25519_pubkey != ed25519 {
         return Err(InviteError::Malformed(

@@ -45,7 +45,7 @@ async fn enroll_member_over_endpoint(
         x25519_pubkey: local.x25519_public_key(),
         transport_node_id: *joiner_endpoint.id().as_bytes(),
         budget: rag_rat_oplog::enrollment_budget(joiner, account).unwrap(),
-        held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(joiner, account)
+        held_entry_hashes: rag_rat_oplog::held_account_entry_hashes(joiner, account, false)
             .unwrap()
             .into_iter()
             .map(|hash| hash.to_bytes())

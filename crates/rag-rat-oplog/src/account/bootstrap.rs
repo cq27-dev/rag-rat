@@ -193,14 +193,15 @@ pub fn prune_account_candidate_reservations_in_tx(
 
 /// Every authenticated candidate hash this store holds for `account_id`, sorted for canonical
 /// enrollment encoding. Parked unauthenticated envelopes are normal-sync work, not bootstrap data.
-/// A re-enrolling store leaves out the entries its own retiring and retired identities signed
-/// (`unclaimed_own_fingerprints`): the inviter may never have received them, and they are
-/// condemned by the removal's cut.
+/// The store leaves out entries its retired identities signed, and — when `reenrolling` (the
+/// request presents the staged identity) — its live one's too (`unclaimed_own_fingerprints`): the
+/// inviter may never have received them, and they are condemned by the removal's cut.
 pub fn held_account_entry_hashes(
     conn: &Connection,
     account_id: AccountId,
+    reenrolling: bool,
 ) -> anyhow::Result<Vec<AccountEntryHash>> {
-    let unclaimed = crate::identity::unclaimed_own_fingerprints(conn)?;
+    let unclaimed = crate::identity::unclaimed_own_fingerprints(conn, reenrolling)?;
     let mut stmt = conn.prepare(
         "SELECT entry_hash, device_fingerprint FROM account_entries WHERE account_id = ?1
           ORDER BY entry_hash",
@@ -744,7 +745,7 @@ mod tests {
         )
         .unwrap();
 
-        let hashes = held_account_entry_hashes(&conn, account).unwrap();
+        let hashes = held_account_entry_hashes(&conn, account, false).unwrap();
         assert_eq!(hashes.len(), 121, "genesis and every authenticated candidate are advertised");
         assert!(!hashes.contains(&AccountEntryHash::from_bytes(parked_signed_hash)));
         assert!(!hashes.contains(&AccountEntryHash::from_bytes(parked_entry_hash)));

@@ -256,19 +256,18 @@ pub(crate) fn adopt_pending_identity_in_tx(
     Ok(Some(old.fingerprint))
 }
 
-/// The fingerprints whose account entries a re-enrolling store does not claim to hold: every
-/// identity it retired, plus the live one while a replacement is staged. Its own entries the
-/// inviting owner never received (a forked branch, work authored after its removal) would
-/// otherwise refuse every redemption as held-state it cannot reconcile, and they are condemned by
-/// the removal's cut in any case.
+/// The fingerprints whose account entries this store does not claim to hold: every identity it
+/// retired, plus the live one when `reenrolling` (the request presents the staged identity). Its
+/// own entries the inviting owner never received (a forked branch, work authored after its removal)
+/// would otherwise refuse every redemption as held-state it cannot reconcile, and they are
+/// condemned by the removal's cut in any case.
 pub(crate) fn unclaimed_own_fingerprints(
     conn: &Connection,
+    reenrolling: bool,
 ) -> anyhow::Result<Vec<DeviceFingerprint>> {
     let mut out: Vec<DeviceFingerprint> =
         retired_identities(conn)?.into_iter().map(|retired| retired.fingerprint).collect();
-    if pending_identity_keys(conn)?.is_some()
-        && let Some(live) = local_device_fingerprint(conn)?
-    {
+    if reenrolling && let Some(live) = local_device_fingerprint(conn)? {
         out.push(live);
     }
     Ok(out)
