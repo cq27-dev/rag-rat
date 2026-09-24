@@ -347,21 +347,18 @@ impl EdgeEmitter<'_> {
     }
 }
 
-/// Build a qualified call from the callee's captured identifiers. Borrow the path so callers
-/// that also emit a receiver-type edge do not need to walk the callee again. `kinds` are the
-/// grammar's identifier kinds, for the [`call_target_name`] fallback when the path is empty.
+/// Build a qualified call from the callee's member chain. Borrow the path so callers that also
+/// emit a receiver-type edge do not need to walk the callee again. An empty chain (a subscript or
+/// an unnamed call result as the callee) emits nothing: there is no callee name to record, and
+/// guessing one from the subtree would name an argument.
 pub(crate) fn qualified_call_edge(
     locator: &SymbolLocator<'_>,
     node: Node<'_>,
     text: &str,
     identifiers: &IdentifierPath<'_>,
-    kinds: &[&str],
     edge_kind: EdgeKind,
 ) -> Option<EdgeCandidate> {
-    let name = identifiers
-        .last_text()
-        .map(ToOwned::to_owned)
-        .or_else(|| call_target_name(node, text, kinds))?;
+    let name = identifiers.last_text()?.to_owned();
     Some(symbol_edge_with_context(
         locator,
         node,
@@ -661,7 +658,8 @@ mod collect_edges_depth_tests {
     /// the same stack-overflow exposure on deeply-nested input (#520), and the extractors call
     /// name-finding helpers that recurse to full SUBTREE depth, which `grow_stack` must grow
     /// instead of overflowing (#543). A callee inside thousands of nested parens drives both —
-    /// `call_target_name -> last_identifier_text` recurses that deep — in every language, on a
+    /// the subtree identifier scans (`last_identifier_text` and friends) recurse that deep — in
+    /// every language, on a
     /// deliberately small stack.
     #[test]
     fn deeply_nested_input_does_not_overflow_the_edge_walk() {

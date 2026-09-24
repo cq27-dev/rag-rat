@@ -395,24 +395,6 @@ fn scope_path(
     segments.join("::")
 }
 
-pub(super) fn last_descendant_node<'tree>(
-    node: Node<'tree>,
-    kinds: &[&str],
-) -> Option<Node<'tree>> {
-    rag_rat_base::stack::grow_stack(|| {
-        let mut last = None;
-        for child in named_children(node) {
-            if kinds.contains(&child.kind()) {
-                last = Some(child);
-            }
-            if let Some(value) = last_descendant_node(child, kinds) {
-                last = Some(value);
-            }
-        }
-        last
-    })
-}
-
 struct SymbolBuildContext<'a> {
     path: &'a Path,
     backend: &'a dyn crate::index::languages::ParserBackend,

@@ -26,6 +26,14 @@ enum GraphHealGate {
     Heal { scope_rows_newer: bool },
 }
 
+/// Whether a heal kept a file row (and may go on to re-derive its edges) or replaced it.
+#[derive(PartialEq, Eq)]
+enum FileRowHeal {
+    Kept,
+    /// Re-extracted into a fresh row at the current versions, edges included.
+    Replaced,
+}
+
 #[derive(Default)]
 struct GraphHealTally {
     unverified: usize,
@@ -221,7 +229,11 @@ impl IndexDatabase {
                     tally.unverified += 1;
                     continue;
                 }
-                self.heal_file_scope(&file, &text, scope_rows_newer, &mut tally)?;
+                if self.heal_file_scope(&file, &text, scope_rows_newer, &mut tally)?
+                    == FileRowHeal::Replaced
+                {
+                    continue;
+                }
                 self.heal_file_graph(&file, &text, &mut tally)?;
             }
             if tally.unverified > 0 || tally.unrefreshed > 0 {
@@ -269,7 +281,22 @@ impl IndexDatabase {
         text: &str,
         scope_rows_newer: bool,
         tally: &mut GraphHealTally,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<FileRowHeal> {
+        let derivable = file.kind != TargetKind::Generated
+            && file.language != Language::Markdown
+            // Above the parse limit there are no persisted symbols to refresh at all
+            // (`prepare_index_content_from_text` skips the same bound), so the scope shape
+            // is vacuously current for this file.
+            && text.len() <= edges::MAX_GRAPH_PARSE_BYTES;
+        if file.scope_owed
+            && !scope_rows_newer
+            && derivable
+            && symbol_set_changed_at(file.language).is_some_and(|at| file.scope_version < at)
+        {
+            self.reextract_file_row(file, text)?;
+            tally.edge_rewrite_staged = true;
+            return Ok(FileRowHeal::Replaced);
+        }
         // A file needs its scopes re-derived: Rust because a scope-affecting key bump
         // changed what its impl scopes ARE. Any
         // other language because the scope entered the key at all: `scope_path` landed
@@ -278,14 +305,8 @@ impl IndexDatabase {
         // new stamp holding a key no fresh index produces, and nested same-named symbols
         // would stay collapsed with no later pass owing them a re-derivation.
         let scope_needs_refresh = file.scope_owed
-                    && file.kind != TargetKind::Generated
-                    && file.language != Language::Markdown
-                // Above the parse limit there are no persisted symbols to refresh at all
-                // (`prepare_index_content_from_text` skips the same bound), so the scope shape
-                // is vacuously current for this file.
-                    && text.len() <= edges::MAX_GRAPH_PARSE_BYTES
-                    && (file.language == Language::Rust
-                        || self.file_has_unscoped_symbols(file.id)?);
+            && derivable
+            && (file.language == Language::Rust || self.file_has_unscoped_symbols(file.id)?);
         if file.scope_owed && !scope_rows_newer {
             if !scope_needs_refresh {
                 self.mark_file_scope_current(file.id)?;
@@ -307,7 +328,17 @@ impl IndexDatabase {
                 tally.unrefreshed += 1;
             }
         }
-        Ok(())
+        Ok(FileRowHeal::Kept)
+    }
+
+    /// Replace a file row with a fresh extraction of `text` in the row's own scope — the ordinary
+    /// incremental remove-and-insert, which stages the row and its in-edge sources for the heal's
+    /// scoped re-resolve and stamps the new row at the current versions. The caller has proven
+    /// `text` is this row's own bytes.
+    fn reextract_file_row(&self, file: &GraphReindexFile, text: &str) -> anyhow::Result<()> {
+        let path = Path::new(&file.path);
+        self.remove_file_in_scope(path, file.checkout.borrowed())?;
+        self.index_file(path, file.language, file.kind, file.modified_at_ms, text, &file.checkout)
     }
 
     fn heal_file_graph(
@@ -598,7 +629,8 @@ impl IndexDatabase {
         let mut stmt = self.storage.connection().prepare(&format!(
             "SELECT id, path, language, kind, sha256,
                     graph_version < CAST(?3 AS INTEGER),
-                    scope_version < CAST(?4 AS INTEGER)
+                    scope_version < CAST(?4 AS INTEGER),
+                    commit_sha, worktree_id, modified_at_ms, scope_version
                  FROM main.files
                  WHERE repo_id = ?1 AND generation = ?2 AND kind != '{TOMBSTONE_FILE_KIND}'
                    AND id IN (SELECT id FROM files)
@@ -624,6 +656,9 @@ impl IndexDatabase {
                     row.get::<_, String>(4)?,
                     row.get::<_, bool>(5)?,
                     row.get::<_, bool>(6)?,
+                    CheckoutKey { commit_sha: row.get(7)?, worktree_id: row.get(8)? },
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             },
         )?;
@@ -633,7 +668,18 @@ impl IndexDatabase {
         // new key stamp, and once the stamp matches nothing ever owes this row a re-derivation.
         let mut unreadable = 0usize;
         for row in rows {
-            let (id, path, language, kind, sha256, graph_owed, scope_owed) = row?;
+            let (
+                id,
+                path,
+                language,
+                kind,
+                sha256,
+                graph_owed,
+                scope_owed,
+                checkout,
+                modified_at_ms,
+                scope_version,
+            ) = row?;
             // A marker row this build cannot name is a row to LEAVE ALONE, not a reason to fail
             // the open. `ensure_graph_index_current` is on the open path, so an unparseable
             // language/kind here would wedge the database for every later open too.
@@ -650,6 +696,9 @@ impl IndexDatabase {
                 language,
                 kind,
                 sha256,
+                checkout,
+                modified_at_ms,
+                scope_version,
                 graph_owed,
                 scope_owed,
             });

@@ -549,6 +549,73 @@ struct Forward *use_forward(struct Defined *d) {
     assert_no_symbol(&symbols, "enum", "EForward");
 }
 
+fn c_symbols(text: &str) -> Vec<(String, String)> {
+    parser::parse_symbols(Path::new("src/types.c"), Language::C, text)
+        .unwrap()
+        .into_iter()
+        .map(|symbol| (symbol.kind, symbol.name))
+        .collect()
+}
+
+/// The name is read down the `declarator` chain; the parameter lists hang off it and are never
+/// searched, so a function returning a function pointer is not named after its parameter.
+#[test]
+fn c_function_returning_a_function_pointer_is_named_by_its_declarator() {
+    assert_eq!(c_symbols("void (*get_handler(int sig))(int) { return 0; }"), vec![(
+        "function".to_string(),
+        "get_handler".to_string()
+    )]);
+}
+
+/// An aggregate with no `name` field declares no symbol of its own: a member (`x`) or an
+/// enumerator (`A`) is not its name. A typedef still names the type.
+#[test]
+fn c_anonymous_aggregates_are_not_symbols() {
+    assert_eq!(c_symbols("typedef struct { int x; } Pt;"), vec![(
+        "type".to_string(),
+        "Pt".to_string()
+    )]);
+    assert_eq!(c_symbols("enum { A, B };"), vec![]);
+}
+
+/// A typedef is named by its `declarator` field, not by the first name under it: with a plain
+/// named source type, that first name is the aliased type.
+#[test]
+fn c_typedef_is_named_by_its_declarator() {
+    let typedef =
+        |text: &str| c_symbols(text).into_iter().map(|(_, name)| name).collect::<Vec<_>>();
+    assert_eq!(typedef("typedef MyInt Len;"), vec!["Len"]);
+    assert_eq!(typedef("typedef MyInt *LenPtr;"), vec!["LenPtr"]);
+    assert_eq!(typedef("typedef Ret (*Handler)(Arg a);"), vec!["Handler"]);
+}
+
+fn cpp_symbols(text: &str) -> Vec<(String, String)> {
+    parser::parse_symbols(Path::new("src/types.cpp"), Language::Cpp, text)
+        .unwrap()
+        .into_iter()
+        .map(|symbol| (symbol.kind, symbol.name))
+        .collect()
+}
+
+/// A C++ function name is read along its declarator's `name` fields, so template arguments and
+/// scopes are never its name, and an operator is named by its operator.
+#[test]
+fn cpp_function_is_named_through_template_scope_and_operator_names() {
+    let functions = |text: &str| {
+        cpp_symbols(text)
+            .into_iter()
+            .filter(|(kind, _)| kind == "function")
+            .map(|(_, name)| name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(functions("template<> void foo<Bar>(Bar b) {}"), vec!["foo"]);
+    assert_eq!(functions("void ns::run<Gizmo>() {}"), vec!["run"]);
+    assert_eq!(functions("Foo& Foo::operator=(const Foo& o) { return *this; }"), vec!["operator="]);
+    assert_eq!(functions("Foo::~Foo() {}"), vec!["Foo"]);
+    assert_eq!(functions("typedef MyInt Len; void a::b::c() {}"), vec!["c"]);
+    assert_eq!(cpp_symbols("typedef MyInt Len;"), vec![("type".to_string(), "Len".to_string())]);
+}
+
 #[test]
 fn extracts_cpp_symbols() {
     let text = r#"

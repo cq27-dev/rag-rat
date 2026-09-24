@@ -153,24 +153,42 @@ pub(crate) fn unwrap_generic_function(function: Node<'_>) -> Node<'_> {
     }
 }
 
-pub(crate) fn call_target_name(node: Node<'_>, text: &str, kinds: &[&str]) -> Option<String> {
-    node.child_by_field_name("function")
-        .map(unwrap_generic_function)
-        .and_then(|child| last_identifier_text(child, text, kinds))
-        .map(|name| short_name(&name).to_string())
-        .or_else(|| first_identifier_text(node, text, kinds))
+/// The callee NAME token of a Rust call, read from grammar fields: a plain `identifier`, the
+/// `name` of a `scoped_identifier` (`a::b::c`), or the `field` of a `field_expression`
+/// (`recv.method`), through parentheses and a turbofish (`f::<T>`). Every other callee is a VALUE
+/// with no name of its own — a subscript (`handlers[key](x)`), a call result (`make(a)(b)`), a `?`
+/// (`get(k)?(x)`), a tuple field (`self.0(x)`), a deref, a closure — and yields `None`: the
+/// identifiers inside it are an index, an argument or a parameter, and no callee name is better
+/// than a wrong one.
+fn rust_callee_name_node(call: Node<'_>) -> Option<Node<'_>> {
+    let mut callee = call.child_by_field_name("function")?;
+    loop {
+        callee = match callee.kind() {
+            "parenthesized_expression" => callee.named_child(0)?,
+            "generic_function" => callee.child_by_field_name("function")?,
+            "identifier" => return Some(callee),
+            "scoped_identifier" => return callee.child_by_field_name("name"),
+            "field_expression" =>
+                return callee
+                    .child_by_field_name("field")
+                    .filter(|field| field.kind() == "field_identifier"),
+            _ => return None,
+        };
+    }
+}
+
+/// The name a Rust call expression calls — see [`rust_callee_name_node`].
+pub(crate) fn call_target_name(node: Node<'_>, text: &str) -> Option<String> {
+    rust_callee_name_node(node)
+        .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
 }
 /// The callee identifier node for a call expression — the same token [`call_target_name`] names,
 /// returned as a node so its byte range can be recorded (SCIP occurrences key on the identifier's
-/// position, #67). Points at the FINAL `::`/`.` segment (the callee name itself), matching how
-/// `call_target_name`'s `short_name` collapses a path to its tail. `None` when no clean identifier
-/// node is available — never guess a wrong range.
-pub(crate) fn call_target_node<'tree>(node: Node<'tree>, kinds: &[&str]) -> Option<Node<'tree>> {
-    node.child_by_field_name("function")
-        .map(unwrap_generic_function)
-        .and_then(|function| last_identifier_node(function, kinds))
-        .or_else(|| first_identifier_node(node, kinds))
-        .map(final_segment_node)
+/// position, #67).
+pub(crate) fn call_target_node(node: Node<'_>) -> Option<Node<'_>> {
+    rust_callee_name_node(node)
 }
 /// The name a call hangs off — the head of `Type::method` / `receiver.method`.
 ///
@@ -226,16 +244,50 @@ pub(crate) struct IdentifierSegment<'tree> {
     text: String,
 }
 
-/// The identifier tokens below one syntax node, in document order.
+/// The identifier segments of a member / callee chain, qualifier first.
 pub(crate) struct IdentifierPath<'tree> {
     segments: Vec<IdentifierSegment<'tree>>,
+    /// Where the written qualified path starts. A member that spells its own scope
+    /// (`w->Widget::run`) restarts the path: the receiver is still `w`, but the qualified target
+    /// is `Widget::run`, not `w::Widget::run`. `None` when the chain was cut at an unnamed value
+    /// and no member restarted it: `foo(bar).x.baz` is not a path `x::baz`.
+    qualified_from: Option<usize>,
+    /// The first segment hangs off an unnamed value (`foo(bar).x.baz`, `this.d.e`), so it is a
+    /// member, not a receiver.
+    unnamed_root: bool,
 }
 
+/// Fields that hold the member NAME of a member-access node, across grammars: TS/JS
+/// `member_expression.property`, Python `attribute.attribute`, C/C++/Rust/Go `field`.
+const MEMBER_FIELDS: &[&str] = &["property", "attribute", "field"];
+/// Fields that hold the QUALIFIER a member hangs off: TS/Python `object`, C/C++ `argument`, Rust
+/// `value`, C++ `scope`, Rust `path`, Go `operand`.
+const QUALIFIER_FIELDS: &[&str] = &["object", "argument", "value", "scope", "path", "operand"];
+/// Nodes whose member is their `name` field: C++ `ns::f` / `f<T>` / `.template f<T>` and a
+/// template scope `Foo<T>::`. Only these: plenty of non-chain nodes have a `name` field (a named
+/// function expression, a keyword argument), and they are not a path.
+const NAMED_MEMBER_KINDS: &[&str] =
+    &["qualified_identifier", "template_function", "template_method", "template_type"];
+/// Nodes without fields whose named children ARE the chain, qualifier first and member last:
+/// Kotlin `navigation_expression` / `qualified_identifier`, Python `dotted_name`, C++
+/// `dependent_name` (the `template` wrapper around a member).
+const FLAT_CHAIN_KINDS: &[&str] =
+    &["navigation_expression", "dotted_name", "qualified_identifier", "dependent_name"];
+
 impl<'tree> IdentifierPath<'tree> {
-    pub(crate) fn under(node: Node<'tree>, text: &str, kinds: &[&str]) -> Self {
-        let mut segments = Vec::new();
-        collect_identifier_segments(node, text, kinds, &mut segments);
-        Self { segments }
+    /// The member chain a callee (or a qualified type / tag name) spells, read from grammar
+    /// fields: qualifier fields, then the member field. Arguments, lambdas and template argument
+    /// lists are never fields of the chain, so their identifiers can never become the callee,
+    /// the qualifier or the receiver.
+    ///
+    /// A qualifier that is not itself a chain — a call result (`foo(bar).baz`), a subscript, a
+    /// `this` — cuts the chain there: `baz` hangs off a value with no name, so the path is just
+    /// `baz`, with no receiver and no qualified target. A member that is not an identifier
+    /// (`obj.#private`) yields an EMPTY path: no callee is better than a wrong one.
+    pub(crate) fn member_chain(node: Node<'tree>, text: &str, kinds: &[&str]) -> Self {
+        let mut path = Self { segments: Vec::new(), qualified_from: Some(0), unnamed_root: false };
+        collect_member_chain(node, text, kinds, &mut path);
+        path
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -247,11 +299,15 @@ impl<'tree> IdentifierPath<'tree> {
     }
 
     pub(crate) fn receiver_text(&self) -> Option<&str> {
-        self.first_text().filter(|_| self.len() > 1)
+        self.first_text().filter(|_| self.has_receiver())
     }
 
     pub(crate) fn receiver_node(&self) -> Option<Node<'tree>> {
-        self.first_node().filter(|_| self.len() > 1)
+        self.first_node().filter(|_| self.has_receiver())
+    }
+
+    fn has_receiver(&self) -> bool {
+        self.len() > 1 && !self.unnamed_root
     }
 
     pub(crate) fn last_text(&self) -> Option<&str> {
@@ -267,38 +323,148 @@ impl<'tree> IdentifierPath<'tree> {
     }
 
     pub(crate) fn qualified_name(&self) -> Option<String> {
-        (self.segments.len() > 1).then(|| {
-            self.segments.iter().map(|segment| segment.text.as_str()).collect::<Vec<_>>().join("::")
+        let qualified = &self.segments[self.qualified_from?..];
+        (qualified.len() > 1).then(|| {
+            qualified.iter().map(|segment| segment.text.as_str()).collect::<Vec<_>>().join("::")
         })
+    }
+
+    /// Drop everything collected from `len` on — a chain that failed below that point.
+    fn truncate(&mut self, len: usize) {
+        self.segments.truncate(len);
+        self.qualified_from = self.qualified_from.map(|from| from.min(len));
     }
 }
 
-fn collect_identifier_segments<'tree>(
+/// One chain node split into the qualifiers it hangs off and its member.
+struct ChainParts<'tree> {
+    qualifiers: Vec<Node<'tree>>,
+    member: Node<'tree>,
+    /// The member is a value access (a `MEMBER_FIELDS` field: `w->Widget::run`, `obj.run`), not
+    /// the next segment of a scope path (`a::b::c`, `pkg.mod`). Only a value access can spell a
+    /// scope of its own that restarts the qualified path.
+    member_is_value_access: bool,
+}
+
+/// The qualifiers and the member of one chain node, or `None` when the node is not a chain.
+fn member_chain_parts(node: Node<'_>) -> Option<ChainParts<'_>> {
+    let qualifiers = || {
+        QUALIFIER_FIELDS
+            .iter()
+            .find_map(|field| node.child_by_field_name(field))
+            .into_iter()
+            .collect()
+    };
+    if let Some(member) = MEMBER_FIELDS.iter().find_map(|field| node.child_by_field_name(field)) {
+        return Some(ChainParts { qualifiers: qualifiers(), member, member_is_value_access: true });
+    }
+    if NAMED_MEMBER_KINDS.contains(&node.kind())
+        && let Some(member) = node.child_by_field_name("name")
+    {
+        return Some(ChainParts {
+            qualifiers: qualifiers(),
+            member,
+            member_is_value_access: false,
+        });
+    }
+    if !FLAT_CHAIN_KINDS.contains(&node.kind()) {
+        return None;
+    }
+    let mut qualifiers = named_children(node).collect::<Vec<_>>();
+    let member = qualifiers.pop()?;
+    Some(ChainParts { qualifiers, member, member_is_value_access: false })
+}
+
+/// Append `node`'s chain to `path`. Returns false — with `path` exactly as it was on entry — when
+/// `node` does not end in an identifier.
+fn collect_member_chain<'tree>(
     node: Node<'tree>,
     text: &str,
     kinds: &[&str],
-    out: &mut Vec<IdentifierSegment<'tree>>,
-) {
+    path: &mut IdentifierPath<'tree>,
+) -> bool {
     if kinds.contains(&node.kind()) {
-        if let Ok(value) = node.utf8_text(text.as_bytes())
-            && !value.is_empty()
-        {
-            out.push(IdentifierSegment { node, text: value.to_string() });
-        }
-        return;
+        return match node.utf8_text(text.as_bytes()) {
+            Ok(value) if !value.is_empty() => {
+                path.segments.push(IdentifierSegment { node, text: value.to_string() });
+                true
+            },
+            _ => false,
+        };
     }
-    // grow_stack: full-subtree recursion; keep the same hostile-input guard as the legacy
-    // text-only and node-only collectors.
+    // A postfix operator can sit where the callee or qualifier belongs, and its operand IS the
+    // chain: kotlin-ng binds prefix/postfix operators tighter than a call or a navigation
+    // (`!isX()`, `a!!.b()` are a `unary_expression`), and TypeScript's non-null assertion
+    // `a!.b()` is a field-less `non_null_expression`. Other grammars cannot place a bare unary
+    // there without parentheses.
+    let operand = match node.kind() {
+        "unary_expression" => node.child_by_field_name("argument"),
+        "non_null_expression" => node.named_child(0),
+        _ => None,
+    };
+    if let Some(operand) = operand {
+        return rag_rat_base::stack::grow_stack(|| {
+            collect_member_chain(operand, text, kinds, path)
+        });
+    }
+    let Some(ChainParts { qualifiers, member, member_is_value_access }) = member_chain_parts(node)
+    else {
+        return false;
+    };
+    let start = path.len();
+    // grow_stack: a chain nests once per member access; a hostile file can make that deep (#543).
     rag_rat_base::stack::grow_stack(|| {
-        for child in named_children(node) {
-            collect_identifier_segments(child, text, kinds, out);
+        for qualifier in qualifiers {
+            if !collect_member_chain(qualifier, text, kinds, path) {
+                // The member hangs off an unnamed value: nothing to its left is its qualifier, and
+                // nothing it leads is a written path.
+                path.truncate(start);
+                path.qualified_from = None;
+                path.unnamed_root |= start == 0;
+            }
         }
-    });
+        let member_start = path.len();
+        if !collect_member_chain(member, text, kinds, path) {
+            path.truncate(start);
+            return false;
+        }
+        // `w->Widget::run`: the member spells its own scope, so the written path restarts there.
+        // A scope node's member (`a::b::c`, which nests as `a` + `b::c`) is the path continuing.
+        if member_is_value_access && path.len() - member_start > 1 {
+            path.qualified_from = Some(member_start);
+        }
+        true
+    })
 }
 
 #[cfg(test)]
 mod identifier_path_tests {
     use super::*;
+
+    /// A misspelled field name reads as an absent child, which silently cuts every chain through
+    /// it — so every field the chain walk reads must be a field of some grammar.
+    #[test]
+    fn every_member_chain_field_exists_in_some_grammar() {
+        use crate::index::parser::{self, ParserKind};
+        let grammars = [
+            ParserKind::Rust,
+            ParserKind::TypeScript,
+            ParserKind::Tsx,
+            ParserKind::Kotlin,
+            ParserKind::C,
+            ParserKind::Cpp,
+            ParserKind::Python,
+            ParserKind::Swift,
+            ParserKind::Go,
+        ]
+        .map(|kind| parser::grammar_for(kind).expect("grammar"));
+        for field in MEMBER_FIELDS.iter().chain(QUALIFIER_FIELDS).chain(&["name", "argument"]) {
+            assert!(
+                grammars.iter().any(|grammar| grammar.field_id_for_name(field).is_some()),
+                "no grammar has a `{field}` field"
+            );
+        }
+    }
 
     #[test]
     fn captures_text_and_nodes_in_one_ordered_path() {
@@ -310,7 +476,8 @@ mod identifier_path_tests {
         let call = statement.named_child(0).unwrap();
         let callee = call.child_by_field_name("function").unwrap();
 
-        let path = IdentifierPath::under(callee, source, &["identifier", "property_identifier"]);
+        let path =
+            IdentifierPath::member_chain(callee, source, &["identifier", "property_identifier"]);
 
         assert_eq!(path.len(), 3);
         assert_eq!(path.first_text(), Some("client"));
@@ -322,9 +489,12 @@ mod identifier_path_tests {
 }
 
 pub(crate) fn identifiers_under(node: Node<'_>, text: &str, kinds: &[&str]) -> Vec<String> {
-    let mut segments = Vec::new();
-    collect_identifier_segments(node, text, kinds, &mut segments);
-    segments.into_iter().map(|segment| segment.text).collect()
+    identifier_nodes_under(node, kinds)
+        .into_iter()
+        .filter_map(|identifier| identifier.utf8_text(text.as_bytes()).ok())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 /// Node-returning twin of [`first_identifier_text`]: the first identifier-kind node in document
 /// order, so its byte range can be recorded for the SCIP join (#67). Same traversal, so the node it

@@ -825,7 +825,7 @@ pub(super) fn rust_dispatch_handle_facts(
     let mut handler_calls = Vec::new();
     collect_handler_calls(value, text, &mut handler_calls);
     for call in &handler_calls {
-        let Some(handler) = call_target_name(*call, text, super::IDENTIFIER_KINDS) else {
+        let Some(handler) = call_target_name(*call, text) else {
             continue;
         };
         let context = EdgeContext {

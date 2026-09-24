@@ -1,3 +1,4 @@
+use rag_rat_base::language::Language;
 use tree_sitter::Parser;
 
 use super::*;
@@ -1383,4 +1384,106 @@ fn receiver_hint_scan_handles_a_matching_impl_among_thousands() {
         1_000,
         "the one impl whose tail matches types every binding",
     );
+}
+
+fn impl_facts(
+    source: &str,
+    kind: EdgeKind,
+) -> Vec<crate::index::languages::test_support::EdgeFact> {
+    crate::index::languages::test_support::edge_facts("src/lib.rs", Language::Rust, source, kind)
+}
+
+/// The trait comes from the impl's `trait` field, so a generic binder or a lifetime in the header
+/// is never the implemented trait.
+#[test]
+fn an_impl_implements_its_trait_field() {
+    use crate::index::languages::test_support::fact;
+    assert_eq!(impl_facts("impl<T: Display> Trait for Foo<T> {}", EdgeKind::Implements), vec![
+        fact(EdgeKind::Implements, "Trait", None, None)
+    ]);
+    assert_eq!(impl_facts("impl<'a> Tr for &'a Bar {}", EdgeKind::Implements), vec![fact(
+        EdgeKind::Implements,
+        "Tr",
+        None,
+        None
+    )]);
+    assert_eq!(impl_facts("impl a::Tr<u8> for b::Baz {}", EdgeKind::Implements), vec![fact(
+        EdgeKind::Implements,
+        "Tr",
+        Some("a::Tr"),
+        None
+    )]);
+}
+
+/// A `for` loop in an inherent impl's body does not make it a trait impl.
+#[test]
+fn an_inherent_impl_with_a_for_loop_implements_nothing() {
+    let source = "impl Foo { fn f(v: Vec<u8>) { for x in v { g(x); } } }";
+    assert_eq!(impl_facts(source, EdgeKind::Implements), vec![]);
+}
+
+/// The edge hangs off the impl symbol that encloses it, by that symbol's qualified name — not a
+/// bare name split out of the header.
+#[test]
+fn an_implements_edge_comes_from_the_impl_symbol() {
+    let source = "impl<T: Display> Trait for Foo<T> {}";
+    let impl_symbol = IndexedSymbol {
+        id: 7,
+        file_id: 0,
+        language: "rust".to_string(),
+        name: "Foo".to_string(),
+        qualified_name: "src/lib.rs::Foo<_> as Trait".to_string(),
+        scope_path: "Foo<_> as Trait".to_string(),
+        kind: "impl".to_string(),
+        start_byte: 0,
+        end_byte: source.len(),
+        start_line: 1,
+        end_line: 1,
+    };
+    let edges = syntactic_edges(
+        std::path::Path::new("src/lib.rs"),
+        Language::Rust,
+        source,
+        std::slice::from_ref(&impl_symbol),
+    )
+    .unwrap();
+    let implements =
+        edges.iter().find(|edge| edge.edge_kind == EdgeKind::Implements).expect("implements edge");
+    assert_eq!(implements.from_symbol_id, Some(7));
+    assert_eq!(implements.from_name.as_deref(), Some("src/lib.rs::Foo<_> as Trait"));
+}
+
+/// A subscript, a call result or a closure is a callee with no name: the identifiers inside it are
+/// an index, an argument or a parameter, never the called function.
+#[test]
+fn a_call_on_an_unnamed_value_names_no_callee() {
+    use crate::index::languages::test_support::fact;
+    let calls = |body: &str| impl_facts(&format!("fn f() {{ {body} }}"), EdgeKind::CallsName);
+    assert_eq!(calls("handlers[key](x);"), vec![]);
+    assert_eq!(calls("make(a)(b);"), vec![fact(EdgeKind::CallsName, "make", None, None)]);
+    assert_eq!(calls("(|x| x)(1);"), vec![]);
+    assert_eq!(calls("get(k)?(x);"), vec![fact(EdgeKind::CallsName, "get", None, None)]);
+    assert_eq!(calls("self.0(x);"), vec![]);
+    assert_eq!(calls("(*make(a))(x);"), vec![fact(EdgeKind::CallsName, "make", None, None)]);
+    // A named callee is still read through a turbofish and parentheses.
+    assert_eq!(calls("a::run::<T>(x);"), vec![fact(
+        EdgeKind::CallsName,
+        "run",
+        Some("a::run"),
+        Some("a")
+    )]);
+    assert_eq!(calls("(run)(x);"), vec![fact(EdgeKind::CallsName, "run", None, None)]);
+}
+
+/// A generic type references its base type and each type argument once: the `generic_type` node
+/// itself is not a reference to its last argument.
+#[test]
+fn a_generic_type_references_each_type_once() {
+    use crate::index::languages::test_support::fact;
+    let types = impl_facts("fn f() { let v: HashMap<Key, Val> = x; }", EdgeKind::ReferencesType);
+    assert_eq!(types, vec![
+        fact(EdgeKind::ReferencesType, "HashMap", None, None),
+        fact(EdgeKind::ReferencesType, "Key", None, None),
+        fact(EdgeKind::ReferencesType, "Val", None, None),
+    ]);
 }

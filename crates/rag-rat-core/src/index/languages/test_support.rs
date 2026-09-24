@@ -124,3 +124,32 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
 pub(crate) fn fixtures() -> impl Iterator<Item = (Language, LanguageFixture)> {
     Language::all().iter().filter_map(|&language| Some((language, fixture(language)?)))
 }
+
+/// One extracted edge as a regression test pins it: kind, target name, written qualified target
+/// and receiver hint.
+pub(crate) type EdgeFact = (crate::index::edges::EdgeKind, String, Option<String>, Option<String>);
+
+/// The syntactic edges of `kind` extracted from `source`, in walk order.
+pub(crate) fn edge_facts(
+    path: &str,
+    language: Language,
+    source: &str,
+    kind: crate::index::edges::EdgeKind,
+) -> Vec<EdgeFact> {
+    crate::index::edges::syntactic_edges(std::path::Path::new(path), language, source, &[])
+        .expect("edge extraction")
+        .into_iter()
+        .filter(|edge| edge.edge_kind == kind)
+        .map(|edge| (edge.edge_kind, edge.to_name, edge.target_qualified_name, edge.receiver_hint))
+        .collect()
+}
+
+/// An [`EdgeFact`] spelled with string literals.
+pub(crate) fn fact(
+    kind: crate::index::edges::EdgeKind,
+    name: &str,
+    qualified: Option<&str>,
+    receiver: Option<&str>,
+) -> EdgeFact {
+    (kind, name.to_string(), qualified.map(ToOwned::to_owned), receiver.map(ToOwned::to_owned))
+}
