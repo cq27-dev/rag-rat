@@ -379,17 +379,9 @@ pub fn memories_for_call_path_hash(
         stmt.query_map(params![edge_sequence_hash, i64::from(limit)], |row| row.get("memory_id"))?,
     )
 }
-pub fn memory_search(
-    conn: &Connection,
-    query: &str,
-    limit: u32,
-) -> anyhow::Result<Vec<RepoMemory>> {
-    Ok(memory_search_scored(conn, query, limit)?.into_iter().map(|(memory, _)| memory).collect())
-}
-
 /// Keyword search over active+stale memories, best match first, carrying each hit's raw
-/// `bm25(repo_memory_fts)` rank so a caller can gate on RELATIVE relevance (the plain
-/// [`memory_search`] drops it).
+/// `bm25(repo_memory_fts)` rank so a caller can gate on RELATIVE relevance. The BM25 arm of the
+/// hybrid memory search in rag-rat-core.
 ///
 /// INVARIANT: the returned score is SQLite's bm25, which is NEGATIVE and lower-is-better — a
 /// stronger match is MORE negative. Callers comparing scores must invert first; treating the
@@ -399,6 +391,22 @@ pub fn memory_search_scored(
     query: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<(RepoMemory, f64)>> {
+    let mut hits = Vec::new();
+    for (memory_id, rank) in memory_search_ranked_ids(conn, query, limit)? {
+        if let Some(memory) = memory_by_id(conn, &memory_id)? {
+            hits.push((memory, rank));
+        }
+    }
+    Ok(hits)
+}
+
+/// [`memory_search_scored`] without hydration: `(memory_id, bm25)` best first, for a caller that
+/// ranks a wide candidate window and hydrates only the page it returns.
+pub fn memory_search_ranked_ids(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+) -> anyhow::Result<Vec<(String, f64)>> {
     let query = fts_query(query);
     if query.is_empty() {
         return Ok(Vec::new());
@@ -435,18 +443,61 @@ pub fn memory_search_scored(
         LIMIT ?2
         "
     ))?;
-    let ranked = stmt
-        .query_map(params![query, i64::from(limit)], |row| {
-            Ok((row.get::<_, String>("memory_id")?, row.get::<_, f64>("bm25_rank")?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut hits = Vec::with_capacity(ranked.len());
-    for (memory_id, rank) in ranked {
-        if let Some(memory) = memory_by_id(conn, &memory_id)? {
-            hits.push((memory, rank));
-        }
+    stmt.query_map(params![query, i64::from(limit)], |row| {
+        Ok((row.get::<_, String>("memory_id")?, row.get::<_, f64>("bm25_rank")?))
+    })?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(Into::into)
+}
+
+/// The text a live memory is embedded from: kind, title, tags and body — the same fields
+/// `repo_memory_fts` indexes, so the vector arm and the BM25 arm see one document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEmbeddingSource {
+    pub memory_id: String,
+    pub text: String,
+}
+
+/// Every live memory in the active repo scope with the text its vector is computed from, ordered by
+/// id. The memory-search vector arm keys each vector by a hash of this text, so an edited memory
+/// reads as a cache miss until it is re-embedded rather than serving its old vector.
+pub fn memory_embedding_sources(conn: &Connection) -> anyhow::Result<Vec<MemoryEmbeddingSource>> {
+    let scope = memory_repo_scope(conn)?;
+    let repo_clause = memory_repo_scope_clause(&scope);
+    let live = live_memory_status_sql("repo_memories");
+    let mut tags = std::collections::HashMap::<String, Vec<String>>::new();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT repo_memory_tags.memory_id, repo_memory_tags.tag
+         FROM repo_memory_tags
+         JOIN repo_memories ON repo_memories.id = repo_memory_tags.memory_id
+         WHERE {live}{repo_clause}
+         ORDER BY repo_memory_tags.memory_id, repo_memory_tags.tag"
+    ))?;
+    for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
+        let (memory_id, tag) = row?;
+        tags.entry(memory_id).or_default().push(tag);
     }
-    Ok(hits)
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, kind, title, body FROM repo_memories
+         WHERE {live}{repo_clause}
+         ORDER BY id"
+    ))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut sources = Vec::new();
+    for row in rows {
+        let (memory_id, kind, title, body) = row?;
+        let tags = tags.remove(&memory_id).unwrap_or_default().join(" ");
+        let text = format!("{kind}: {title}\n{tags}\n{body}");
+        sources.push(MemoryEmbeddingSource { memory_id, text });
+    }
+    Ok(sources)
 }
 
 #[cfg(test)]

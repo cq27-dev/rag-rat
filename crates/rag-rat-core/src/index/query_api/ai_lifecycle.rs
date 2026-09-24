@@ -70,9 +70,23 @@ impl IndexDatabase {
         options: ai::ReconcileOptions,
         progress: impl FnMut(ai::ReconcileProgress),
     ) -> anyhow::Result<ReconcileReport> {
+        // The memory refresh below gets the same soft budget the chunk reconcile ran under.
+        let memory_deadline = options
+            .max_seconds
+            .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
         let report =
             ai::reconcile_with_options_progress(self.storage.connection(), options, progress)?;
         self.heal_memory_oplog_ghosts()?;
+        // Memory vectors ride the same idle-repo seam (#1443). A failed memory embed must not fail
+        // the chunk reconcile that already committed: memory search just stays BM25-only for the
+        // memories left unembedded, and the next pass retries them.
+        if let Err(err) = ai::refresh_memory_vectors(self.storage.connection(), memory_deadline) {
+            tracing::warn!(
+                target: "rag_rat_core::index::ai::reconcile",
+                error = %err,
+                "memory vector refresh failed"
+            );
+        }
         Ok(report)
     }
 

@@ -15,11 +15,31 @@ impl IndexDatabase {
         &self,
         request: RepoMemoryCreate,
     ) -> anyhow::Result<RepoMemoryCreateResult> {
-        crate::memory_write::create_memory(self.storage.connection(), request)
+        let created = crate::memory_write::create_memory(self.storage.connection(), request)?;
+        self.embed_written_memory(&created.memory.memory_id);
+        Ok(created)
     }
 
     pub fn memory_update(&self, update: RepoMemoryUpdate) -> anyhow::Result<RepoMemory> {
-        crate::memory_write::update_memory(self.storage.connection(), update)
+        let updated = crate::memory_write::update_memory(self.storage.connection(), update)?;
+        self.embed_written_memory(&updated.memory_id);
+        Ok(updated)
+    }
+
+    /// Embed a memory this connection just wrote, so it ranks by meaning on the next search
+    /// (#1443). Best effort after the write committed: a failure is logged and left to the
+    /// reconcile backfill, never surfaced as a failed write.
+    fn embed_written_memory(&self, memory_id: &str) {
+        if let Err(err) =
+            crate::index::ai::embed_written_memory(self.storage.connection(), memory_id)
+        {
+            tracing::warn!(
+                target: "rag_rat_core::index::ai::reconcile",
+                error = %err,
+                memory_id,
+                "memory embed after write failed; the next reconcile retries it"
+            );
+        }
     }
 
     pub fn memory_mark_obsolete(&self, memory_id: &str) -> anyhow::Result<RepoMemory> {
@@ -60,12 +80,20 @@ impl IndexDatabase {
         surface: rag_rat_base::config::MemorySurface,
     ) -> anyhow::Result<Vec<RepoMemory>> {
         let conn = self.storage.connection();
+        // Embed the query once, outside the corruption retry, so a heal-and-retry does not pay
+        // for it twice.
+        let query_embedding = crate::index::ai::embed_query(conn, query)?;
         // #582: both the MATCH and the surface hydration (whose Summary path runs a RANKED
         // chunk_fts query) can hit FTS shadow corruption; heal-and-retry rather than surfacing
         // a bare "database disk image is malformed" forever.
         crate::index::retry_once_on_fts_corruption(
             || {
-                let mut memories = memory::memory_search(conn, query, limit)?;
+                let mut memories = crate::search::lexical::memory_search(
+                    conn,
+                    query,
+                    limit,
+                    query_embedding.as_ref(),
+                )?;
                 memory::apply_memory_surface(conn, &mut memories, surface)?;
                 Ok(memories)
             },

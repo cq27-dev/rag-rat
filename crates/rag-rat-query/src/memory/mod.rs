@@ -12,10 +12,11 @@ use std::collections::BTreeSet;
 pub(crate) use api::memory_ids_with_broken_anchors;
 pub use api::{
     MAX_EDGE_ANCHOR_LEN, MAX_MEMORY_BODY_LEN, MAX_MEMORY_PAYLOAD_LEN, MAX_MEMORY_TITLE_LEN,
-    MemoryDoctorEntry, MemorySummary, anchor_health_counts, doctor_attention_count, doctor_report,
-    list_memories, memories_for_call_path_hash, memories_for_chunk, memories_for_edges,
-    memories_for_path, memories_for_symbol, memory_by_id, memory_evidence_for_symbol,
-    memory_evidence_for_symbol_and_edges, memory_search, memory_search_scored, validate_memories,
+    MemoryDoctorEntry, MemoryEmbeddingSource, MemorySummary, anchor_health_counts,
+    doctor_attention_count, doctor_report, list_memories, memories_for_call_path_hash,
+    memories_for_chunk, memories_for_edges, memories_for_path, memories_for_symbol, memory_by_id,
+    memory_embedding_sources, memory_evidence_for_symbol, memory_evidence_for_symbol_and_edges,
+    memory_search_ranked_ids, memory_search_scored, validate_memories,
 };
 pub use edges::{
     EDGE_SELECT, edge_by_key, edge_key, edge_row, edges_from, edges_into,

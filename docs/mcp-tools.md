@@ -577,7 +577,8 @@ or not fingerprinted. This is the same signal the Write/Edit clone-check hook us
 
 Memory tools read and write the durable, source-anchored notes described in the
 [README](../README.md#repo-memories). `memory_create` records one (typed `kind`, `title`, `body`,
-`confidence`), `memory_search` finds them by keyword, and `memory_for_symbol` / `memory_for_path` /
+`confidence`), `memory_search` finds them by keyword and — once an embedding model is installed and a reconcile has
+embedded them — by meaning, and `memory_for_symbol` / `memory_for_path` /
 `memory_for_call_path` fetch the full memories bound to an anchor (the expanded form of the compact
 headers `impact_surface` attaches). `memory_show` expands one memory to its full body by
 `memory_id` — the expand path for a `[memory] surface = "summary"` compact attachment.

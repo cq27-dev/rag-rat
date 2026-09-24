@@ -958,11 +958,11 @@ fn papertrail_queries_never_surface_the_other_repo() {
 // `repo_registry.rs`; these tests pin the cross-repo SCOPING BEHAVIOR of the query sweeps.
 // ================================================================================================
 
-use rag_rat_query::memory::{
-    RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryCreateResult, memory_search,
-};
+use rag_rat_query::memory::{RepoMemoryBindTarget, RepoMemoryCreate, RepoMemoryCreateResult};
 
+use crate::index::ai;
 use crate::memory_write::create_memory;
+use crate::search::lexical::memory_search;
 
 const A5_REPO_A: &str = "a5-repo-a";
 const A5_REPO_B: &str = "a5-repo-b";
@@ -1046,14 +1046,49 @@ fn identical_titled_memories_live_in_both_repos_and_search_isolates() {
     assert_ne!(a.memory.memory_id, b.memory.memory_id, "the two are distinct memories");
 
     a5_set_active_repo(&conn, A5_REPO_A);
-    let hits_a = memory_search(&conn, "reentrancy", 10).unwrap();
+    let hits_a = memory_search(&conn, "reentrancy", 10, None).unwrap();
     assert_eq!(hits_a.len(), 1, "repo A search returns exactly its own memory: {hits_a:?}");
     assert_eq!(hits_a[0].memory_id, a.memory.memory_id);
 
     a5_set_active_repo(&conn, A5_REPO_B);
-    let hits_b = memory_search(&conn, "reentrancy", 10).unwrap();
+    let hits_b = memory_search(&conn, "reentrancy", 10, None).unwrap();
     assert_eq!(hits_b.len(), 1, "repo B search returns exactly its own memory: {hits_b:?}");
     assert_eq!(hits_b[0].memory_id, b.memory.memory_id);
+}
+
+/// The memory vector arm isolates repos the same way: `embedding_cache` is global and
+/// content-addressed, so two repos holding a memory with IDENTICAL text share one cache row, yet
+/// each repo reaches only its own memory through it.
+#[test]
+fn memory_vector_arm_never_surfaces_a_sibling_repos_memory() {
+    let hash_dim = rag_rat_base::embedding_models::spec(HASH_MODEL_ID).unwrap().dim;
+    let hash_embedder =
+        || -> anyhow::Result<Box<dyn ai::Embedder>> { Ok(Box::new(ai::HashEmbedder)) };
+    let conn = a5_scoped_two_repo_conn();
+    a5_set_active_repo(&conn, A5_REPO_A);
+    let a = a5_create_memory(&conn, "cache eviction order", "evict the oldest widget first", "ca");
+    a5_set_active_repo(&conn, A5_REPO_B);
+    let b = a5_create_memory(&conn, "cache eviction order", "evict the oldest widget first", "cb");
+    a5_set_active_repo(&conn, A5_REPO_A);
+    assert_eq!(
+        ai::refresh_memory_vectors_with(&conn, HASH_MODEL_ID, hash_dim, None, hash_embedder)
+            .unwrap(),
+        1
+    );
+    a5_set_active_repo(&conn, A5_REPO_B);
+    assert_eq!(
+        ai::refresh_memory_vectors_with(&conn, HASH_MODEL_ID, hash_dim, None, hash_embedder)
+            .unwrap(),
+        0,
+        "repo B's identical text is already cached under repo A's row"
+    );
+    let query = ai::hash_query_embedding("cache eviction order widget").unwrap();
+    for (repo, own) in [(A5_REPO_A, &a), (A5_REPO_B, &b)] {
+        a5_set_active_repo(&conn, repo);
+        let hits = ai::memory_vector_similarities(&conn, &query).unwrap();
+        let ids = hits.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>();
+        assert_eq!(ids, [own.memory.memory_id.as_str()], "{repo} reaches only its own memory");
+    }
 }
 
 /// Dedupe NEVER crosses repos: identical title+body+binding is a duplicate WITHIN a repo, but the

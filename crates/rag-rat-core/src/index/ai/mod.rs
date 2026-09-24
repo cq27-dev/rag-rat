@@ -1,5 +1,6 @@
 pub(crate) mod embedder_select;
 mod helpers;
+mod memory_vectors;
 mod policy;
 mod reconcile;
 mod reencode;
@@ -16,6 +17,7 @@ use std::time::Instant;
 // selection, no tune-cache write — those stay on the reconcile path.
 pub(crate) use embedder_select::{ChunkEmbedder, acquire_chunk_embedder, active_embedder};
 pub(crate) use helpers::*;
+pub(crate) use memory_vectors::*;
 pub use policy::EmbeddingPolicy;
 pub(crate) use policy::*;
 use rag_rat_base::language::Language;
