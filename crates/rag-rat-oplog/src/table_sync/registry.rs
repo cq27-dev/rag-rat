@@ -945,6 +945,20 @@ pub(crate) const PROJECTOR_GENERATIONS: &[&[TableGeneration]] = &[
         PAPERTRAIL_DISTILL_ANCHORS_V1,
         MEMORY_NOTE_SUMMARIES_V1,
     ],
+    // v11: the `restate-rows` row-op kind (#1488), the same kind of widening as v10: the snapshot
+    // repeats, and the bump replays every `restate-rows` entry an older binary retained.
+    &[
+        REPO_MEMORY_BINDINGS_V1,
+        MEMORY_REALITY_V1,
+        MEMORY_SUMMARIES_V1,
+        PAPERTRAIL_DISTILL_V1,
+        PAPERTRAIL_DISTILL_EDGES_V1,
+        PAPERTRAIL_DISTILL_ALTERNATIVES_V1,
+        PAPERTRAIL_DISTILL_RECORD_COMMITS_V1,
+        PAPERTRAIL_DISTILL_EVIDENCE_V1,
+        PAPERTRAIL_DISTILL_ANCHORS_V1,
+        MEMORY_NOTE_SUMMARIES_V1,
+    ],
 ];
 
 /// Assert a spec classifies EVERY physical column of its table exactly once — as pk, a synced

@@ -115,6 +115,19 @@ pub(crate) fn apply_row_op_on_stream(
             changed: false,
         });
     }
+    // The same rule for restated rows: a row identity at or above the carrier would mint a write
+    // its chain never held.
+    if let RowOp::RestateRows { rows, .. } = op
+        && rows.iter().any(|row| row.lamport >= meta.lamport)
+    {
+        return Ok(ApplyOutcome::Quarantined {
+            why: format!(
+                "restate-rows on `{}` states a row at or above its own lamport {}",
+                spec.name, meta.lamport
+            ),
+            changed: false,
+        });
+    }
     let known = match payload_verdict(spec, repo_id, op) {
         PayloadVerdict::Gap(reason) => return Ok(ApplyOutcome::Unprojectable(reason)),
         PayloadVerdict::Rejected(why) =>
@@ -129,7 +142,10 @@ pub(crate) fn apply_row_op_on_stream(
         (None, RowOp::Remove { pk, .. }) => apply_remove(tx, spec, repo_id, stream, pk, meta),
         (None, RowOp::Restate { deletes, .. }) =>
             apply_restate(tx, spec, repo_id, stream, deletes, meta),
-        (Some(_), RowOp::Remove { .. } | RowOp::Restate { .. }) | (None, RowOp::Upsert { .. }) =>
+        (None, RowOp::RestateRows { spec_version, rows, .. }) =>
+            apply_restate_rows(tx, spec, repo_id, stream, *spec_version, rows, meta),
+        (Some(_), RowOp::Remove { .. } | RowOp::Restate { .. } | RowOp::RestateRows { .. })
+        | (None, RowOp::Upsert { .. }) =>
             unreachable!("payload_verdict pairs an after-image with an upsert only"),
     }
 }
@@ -171,7 +187,9 @@ pub(crate) fn payload_verdict(spec: &TableSpec, repo_id: &str, op: &RowOp) -> Pa
     // set is involved and there is nothing a later binary would understand better. Parking one
     // would delay a deletion across a version skew for no benefit, and a row deleted after a column
     // change would become permanently undeletable — a convergence wedge.
-    if matches!(op, RowOp::Upsert { .. }) && op.spec_version() > spec.spec_version {
+    if matches!(op, RowOp::Upsert { .. } | RowOp::RestateRows { .. })
+        && op.spec_version() > spec.spec_version
+    {
         return PayloadVerdict::Gap(PendingReason::NewerSpecVersion);
     }
     // Every identity the op names is checked before anything is written, so a restatement with
@@ -224,6 +242,19 @@ pub(crate) fn payload_verdict(spec: &TableSpec, repo_id: &str, op: &RowOp) -> Pa
         // carried for wire symmetry and diagnostics, never acted on. Gating a deletion on a version
         // skew would delay it for no benefit. A restate names identities the same way.
         RowOp::Remove { .. } | RowOp::Restate { .. } => PayloadVerdict::RowDecides(None),
+        // Every stated row carries a whole after-image, resolved exactly as an upsert's. The batch
+        // is decided whole: one row this binary cannot project yet parks it all, one that can
+        // never fit quarantines it all. The applier projects each row again as it settles it.
+        RowOp::RestateRows { spec_version, rows, .. } => {
+            for row in rows {
+                match project_cells(spec, *spec_version, &row.cells) {
+                    Projection::Complete(_) => {},
+                    Projection::Park(reason) => return PayloadVerdict::Gap(reason),
+                    Projection::Quarantine(why) => return PayloadVerdict::Rejected(why),
+                }
+            }
+            PayloadVerdict::RowDecides(None)
+        },
         // Resolve the payload into the full after-image THIS registry expects, from the payload
         // alone, so the decision is deterministic and idempotent.
         RowOp::Upsert { spec_version, cells, .. } =>
@@ -458,7 +489,7 @@ fn default_as_value(default: DefaultValue) -> TypedValue {
 }
 
 /// Apply an upsert whose after-image [`payload_verdict`] has already resolved — every synced column
-/// this registry knows, in registry order.
+/// this registry knows, in registry order. The upsert is its own identity and its own carrier.
 fn apply_upsert(
     tx: &Transaction<'_>,
     spec: &TableSpec,
@@ -468,35 +499,121 @@ fn apply_upsert(
     known: Vec<(&'static str, TypedValue)>,
     meta: OpMeta,
 ) -> anyhow::Result<ApplyOutcome> {
+    let identity = RowClock { lamport: meta.lamport, device_hex: meta.device.to_string() };
+    let write = RowWrite { pk_vals, known, identity: &identity, signer: &identity };
+    Ok(match settle_row(tx, spec, repo_id, stream, write)? {
+        RowSettle::Won => ApplyOutcome::Applied,
+        RowSettle::Held { .. } => ApplyOutcome::Superseded,
+        RowSettle::Quarantined(why) => ApplyOutcome::Quarantined { why, changed: false },
+    })
+}
+
+/// Apply a live-row restatement (#1488): every stated row settles at ITS OWN identity exactly as
+/// the write that put its cells there did, and the signer becomes a carrier of each identity that
+/// is current. Validated whole by [`payload_verdict`]; a row whose write fails on a constraint
+/// quarantines the ENTRY but every other row still settles, as for [`apply_restate`].
+fn apply_restate_rows(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    spec_version: u32,
+    rows: &[row_op::StatedRow],
+    meta: OpMeta,
+) -> anyhow::Result<ApplyOutcome> {
+    let signer = RowClock { lamport: meta.lamport, device_hex: meta.device.to_string() };
+    let mut changed = false;
+    let mut quarantined = None;
+    for row in rows {
+        let Projection::Complete(known) = project_cells(spec, spec_version, &row.cells) else {
+            unreachable!("payload_verdict projected every stated row");
+        };
+        let identity = RowClock { lamport: row.lamport, device_hex: row.device.to_string() };
+        let write = RowWrite { pk_vals: &row.pk, known, identity: &identity, signer: &signer };
+        match settle_row(tx, spec, repo_id, stream, write)? {
+            RowSettle::Won => changed = true,
+            RowSettle::Held { carried } => changed |= carried,
+            RowSettle::Quarantined(why) => {
+                quarantined.get_or_insert(why);
+            },
+        }
+    }
+    Ok(match quarantined {
+        Some(why) => ApplyOutcome::Quarantined { why, changed },
+        None if changed => ApplyOutcome::Applied,
+        None => ApplyOutcome::Superseded,
+    })
+}
+
+/// One write [`settle_row`] decides: the row, its complete after-image, the identity it competes
+/// under, and the entry that carries it.
+struct RowWrite<'a> {
+    pk_vals: &'a [TypedValue],
+    known: Vec<(&'static str, TypedValue)>,
+    identity: &'a RowClock,
+    signer: &'a RowClock,
+}
+
+/// What one write — an upsert, or one stated row — did to its row.
+enum RowSettle {
+    /// The write won the row: its cells are the row, its identity the clock, its signer the
+    /// row's one carrier.
+    Won,
+    /// The row kept its state. `carried` says whether the signer's statement moved (a
+    /// restatement of the current identity, or of an older write of the clock's own writer).
+    Held { carried: bool },
+    /// The write failed on a constraint; the entry is retained, the row untouched.
+    Quarantined(String),
+}
+
+/// The one write decision, run by an `Upsert` at its own identity and by a `RestateRows` once per
+/// stated row. The write at `identity` wins the row iff it beats both the tombstone and the write
+/// clock (or the row is new); the winner replaces the whole row, raises the clock to `identity`,
+/// and makes `signer` the row's only carrier (`sync_row_statements`).
+///
+/// A write that does not win still leaves `signer` carrying the row in two cases, so retention
+/// keeps its entry: it restates the current identity (another chain now carries the same write),
+/// or it restates an OLDER write of the clock's own device. The second is the one place a
+/// restatement is the only carrier a replica could consume: a store that holds a removed writer's
+/// newer entry still hands fresh peers the row through restatements only, since that writer's own
+/// entries are refused everywhere once its removal folds (#1488).
+fn settle_row(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    write: RowWrite<'_>,
+) -> anyhow::Result<RowSettle> {
+    let RowWrite { pk_vals, known, identity, signer } = write;
     let row_pk = &row_op::row_pk_string(pk_vals);
-    let incoming = RowClock { lamport: meta.lamport, device_hex: meta.device.to_string() };
-    let device_hex = &incoming.device_hex;
     let key = RowKey { stream, repo_id, table: spec.name, row_pk };
 
-    // A row deleted at a clock this op cannot beat stays deleted: the delete is newer than this
+    // A row deleted at a clock this write cannot beat stays deleted: the delete is newer than this
     // edit, so the edit must not resurrect the row. (Suppressed, but the entry is still stored, so
     // redelivery stays idempotent.)
     if let Some(stored) = current_tombstone(tx, &key)?
-        && !incoming.beats(&stored)
+        && !identity.beats(&stored)
     {
-        return Ok(ApplyOutcome::Superseded);
+        return Ok(RowSettle::Held { carried: false });
     }
 
-    // Whole-row LWW: the op wins the ENTIRE row iff it beats the row's write clock (or the row is
-    // new). A losing op is a no-op — it never partially overwrites, and it must not touch the
-    // published hash (that would mark an unsent local edit as sent and make the producer drop it).
-    let wins = match current_row_clock_on_stream(tx, &key)? {
-        Some(stored) => incoming.beats(&stored),
-        None => true, // no prior write — this op establishes the row.
-    };
-    if !wins {
-        return Ok(ApplyOutcome::Superseded);
+    // Whole-row LWW: the write wins the ENTIRE row iff it beats the row's write clock (or the row
+    // is new). A losing write never partially overwrites, and it must not touch the published hash
+    // (that would mark an unsent local edit as sent and make the producer drop it).
+    match current_row_clock_on_stream(tx, &key)? {
+        Some(stored) if !identity.beats(&stored) => {
+            let carries = *identity == stored
+                || (signer != identity && identity.device_hex == stored.device_hex);
+            let carried = carries && state_row(tx, &key, signer)?;
+            return Ok(RowSettle::Held { carried });
+        },
+        _ => {},
     }
 
     // The winner replaces the whole row in ONE statement (so a constraint failure can't leave a
     // half-written row), then owns its write clock and published hash. A constraint violation — a
-    // NULL in a NOT NULL column, a failed CHECK — means the op's data doesn't fit the table
-    // (malformed producer / schema skew); it is quarantined, NOT propagated as an error, so the
+    // NULL in a NOT NULL column, a failed CHECK — means the data doesn't fit the table (malformed
+    // producer / schema skew); it is quarantined, NOT propagated as an error, so the
     // already-stored entry is retained and the chain advances instead of wedging.
     let write = if row_exists(tx, spec, pk_vals)? {
         // A winner that CHANGES the row's synced columns is a new authored statement, and this
@@ -517,22 +634,22 @@ fn apply_upsert(
     };
     if let Err(err) = write {
         if is_constraint_violation(&err) {
-            return Ok(ApplyOutcome::Quarantined {
-                why: format!("op violates a column constraint on `{}`", spec.name),
-                changed: false,
-            });
+            return Ok(RowSettle::Quarantined(format!(
+                "op violates a column constraint on `{}`",
+                spec.name
+            )));
         }
         return Err(err);
     }
-    raise_row_clock(tx, &key, meta.lamport, device_hex)?;
+    raise_row_clock(tx, &key, identity, signer)?;
 
-    // Anti-echo: the winning op now owns the whole current row state, so record its synced hash.
-    // (A losing op returned above without touching the published hash.)
+    // Anti-echo: the winning write now owns the whole current row state, so record its synced
+    // hash. (A losing write returned above without touching the published hash.)
     if let Some(hash) = synced_row_hash(tx, spec, pk_vals)? {
         record_published(tx, &key, &hash, spec.spec_version)?;
         diagnostics::clear(tx, &key)?;
     }
-    Ok(ApplyOutcome::Applied)
+    Ok(RowSettle::Won)
 }
 
 /// The total order on clocks: `(lamport, device_hex)` beats `(other_lamport, other_device)` iff its
@@ -659,33 +776,43 @@ fn current_row_clock(
     current_row_clock_on_stream(tx, &RowKey { stream: NO_STREAM, repo_id, table, row_pk })
 }
 
-/// Raise the row's write clock to `(lamport, device_hex)` under LWW — a later-arriving but older
-/// write never lowers it. A raise replaces the row's statements with the writing entry's own: the
-/// entry that wrote the clock is the one that carries it (#1488).
+/// Raise the row's write clock to `identity` under LWW — a later-arriving but older write never
+/// lowers it. A raise replaces the row's statements with `signer`'s: the entry that carried the
+/// winning write is the one that carries the row (#1488). For an upsert that is the writing entry
+/// itself; for a restated row, the restating entry.
 fn raise_row_clock(
     tx: &Transaction<'_>,
     key: &RowKey<'_>,
-    lamport: u64,
-    device_hex: &str,
+    identity: &RowClock,
+    signer: &RowClock,
 ) -> anyhow::Result<()> {
-    if !raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)? {
+    if !raise_clock(tx, ClockTable::Rows, key, identity.lamport, &identity.device_hex)? {
         return Ok(());
     }
     clear_row_statements(tx, key)?;
-    tx.execute(
+    state_row(tx, key, signer)?;
+    Ok(())
+}
+
+/// Record `signer`'s chain as a carrier of the row, advancing its statement and never lowering
+/// it. Returns whether it moved.
+fn state_row(tx: &Transaction<'_>, key: &RowKey<'_>, signer: &RowClock) -> anyhow::Result<bool> {
+    Ok(tx.execute(
         "INSERT INTO sync_row_statements(
              stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(stream_id, table_name, row_pk, device_fingerprint)
+         DO UPDATE SET lamport = excluded.lamport
+         WHERE excluded.lamport > sync_row_statements.lamport",
         rusqlite::params![
             key.stream.to_bytes().as_slice(),
             key.repo_id,
             key.table,
             key.row_pk,
-            device_hex,
-            i64::try_from(lamport)?,
+            signer.device_hex,
+            i64::try_from(signer.lamport)?,
         ],
-    )?;
-    Ok(())
+    )? > 0)
 }
 
 /// Drop the row's statements, keyed exactly as its clock is (`clear_row_clock`), so the two never
@@ -1064,6 +1191,55 @@ pub(crate) fn stale_row_disposition(
     Ok(outcome)
 }
 
+/// The winning write of a row whose clock names an entry this store does not hold, read from a
+/// chain that re-stated it at that identity (#1488): the row's carriers are walked in
+/// `(lamport, device)` order, and the first whose entry is a `RestateRows` holding exactly this
+/// table, row and clock identity answers, as the `Upsert` that write was. `None` when no carrier
+/// does — the caller then cannot resolve the winner, exactly as without a fallback. The identity is
+/// matched whole, so a carrier on a sibling table or row can never stand in for this one.
+fn restated_winner(
+    tx: &Transaction<'_>,
+    stream: StreamId,
+    table: &str,
+    row_pk: &str,
+    clock: &RowClock,
+) -> anyhow::Result<Option<RowOp>> {
+    let carriers: Vec<(String, i64)> = tx
+        .prepare(
+            "SELECT device_fingerprint, lamport FROM sync_row_statements
+              WHERE stream_id = ?1 AND table_name = ?2 AND row_pk = ?3
+              ORDER BY lamport, device_fingerprint",
+        )?
+        .query_map(rusqlite::params![stream.to_bytes().as_slice(), table, row_pk], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (carrier, lamport) in carriers {
+        let Ok(RowOp::RestateRows { table: stated_table, spec_version, rows }) =
+            super::store::winning_entry_op(tx, stream, &carrier, u64::try_from(lamport)?)?
+        else {
+            continue;
+        };
+        if stated_table != table {
+            continue;
+        }
+        let stated = rows.into_iter().find(|row| {
+            row.lamport == clock.lamport
+                && row.device.to_string() == clock.device_hex
+                && row_op::row_pk_string(&row.pk) == row_pk
+        });
+        if let Some(row) = stated {
+            return Ok(Some(RowOp::Upsert {
+                table: stated_table,
+                spec_version,
+                pk: row.pk,
+                cells: row.cells,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 fn compare_stale_row(
     tx: &Transaction<'_>,
     spec: &TableSpec,
@@ -1084,6 +1260,14 @@ fn compare_stale_row(
     };
     let op = match super::store::winning_entry_op(tx, stream, &clock.device_hex, clock.lamport)? {
         Ok(op) => op,
+        // The clock names a write re-stated at its identity (#1488) whose own entry this store
+        // never held — a removed writer's, refused here. The row is then resolved through the
+        // entry that carries it.
+        Err(TableSyncRowCause::MissingEntry) =>
+            match restated_winner(tx, stream, spec.name, &row_pk, &clock)? {
+                Some(op) => op,
+                None => return Ok(StaleRow::Unknown(TableSyncRowCause::MissingEntry)),
+            },
         Err(cause) => return Ok(StaleRow::Unknown(cause)),
     };
     // The entry is located by `(stream, device, lamport)`, which identifies it uniquely WITHIN a
@@ -1182,7 +1366,43 @@ pub(crate) fn unsent_work_blocking_replay(
             }
             Ok(unprovable)
         },
+        // A live-row restatement likewise, about the rows whose identity would take the row: a
+        // stated row that loses to the clock or the tombstone rewrites nothing.
+        RowOp::RestateRows { rows, .. } => {
+            let mut unprovable = None;
+            for row in rows {
+                if !row_would_take(tx, spec, repo_id, stream, row)? {
+                    continue;
+                }
+                match unsent_work_on_row(tx, spec, repo_id, stream, &row.pk, false)? {
+                    Some(reason) if reason.is_proven_unsent_work() => return Ok(Some(reason)),
+                    Some(reason) => unprovable.get_or_insert(reason),
+                    None => continue,
+                };
+            }
+            Ok(unprovable)
+        },
     }
+}
+
+/// Whether a stated row would take its row here: its identity beats both the tombstone and the
+/// write clock (a row with neither counts). The same test [`settle_row`] applies, asked before
+/// anything is written.
+fn row_would_take(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    repo_id: &str,
+    stream: StreamId,
+    row: &row_op::StatedRow,
+) -> anyhow::Result<bool> {
+    if row.pk.len() != spec.pk.len() {
+        return Ok(false);
+    }
+    let row_pk = row_op::row_pk_string(&row.pk);
+    let key = RowKey { stream, repo_id, table: spec.name, row_pk: &row_pk };
+    let identity = RowClock { lamport: row.lamport, device_hex: row.device.to_string() };
+    let beats = |stored: Option<RowClock>| stored.is_none_or(|stored| identity.beats(&stored));
+    Ok(beats(current_tombstone(tx, &key)?) && beats(current_row_clock_on_stream(tx, &key)?))
 }
 
 /// Whether a stated delete would physically remove its row here: the row is present and no write
@@ -1214,11 +1434,12 @@ fn delete_would_remove_row(
 }
 
 /// The part of a `Restate` that can settle NOW while the rest waits: every stated delete that
-/// would not physically remove a row, or whose row holds no unsent work. `None` for any other op
-/// kind or when nothing in the batch is settleable. A parked entry is replayed whole later, and
-/// [`settle_delete`] is idempotent, so applying this subset first and parking the entry is safe —
-/// and it is what keeps one row's unsent edit from holding hundreds of unrelated deletes (and,
-/// through the pending clamp, the chain's floor) behind it.
+/// would not physically remove a row, or whose row holds no unsent work — and likewise for a
+/// `RestateRows`, every stated row that would not take its row, or whose row holds no unsent work.
+/// `None` for any other op kind or when nothing in the batch is settleable. A parked entry is
+/// replayed whole later, and [`settle_delete`] is idempotent, so applying this subset first and
+/// parking the entry is safe — and it is what keeps one row's unsent edit from holding hundreds of
+/// unrelated deletes (and, through the pending clamp, the chain's floor) behind it.
 pub(crate) fn restate_settleable_now(
     tx: &Transaction<'_>,
     spec: &TableSpec,
@@ -1226,6 +1447,23 @@ pub(crate) fn restate_settleable_now(
     stream: StreamId,
     op: &RowOp,
 ) -> anyhow::Result<Option<RowOp>> {
+    if let RowOp::RestateRows { table, spec_version, rows } = op {
+        let mut settleable = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !row_would_take(tx, spec, repo_id, stream, row)?
+                || unsent_work_on_row(tx, spec, repo_id, stream, &row.pk, false)?.is_none()
+            {
+                settleable.push(row.clone());
+            }
+        }
+        return Ok((!settleable.is_empty() && settleable.len() < rows.len()).then(|| {
+            RowOp::RestateRows {
+                table: table.clone(),
+                spec_version: *spec_version,
+                rows: settleable,
+            }
+        }));
+    }
     let RowOp::Restate { table, spec_version, deletes } = op else {
         return Ok(None);
     };
@@ -1477,9 +1715,13 @@ pub(crate) fn pre_apply(
     }
     // Same rule for a restatement that names a lamport its chain never held: terminal, so it
     // must reach the applier's quarantine rather than park behind a row it will never touch.
-    if let RowOp::Restate { deletes, .. } = op
-        && deletes.iter().any(|delete| delete.lamport >= entry_lamport)
-    {
+    let states_at_or_above = match op {
+        RowOp::Restate { deletes, .. } =>
+            deletes.iter().any(|delete| delete.lamport >= entry_lamport),
+        RowOp::RestateRows { rows, .. } => rows.iter().any(|row| row.lamport >= entry_lamport),
+        RowOp::Upsert { .. } | RowOp::Remove { .. } => false,
+    };
+    if states_at_or_above {
         return Ok(PreApply::Apply);
     }
     if doubt == RowDoubt::NothingUnsent {

@@ -1,8 +1,9 @@
 //! The table→log sync engine's row op + its canonical CBOR wire form.
 //!
 //! A [`RowOp`] is one replicated row mutation on a syncable table: an `Upsert` (a row identity plus
-//! its synced cells), a `Remove` (a row identity), or a `Restate` (a batch of earlier deletes at
-//! their original identities, re-carried so the entries that first stated them can be reclaimed).
+//! its synced cells), a `Remove` (a row identity), a `Restate` (a batch of earlier deletes at
+//! their original identities, re-carried so the entries that first stated them can be reclaimed),
+//! or a `RestateRows` (a batch of live rows at their original identities, likewise re-carried).
 //! It mirrors [`super::super::op`]'s discipline —
 //! a domain-tagged, definite-length, deterministic envelope `[domain, op-kind, payload]`, versioned
 //! (`"rag-rat/table-op/1"`) so a future format can never collide — but its vocabulary is
@@ -76,6 +77,28 @@ pub enum RowOp {
     /// sorted by row identity, unique, non-empty; every `lamport` must be strictly below the
     /// carrying entry's own, which the applier checks (the wire cannot).
     Restate { table: String, spec_version: u32, deletes: Vec<StatedDelete> },
+    /// Re-state a batch of live rows at their ORIGINAL identities (#1488): the row's cells as they
+    /// stand under the write clock `(device, lamport)` that put them there. Like `Restate`, the
+    /// signer asserts nothing a tail `Upsert` could not, and strictly less: each row settles under
+    /// LWW exactly as its original write did, so a newer write — or a newer write of the same
+    /// device that this signer never held — still wins. It changes delivery only: the signer's
+    /// chain now carries the row, which is how a removed writer's rows keep reaching replicas that
+    /// refuse that writer's own entries, without a stale copy overwriting a newer one.
+    ///
+    /// `spec_version` states the column set the cells were written against and is gated like an
+    /// `Upsert`'s. `rows` is canonical: sorted by row identity, unique, non-empty; every `lamport`
+    /// must be strictly below the carrying entry's own, which the applier checks.
+    RestateRows { table: String, spec_version: u32, rows: Vec<StatedRow> },
+}
+
+/// One live row a [`RowOp::RestateRows`] re-carries: its identity, its synced cells, and the
+/// `(device, lamport)` of the write that put them there — the identity it competes under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatedRow {
+    pub pk: Vec<TypedValue>,
+    pub device: DeviceFingerprint,
+    pub lamport: u64,
+    pub cells: Vec<Cell>,
 }
 
 /// One delete a [`RowOp::Restate`] re-carries: the row identity and the `(device, lamport)` the
@@ -93,18 +116,23 @@ impl RowOp {
         match self {
             Self::Upsert { table, .. }
             | Self::Remove { table, .. }
-            | Self::Restate { table, .. } => table,
+            | Self::Restate { table, .. }
+            | Self::RestateRows { table, .. } => table,
         }
     }
 
     /// Every row identity the op names: one for an `Upsert` or `Remove`, each stated delete's for
-    /// a `Restate`.
+    /// a `Restate`, each stated row's for a `RestateRows`.
     pub fn pks(&self) -> impl Iterator<Item = &[TypedValue]> {
-        let (one, many): (Option<&[TypedValue]>, &[StatedDelete]) = match self {
-            Self::Upsert { pk, .. } | Self::Remove { pk, .. } => (Some(pk), &[]),
-            Self::Restate { deletes, .. } => (None, deletes),
-        };
-        one.into_iter().chain(many.iter().map(|delete| delete.pk.as_slice()))
+        let (one, deletes, rows): (Option<&[TypedValue]>, &[StatedDelete], &[StatedRow]) =
+            match self {
+                Self::Upsert { pk, .. } | Self::Remove { pk, .. } => (Some(pk), &[], &[]),
+                Self::Restate { deletes, .. } => (None, deletes, &[]),
+                Self::RestateRows { rows, .. } => (None, &[], rows),
+            };
+        one.into_iter()
+            .chain(deletes.iter().map(|delete| delete.pk.as_slice()))
+            .chain(rows.iter().map(|row| row.pk.as_slice()))
     }
 
     /// The synced column set this op was authored against.
@@ -112,7 +140,8 @@ impl RowOp {
         match self {
             Self::Upsert { spec_version, .. }
             | Self::Remove { spec_version, .. }
-            | Self::Restate { spec_version, .. } => *spec_version,
+            | Self::Restate { spec_version, .. }
+            | Self::RestateRows { spec_version, .. } => *spec_version,
         }
     }
 
@@ -122,6 +151,7 @@ impl RowOp {
             Self::Upsert { .. } => "upsert",
             Self::Remove { .. } => "remove",
             Self::Restate { .. } => "restate",
+            Self::RestateRows { .. } => "restate-rows",
         }
     }
 }
@@ -172,7 +202,32 @@ fn encode_payload(enc: &mut VecEncoder<'_>, op: &RowOp) {
             enc.put_u32(*spec_version);
             encode_deletes(enc, deletes);
         },
+        RowOp::RestateRows { table, spec_version, rows } => {
+            enc.put_array(3);
+            enc.put_str(table);
+            enc.put_u32(*spec_version);
+            encode_stated_rows(enc, rows);
+        },
     }
+}
+
+/// Encode stated rows sorted by row identity (the canonical order), each as a
+/// `[pk, device, lamport, cells]` quadruple.
+fn encode_stated_rows(enc: &mut VecEncoder<'_>, rows: &[StatedRow]) {
+    let mut sorted: Vec<&StatedRow> = rows.iter().collect();
+    sorted.sort_by_cached_key(|row| row_pk_string(&row.pk));
+    enc.put_array(sorted.len() as u64);
+    for row in sorted {
+        encode_stated_row(enc, row);
+    }
+}
+
+fn encode_stated_row(enc: &mut VecEncoder<'_>, row: &StatedRow) {
+    enc.put_array(4);
+    encode_values(enc, &row.pk);
+    enc.put_bytes(&row.device.to_bytes());
+    enc.put_u64(row.lamport);
+    encode_cells(enc, &row.cells);
 }
 
 /// Encode stated deletes sorted by row identity (the canonical order), each as a
@@ -264,6 +319,13 @@ fn decode_envelope(bytes: &[u8]) -> Result<DecodedRowOp, CborError> {
             let spec_version = d.u32()?;
             let deletes = decode_deletes(&mut d)?;
             Some(RowOp::Restate { table, spec_version, deletes })
+        },
+        "restate-rows" => {
+            cbor::expect_array(&mut d, 3)?;
+            let table = d.str()?.to_string();
+            let spec_version = d.u32()?;
+            let rows = decode_stated_rows(&mut d)?;
+            Some(RowOp::RestateRows { table, spec_version, rows })
         },
         // A future op-kind this binary doesn't know — retained opaque, canonicity checked below.
         _ => None,
@@ -358,6 +420,31 @@ fn decode_deletes(d: &mut Decoder<'_>) -> Result<Vec<StatedDelete>, CborError> {
     Ok(deletes)
 }
 
+/// Decode stated rows under the same rules as stated deletes: strictly-ascending unique row
+/// identities and a non-empty batch.
+fn decode_stated_rows(d: &mut Decoder<'_>) -> Result<Vec<StatedRow>, CborError> {
+    let len = capped_len(d)?;
+    if len == 0 {
+        return Err(CborError::message("a restate-rows batch names no rows"));
+    }
+    let mut rows = Vec::with_capacity(len);
+    let mut prev: Option<String> = None;
+    for _ in 0..len {
+        cbor::expect_array(d, 4)?;
+        let pk = decode_values(d)?;
+        let identity = row_pk_string(&pk);
+        if prev.as_ref().is_some_and(|p| &identity <= p) {
+            return Err(CborError::message("restate-rows rows not sorted or duplicated"));
+        }
+        let device = DeviceFingerprint::from_bytes(cbor::fixed_bytes::<32>(d.bytes()?, "device")?);
+        let lamport = d.u64()?;
+        let cells = decode_cells(d)?;
+        prev = Some(identity);
+        rows.push(StatedRow { pk, device, lamport, cells });
+    }
+    Ok(rows)
+}
+
 fn decode_value(d: &mut Decoder<'_>) -> Result<TypedValue, CborError> {
     match d.datatype()? {
         Type::Null => {
@@ -378,6 +465,59 @@ fn decode_value(d: &mut Decoder<'_>) -> Result<TypedValue, CborError> {
         other =>
             Err(CborError::message(format!("unexpected CBOR type for a row-op value: {other:?}"))),
     }
+}
+
+impl StatedRow {
+    /// The bytes this row adds to a `RestateRows` payload: its `[pk, device, lamport, cells]`.
+    fn encoded_len(&self) -> usize {
+        let mut buf = Vec::with_capacity(128);
+        {
+            let mut enc = Encoder::new(&mut buf);
+            encode_stated_row(&mut enc, self);
+        }
+        buf.len()
+    }
+}
+
+/// `rows` packed, in the order given, into the fewest `RestateRows` ops on `table` under the same
+/// rules as [`pack_restates`].
+pub(crate) struct PackedRestateRows {
+    pub batches: Vec<(RowOp, Vec<usize>)>,
+    pub unfit: Vec<usize>,
+}
+
+pub(crate) fn pack_restate_rows(
+    table: &str,
+    spec_version: u32,
+    rows: &[StatedRow],
+    payload_max: usize,
+) -> PackedRestateRows {
+    let mut packer = RestatePacker::for_rows(table, spec_version, payload_max);
+    let mut packed = PackedRestateRows { batches: Vec::new(), unfit: Vec::new() };
+    let mut batch: Vec<usize> = Vec::new();
+    let flush = |batch: &mut Vec<usize>, packed: &mut PackedRestateRows| {
+        if batch.is_empty() {
+            return;
+        }
+        let op = RowOp::RestateRows {
+            table: table.to_string(),
+            spec_version,
+            rows: batch.iter().map(|&i| rows[i].clone()).collect(),
+        };
+        packed.batches.push((op, std::mem::take(batch)));
+    };
+    for (index, row) in rows.iter().enumerate() {
+        match packer.push_row(row) {
+            Placed::Unfit => packed.unfit.push(index),
+            Placed::NewBatch => {
+                flush(&mut batch, &mut packed);
+                batch.push(index);
+            },
+            Placed::SameBatch => batch.push(index),
+        }
+    }
+    flush(&mut batch, &mut packed);
+    packed
 }
 
 impl StatedDelete {
@@ -464,9 +604,24 @@ pub(crate) struct RestatePacker {
 
 impl RestatePacker {
     pub(crate) fn new(table: &str, spec_version: u32, payload_max: usize) -> Self {
-        let empty = RowOp::Restate { table: table.to_string(), spec_version, deletes: vec![] };
+        Self::around(
+            &RowOp::Restate { table: table.to_string(), spec_version, deletes: vec![] },
+            payload_max,
+        )
+    }
+
+    /// The packer for `RestateRows` batches.
+    pub(crate) fn for_rows(table: &str, spec_version: u32, payload_max: usize) -> Self {
+        Self::around(
+            &RowOp::RestateRows { table: table.to_string(), spec_version, rows: vec![] },
+            payload_max,
+        )
+    }
+
+    /// A packer whose batches are `empty` with their element array filled.
+    fn around(empty: &RowOp, payload_max: usize) -> Self {
         Self {
-            base: encode(&empty).len() - 1,
+            base: encode(empty).len() - 1,
             payload_max,
             batches: 0,
             batch_len: 0,
@@ -485,7 +640,14 @@ impl RestatePacker {
     }
 
     pub(crate) fn push(&mut self, delete: &StatedDelete) -> Placed {
-        let len = delete.encoded_len();
+        self.push_len(delete.encoded_len())
+    }
+
+    pub(crate) fn push_row(&mut self, row: &StatedRow) -> Placed {
+        self.push_len(row.encoded_len())
+    }
+
+    fn push_len(&mut self, len: usize) -> Placed {
         if self.base + Self::array_header(1) + len > self.payload_max {
             return Placed::Unfit;
         }
@@ -680,6 +842,124 @@ mod tests {
             }
         }
         buf
+    }
+
+    fn sample_restate_rows() -> RowOp {
+        RowOp::RestateRows {
+            table: "t_demo".to_string(),
+            spec_version: 2,
+            rows: vec![
+                StatedRow {
+                    pk: vec![TypedValue::Text("s".to_string())],
+                    device: DeviceFingerprint::from_bytes([0x22; 32]),
+                    lamport: 9,
+                    cells: vec![Cell {
+                        column: "title".to_string(),
+                        value: TypedValue::Text("later".to_string()),
+                    }],
+                },
+                StatedRow {
+                    pk: vec![TypedValue::Text("r".to_string())],
+                    device: DeviceFingerprint::from_bytes([0x11; 32]),
+                    lamport: 4,
+                    cells: vec![
+                        Cell { column: "title".to_string(), value: TypedValue::Text("x".into()) },
+                        Cell { column: "n".to_string(), value: TypedValue::I64(3) },
+                    ],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn restate_rows_round_trip_canonically() {
+        let bytes = encode(&sample_restate_rows());
+        let DecodedRowOp::Known(decoded) = decode(&bytes).unwrap() else {
+            panic!("known op");
+        };
+        let RowOp::RestateRows { rows, .. } = &decoded else { panic!("restate-rows") };
+        let lamports: Vec<u64> = rows.iter().map(|row| row.lamport).collect();
+        assert_eq!(lamports, [4, 9], "rows decode in identity order");
+        assert_eq!(rows[0].cells[0].column, "n", "cells decode in column order");
+        assert_eq!(encode(&decoded), bytes, "canonical identity");
+        assert_eq!(decoded.pks().count(), 2, "every stated row is a pk of the op");
+    }
+
+    /// Golden vector for `RestateRows`, held to the same discipline as [`upsert_golden_vector`].
+    #[test]
+    fn restate_rows_golden_vector() {
+        let bytes = encode(&sample_restate_rows());
+        assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_RESTATE_ROWS_HEX);
+    }
+
+    /// Hand-encode a restate-rows envelope with rows given as `(pk, device, lamport)` and one
+    /// `title` cell each, past the encoder's sort.
+    fn restate_rows_envelope(rows: &[(&[TypedValue], u8, u64)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.array(3).unwrap();
+            enc.str(DOMAIN).unwrap();
+            enc.str("restate-rows").unwrap();
+            enc.array(3).unwrap();
+            enc.str("t_demo").unwrap();
+            enc.u32(1).unwrap();
+            enc.array(rows.len() as u64).unwrap();
+            for (pk, device, lamport) in rows {
+                enc.array(4).unwrap();
+                encode_values(&mut enc, pk);
+                enc.bytes(&[*device; 32]).unwrap();
+                enc.u64(*lamport).unwrap();
+                encode_cells(&mut enc, &[Cell {
+                    column: "title".to_string(),
+                    value: TypedValue::Text("t".to_string()),
+                }]);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn an_empty_duplicate_or_unsorted_restate_rows_is_rejected() {
+        let seven = [TypedValue::I64(7)];
+        let nine = [TypedValue::I64(9)];
+        let err = decode(&restate_rows_envelope(&[])).unwrap_err().to_string();
+        assert!(err.contains("names no rows"), "{err}");
+        for rows in
+            [[(&seven[..], 1, 1), (&seven[..], 2, 2)], [(&nine[..], 1, 1), (&seven[..], 2, 2)]]
+        {
+            let err = decode(&restate_rows_envelope(&rows)).unwrap_err().to_string();
+            assert!(err.contains("not sorted or duplicated"), "{err}");
+        }
+        assert!(matches!(
+            decode(&restate_rows_envelope(&[(&seven, 1, 1), (&nine, 2, 2)])).unwrap(),
+            DecodedRowOp::Known(RowOp::RestateRows { .. })
+        ));
+    }
+
+    #[test]
+    fn restate_rows_packing_obeys_the_signed_byte_limit() {
+        let rows: Vec<StatedRow> = (0..40)
+            .map(|i| StatedRow {
+                pk: vec![TypedValue::I64(i)],
+                device: DeviceFingerprint::from_bytes([1; 32]),
+                lamport: 1,
+                cells: vec![Cell {
+                    column: "title".into(),
+                    value: TypedValue::Text("x".repeat(50)),
+                }],
+            })
+            .collect();
+        let budget = 1024;
+        let packed = pack_restate_rows("t", 1, &rows, budget);
+        assert!(packed.unfit.is_empty());
+        assert!(packed.batches.len() > 1, "forty rows do not fit one kilobyte");
+        let mut seen = Vec::new();
+        for (op, members) in &packed.batches {
+            assert!(encode(op).len() <= budget, "every batch fits the budget");
+            seen.extend(members.iter().copied());
+        }
+        assert_eq!(seen, (0..40).collect::<Vec<_>>(), "every row lands once, in order");
     }
 
     #[test]
@@ -881,6 +1161,7 @@ mod tests {
         assert_eq!(rag_rat_base::hash::hex_lower(&bytes), GOLDEN_UPSERT_HEX);
     }
 
+    const GOLDEN_RESTATE_ROWS_HEX: &str = "83727261672d7261742f7461626c652d6f702f316c726573746174652d726f77738366745f64656d6f02828481617258201111111111111111111111111111111111111111111111111111111111111111048282616e0382657469746c6561788481617358202222222222222222222222222222222222222222222222222222222222222222098182657469746c65656c61746572";
     const GOLDEN_RESTATE_HEX: &str = "83727261672d7261742f7461626c652d6f702f3167726573746174658366745f64656d6f038283826172075820111111111111111111111111111111111111111111111111111111111111111118288382617209582022222222222222222222222222222222222222222222222222222222222222221829";
 
     /// The one value type the upsert sample does not carry — a byte string — plus a negative

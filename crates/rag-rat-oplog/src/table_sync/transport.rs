@@ -429,6 +429,7 @@ fn compact_overdue_against(
                         .collect::<Vec<_>>();
                     let worth = pins_worth_reauthoring(
                         &tx,
+                        &stream.repo_id,
                         stream_id,
                         chain,
                         &pins,
@@ -478,8 +479,10 @@ fn compact_overdue_against(
 /// entries on pins it cannot finish. A pin whose table this binary does not register, whose key
 /// does not fit an entry alone, or whose stored coordinates do not parse ends the run — nothing
 /// past it can move this pass, and the authoring side leaves such a pin standing the same way.
-fn pins_worth_reauthoring(
+#[expect(clippy::too_many_arguments, reason = "one estimate over one compaction pass's state")]
+pub(crate) fn pins_worth_reauthoring(
     tx: &Transaction<'_>,
+    repo_id: &str,
     stream: StreamId,
     chain: crate::op::DeviceFingerprint,
     pins: &[retention::Pin],
@@ -506,16 +509,43 @@ fn pins_worth_reauthoring(
         .collect::<anyhow::Result<Vec<u64>>>()?;
     let payload_max = engine::restate_payload_max();
     let mut packers: Vec<(&str, super::row_op::RestatePacker)> = Vec::new();
+    // Rows this chain restated move as `RestateRows` batches, priced by batch like deletes.
+    let mut row_packers: Vec<(&str, super::row_op::RestatePacker)> = Vec::new();
+    let local_hex = chain.to_string();
     let mut live = 0;
     let mut worth = 0;
     let mut within_cap = 0;
     'run: for (index, pin) in pins.iter().enumerate() {
         match &pin.kind {
-            retention::PinKind::LiveRow { table_name, .. } => {
-                if !scoped.iter().any(|spec| spec.name == *table_name) {
+            retention::PinKind::LiveRow { table_name, row_pk } => {
+                let Some(spec) = scoped.iter().find(|spec| spec.name == *table_name) else {
                     break 'run;
+                };
+                match engine::own_pin_move(tx, repo_id, spec, stream, row_pk, &local_hex)? {
+                    engine::OwnPinMove::Upsert => live += 1,
+                    engine::OwnPinMove::Stuck => break 'run,
+                    engine::OwnPinMove::Restate(row) => {
+                        let packer =
+                            match row_packers.iter_mut().find(|(table, _)| *table == spec.name) {
+                                Some((_, packer)) => packer,
+                                None => {
+                                    row_packers.push((
+                                        spec.name,
+                                        super::row_op::RestatePacker::for_rows(
+                                            spec.name,
+                                            spec.spec_version,
+                                            payload_max,
+                                        ),
+                                    ));
+                                    &mut row_packers.last_mut().expect("just pushed").1
+                                },
+                            };
+                        // Too large to restate alone: it moves as a tail upsert instead.
+                        if packer.push_row(&row) == super::row_op::Placed::Unfit {
+                            live += 1;
+                        }
+                    },
                 }
-                live += 1;
             },
             retention::PinKind::Statements(rows) =>
                 for row in rows {
@@ -549,13 +579,20 @@ fn pins_worth_reauthoring(
                 },
         }
         let k = index + 1;
-        let cost = live + packers.iter().map(|(_, packer)| packer.batches()).sum::<usize>();
+        let cost = live
+            + packers.iter().chain(&row_packers).map(|(_, packer)| packer.batches()).sum::<usize>();
         if cost <= cap {
             within_cap = k;
         }
         let bound = pins.get(k).map_or(target, |pin| pin.lamport);
         if lamports.partition_point(|&lamport| lamport < bound) >= 2 * cost {
             worth = k;
+        }
+        // Cost only grows along the run, and nothing past `lamports` can be reclaimed: once the
+        // cost passes the cap or half of everything reclaimable, no longer prefix can qualify, so
+        // stop before pricing more pins (each reads its row).
+        if cost > cap || 2 * cost > lamports.len() {
+            break;
         }
     }
     Ok(worth.min(within_cap))
