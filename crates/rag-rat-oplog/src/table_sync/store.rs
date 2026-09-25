@@ -1375,6 +1375,20 @@ pub(crate) fn readoption_candidates(
                          WHERE l.stream_id = c.stream_id AND l.table_name = c.table_name
                            AND l.row_pk = c.row_pk AND l.device_fingerprint = ?3)
              UNION ALL
+             -- A live row the removed writer CARRIES without having written it: one it restated at
+             -- another device's identity (#1488). Once its entries are refused, whoever else still
+             -- carries the row must carry it on, or a fresh peer never receives it.
+             SELECT s.table_name, s.row_pk, s.lamport FROM sync_row_statements s
+               JOIN sync_row_clocks c
+                 ON c.stream_id = s.stream_id AND c.table_name = s.table_name
+                AND c.row_pk = s.row_pk
+              WHERE s.stream_id = ?1 AND s.device_fingerprint = ?2
+                AND c.device_fingerprint != ?2 AND c.device_fingerprint != ?3
+                AND NOT EXISTS (
+                        SELECT 1 FROM sync_row_statements l
+                         WHERE l.stream_id = s.stream_id AND l.table_name = s.table_name
+                           AND l.row_pk = s.row_pk AND l.device_fingerprint = ?3)
+             UNION ALL
              SELECT t.table_name, t.row_pk, COALESCE(s.lamport, t.lamport)
                FROM sync_row_tombstones t
                LEFT JOIN sync_tombstone_statements s

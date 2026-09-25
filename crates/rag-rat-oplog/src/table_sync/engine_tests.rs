@@ -516,6 +516,183 @@ fn compaction_moves_a_restated_row_by_restating_it() {
     assert_eq!(clock, a.pubkey().fingerprint().to_string());
 }
 
+/// A removed writer that CARRIED a row it did not write (a restatement at another device's
+/// identity) leaves that row owed: once its entries are refused, whoever else holds the row must
+/// carry it on, or a fresh peer never receives it (#1488).
+#[test]
+fn removing_a_rows_only_carrier_hands_the_row_to_another_writer() {
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
+    let mut a = Device::new();
+    let mut c = Device::new();
+    let mut d = Device::new();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'older')", []).unwrap();
+    let first = a.produce();
+    a.set_title("newer");
+    let second = a.produce();
+    c.ingest_all(&first, &a.pubkey());
+    d.ingest_all(&first, &a.pubkey());
+    d.ingest_all(&second, &a.pubkey());
+    for store in [&c, &d] {
+        enroll_writer(&store.conn, account, c.local.fingerprint());
+        enroll_writer(&store.conn, account, d.local.fingerprint());
+        remove_writer(&store.conn, account, a.pubkey().fingerprint());
+    }
+    assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, 9), Some(1));
+    assert_eq!(drain_readoption(&mut d, a.pubkey().fingerprint(), stream, 9), Some(1));
+    c.ingest_all(&own_entries(&d), &d.pubkey());
+    assert_eq!(c.title().as_deref(), Some("newer"), "only D carries the newer write now");
+
+    remove_writer(&c.conn, account, d.pubkey().fingerprint());
+    assert_eq!(drain_readoption(&mut c, d.pubkey().fingerprint(), stream, 10), Some(1));
+    // A fresh peer that refuses A and D receives the row from C's chain alone.
+    let mut fresh = Device::new();
+    fresh.ingest_all(&own_entries(&c), &c.pubkey());
+    assert_eq!(fresh.title().as_deref(), Some("newer"), "C carries the row D carried");
+}
+
+/// A restatement asserts its cells ARE the write at its identity, so a row with a local edit the
+/// producer has not authored yet is never restated: compaction holds the pin until it has (#1488).
+#[test]
+fn compaction_never_restates_an_unsent_local_edit() {
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
+    let mut a = Device::new();
+    let mut c = Device::new();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'kept')", []).unwrap();
+    let entries = a.produce();
+    c.ingest_all(&entries, &a.pubkey());
+    enroll_writer(&c.conn, account, c.local.fingerprint());
+    remove_writer(&c.conn, account, a.pubkey().fingerprint());
+    assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, 9), Some(1));
+    c.set_title("unsent");
+
+    let before = own_entries(&c).len();
+    let tx = c.conn.transaction().unwrap();
+    let pins = crate::table_sync::retention::chain_pins(
+        &tx,
+        stream,
+        c.local.fingerprint(),
+        0,
+        1 << 40,
+        16,
+    )
+    .unwrap();
+    let ctx = SyncCtx {
+        repo_id: "repo",
+        account_id: account,
+        incarnation_ref: [0x44; 32],
+        device: &c.local,
+        registry: REGISTRY,
+        now_ms: 0,
+        local_writer: Default::default(),
+    };
+    assert_eq!(reauthor_chain_pins(&tx, &ctx, "demo/1", stream, &pins, 4, false).unwrap(), 0);
+    tx.commit().unwrap();
+    assert_eq!(own_entries(&c).len(), before, "nothing was signed over the unsent edit");
+}
+
+/// A live row too large to restate — a restatement adds its identity to the row's bytes — is
+/// still carried, re-authored at the tail as before, rather than written off (#1488).
+#[test]
+fn a_row_too_large_to_restate_is_carried_at_the_tail() {
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
+    // The largest title a restatement cannot carry alone.
+    let title = (1_000..restate_payload_max())
+        .rev()
+        .map(|len| "x".repeat(len))
+        .find(|title| {
+            let row = row_op::StatedRow {
+                pk: vec![row_op::TypedValue::Text("r1".into())],
+                device: crate::op::DeviceFingerprint::from_bytes([0xff; 32]),
+                lamport: u64::MAX,
+                cells: vec![row_op::Cell {
+                    column: "title".into(),
+                    value: row_op::TypedValue::Text(title.clone()),
+                }],
+            };
+            !row_op::pack_restate_rows("t_demo", 1, &[row], restate_payload_max()).unfit.is_empty()
+                && row_op::encode(&RowOp::Upsert {
+                    table: "t_demo".into(),
+                    spec_version: 1,
+                    pk: vec![row_op::TypedValue::Text("r1".into())],
+                    cells: vec![row_op::Cell {
+                        column: "title".into(),
+                        value: row_op::TypedValue::Text(title.clone()),
+                    }],
+                })
+                .len()
+                    <= restate_payload_max()
+        })
+        .expect("a title only the tail upsert fits");
+    let mut a = Device::new();
+    let mut c = Device::new();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', ?1)", [&title]).unwrap();
+    let entries = a.produce();
+    c.ingest_all(&entries, &a.pubkey());
+    enroll_writer(&c.conn, account, c.local.fingerprint());
+    remove_writer(&c.conn, account, a.pubkey().fingerprint());
+    assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, 9), Some(1));
+    let newest = own_entries(&c).pop().expect("the row was carried");
+    let signed = crate::entry::decode_signed(&newest).unwrap();
+    assert!(matches!(
+        row_op::decode(&signed.entry.op_bytes).unwrap(),
+        row_op::DecodedRowOp::Known(RowOp::Upsert { .. })
+    ));
+}
+
+/// Rows restated together move together: compaction prices a run of restated pins by the
+/// `RestateRows` batches that carry them, not one entry per row, or an adopter's chain could not
+/// reclaim anything until twice as many entries per restated row had piled up above it (#1488).
+#[test]
+fn restated_pins_are_priced_by_batch() {
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
+    let mut a = Device::new();
+    let mut c = Device::new();
+    for i in 0..10 {
+        a.conn
+            .execute("INSERT INTO t_demo(id, title) VALUES (?1, 'kept')", [format!("r{i}")])
+            .unwrap();
+    }
+    let entries = a.produce();
+    c.ingest_all(&entries, &a.pubkey());
+    enroll_writer(&c.conn, account, c.local.fingerprint());
+    remove_writer(&c.conn, account, a.pubkey().fingerprint());
+    assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, 9), Some(10));
+    // Three entries of C's own above the restatement: the last write pins; two are reclaimable.
+    c.conn.execute("INSERT INTO t_demo(id, title) VALUES ('own', 'v0')", []).unwrap();
+    c.produce();
+    for title in ["v1", "v2"] {
+        c.conn.execute("UPDATE t_demo SET title = ?1 WHERE id = 'own'", [title]).unwrap();
+        c.produce();
+    }
+    let tx = c.conn.transaction().unwrap();
+    let pins = crate::table_sync::retention::chain_pins(
+        &tx,
+        stream,
+        c.local.fingerprint(),
+        0,
+        1 << 40,
+        64,
+    )
+    .unwrap();
+    assert_eq!(pins.len(), 11, "ten restated rows and C's own row: {pins:?}");
+    let worth = crate::table_sync::transport::pins_worth_reauthoring(
+        &tx,
+        "repo",
+        stream,
+        c.local.fingerprint(),
+        &pins,
+        1 << 40,
+        REGISTRY,
+        64,
+    )
+    .unwrap();
+    assert!(worth >= 10, "one batch moves all ten restated rows: {worth}");
+}
+
 #[test]
 fn readoption_never_authors_a_remove_while_the_physical_row_is_live() {
     let mut a = Device::new(); // creates AND deletes r1, then leaves the roster

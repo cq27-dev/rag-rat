@@ -263,11 +263,14 @@ pub(crate) fn process_readoption_work_for_stream(
         }) else {
             continue;
         };
-        let op = match row_repair_op(tx, ctx.repo_id, spec, stream, &candidate.row_pk, &Carrier {
-            winner_hex: &removed_hex,
-            local_hex: &local_hex,
-            deletes_at_tail: !restates,
-        })? {
+        let op = match row_repair_op(
+            tx,
+            ctx.repo_id,
+            spec,
+            stream,
+            &candidate.row_pk,
+            &Carrier::removed(&removed_hex, &local_hex, !restates),
+        )? {
             RowRepair::Skip => continue,
             RowRepair::Unrepairable => {
                 unrepairable += 1;
@@ -326,8 +329,20 @@ pub(crate) fn process_readoption_work_for_stream(
         let stated: Vec<StatedRow> = rows.iter().map(|(_, row)| row.clone()).collect();
         let packed =
             row_op::pack_restate_rows(spec.name, spec.spec_version, &stated, restate_payload_max());
-        // A row too large for a batch alone is left uncarried and not owed, as an oversized
-        // delete is above.
+        // A row too large to restate alone (a restatement adds its identity to the row's bytes)
+        // is re-authored at the tail as before, the one case left with a tail write's hazard;
+        // one too large even for that stays owed.
+        for index in packed.unfit {
+            let op = tail_upsert(spec, &stated[index]);
+            let Some(adopted_entry_hash) =
+                author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
+            else {
+                unrepairable += 1;
+                continue;
+            };
+            store::record_readoption_audit(tx, audit(&rows[index].0, spec, adopted_entry_hash))?;
+            authored += 1;
+        }
         for (op, members) in packed.batches {
             let Some(adopted_entry_hash) =
                 author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
@@ -526,8 +541,16 @@ pub(crate) fn reauthor_chain_pins(
         let stated: Vec<StatedRow> = gathered.iter().map(|(_, row)| row.clone()).collect();
         let packed =
             row_op::pack_restate_rows(spec.name, spec.spec_version, &stated, restate_payload_max());
+        // Too large to restate alone: re-authored at the tail, as re-adoption does.
         for unfit in packed.unfit {
-            stuck[gathered[unfit].0] = true;
+            let op = tail_upsert(spec, &stated[unfit]);
+            if authored >= cap || author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_none()
+            {
+                stuck[gathered[unfit].0] = true;
+                continue;
+            }
+            authored += 1;
+            remaining[gathered[unfit].0] -= 1;
         }
         for (op, members) in packed.batches {
             if authored >= cap {
@@ -550,6 +573,43 @@ pub(crate) fn reauthor_chain_pins(
         .enumerate()
         .take_while(|(index, _)| !stuck[*index] && remaining[*index] == 0)
         .count())
+}
+
+/// A stated row as a tail `Upsert` of the same cells — the fallback for a row too large to
+/// restate.
+fn tail_upsert(spec: &TableSpec, row: &StatedRow) -> RowOp {
+    RowOp::Upsert {
+        table: spec.name.to_string(),
+        spec_version: spec.spec_version,
+        pk: row.pk.clone(),
+        cells: row.cells.clone(),
+    }
+}
+
+/// How one of the local chain's own live-row pins would move, for compaction's cost estimate:
+/// the same decision [`reauthor_chain_pins`] makes.
+pub(crate) enum OwnPinMove {
+    /// As a tail `Upsert` of a row the local device wrote.
+    Upsert,
+    /// As a restatement at another device's identity.
+    Restate(StatedRow),
+    /// Not today.
+    Stuck,
+}
+
+pub(crate) fn own_pin_move(
+    tx: &Transaction<'_>,
+    repo_id: &str,
+    spec: &TableSpec,
+    stream: crate::stream::StreamId,
+    row_pk: &str,
+    local_hex: &str,
+) -> anyhow::Result<OwnPinMove> {
+    Ok(match row_repair_op(tx, repo_id, spec, stream, row_pk, &Carrier::own(local_hex))? {
+        RowRepair::Upsert(_) => OwnPinMove::Upsert,
+        RowRepair::Row(row) => OwnPinMove::Restate(row),
+        RowRepair::Delete(_) | RowRepair::Skip | RowRepair::Unrepairable => OwnPinMove::Stuck,
+    })
 }
 
 /// Sign `op` under the local key and self-apply it, returning the new entry's hash — `None`, with
@@ -627,6 +687,20 @@ impl<'a> Carrier<'a> {
     fn own(local_hex: &'a str) -> Self {
         Self { winner_hex: local_hex, local_hex, deletes_at_tail: false }
     }
+
+    /// Re-adoption: the local chain carries what the removed writer `winner_hex` carried — the
+    /// rows it wrote and the rows it restated at another device's identity.
+    fn removed(winner_hex: &'a str, local_hex: &'a str, deletes_at_tail: bool) -> Self {
+        Self { winner_hex, local_hex, deletes_at_tail }
+    }
+
+    /// Whether a live clock at `clock_hex` is this pass's to carry: in compaction, any clock the
+    /// local chain carries (it only asks about its own pins); in re-adoption, any clock but the
+    /// local device's own — the removed writer's, or one it restated, which the candidate set
+    /// selected (#1488). A row the local device wrote needs no one else to carry it.
+    fn carries_live(&self, clock_hex: &str) -> bool {
+        self.winner_hex == self.local_hex || clock_hex != self.local_hex
+    }
 }
 
 /// The physical-table repair for one row, carried under the local key (`local_hex`) for the rows
@@ -647,18 +721,16 @@ fn row_repair_op(
     row_pk: &str,
     carrier: &Carrier<'_>,
 ) -> anyhow::Result<RowRepair> {
-    let Carrier { winner_hex, local_hex, deletes_at_tail } = *carrier;
+    let Carrier { local_hex, deletes_at_tail, .. } = *carrier;
     let key = apply::RowKey { stream, repo_id, table: spec.name, row_pk };
     let clock = apply::current_row_clock_on_stream(tx, &key)?;
     let tombstone = apply::current_tombstone(tx, &key)?;
     // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
     // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a live
     // clock always owns the row, and a tombstone owns the deletion only without one.
-    // A live clock is carried when it is the caller's to carry: the winner's own (a removed
-    // writer's, or the local device's), or — compaction only — one the local chain restated at
-    // another device's identity.
+    // A live clock is carried when it is this pass's to carry (`Carrier::carries_live`).
     let (winner_lamport, identity, live) = match (clock, tombstone) {
-        (Some(clock), _) if clock.device_hex == winner_hex || winner_hex == local_hex =>
+        (Some(clock), _) if carrier.carries_live(&clock.device_hex) =>
             (clock.lamport, None, Some(clock)),
         (None, Some(clock)) => (clock.lamport, Some((clock.lamport, clock.device_hex)), None),
         _ => return Ok(RowRepair::Skip),
@@ -669,17 +741,30 @@ fn row_repair_op(
     let pk = row_op::row_pk_values(row_pk)?;
     let repair = match (identity, apply::read_synced_cells(tx, spec, &pk)?) {
         (None, apply::SyncedRow::Cells(cells)) => match live {
-            Some(clock) if clock.device_hex != local_hex => RowRepair::Row(StatedRow {
-                pk,
-                device: clock.device_hex.parse().map_err(|err| {
-                    anyhow::anyhow!(
-                        "clock device fingerprint `{}` is not hex: {err:?}",
-                        clock.device_hex
-                    )
-                })?,
-                lamport: clock.lamport,
-                cells,
-            }),
+            // A restatement asserts these cells ARE the write at the clock's identity, so they
+            // must be exactly what was published for it: a local edit the producer has not
+            // authored yet would otherwise be signed under someone else's write, and peers that
+            // already hold that write would never see it (#1488). Held until the producer runs.
+            Some(clock) if clock.device_hex != local_hex => {
+                let published = apply::published_hash_on_stream(tx, &key)?;
+                let current = apply::synced_row_hash(tx, spec, &pk)?;
+                if published.is_none_or(|(hash, version)| {
+                    version != spec.spec_version || Some(hash) != current
+                }) {
+                    return Ok(RowRepair::Unrepairable);
+                }
+                RowRepair::Row(StatedRow {
+                    pk,
+                    device: clock.device_hex.parse().map_err(|err| {
+                        anyhow::anyhow!(
+                            "clock device fingerprint `{}` is not hex: {err:?}",
+                            clock.device_hex
+                        )
+                    })?,
+                    lamport: clock.lamport,
+                    cells,
+                })
+            },
             _ => RowRepair::Upsert(RowOp::Upsert {
                 table: spec.name.to_string(),
                 spec_version: spec.spec_version,
