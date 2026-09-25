@@ -603,19 +603,19 @@ fn stored_clock(
 }
 
 /// Raise `key`'s clock in `table` to `(lamport, device_hex)` under LWW — a clock that does not
-/// [`RowClock::beats`] the stored one never lowers it.
+/// [`RowClock::beats`] the stored one never lowers it. Returns whether it raised.
 fn raise_clock(
     tx: &Transaction<'_>,
     table: ClockTable,
     key: &RowKey<'_>,
     lamport: u64,
     device_hex: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let incoming = RowClock { lamport, device_hex: device_hex.to_owned() };
     if let Some(stored) = stored_clock(tx, table, key)?
         && !incoming.beats(&stored)
     {
-        return Ok(());
+        return Ok(false);
     }
     tx.execute(
         &format!(
@@ -636,7 +636,7 @@ fn raise_clock(
             device_hex,
         ],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 /// The row's latest-write clock, or `None` if it has never been written on this device. Recorded on
@@ -660,14 +660,43 @@ fn current_row_clock(
 }
 
 /// Raise the row's write clock to `(lamport, device_hex)` under LWW — a later-arriving but older
-/// write never lowers it.
+/// write never lowers it. A raise replaces the row's statements with the writing entry's own: the
+/// entry that wrote the clock is the one that carries it (#1488).
 fn raise_row_clock(
     tx: &Transaction<'_>,
     key: &RowKey<'_>,
     lamport: u64,
     device_hex: &str,
 ) -> anyhow::Result<()> {
-    raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)
+    if !raise_clock(tx, ClockTable::Rows, key, lamport, device_hex)? {
+        return Ok(());
+    }
+    clear_row_statements(tx, key)?;
+    tx.execute(
+        "INSERT INTO sync_row_statements(
+             stream_id, repo_id, table_name, row_pk, device_fingerprint, lamport
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            key.stream.to_bytes().as_slice(),
+            key.repo_id,
+            key.table,
+            key.row_pk,
+            device_hex,
+            i64::try_from(lamport)?,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drop the row's statements, keyed exactly as its clock is (`clear_row_clock`), so the two never
+/// part ways.
+fn clear_row_statements(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()> {
+    tx.execute(
+        "DELETE FROM sync_row_statements
+          WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
+        rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn current_tombstone(
@@ -955,7 +984,7 @@ fn clear_row_clock(tx: &Transaction<'_>, key: &RowKey<'_>) -> anyhow::Result<()>
           WHERE stream_id = ?1 AND repo_id = ?2 AND table_name = ?3 AND row_pk = ?4",
         rusqlite::params![key.stream.to_bytes().as_slice(), key.repo_id, key.table, key.row_pk],
     )?;
-    Ok(())
+    clear_row_statements(tx, key)
 }
 
 /// The row's recorded anti-echo hash and the projector version whose column set it covers, or

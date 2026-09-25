@@ -640,6 +640,40 @@ fn a_published_hash_carries_the_column_set_it_covers() {
     assert_eq!(version, SPEC.spec_version);
 }
 
+/// The chains carrying a row's current live clock (`sync_row_statements`), with their lamports.
+fn row_statements(tx: &Transaction<'_>) -> Vec<(String, i64)> {
+    tx.prepare("SELECT device_fingerprint, lamport FROM sync_row_statements ORDER BY 1")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The entry that wins a row carries it: a winning write replaces the row's statements with its
+/// own, and a losing one leaves them alone (#1488).
+#[test]
+fn a_winning_write_is_the_rows_only_carrier() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    let write = |title: &str, lamport, seed| {
+        apply_row_op(
+            &tx,
+            &SPEC,
+            "repo",
+            &upsert(&[("title", TypedValue::Text(title.into()))]),
+            OpMeta { lamport, device: device(seed) },
+        )
+        .unwrap()
+    };
+    write("first", 3, 2);
+    assert_eq!(row_statements(&tx), [(device(2).to_string(), 3)]);
+    write("newer", 5, 4);
+    assert_eq!(row_statements(&tx), [(device(4).to_string(), 5)], "the newer write replaced it");
+    write("older", 4, 2);
+    assert_eq!(row_statements(&tx), [(device(4).to_string(), 5)], "a losing write carries nothing");
+}
+
 #[test]
 fn a_remove_deletes_the_row_and_its_bookkeeping() {
     let mut c = conn();
@@ -649,6 +683,7 @@ fn a_remove_deletes_the_row_and_its_bookkeeping() {
         device: device(2),
     })
     .unwrap();
+    assert_eq!(row_statements(&tx).len(), 1);
     apply_row_op(
         &tx,
         &SPEC,
@@ -664,6 +699,7 @@ fn a_remove_deletes_the_row_and_its_bookkeeping() {
     let row_pk = row_op::row_pk_string(&[TypedValue::Text("r1".to_string())]);
     assert!(published_hash(&tx, "repo", "t_demo", &row_pk).unwrap().is_none());
     assert!(current_row_clock(&tx, "repo", "t_demo", &row_pk).unwrap().is_none());
+    assert!(row_statements(&tx).is_empty(), "no chain carries a deleted row's clock");
     tx.commit().unwrap();
     assert_eq!(title(&c), None);
 }

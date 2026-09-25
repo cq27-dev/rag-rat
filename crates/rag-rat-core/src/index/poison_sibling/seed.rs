@@ -59,6 +59,7 @@ pub(super) const SEEDED_TABLES: &[&str] = &[
     "repo_roots",
     "repos",
     "symbols",
+    "sync_row_statements",
     "sync_tombstone_statements",
 ];
 
@@ -842,8 +843,16 @@ const DIRECT_TRIPWIRES: &[(&str, &str, &str)] = &[
          (?1, ?2, ?2)",
         "repo_id = ?1 AND memory_id = ?2 AND source_text_hash = ?2",
     ),
-    // V127 protocol metadata is not adopted with derived rows, but its repo dimension still
-    // needs a sibling-preservation tripwire. It has no parent-row foreign keys.
+    // V127 / V134 protocol metadata is not adopted with derived rows, but its repo dimension
+    // still needs a sibling-preservation tripwire. Neither has parent-row foreign keys.
+    (
+        "sync_row_statements",
+        "INSERT INTO sync_row_statements (stream_id, repo_id, table_name, row_pk, \
+         device_fingerprint, lamport) VALUES (zeroblob(32), ?1, 'repo_memories', json_array(?2), \
+         lower(hex(zeroblob(32))), 0)",
+        "repo_id = ?1 AND stream_id = zeroblob(32) AND table_name = 'repo_memories' AND row_pk = \
+         json_array(?2) AND device_fingerprint = lower(hex(zeroblob(32))) AND lamport = 0",
+    ),
     (
         "sync_tombstone_statements",
         "INSERT INTO sync_tombstone_statements (stream_id, repo_id, table_name, row_pk, \

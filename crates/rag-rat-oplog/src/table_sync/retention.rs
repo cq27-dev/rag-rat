@@ -176,13 +176,20 @@ pub(crate) fn chain_pins(
     below: u64,
     limit: usize,
 ) -> anyhow::Result<Vec<Pin>> {
-    // The merge tables store fingerprints as the lowercase hex the applier wrote. A live clock owns
-    // its row whatever tombstone sits beside it; a statement pins only while its tombstone is
-    // current (a statement never outlives its tombstone row — the join is that guarantee) and the
-    // pk has no live clock.
+    // The merge tables store fingerprints as the lowercase hex the applier wrote. A live row pins
+    // the entry of each chain that carries its current clock (`sync_row_statements`, #1488) — not
+    // the clock's device, which a restated row names although that device's entry may never be
+    // held here. The join keeps a stray statement from pinning a row that has no live clock. A
+    // live clock owns its row whatever tombstone sits beside it; a tombstone statement pins only
+    // while its tombstone is current (a statement never outlives its tombstone row — the join is
+    // that guarantee) and the pk has no live clock.
     let mut stmt = tx.prepare(
-        "SELECT lamport, table_name, row_pk, NULL, NULL FROM sync_row_clocks
-         WHERE stream_id = ?1 AND device_fingerprint = ?2 AND lamport >= ?3 AND lamport < ?4
+        "SELECT s.lamport, s.table_name, s.row_pk, NULL, NULL
+           FROM sync_row_statements s
+           JOIN sync_row_clocks c
+             ON c.stream_id = s.stream_id AND c.table_name = s.table_name AND c.row_pk = s.row_pk
+         WHERE s.stream_id = ?1 AND s.device_fingerprint = ?2 AND s.lamport >= ?3
+           AND s.lamport < ?4
          UNION ALL
          SELECT s.lamport, s.table_name, s.row_pk, t.device_fingerprint, t.lamport
            FROM sync_tombstone_statements s

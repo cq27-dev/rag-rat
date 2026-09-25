@@ -1642,6 +1642,10 @@ mod repo_id_scope_coverage {
             "per-chain statements of a row's current tombstone, keyed on the row plus the chain",
         ),
         (
+            "sync_row_statements",
+            "per-chain statements of a row's current live clock, keyed on the row plus the chain",
+        ),
+        (
             "table_sync_readoption_audit",
             "re-adoption provenance, keyed to its stream like the directory's other children",
         ),
