@@ -633,6 +633,22 @@ fn a_row_too_large_to_restate_is_carried_at_the_tail() {
     c.ingest_all(&entries, &a.pubkey());
     enroll_writer(&c.conn, account, c.local.fingerprint());
     remove_writer(&c.conn, account, a.pubkey().fingerprint());
+    // An accepted entry this binary cannot apply yet above the row's winner may be a newer write
+    // to it, which a tail write would beat: the fallback holds, as every tail-signed repair does.
+    c.conn
+        .execute(
+            "INSERT INTO table_sync_entries(
+                     entry_hash, stream_id, device_fingerprint, lamport, signed_bytes,
+                     received_at_ms, pending_reason
+                 ) VALUES (x'77', ?1, ?2, 1000, x'00', 0, 'newer_spec_version')",
+            rusqlite::params![stream.to_bytes().as_slice(), [2u8; 32].as_slice()],
+        )
+        .unwrap();
+    assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, 9), None);
+    assert!(own_entries(&c).is_empty(), "nothing was signed over the parked write");
+    c.conn
+        .execute("UPDATE table_sync_entries SET pending_reason = NULL WHERE entry_hash = x'77'", [])
+        .unwrap();
     assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, 9), Some(1));
     let newest = own_entries(&c).pop().expect("the row was carried");
     let signed = crate::entry::decode_signed(&newest).unwrap();
@@ -691,6 +707,36 @@ fn restated_pins_are_priced_by_batch() {
     )
     .unwrap();
     assert!(worth >= 10, "one batch moves all ten restated rows: {worth}");
+}
+
+/// A removed writer's delete that a current writer's newer write outranks leaves nothing owed:
+/// the row is that writer's, and re-adoption must not restate it on the removed writer's behalf
+/// — least of all again on every drain (#1488).
+#[test]
+fn a_removed_writers_outranked_delete_owes_nothing() {
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
+    let mut a = Device::new();
+    let mut b = Device::new();
+    let mut c = Device::new();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'first')", []).unwrap();
+    let create = a.produce();
+    a.delete_row();
+    let delete = a.produce();
+    b.ingest_all(&create, &a.pubkey());
+    b.ingest_all(&delete, &a.pubkey());
+    b.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'again')", []).unwrap();
+    let reinsert = b.produce();
+    for (entries, from) in [(&create, a.pubkey()), (&delete, a.pubkey()), (&reinsert, b.pubkey())] {
+        c.ingest_all(entries, &from);
+    }
+    assert_eq!(c.title().as_deref(), Some("again"));
+    enroll_writer(&c.conn, account, c.local.fingerprint());
+    remove_writer(&c.conn, account, a.pubkey().fingerprint());
+    for epoch in [9, 10] {
+        assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, epoch), Some(0));
+    }
+    assert!(own_entries(&c).is_empty(), "B's row is not restated for A");
 }
 
 #[test]

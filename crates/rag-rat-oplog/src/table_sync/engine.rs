@@ -333,7 +333,10 @@ pub(crate) fn process_readoption_work_for_stream(
         // is re-authored at the tail as before, the one case left with a tail write's hazard;
         // one too large even for that stays owed.
         for index in packed.unfit {
-            let op = tail_upsert(spec, &stated[index]);
+            let Some(op) = tail_upsert(tx, spec, stream, &stated[index])? else {
+                unrepairable += 1;
+                continue;
+            };
             let Some(adopted_entry_hash) =
                 author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
             else {
@@ -543,9 +546,12 @@ pub(crate) fn reauthor_chain_pins(
             row_op::pack_restate_rows(spec.name, spec.spec_version, &stated, restate_payload_max());
         // Too large to restate alone: re-authored at the tail, as re-adoption does.
         for unfit in packed.unfit {
-            let op = tail_upsert(spec, &stated[unfit]);
-            if authored >= cap || author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_none()
-            {
+            let moved = match tail_upsert(tx, spec, stream, &stated[unfit])? {
+                Some(op) if authored < cap =>
+                    author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_some(),
+                _ => false,
+            };
+            if !moved {
                 stuck[gathered[unfit].0] = true;
                 continue;
             }
@@ -576,14 +582,24 @@ pub(crate) fn reauthor_chain_pins(
 }
 
 /// A stated row as a tail `Upsert` of the same cells — the fallback for a row too large to
-/// restate.
-fn tail_upsert(spec: &TableSpec, row: &StatedRow) -> RowOp {
-    RowOp::Upsert {
+/// restate. `None` while an entry this binary cannot apply yet sits above the row's winner: that
+/// may be a newer write to the row, and a tail-signed write would beat it on peers that
+/// understand it, the same hold every tail-signed repair gets.
+fn tail_upsert(
+    tx: &Transaction<'_>,
+    spec: &TableSpec,
+    stream: crate::stream::StreamId,
+    row: &StatedRow,
+) -> anyhow::Result<Option<RowOp>> {
+    if store::pending_entry_at_or_above(tx, stream, row.lamport)? {
+        return Ok(None);
+    }
+    Ok(Some(RowOp::Upsert {
         table: spec.name.to_string(),
         spec_version: spec.spec_version,
         pk: row.pk.clone(),
         cells: row.cells.clone(),
-    }
+    }))
 }
 
 /// How one of the local chain's own live-row pins would move, for compaction's cost estimate:

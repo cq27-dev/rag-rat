@@ -588,6 +588,12 @@ pub(crate) fn pins_worth_reauthoring(
         if lamports.partition_point(|&lamport| lamport < bound) >= 2 * cost {
             worth = k;
         }
+        // Cost only grows along the run, and nothing past `lamports` can be reclaimed: once the
+        // cost passes the cap or half of everything reclaimable, no longer prefix can qualify, so
+        // stop before pricing more pins (each reads its row).
+        if cost > cap || 2 * cost > lamports.len() {
+            break;
+        }
     }
     Ok(worth.min(within_cap))
 }

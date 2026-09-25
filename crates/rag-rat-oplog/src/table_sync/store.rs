@@ -1400,6 +1400,12 @@ pub(crate) fn readoption_candidates(
                         SELECT 1 FROM sync_tombstone_statements l
                          WHERE l.stream_id = t.stream_id AND l.table_name = t.table_name
                            AND l.row_pk = t.row_pk AND l.device_fingerprint = ?3)
+                -- A tombstone a newer live write outranks is carried by nothing: the row is that
+                -- write's, and the arms above decide whether it is owed (as `chain_pins` does).
+                AND NOT EXISTS (
+                        SELECT 1 FROM sync_row_clocks c
+                         WHERE c.stream_id = t.stream_id AND c.table_name = t.table_name
+                           AND c.row_pk = t.row_pk)
          )
          GROUP BY table_name, row_pk
          ORDER BY MAX(lamport)",
