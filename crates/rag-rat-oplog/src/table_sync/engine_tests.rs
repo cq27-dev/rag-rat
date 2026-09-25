@@ -275,11 +275,13 @@ fn readoption_re_authors_a_removed_writers_row_and_uses_it_to_converge_a_fresh_r
     assert_eq!(d.title().as_deref(), Some("distilled"));
 }
 
-/// A re-adoption is signed at the stream tail. An accepted entry this binary cannot apply yet,
-/// above the removed writer's winner, may be a newer write to that row — re-adopting over it
-/// would overwrite it on up-to-date peers — so the work waits until the entry replays.
+/// An accepted entry this binary cannot apply yet, above the removed writer's winner, may be a
+/// newer write to that row. A re-adoption at the stream tail would overwrite it on up-to-date
+/// peers, which is why it used to wait. A live row is now restated at its own identity (#1488),
+/// which beats nothing newer, so the removal drains at once and the parked write still wins
+/// wherever it applies.
 #[test]
-fn readoption_waits_while_a_parked_newer_write_sits_above_the_winner() {
+fn readoption_restates_at_identity_under_a_parked_newer_write() {
     let mut a = Device::new();
     let mut c = Device::new();
     let account = AccountId::from_bytes([42; 32]);
@@ -329,21 +331,189 @@ fn readoption_waits_while_a_parked_newer_write_sits_above_the_winner() {
         processed
     };
 
-    assert_eq!(drain(&mut c), None, "the removal cannot drain past the parked write");
-    let own: i64 = c
+    assert_eq!(drain(&mut c), Some(1), "the row is restated without waiting");
+    let own: Vec<u8> = c
         .conn
         .query_row(
-            "SELECT COUNT(*) FROM table_sync_entries WHERE device_fingerprint = ?1",
+            "SELECT signed_bytes FROM table_sync_entries WHERE device_fingerprint = ?1",
             [c.local.fingerprint().to_bytes().as_slice()],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(own, 0, "nothing was re-authored over it");
-
-    c.conn
-        .execute("UPDATE table_sync_entries SET pending_reason = NULL WHERE entry_hash = x'77'", [])
+    let signed = crate::entry::decode_signed(&own).unwrap();
+    let Ok(row_op::DecodedRowOp::Known(RowOp::RestateRows { rows, .. })) =
+        row_op::decode(&signed.entry.op_bytes)
+    else {
+        panic!("re-adoption restates the row");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].device, a.pubkey().fingerprint(), "at the removed writer's identity");
+    let clock: String = c
+        .conn
+        .query_row("SELECT device_fingerprint FROM sync_row_clocks", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(drain(&mut c), Some(1), "once it replays, the row is re-adopted");
+    assert_eq!(clock, a.pubkey().fingerprint().to_string(), "the row keeps its writer's clock");
+}
+
+/// Enqueue re-adoption of `removed` on `stream` (at removal epoch `epoch`) and drain it.
+fn drain_readoption(
+    d: &mut Device,
+    removed: crate::op::DeviceFingerprint,
+    stream: crate::stream::StreamId,
+    epoch: u64,
+) -> Option<usize> {
+    let account = AccountId::from_bytes([42; 32]);
+    let tx = d.conn.transaction().unwrap();
+    store::enqueue_readoption_work(&tx, account, removed, stream, [7; 32], epoch, 10).unwrap();
+    let ctx = SyncCtx {
+        repo_id: "repo",
+        account_id: account,
+        incarnation_ref: [0x44; 32],
+        device: &d.local,
+        registry: REGISTRY,
+        now_ms: 0,
+        local_writer: Default::default(),
+    };
+    let processed = process_readoption_work_for_stream(&tx, &ctx, stream).unwrap();
+    tx.commit().unwrap();
+    processed
+}
+
+/// Every entry `d`'s own chain holds, in lamport order.
+fn own_entries(d: &Device) -> Vec<Vec<u8>> {
+    d.conn
+        .prepare(
+            "SELECT signed_bytes FROM table_sync_entries WHERE device_fingerprint = ?1
+              ORDER BY lamport",
+        )
+        .unwrap()
+        .query_map([d.local.fingerprint().to_bytes().as_slice()], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// #1488. A removed writer's newer write reached only some stores. Every adopter re-adopts the row
+/// from its own view — a lagging one from an older copy — and whichever order the restatements
+/// arrive in, every store ends at the newest copy any adopter held. A tail re-author would have
+/// let the lagging adopter's older copy win wherever it was re-authored last. (#1479 is the same
+/// shape: a store restored from an older backup is a lagging adopter of its retired identity.)
+#[test]
+fn readoption_at_identity_keeps_the_newest_copy_whatever_the_order() {
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
+    let mut a = Device::new(); // the writer, later removed
+    let mut lagging = Device::new();
+    let mut current = Device::new();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'older')", []).unwrap();
+    let first = a.produce();
+    a.set_title("newer");
+    let second = a.produce();
+    lagging.ingest_all(&first, &a.pubkey());
+    current.ingest_all(&first, &a.pubkey());
+    current.ingest_all(&second, &a.pubkey());
+    assert_eq!(lagging.title().as_deref(), Some("older"));
+    // The lagging adopter has seen MORE of the stream's clock than the current one (its own
+    // writes), so anything it signs at the tail outranks what the current adopter signs.
+    for id in ["x1", "x2", "x3"] {
+        lagging.conn.execute("INSERT INTO t_demo(id, title) VALUES (?1, 'own')", [id]).unwrap();
+        lagging.produce();
+    }
+    for store in [&lagging, &current] {
+        enroll_writer(&store.conn, account, lagging.local.fingerprint());
+        enroll_writer(&store.conn, account, current.local.fingerprint());
+        remove_writer(&store.conn, account, a.pubkey().fingerprint());
+    }
+
+    assert_eq!(drain_readoption(&mut lagging, a.pubkey().fingerprint(), stream, 9), Some(1));
+    assert_eq!(drain_readoption(&mut current, a.pubkey().fingerprint(), stream, 9), Some(1));
+    let (from_lagging, from_current) = (own_entries(&lagging), own_entries(&current));
+
+    // The adopters exchange restatements: the older copy never overwrites the newer one.
+    current.ingest_all(&from_lagging, &lagging.pubkey());
+    assert_eq!(current.title().as_deref(), Some("newer"));
+    lagging.ingest_all(&from_current, &current.pubkey());
+    assert_eq!(lagging.title().as_deref(), Some("newer"), "the lagging adopter catches up");
+
+    // Fresh replicas, which refuse A's own entries, reach the newest copy in either order.
+    for older_first in [true, false] {
+        let mut fresh = Device::new();
+        let batches = [(&from_lagging, lagging.pubkey()), (&from_current, current.pubkey())];
+        let order: Vec<usize> = if older_first { vec![0, 1] } else { vec![1, 0] };
+        for index in order {
+            let (entries, from) = &batches[index];
+            fresh.ingest_all(entries, from);
+        }
+        assert_eq!(fresh.title().as_deref(), Some("newer"), "older_first = {older_first}");
+        // The row's winning entry is never held here; it resolves through its carrier.
+        let tx = fresh.conn.transaction().unwrap();
+        let pk = [row_op::TypedValue::Text("r1".into())];
+        let apply::SyncedRow::Cells(cells) = apply::read_synced_cells(&tx, &SPEC, &pk).unwrap()
+        else {
+            panic!("the row is readable")
+        };
+        assert_eq!(
+            apply::stale_row_disposition(&tx, &SPEC, "repo", stream, &pk, &cells).unwrap(),
+            apply::StaleRow::Unchanged,
+            "the winner resolves through the restating entry",
+        );
+    }
+
+    // Draining the removal again owes nothing: this chain already carries the row.
+    assert_eq!(drain_readoption(&mut current, a.pubkey().fingerprint(), stream, 11), Some(0));
+}
+
+/// A row this chain carries at another device's identity pins its restating entry, and compaction
+/// carries that pin forward by restating the row at the same identity — never as a tail write of
+/// this device's own, which would beat a newer write it has not seen (#1488).
+#[test]
+fn compaction_moves_a_restated_row_by_restating_it() {
+    let account = AccountId::from_bytes([42; 32]);
+    let stream = scope_stream_id("repo", account, [0x44; 32], ScopeId::new("demo/1"));
+    let mut a = Device::new();
+    let mut c = Device::new();
+    a.conn.execute("INSERT INTO t_demo(id, title) VALUES ('r1', 'kept')", []).unwrap();
+    let entries = a.produce();
+    c.ingest_all(&entries, &a.pubkey());
+    enroll_writer(&c.conn, account, c.local.fingerprint());
+    remove_writer(&c.conn, account, a.pubkey().fingerprint());
+    assert_eq!(drain_readoption(&mut c, a.pubkey().fingerprint(), stream, 9), Some(1));
+
+    let tx = c.conn.transaction().unwrap();
+    let pins = crate::table_sync::retention::chain_pins(
+        &tx,
+        stream,
+        c.local.fingerprint(),
+        0,
+        1 << 40,
+        16,
+    )
+    .unwrap();
+    assert_eq!(pins.len(), 1, "the restating entry carries the row: {pins:?}");
+    let ctx = SyncCtx {
+        repo_id: "repo",
+        account_id: account,
+        incarnation_ref: [0x44; 32],
+        device: &c.local,
+        registry: REGISTRY,
+        now_ms: 0,
+        local_writer: Default::default(),
+    };
+    assert_eq!(reauthor_chain_pins(&tx, &ctx, "demo/1", stream, &pins, 4, false).unwrap(), 1);
+    tx.commit().unwrap();
+    let newest = own_entries(&c).pop().unwrap();
+    let signed = crate::entry::decode_signed(&newest).unwrap();
+    let Ok(row_op::DecodedRowOp::Known(RowOp::RestateRows { rows, .. })) =
+        row_op::decode(&signed.entry.op_bytes)
+    else {
+        panic!("the pin moves as a restatement");
+    };
+    assert_eq!(rows[0].device, a.pubkey().fingerprint(), "at the same identity");
+    let clock: String = c
+        .conn
+        .query_row("SELECT device_fingerprint FROM sync_row_clocks", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(clock, a.pubkey().fingerprint().to_string());
 }
 
 #[test]

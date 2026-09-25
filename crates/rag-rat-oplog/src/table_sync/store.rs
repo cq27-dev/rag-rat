@@ -1366,8 +1366,14 @@ pub(crate) fn readoption_candidates(
     // An identity with no statement still names its original Remove, including legacy state.
     let mut stmt = tx.prepare(
         "SELECT table_name, row_pk, MAX(lamport) FROM (
-             SELECT table_name, row_pk, lamport FROM sync_row_clocks
-              WHERE stream_id = ?1 AND device_fingerprint = ?2
+             SELECT c.table_name, c.row_pk, c.lamport FROM sync_row_clocks c
+              WHERE c.stream_id = ?1 AND c.device_fingerprint = ?2
+                -- A row the local chain already carries at this identity (#1488) is not owed
+                -- again: the anti-loop tombstones get from their own statements below.
+                AND NOT EXISTS (
+                        SELECT 1 FROM sync_row_statements l
+                         WHERE l.stream_id = c.stream_id AND l.table_name = c.table_name
+                           AND l.row_pk = c.row_pk AND l.device_fingerprint = ?3)
              UNION ALL
              SELECT t.table_name, t.row_pk, COALESCE(s.lamport, t.lamport)
                FROM sync_row_tombstones t

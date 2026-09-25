@@ -1517,3 +1517,148 @@ fn a_proven_unsent_edit_on_one_stated_row_outranks_an_unprovable_verdict_on_anot
         PreApply::Apply
     );
 }
+
+fn stated_row(seed: u8, lamport: u64, title: &str) -> row_op::StatedRow {
+    row_op::StatedRow {
+        pk: vec![TypedValue::Text("r1".to_string())],
+        device: device(seed),
+        lamport,
+        cells: vec![Cell { column: "title".to_string(), value: TypedValue::Text(title.into()) }],
+    }
+}
+
+fn restate_rows(rows: Vec<row_op::StatedRow>) -> RowOp {
+    RowOp::RestateRows { spec_version: 1, table: "t_demo".to_string(), rows }
+}
+
+fn row_title(tx: &Transaction<'_>) -> Option<String> {
+    tx.query_row("SELECT title FROM t_demo WHERE id = 'r1'", [], |r| r.get(0)).optional().unwrap()
+}
+
+fn row_clock(tx: &Transaction<'_>) -> Option<(u64, String)> {
+    current_row_clock(tx, "repo", "t_demo", &r1_key())
+        .unwrap()
+        .map(|clock| (clock.lamport, clock.device_hex))
+}
+
+/// A restated row settles at ITS identity exactly as the write that put its cells there would
+/// (#1488): it wins a row that write would win and leaves the clock with the writer, adds the
+/// signer as a carrier of the current identity, loses to anything newer, and never resurrects a
+/// row a newer delete owns.
+#[test]
+fn a_restated_row_settles_at_its_identity() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    let dev = |seed| device(seed).to_string();
+
+    // Device 7 restates device 2's write at lamport 5, signed at 9: a new row takes it.
+    assert_eq!(
+        apply(&tx, &restate_rows(vec![stated_row(2, 5, "v5")]), 9, 7),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(row_title(&tx).as_deref(), Some("v5"));
+    assert_eq!(row_clock(&tx), Some((5, dev(2))), "the clock stays with the writer");
+    assert_eq!(row_statements(&tx), [(dev(7), 9)], "the signer carries the row");
+    assert!(published_hash(&tx, "repo", "t_demo", &r1_key()).unwrap().is_some(), "anti-echo");
+
+    // Another chain restating the same write becomes a second carrier.
+    assert_eq!(
+        apply(&tx, &restate_rows(vec![stated_row(2, 5, "v5")]), 12, 8),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(row_statements(&tx), [(dev(7), 9), (dev(8), 12)]);
+    // Re-applying the same restatement changes nothing.
+    assert_eq!(
+        apply(&tx, &restate_rows(vec![stated_row(2, 5, "v5")]), 12, 8),
+        ApplyOutcome::Superseded
+    );
+
+    // An OLDER write of the clock's own writer loses, but its carrier still carries the row: a
+    // store that holds the writer's newer entry must keep the only restatement fresh peers can
+    // consume.
+    assert_eq!(
+        apply(&tx, &restate_rows(vec![stated_row(2, 3, "v3")]), 13, 9),
+        ApplyOutcome::Applied
+    );
+    assert_eq!(row_title(&tx).as_deref(), Some("v5"), "a stale view never overwrites");
+    assert_eq!(row_clock(&tx), Some((5, dev(2))));
+    assert!(row_statements(&tx).contains(&(dev(9), 13)));
+
+    // An older write of ANOTHER device just loses.
+    assert_eq!(
+        apply(&tx, &restate_rows(vec![stated_row(4, 4, "v4")]), 14, 10),
+        ApplyOutcome::Superseded
+    );
+    assert!(!row_statements(&tx).iter().any(|(device, _)| *device == dev(10)));
+
+    // A newer write wins and becomes the only carrier.
+    apply(&tx, &upsert(&[("title", TypedValue::Text("v20".to_string()))]), 20, 3);
+    assert_eq!(row_title(&tx).as_deref(), Some("v20"));
+    assert_eq!(row_statements(&tx), [(dev(3), 20)]);
+
+    // A newer delete owns the row: a restatement below it never resurrects it.
+    apply(&tx, &remove(), 25, 3);
+    assert_eq!(
+        apply(&tx, &restate_rows(vec![stated_row(2, 22, "v22")]), 30, 7),
+        ApplyOutcome::Superseded
+    );
+    assert_eq!(row_title(&tx), None);
+}
+
+/// A restated row at or above its carrier's own lamport names a write the carrier's chain never
+/// held; it is quarantined with no effect, as a restated delete is.
+#[test]
+fn a_restated_row_at_or_above_its_carrier_is_quarantined() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    let outcome = apply(&tx, &restate_rows(vec![stated_row(2, 9, "v9")]), 9, 7);
+    assert!(matches!(outcome, ApplyOutcome::Quarantined { changed: false, .. }), "{outcome:?}");
+    assert_eq!(row_title(&tx), None);
+}
+
+/// A live-row restatement protects unsent local work exactly as an upsert of the same row would,
+/// but only on the rows it would take: an unsent edit parks it, a row its identity loses on does
+/// not, and the rows with no unsent work settle now while the rest wait (#1488).
+#[test]
+fn a_restated_row_defers_only_on_the_unsent_rows_it_would_take() {
+    let mut c = conn();
+    let tx = c.transaction().unwrap();
+    let stream = StreamId::from_bytes([0; 32]);
+    let row = |id: &str, seed, lamport| row_op::StatedRow {
+        pk: vec![TypedValue::Text(id.to_string())],
+        device: device(seed),
+        lamport,
+        cells: vec![Cell { column: "title".into(), value: TypedValue::Text("stated".into()) }],
+    };
+    // b1: a raw local row nothing has published — a proven unsent edit.
+    tx.execute("INSERT INTO t_demo(id, title) VALUES ('b1', 'unsent')", []).unwrap();
+    let op = restate_rows(vec![row("a1", 2, 5), row("b1", 2, 6)]);
+    assert_eq!(
+        unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &op).unwrap(),
+        Some(PendingReason::DeferredUnsentEdit),
+    );
+    let Some(RowOp::RestateRows { rows, .. }) =
+        restate_settleable_now(&tx, &SPEC, "repo", stream, &op).unwrap()
+    else {
+        panic!("the row with no unsent work settles now");
+    };
+    assert_eq!(rows.iter().map(|row| row.pk.clone()).collect::<Vec<_>>(), [vec![
+        TypedValue::Text("a1".into())
+    ]]);
+
+    // Once b1 is written at a clock the stated identity cannot beat, the restatement would not
+    // take it, so it no longer blocks.
+    apply(
+        &tx,
+        &RowOp::Upsert {
+            spec_version: 1,
+            table: "t_demo".into(),
+            pk: vec![TypedValue::Text("b1".into())],
+            cells: vec![Cell { column: "title".into(), value: TypedValue::Text("newer".into()) }],
+        },
+        9,
+        3,
+    );
+    tx.execute("UPDATE t_demo SET title = 'edited again' WHERE id = 'b1'", []).unwrap();
+    assert_eq!(unsent_work_blocking_replay(&tx, &SPEC, "repo", stream, &op).unwrap(), None);
+}

@@ -58,7 +58,7 @@ use crate::op::OpMeta;
 /// registering a table or widening a spec forces an append, and an append is the bump. A widening
 /// that is not a registry change (a new row-op kind) still has to append a generation by hand,
 /// repeating the previous snapshot.
-pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 10;
+pub(crate) const TABLE_SYNC_PROJECTOR_VERSION: i64 = 11;
 
 const TABLE_SYNC_PROJECTOR_VERSION_KEY: &str = "table_sync_projector_version";
 
@@ -419,7 +419,8 @@ fn replay_pending_entry(
 
 /// Re-open the completed re-adoption of every device whose merge state an applied `op` (signed
 /// by `meta.device`) may have materialised — the signer's live clock or tombstone, and each
-/// identity a restatement names — when that device is no longer an effective writer. See
+/// identity a restatement (of deletes or of live rows) names — when that device is no longer an
+/// effective writer. See
 /// `store::reopen_readoption_work` for what a re-open is and is not.
 fn rearm_removed_writers(
     tx: &Transaction<'_>,
@@ -429,8 +430,11 @@ fn rearm_removed_writers(
     meta: OpMeta,
 ) -> anyhow::Result<()> {
     let mut devices = vec![meta.device];
-    if let RowOp::Restate { deletes, .. } = op {
-        devices.extend(deletes.iter().map(|delete| delete.device));
+    match op {
+        RowOp::Restate { deletes, .. } =>
+            devices.extend(deletes.iter().map(|delete| delete.device)),
+        RowOp::RestateRows { rows, .. } => devices.extend(rows.iter().map(|row| row.device)),
+        RowOp::Upsert { .. } | RowOp::Remove { .. } => {},
     }
     devices.sort_unstable();
     devices.dedup();

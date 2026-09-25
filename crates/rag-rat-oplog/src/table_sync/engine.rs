@@ -15,7 +15,7 @@ use rusqlite::Transaction;
 use super::apply::{self, ApplyOutcome};
 use super::registry::TableSpec;
 use super::retention::{Pin, PinKind};
-use super::row_op::{self, RowOp, StatedDelete};
+use super::row_op::{self, RowOp, StatedDelete, StatedRow};
 use super::scope_stream::{ScopeId, scope_stream_id};
 use super::store::{self, AcceptOutcome, PendingReason};
 use super::{produce, refold};
@@ -232,6 +232,11 @@ pub(crate) fn process_readoption_work_for_stream(
     // Deletes gathered per table for the restate arm, each with the candidate it carries.
     let mut deletes: Vec<(&TableSpec, Vec<(store::ReadoptionCandidate, StatedDelete)>)> =
         Vec::new();
+    // Live rows gathered per table, restated at their identities in every scope (#1488): a tail
+    // re-author would carry this store's view of the removed writer's row as a NEW write, beating
+    // a newer write of that writer's that other stores hold and this one refused. A restatement
+    // settles at the write's own identity, so the newest copy any writer holds wins everywhere.
+    let mut live: Vec<(&TableSpec, Vec<(store::ReadoptionCandidate, StatedRow)>)> = Vec::new();
     let audit = |candidate: &store::ReadoptionCandidate,
                  spec: &TableSpec,
                  adopted_entry_hash: EntryHash|
@@ -258,21 +263,24 @@ pub(crate) fn process_readoption_work_for_stream(
         }) else {
             continue;
         };
-        let op = match row_repair_op(
-            tx,
-            ctx.repo_id,
-            spec,
-            stream,
-            &candidate.row_pk,
-            &removed_hex,
-            !restates,
-        )? {
+        let op = match row_repair_op(tx, ctx.repo_id, spec, stream, &candidate.row_pk, &Carrier {
+            winner_hex: &removed_hex,
+            local_hex: &local_hex,
+            deletes_at_tail: !restates,
+        })? {
             RowRepair::Skip => continue,
             RowRepair::Unrepairable => {
                 unrepairable += 1;
                 continue;
             },
             RowRepair::Upsert(op) => op,
+            RowRepair::Row(row) => {
+                match live.iter_mut().find(|(table, _)| table.name == spec.name) {
+                    Some((_, rows)) => rows.push((candidate, row)),
+                    None => live.push((spec, vec![(candidate, row)])),
+                }
+                continue;
+            },
             RowRepair::Delete(delete) if restates => {
                 match deletes.iter_mut().find(|(table, _)| table.name == spec.name) {
                     Some((_, rows)) => rows.push((candidate, delete)),
@@ -298,6 +306,28 @@ pub(crate) fn process_readoption_work_for_stream(
         // would keep the removal pending on every pass with nothing this path could ever settle.
         // Its tombstone stays stated only on the removed writer's chain, which nothing
         // re-authors — the same standing an oversized live row has under compaction.
+        for (op, members) in packed.batches {
+            let Some(adopted_entry_hash) =
+                author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
+            else {
+                unrepairable += members.len();
+                continue;
+            };
+            for index in members {
+                store::record_readoption_audit(
+                    tx,
+                    audit(&rows[index].0, spec, adopted_entry_hash),
+                )?;
+                authored += 1;
+            }
+        }
+    }
+    for (spec, rows) in live {
+        let stated: Vec<StatedRow> = rows.iter().map(|(_, row)| row.clone()).collect();
+        let packed =
+            row_op::pack_restate_rows(spec.name, spec.spec_version, &stated, restate_payload_max());
+        // A row too large for a batch alone is left uncarried and not owed, as an oversized
+        // delete is above.
         for (op, members) in packed.batches {
             let Some(adopted_entry_hash) =
                 author_repair(tx, ctx, spec, stream, &op, "re-adoption")?
@@ -382,6 +412,8 @@ pub(crate) fn reauthor_chain_pins(
     let mut stuck = vec![false; pins.len()];
     // Stated deletes gathered per table in pin order, each tagged with its pin.
     let mut deletes: Vec<(&TableSpec, Vec<(usize, StatedDelete)>)> = Vec::new();
+    // Live rows this chain carries at another device's identity (#1488), likewise.
+    let mut restated: Vec<(&TableSpec, Vec<(usize, StatedRow)>)> = Vec::new();
     'pins: for (index, pin) in pins.iter().enumerate() {
         match &pin.kind {
             PinKind::LiveRow { table_name, row_pk } => {
@@ -393,15 +425,30 @@ pub(crate) fn reauthor_chain_pins(
                         break;
                     };
                 };
-                let RowRepair::Upsert(op) =
-                    row_repair_op(tx, ctx.repo_id, spec, stream, row_pk, &device_hex, false)?
-                else {
-                    stuck[index] = true;
-                    if past_stuck {
+                let op = match row_repair_op(
+                    tx,
+                    ctx.repo_id,
+                    spec,
+                    stream,
+                    row_pk,
+                    &Carrier::own(&device_hex),
+                )? {
+                    RowRepair::Upsert(op) => op,
+                    RowRepair::Row(row) => {
+                        match restated.iter_mut().find(|(table, _)| table.name == spec.name) {
+                            Some((_, gathered)) => gathered.push((index, row)),
+                            None => restated.push((spec, vec![(index, row)])),
+                        }
                         continue;
-                    } else {
-                        break;
-                    };
+                    },
+                    RowRepair::Delete(_) | RowRepair::Skip | RowRepair::Unrepairable => {
+                        stuck[index] = true;
+                        if past_stuck {
+                            continue;
+                        } else {
+                            break;
+                        };
+                    },
                 };
                 if authored >= cap {
                     break;
@@ -433,8 +480,7 @@ pub(crate) fn reauthor_chain_pins(
                         spec,
                         stream,
                         &row.row_pk,
-                        &device_hex,
-                        false,
+                        &Carrier::own(&device_hex),
                     )?
                     else {
                         stuck[index] = true;
@@ -457,6 +503,29 @@ pub(crate) fn reauthor_chain_pins(
         let stated: Vec<StatedDelete> = gathered.iter().map(|(_, delete)| delete.clone()).collect();
         let packed =
             row_op::pack_restates(spec.name, spec.spec_version, &stated, restate_payload_max());
+        for unfit in packed.unfit {
+            stuck[gathered[unfit].0] = true;
+        }
+        for (op, members) in packed.batches {
+            if authored >= cap {
+                break;
+            }
+            if author_repair(tx, ctx, spec, stream, &op, "compaction")?.is_none() {
+                for member in members {
+                    stuck[gathered[member].0] = true;
+                }
+                continue;
+            }
+            authored += 1;
+            for member in members {
+                remaining[gathered[member].0] -= 1;
+            }
+        }
+    }
+    for (spec, gathered) in restated {
+        let stated: Vec<StatedRow> = gathered.iter().map(|(_, row)| row.clone()).collect();
+        let packed =
+            row_op::pack_restate_rows(spec.name, spec.spec_version, &stated, restate_payload_max());
         for unfit in packed.unfit {
             stuck[gathered[unfit].0] = true;
         }
@@ -525,8 +594,12 @@ fn author_repair(
 
 /// What a repair pass can do with one row it wants to carry under the local key.
 enum RowRepair {
-    /// Re-author the row's current cells under the local key: a live winner carried forward.
+    /// Re-author the row's current cells under the local key: a live winner this device wrote,
+    /// carried forward.
     Upsert(RowOp),
+    /// Restate this live row at its identity: its current cells under the write clock that put
+    /// them there, carried by the local chain without a new write (#1488).
+    Row(StatedRow),
     /// Restate this delete at its identity: the row's current tombstone, carried without a row.
     Delete(StatedDelete),
     /// Nothing to carry: the row is settled under another writer, or physically inconsistent with
@@ -539,29 +612,55 @@ enum RowRepair {
     Unrepairable,
 }
 
-/// The physical-table repair for one row. A live clock is carried only by its owner, so
-/// `winner_hex` must own it; a tombstone may be stated by any effective writer at its unchanged
-/// identity, so the caller's selection (its own chain's statements, or a removed writer's) is the
-/// only ownership test a delete gets. `deletes_at_tail` says whether the caller will sign a
-/// `Delete` as a tail `Remove` (a new identity) rather than restate it.
+/// Whose rows a repair pass carries, and how: `winner_hex`'s rows under the local key
+/// `local_hex`, with `deletes_at_tail` saying whether a delete is signed as a tail `Remove` (a new
+/// identity) rather than restated.
+#[derive(Clone, Copy)]
+struct Carrier<'a> {
+    winner_hex: &'a str,
+    local_hex: &'a str,
+    deletes_at_tail: bool,
+}
+
+impl<'a> Carrier<'a> {
+    /// Compaction: the local chain carries its own rows forward, restating its deletes.
+    fn own(local_hex: &'a str) -> Self {
+        Self { winner_hex: local_hex, local_hex, deletes_at_tail: false }
+    }
+}
+
+/// The physical-table repair for one row, carried under the local key (`local_hex`) for the rows
+/// `winner_hex` carries (see [`Carrier`]): the local chain's own (compaction) or a removed writer's
+/// (re-adoption).
+///
+/// A live clock the local device wrote is re-authored at the tail. Any other live clock is
+/// restated at its identity (#1488): a removed writer's row, or a row the local chain already
+/// carries at another device's identity. A restatement never beats a newer write the local store
+/// has not seen, which is what keeps a stale view from overwriting one. A tombstone may be stated
+/// by any effective writer at its unchanged identity, so the caller's selection (its own chain's
+/// statements, or a removed writer's) is the only ownership test a delete gets.
 fn row_repair_op(
     tx: &Transaction<'_>,
     repo_id: &str,
     spec: &TableSpec,
     stream: crate::stream::StreamId,
     row_pk: &str,
-    winner_hex: &str,
-    deletes_at_tail: bool,
+    carrier: &Carrier<'_>,
 ) -> anyhow::Result<RowRepair> {
+    let Carrier { winner_hex, local_hex, deletes_at_tail } = *carrier;
     let key = apply::RowKey { stream, repo_id, table: spec.name, row_pk };
     let clock = apply::current_row_clock_on_stream(tx, &key)?;
     let tombstone = apply::current_tombstone(tx, &key)?;
     // A live clock and a tombstone can only coexist with the clock newer: a remove raises the
     // tombstone at its own lamport, and a remove that BEATS the clock clears the clock. So a live
     // clock always owns the row, and a tombstone owns the deletion only without one.
-    let (winner_lamport, identity) = match (clock, tombstone) {
-        (Some(clock), _) if clock.device_hex == winner_hex => (clock.lamport, None),
-        (None, Some(clock)) => (clock.lamport, Some((clock.lamport, clock.device_hex))),
+    // A live clock is carried when it is the caller's to carry: the winner's own (a removed
+    // writer's, or the local device's), or — compaction only — one the local chain restated at
+    // another device's identity.
+    let (winner_lamport, identity, live) = match (clock, tombstone) {
+        (Some(clock), _) if clock.device_hex == winner_hex || winner_hex == local_hex =>
+            (clock.lamport, None, Some(clock)),
+        (None, Some(clock)) => (clock.lamport, Some((clock.lamport, clock.device_hex)), None),
         _ => return Ok(RowRepair::Skip),
     };
     // What the PHYSICAL row allows decides the repair. A live winner is carried while its row is
@@ -569,12 +668,25 @@ fn row_repair_op(
     // exists, or a live local row would be destroyed by a stale repair.
     let pk = row_op::row_pk_values(row_pk)?;
     let repair = match (identity, apply::read_synced_cells(tx, spec, &pk)?) {
-        (None, apply::SyncedRow::Cells(cells)) => RowRepair::Upsert(RowOp::Upsert {
-            table: spec.name.to_string(),
-            spec_version: spec.spec_version,
-            pk,
-            cells,
-        }),
+        (None, apply::SyncedRow::Cells(cells)) => match live {
+            Some(clock) if clock.device_hex != local_hex => RowRepair::Row(StatedRow {
+                pk,
+                device: clock.device_hex.parse().map_err(|err| {
+                    anyhow::anyhow!(
+                        "clock device fingerprint `{}` is not hex: {err:?}",
+                        clock.device_hex
+                    )
+                })?,
+                lamport: clock.lamport,
+                cells,
+            }),
+            _ => RowRepair::Upsert(RowOp::Upsert {
+                table: spec.name.to_string(),
+                spec_version: spec.spec_version,
+                pk,
+                cells,
+            }),
+        },
         (Some((lamport, device_hex)), apply::SyncedRow::Absent) =>
             RowRepair::Delete(StatedDelete {
                 pk,
@@ -592,12 +704,12 @@ fn row_repair_op(
     // above the winner (a newer spec version during a rolling upgrade) may be a newer write to
     // this very row: peers that understand it have applied it, and a tail-signed repair — a
     // re-authored row, or a tail `Remove` — would beat it there. Hold such a repair until that
-    // entry replays. A restatement beats nothing newer — it settles at the delete's own identity
-    // — so it is never held.
+    // entry replays. A restatement beats nothing newer — it settles at its own identity, a
+    // delete's or a row's — so it is never held.
     let signed_at_tail = match repair {
         RowRepair::Upsert(_) => true,
         RowRepair::Delete(_) => deletes_at_tail,
-        RowRepair::Skip | RowRepair::Unrepairable => false,
+        RowRepair::Row(_) | RowRepair::Skip | RowRepair::Unrepairable => false,
     };
     if signed_at_tail && store::pending_entry_at_or_above(tx, stream, winner_lamport)? {
         return Ok(RowRepair::Unrepairable);
