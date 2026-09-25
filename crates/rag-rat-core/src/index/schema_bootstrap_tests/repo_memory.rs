@@ -1,5 +1,6 @@
 use super::*;
 
+mod dead_source_findings;
 mod diagnostics;
 mod duplicate_findings;
 mod hybrid_search;
