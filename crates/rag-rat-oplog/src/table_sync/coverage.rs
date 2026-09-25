@@ -69,9 +69,10 @@ pub(super) fn record(
     Ok(())
 }
 
-/// Gapped, rejected and merely advertised entries cannot settle delivery. While an obligation
-/// exists, ingress prohibits another discontinuous root, so exact accepted presence proves the
-/// contiguous suffix arrived. This includes entries promoted behind a newly received predecessor.
+/// Gapped, rejected and merely advertised entries cannot settle delivery. Every re-root rewrites
+/// the obligation to the new root in the same transaction ([`record`]), so exact accepted presence
+/// of the tip proves the contiguous suffix from the current root arrived. This includes entries
+/// promoted behind a newly received predecessor.
 pub(super) fn clear_delivered(
     tx: &Transaction<'_>,
     stream: StreamId,
