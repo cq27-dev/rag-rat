@@ -839,3 +839,385 @@ fn every_recursive_tree_descender_grows_the_stack() {
          rag_rat_base::stack::grow_stack, #543):\n{offenders:#?}",
     );
 }
+
+#[test]
+fn declarations_beneath_an_error_node_are_recovered_with_their_scopes() {
+    for (language, fixture) in crate::index::languages::test_support::fixtures() {
+        let parsed =
+            parser::parse_file(Path::new(fixture.path), language, fixture.broken_declaration)
+                .expect("parse");
+        assert!(parsed.has_error, "{language}: the fixture must stay malformed");
+        let symbols = parsed
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.kind.as_str(), symbol.scope_path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, fixture.broken_declaration_symbols, "{language}");
+    }
+}
+
+/// The parser folded `class A {` into a top-level ERROR, so `s` and `g` are A's members. Scoped
+/// from their ancestors they would read as top-level declarations; they are not recovered. The
+/// `${1}` interpolation's closing `}` must not be read as closing A.
+#[test]
+fn members_of_a_container_whose_header_the_error_swallowed_are_not_recovered() {
+    let src = "class A { val s = \"${1}\"\n fun g() {} }\nobject O { fun h() {} }\n";
+    let parsed = parser::parse_file(Path::new("s.kt"), Language::Kotlin, src).expect("parse");
+    assert!(parsed.root().child(0).is_some_and(|node| node.is_error()), "the file is one ERROR");
+    assert!(parsed.symbols.is_empty(), "{:?}", parsed.symbols);
+}
+
+/// A method is legal only in a class body. One that parsed whole directly beneath a top-level
+/// ERROR is not recovered as a top-level declaration.
+#[test]
+fn a_declaration_is_not_recovered_where_its_kind_is_illegal() {
+    let src = "function broken( { target(); }\nasync m() {}\n";
+    let parsed = parser::parse_file(Path::new("s.ts"), Language::TypeScript, src).expect("parse");
+    let error = parsed.root().child(0).expect("the top-level ERROR");
+    assert!(error.is_error());
+    assert!(
+        crate::index::edges::named_children(error).any(|node| node.kind() == "method_definition"),
+        "the method must parse whole beneath the ERROR for this to test anything",
+    );
+    assert!(parsed.symbols.is_empty(), "{:?}", parsed.symbols);
+}
+
+/// `K`'s type parameter list is missing its `>`, so its header did not parse as written: the class
+/// is not recovered, and neither is its method.
+#[test]
+fn a_declaration_whose_header_is_broken_is_not_recovered() {
+    let src = "function broken( { target(); }\nclass K<T { m(){} }\n";
+    let parsed = parser::parse_file(Path::new("s.ts"), Language::TypeScript, src).expect("parse");
+    assert!(parsed.symbols.is_empty(), "{:?}", parsed.symbols);
+}
+
+/// `(kind, scope path)` of each symbol parsed from `src`.
+fn symbol_scopes(path: &str, language: Language, src: &str) -> Vec<(String, String)> {
+    let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+    assert!(parsed.has_error, "the source must stay malformed");
+    parsed.symbols.iter().map(|symbol| (symbol.kind.clone(), symbol.scope_path.clone())).collect()
+}
+
+/// The ERROR folded each class header, and a lambda brace in the header (a constructor argument,
+/// a default value) comes before the class body's `{`. That lambda brace is not the container's,
+/// so `f` is still read as the folded class's member and is not recovered.
+#[test]
+fn a_brace_inside_a_folded_container_header_does_not_open_its_body() {
+    for src in [
+        "class A : Base({ }) { fun f() {} init { } }\n",
+        "class A(val cb: () -> Unit = {}) { fun f() {} init { } }\n",
+    ] {
+        let parsed = parser::parse_file(Path::new("s.kt"), Language::Kotlin, src).expect("parse");
+        let error = parsed.root().child(0).expect("the top-level ERROR");
+        assert!(error.is_error(), "{src}");
+        assert!(
+            crate::index::edges::named_children(error)
+                .any(|node| node.kind() == "function_declaration"),
+            "{src}: `f` must parse whole beneath the ERROR for this to test anything",
+        );
+        assert!(parsed.symbols.is_empty(), "{src}: {:?}", parsed.symbols);
+    }
+}
+
+/// `broken` leaves its `(` unclosed, so the folded class `C` is read inside a bracket. Its body's
+/// `{` is at the same depth as its `class` keyword, so it still opens `C`, and `m` is not
+/// recovered.
+#[test]
+fn a_container_folded_after_an_unclosed_bracket_still_encloses_its_members() {
+    let src = "void b( {\nclass C { void m() {}\n";
+    assert!(symbol_scopes("s.cpp", Language::Cpp, src).is_empty());
+}
+
+/// The ERROR in `C`'s body swallowed `C`'s closing `}` (the second `}` after `int x;`), so `S`
+/// follows the end of `C`: scoped from its ancestors it would read as `C::S`, and it is not
+/// recovered. `T`, before that `}`, is `C`'s member and is.
+#[test]
+fn a_declaration_after_the_error_closes_the_enclosing_container_is_not_recovered() {
+    let src = "class C {\nstruct T {\nint x; } } struct S {\n}\n}\n";
+    assert_eq!(symbol_scopes("s.cpp", Language::Cpp, src), [
+        ("class".to_owned(), "C".to_owned()),
+        ("struct".to_owned(), "C::T".to_owned()),
+    ]);
+}
+
+/// `S` sits in `broken`'s body, which parsed as a node of its own beneath the ERROR. Only direct
+/// children of the ERROR are recovered, so `S` is not read as a top-level struct.
+#[test]
+fn a_declaration_nested_in_parsed_syntax_beneath_the_error_is_not_recovered() {
+    let src = "void broken( { struct S { int x; }; }\n";
+    assert!(symbol_scopes("s.cpp", Language::Cpp, src).is_empty());
+}
+
+/// A stray `}` in a file-root ERROR closes nothing: the file root has no end to reach, so the
+/// declarations after it are still recovered.
+#[test]
+fn a_stray_brace_in_a_file_root_error_does_not_stop_recovery() {
+    let src = "function broken( { target(); } }\nclass K { m(){} }\n";
+    assert_eq!(symbol_scopes("s.ts", Language::TypeScript, src), [
+        ("class".to_owned(), "K".to_owned()),
+        ("function".to_owned(), "K::m".to_owned()),
+    ]);
+}
+
+/// A class expression beneath the ERROR is recovered only as a named class in statement position.
+/// An anonymous one has no name of its own, so it would be named after its first method or its
+/// `extends` target; one after `(` or `[` is an argument or an element. None of them, nor their
+/// methods, is recovered. The named class in statement position still is, including behind a
+/// leading `export` or `export default`, whether the parser folds that modifier into an ERROR of
+/// its own or leaves it as a bare token beside the class.
+#[test]
+fn a_class_expression_beneath_the_error_is_recovered_only_as_a_named_statement() {
+    for src in [
+        "function broken( { target(); }\nclass { m(){} }\n",
+        "function broken( { target(); }\nclass extends Base { m(){} }\n",
+        "function broken( { target(); }\nfoo(class { m(){} });\n",
+        "function broken( { target(); }\nregister(class Handler extends Base { handle(){} });\n",
+        "let x = [\nclass { run(){} },\n",
+        // A comment is an extra, so it neither ends a statement nor hides the operand position.
+        "function broken( { target(); }\nregister( // the handler\nclass Handler extends Base { \
+         handle(){} });\n",
+        "function broken( { target(); }\nregister(/* cb */ class Handler { handle(){} });\n",
+    ] {
+        assert!(symbol_scopes("s.ts", Language::TypeScript, src).is_empty(), "{src}");
+    }
+    for modifier in ["", "export ", "export default "] {
+        let src = format!("function broken( {{ target(); }}\n{modifier}class K {{ m(){{}} }}\n");
+        assert_eq!(
+            symbol_scopes("s.ts", Language::TypeScript, &src),
+            [("class".to_owned(), "K".to_owned()), ("function".to_owned(), "K::m".to_owned())],
+            "{src}",
+        );
+    }
+    // The broken statement's tokens and the `export` share one inner ERROR, so the bare `export`
+    // token is the class's previous sibling.
+    let src =
+        "function broken( { target(); }\nexport class E { m(){ x(; } }\nclass F { n(){ y(; } }\n";
+    assert_eq!(symbol_scopes("s.ts", Language::TypeScript, src), [
+        ("class".to_owned(), "E".to_owned()),
+        ("function".to_owned(), "E::m".to_owned()),
+        ("class".to_owned(), "F".to_owned()),
+        ("function".to_owned(), "F::n".to_owned()),
+    ]);
+}
+
+/// An abstract class declares its name but is no symbol and scopes nothing, so its method is an
+/// unscoped `function m`. Recovered beneath an ERROR it keys the same as a clean parse, whether the
+/// parser leaves `abstract` as a bare token beside a class expression or keeps the whole
+/// `abstract_class_declaration`: a broken line elsewhere must not change its members' keys.
+#[test]
+fn a_recovered_abstract_class_keys_its_members_as_a_clean_parse_does() {
+    let clean = "abstract class Q { m(){} }\n";
+    let expected = [("function".to_owned(), "m".to_owned())];
+    let parsed = parser::parse_file(Path::new("s.ts"), Language::TypeScript, clean).expect("parse");
+    assert!(!parsed.has_error);
+    let clean_scopes: Vec<_> = parsed
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.kind.clone(), symbol.scope_path.clone()))
+        .collect();
+    assert_eq!(clean_scopes, expected);
+    for prefix in ["function broken( { target(); }\n", "function broken( { target(); }\nexport "] {
+        let src = format!("{prefix}{clean}");
+        assert_eq!(symbol_scopes("s.ts", Language::TypeScript, &src), expected, "{src}");
+    }
+    // A comment between `abstract` and `class` is an extra and does not hide the modifier.
+    let src = "function broken( { target(); }\nabstract /* why */ class Q { m(){} }\n";
+    assert_eq!(symbol_scopes("s.ts", Language::TypeScript, src), expected, "{src}");
+    let src = format!("do\n{clean}class R {{ n(){{}} }}\n");
+    assert_eq!(
+        symbol_scopes("s.ts", Language::TypeScript, &src),
+        [
+            ("function".to_owned(), "m".to_owned()),
+            ("class".to_owned(), "R".to_owned()),
+            ("function".to_owned(), "R::n".to_owned()),
+        ],
+        "{src}",
+    );
+}
+
+/// A conditional splits `f` across its branches and the file becomes one ERROR. The `struct` of
+/// `f`'s return type and the `class` of its template parameter are container keywords, but each
+/// sits in a node the parser built (a bodiless specifier, a template parameter), so neither heads
+/// a folded container: `f`'s body brace is not taken for one, and `after` is still recovered.
+#[test]
+fn a_container_keyword_in_a_parsed_type_does_not_fold_the_next_brace() {
+    let split = |header_a: &str, header_b: &str| {
+        format!(
+            "#ifdef X\n{header_a} {{\n#else\n{header_b} {{\n#endif\n  return 0;\n}}\nint \
+             after(void){{ return 0; }}\n"
+        )
+    };
+    for (path, language, src) in [
+        ("s.c", Language::C, split("struct S *f(int a)", "struct S *f(int a, int b)")),
+        ("s.c", Language::C, split("union U f(int a)", "union U f(int a, int b)")),
+        ("s.cpp", Language::Cpp, split("struct S *f(int a)", "struct S *f(int a, int b)")),
+        (
+            "s.cpp",
+            Language::Cpp,
+            split("template <class T> T f(T a)", "template <class T> T f(T a, T b)"),
+        ),
+    ] {
+        assert_eq!(
+            symbol_scopes(path, language, &src),
+            [("function".to_owned(), "after".to_owned())],
+            "{src}"
+        );
+    }
+}
+
+/// One source per recovery context whose ERROR sits directly in that context and holds a whole
+/// declaration of a kind legal there. Each context in a backend's policy needs a case here: one no
+/// real input reaches is policy without evidence behind it. The file-root contexts of TypeScript, C
+/// and C++ are the shared fixtures' `broken_declaration` cases, and C++ `field_declaration_list` is
+/// `a_declaration_after_the_error_closes_the_enclosing_container_is_not_recovered`.
+#[test]
+fn every_recovery_context_recovers_a_declaration_with_its_scope() {
+    /// `(path, language, context, source, expected (kind, scope path) symbols)`.
+    type Case = (
+        &'static str,
+        Language,
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+    let cases: [Case; 6] = [
+        // kotlin-ng cannot parse two declarations on one line: the first lands in an ERROR.
+        ("s.kt", Language::Kotlin, "source_file", "fun a() {} fun b() {}\nfun c() {}\n", &[
+            ("function", "a"),
+            ("function", "b"),
+            ("function", "c"),
+        ]),
+        // As above, inside a class whose body parsed as a `class_body`.
+        ("s.kt", Language::Kotlin, "class_body", "class A : B {\n  fun f() {} fun g() {}\n}\n", &[
+            ("class", "A"),
+            ("function", "A::f"),
+            ("function", "A::g"),
+        ]),
+        // Kotlin's `enum_class_body` case is the shared fixture's `class A { fun f() {} }`.
+        ("s.kt", Language::Kotlin, "enum_class_body", "class A { fun f() {} }\n", &[
+            ("class", "A"),
+            ("function", "A::f"),
+        ]),
+        // The stray `x(` puts the struct after it in an ERROR inside the namespace body.
+        (
+            "s.cpp",
+            Language::Cpp,
+            "declaration_list",
+            "namespace N {\nint a() { return 0; }\nx(struct S { int x; };\nint b() { return 0; \
+             }\n}\n",
+            &[("namespace", "N"), ("function", "N::a"), ("struct", "N::S"), ("function", "N::b")],
+        ),
+        // A TypeScript namespace body is a `statement_block` beneath `internal_module`.
+        (
+            "s.ts",
+            Language::TypeScript,
+            "statement_block",
+            "namespace N {\n  function broken( { target(); }\n  class K { m(){} }\n}\n",
+            &[("class", "N::K"), ("function", "N::K::m")],
+        ),
+        // A `declare module` body is a `statement_block` beneath `module`.
+        (
+            "s.ts",
+            Language::TypeScript,
+            "statement_block",
+            "declare module M {\n  function broken( { target(); }\n  class K { m(){} }\n}\n",
+            &[("class", "M::K"), ("function", "M::K::m")],
+        ),
+    ];
+    for (path, language, context, src, expected) in cases {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        let mut stack = vec![parsed.root()];
+        let mut error_in_context = false;
+        while let Some(node) = stack.pop() {
+            error_in_context |=
+                node.is_error() && node.parent().is_some_and(|parent| parent.kind() == context);
+            stack.extend(crate::index::edges::named_children(node));
+        }
+        assert!(error_in_context, "{src}: the ERROR must sit in `{context}` for this to test it");
+        let symbols = parsed
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.kind.as_str(), symbol.scope_path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, expected, "{src}");
+    }
+}
+
+/// A function body is a `statement_block` too, but not a namespace body: the class the ERROR in
+/// it holds is a local, and it is not recovered as one of the file's declarations.
+#[test]
+fn a_statement_block_is_a_recovery_context_only_as_a_namespace_body() {
+    let src = "function f() {\n  function broken( { target(); }\n  class K { m(){} }\n}\n";
+    assert_eq!(symbol_scopes("s.ts", Language::TypeScript, src), [(
+        "function".to_owned(),
+        "f".to_owned()
+    )]);
+}
+
+/// An error at the file's first token makes the ERROR the tree's root, with no file-root node
+/// above it. It is judged as sitting in the file root, so the declarations after it are recovered.
+#[test]
+fn declarations_beneath_an_error_at_the_tree_root_are_recovered() {
+    type Case = (&'static str, Language, &'static str, &'static [(&'static str, &'static str)]);
+    let cases: [Case; 4] = [
+        ("s.c", Language::C, "void b( {\nint after(void){ return 0; }\n", &[("function", "after")]),
+        // A template is whole though its function's body has an error, like the plain function.
+        (
+            "s.cpp",
+            Language::Cpp,
+            "void b( {\ntemplate <typename T> T id(T x) { return x +; }\nint plain(int x) { \
+             return x +; }\n",
+            &[("function", "id"), ("function", "plain")],
+        ),
+        ("s.cpp", Language::Cpp, "void b( {\nint after(void){ return 0; }\n", &[(
+            "function", "after",
+        )]),
+        ("s.ts", Language::TypeScript, "f(1,\nexport class K { m(){} }\n", &[
+            ("class", "K"),
+            ("function", "K::m"),
+        ]),
+    ];
+    for (path, language, src, expected) in cases {
+        let parsed = parser::parse_file(Path::new(path), language, src).expect("parse");
+        assert!(parsed.root().is_error(), "{src}: the ERROR must be the tree's root");
+        let symbols = parsed
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.kind.as_str(), symbol.scope_path.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(symbols, expected, "{src}");
+    }
+}
+
+/// Most top-level TypeScript is `export`ed or a variable declaration. An `export` is recovered
+/// when the declaration it exports is legal where it sits, and a `const` like any declaration.
+/// Neither wrapper has a body of its own: an error inside the exported declaration's body, or the
+/// body of the arrow function a `const` holds, does not reject it; one outside every body does.
+#[test]
+fn an_export_or_a_variable_declaration_beneath_the_error_is_recovered() {
+    let src = "do\nexport function after(){}\nexport class E { m(){} }\nconst c = 1;\n";
+    let parsed = parser::parse_file(Path::new("s.ts"), Language::TypeScript, src).expect("parse");
+    let error = parsed.root().child(0).expect("the top-level ERROR");
+    assert!(error.is_error());
+    assert!(
+        crate::index::edges::named_children(error).any(|node| node.kind() == "lexical_declaration"),
+        "the declaration must sit directly beneath the ERROR for this to test anything",
+    );
+    assert_eq!(symbol_scopes("s.ts", Language::TypeScript, src), [
+        ("function".to_owned(), "after".to_owned()),
+        ("class".to_owned(), "E".to_owned()),
+        ("function".to_owned(), "E::m".to_owned()),
+        ("const".to_owned(), "c".to_owned()),
+    ]);
+    let src = "do\nexport function after(){ y(; }\nexport class E { m(){ y(; } }\nconst c = () => \
+               { let s = ; };\n";
+    assert_eq!(symbol_scopes("s.ts", Language::TypeScript, src), [
+        ("function".to_owned(), "after".to_owned()),
+        ("class".to_owned(), "E".to_owned()),
+        ("function".to_owned(), "E::m".to_owned()),
+        ("const".to_owned(), "c".to_owned()),
+        ("const".to_owned(), "s".to_owned()),
+    ]);
+    let src = "do\nconst a = () => {}, b = f(;\n";
+    assert!(symbol_scopes("s.ts", Language::TypeScript, src).is_empty(), "{src}");
+}

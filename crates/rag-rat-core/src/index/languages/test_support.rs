@@ -18,6 +18,11 @@ pub(crate) struct LanguageFixture {
     pub(crate) malformed: &'static str,
     /// The edges the walk recovers from `malformed` by descending into its ERROR nodes.
     pub(crate) malformed_recovered: &'static [(&'static str, &'static str)],
+    /// A broken declaration followed by declarations that parse whole, some inside a container:
+    /// the case the symbol walk's ERROR recovery exists for.
+    pub(crate) broken_declaration: &'static str,
+    /// Every symbol parsed from `broken_declaration`, as `(kind, scope path)` in source order.
+    pub(crate) broken_declaration_symbols: &'static [(&'static str, &'static str)],
     /// The text before and after a callee `g` wrapped in nested parentheses, forming a function
     /// named `deep_marker_fn`: see [`Self::deep_call`].
     deep_call: (&'static str, &'static str),
@@ -44,6 +49,16 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                  println!(\"{}\", value);\n    another_call(value)\n}\n",
             malformed: "fn f() { if { target(); } }\n",
             malformed_recovered: &[("calls_name", "target")],
+            // tree-sitter-rust repairs the header with a MISSING `)`: no ERROR node forms.
+            broken_declaration: "fn ok(){}\nfn broken( { target(); }\nfn after(){}\nimpl K { fn \
+                                 m(){} }\n",
+            broken_declaration_symbols: &[
+                ("function", "ok"),
+                ("function", "broken"),
+                ("function", "after"),
+                ("impl", "K"),
+                ("function", "K::m"),
+            ],
             deep_call: ("fn deep_marker_fn() { ", "(); }\n"),
         },
         Language::TypeScript => LanguageFixture {
@@ -54,6 +69,13 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                          input + 1;\n    return value + compute(value);\n}\n",
             malformed: "function broken( { target(); }\n",
             malformed_recovered: &[],
+            // The rest of the file after `broken(` becomes a top-level ERROR. `K` parses whole
+            // beneath it and is recovered with its method. `after` is not: the parser folded its
+            // name into a malformed method header, so no declaration node for it exists.
+            // Recovering it needs text-level recovery, tracked in #1486.
+            broken_declaration: "function ok(){}\nfunction broken( { target(); }\nfunction \
+                                 after(){}\nclass K { m(){} }\n",
+            broken_declaration_symbols: &[("function", "ok"), ("class", "K"), ("function", "K::m")],
             deep_call: ("function deep_marker_fn() { ", "(); }\n"),
         },
         Language::Kotlin => LanguageFixture {
@@ -64,6 +86,14 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                          return value + compute(value)\n}\n",
             malformed: "fun broken( { target() }\n",
             malformed_recovered: &[],
+            // kotlin-ng cannot parse a member on its class's opening line: `f` lands in an ERROR
+            // inside the class body and is recovered with its class scope.
+            broken_declaration: "class A { fun f() {} }\nfun after() {}\n",
+            broken_declaration_symbols: &[
+                ("class", "A"),
+                ("function", "A::f"),
+                ("function", "after"),
+            ],
             deep_call: ("fun deep_marker_fn() { ", "() }\n"),
         },
         Language::C => LanguageFixture {
@@ -74,6 +104,13 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                          value + compute(value);\n}\n",
             malformed: "void broken( { target(); }\n",
             malformed_recovered: &[("calls_name", "target")],
+            // The conditional splits `f` across its branches and the file becomes one ERROR.
+            // `after` parses whole beneath it; the second `f`, whose body closes the other
+            // branch, is not taken for a definition.
+            broken_declaration:
+                "#ifdef X\nint f(int a) {\n#else\nint f(int a, int b) {\n#endif\n  return \
+                 a;\n}\nint after(void){ return 0; }\n",
+            broken_declaration_symbols: &[("function", "after")],
             deep_call: ("void deep_marker_fn() { ", "(); }\n"),
         },
         Language::Cpp => LanguageFixture {
@@ -84,6 +121,11 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                          value + compute(value);\n}\n",
             malformed: "void broken( { target(); }\n",
             malformed_recovered: &[("calls_name", "target")],
+            // As for C.
+            broken_declaration:
+                "#ifdef X\nint f(int a) {\n#else\nint f(int a, int b) {\n#endif\n  return \
+                 a;\n}\nint after(void){ return 0; }\n",
+            broken_declaration_symbols: &[("function", "after")],
             deep_call: ("void deep_marker_fn() { ", "(); }\n"),
         },
         Language::Python => LanguageFixture {
@@ -94,6 +136,16 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                          compute(value)\n    return result\n",
             malformed: "def broken(:\n    target()\n",
             malformed_recovered: &[],
+            // tree-sitter-python repairs the header with a MISSING `)`: no ERROR node forms.
+            broken_declaration: "def ok(): pass\ndef broken(:\n    target()\ndef after(): \
+                                 pass\nclass K:\n    def m(self): pass\n",
+            broken_declaration_symbols: &[
+                ("function", "ok"),
+                ("function", "broken"),
+                ("function", "after"),
+                ("class", "K"),
+                ("function", "K::m"),
+            ],
             deep_call: ("def deep_marker_fn():\n    ", "()\n"),
         },
         Language::Swift => LanguageFixture {
@@ -104,6 +156,16 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                          return value + compute(value)\n}\n",
             malformed: "func f() { if { target() } }\n",
             malformed_recovered: &[("calls_name", "target")],
+            // tree-sitter-swift repairs the header with a MISSING `)`: no ERROR node forms.
+            broken_declaration: "func ok(){}\nfunc broken( { target() }\nfunc after(){}\nclass K \
+                                 { func m(){} }\n",
+            broken_declaration_symbols: &[
+                ("function", "ok"),
+                ("function", "broken"),
+                ("function", "after"),
+                ("class", "K"),
+                ("function", "K::m"),
+            ],
             deep_call: ("func deep_marker_fn() { ", "() }\n"),
         },
         Language::Go => LanguageFixture {
@@ -114,6 +176,16 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                          + compute(value)\n}\n",
             malformed: "func broken( { target() }\n",
             malformed_recovered: &[],
+            // tree-sitter-go repairs the header with a MISSING `)`: no ERROR node forms.
+            broken_declaration: "package p\nfunc ok(){}\nfunc broken( { target() }\nfunc \
+                                 after(){}\ntype K struct{}\nfunc (k K) m(){}\n",
+            broken_declaration_symbols: &[
+                ("function", "ok"),
+                ("function", "broken"),
+                ("function", "after"),
+                ("struct", "K"),
+                ("method", "K.m"),
+            ],
             deep_call: ("func deep_marker_fn() { ", "() }\n"),
         },
         Language::Markdown => return None,

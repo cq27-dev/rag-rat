@@ -288,9 +288,11 @@ pub fn parse_symbols(
 /// cursor per node AND recursed to full tree depth — a deeply-nested 512 KB file (thousands of
 /// nested blocks/expressions) overflows the stack on a worker thread even though the parse itself
 /// stays within budget. An explicit heap stack keeps the call stack O(1); one reused cursor + one
-/// reused child buffer keep it single-allocation. Error/missing subtrees are pruned (skipped, not
-/// descended) and named children are pushed in reverse so they pop in document order — the same
-/// visit set and order as the recursion, so the emitted symbols are byte-identical.
+/// reused child buffer keep it single-allocation. Named children are pushed in reverse so they pop
+/// in document order.
+///
+/// Missing subtrees are pruned. An ERROR subtree is pruned except for the declarations the
+/// backend's recovery policy trusts beneath it ([`recovered_declarations`]).
 fn collect_symbols(
     path: &Path,
     language: Language,
@@ -311,6 +313,7 @@ fn collect_symbols(
                     out.push(make_symbol(&context, span_node, node, kind, name));
                 }
             });
+            stack.extend(recovered_declarations(backend, node, text).into_iter().rev());
             continue;
         }
         if node.is_missing() {
@@ -330,6 +333,191 @@ fn collect_symbols(
         named_children.extend(node.named_children(&mut cursor));
         for &child in named_children.iter().rev() {
             stack.push(child);
+        }
+    }
+}
+
+/// The declarations beneath the ERROR subtree `error` (whose parent is not an ERROR) that the
+/// backend's [`ErrorRecovery`] policy trusts, in document order. A trusted declaration:
+///
+/// - is a direct child of `error` or of an ERROR nested only in ERRORs beneath it, since anything
+///   deeper sits inside syntax the parser did build, whose own rules already apply;
+/// - has a kind legal where the ERROR sits, judged by the nearest non-ERROR ancestor (the file root
+///   when the ERROR is the tree's root);
+/// - does not follow a `{` the ERROR opened after a container keyword and left open, nor a `}` that
+///   closed the enclosing container: the parser folded that container's header into the ERROR, so
+///   the declaration is its member and would otherwise be scoped outside it;
+/// - is whole ([`declaration_is_whole`]).
+///
+/// A recovered declaration is then walked like any other node, so its scope path comes from its
+/// real ancestors and its members are judged by the ordinary rules. One pass over the subtree, on
+/// one cursor: every token is needed to track braces, and the subtree can be arbitrarily deep.
+///
+/// [`ErrorRecovery`]: crate::index::languages::ErrorRecovery
+fn recovered_declarations<'tree>(
+    backend: &dyn crate::index::languages::ParserBackend,
+    error: Node<'tree>,
+    text: &str,
+) -> Vec<Node<'tree>> {
+    let Some(recovery) = backend.error_recovery() else { return Vec::new() };
+    // An ERROR with no parent is the tree's root: the error began at the file's first token.
+    let (context_kind, context_parent) = match error.parent() {
+        Some(context) => (context.kind(), context.parent()),
+        None => (recovery.file_root, None),
+    };
+    let Some(legal_kinds) = recovery
+        .contexts
+        .iter()
+        .find(|context| {
+            context.kind == context_kind
+                && (context.within.is_empty()
+                    || context_parent.is_some_and(|parent| context.within.contains(&parent.kind())))
+        })
+        .map(|context| context.legal)
+    else {
+        return Vec::new();
+    };
+    let mut braces = BraceScan { at_file_root: context_parent.is_none(), ..BraceScan::default() };
+    let mut recovered = Vec::new();
+    let mut cursor = error.walk();
+    // For each ancestor of the cursor's node (outermost first): whether it is `error` or an ERROR
+    // with only ERRORs between it and `error`.
+    let mut error_chain: Vec<bool> = Vec::new();
+    loop {
+        let node = cursor.node();
+        let beneath_chain = error_chain.last().copied().unwrap_or(false);
+        if beneath_chain
+            && !node.is_error()
+            && legal_kinds.contains(&backend.declaration_kind(node))
+            && braces.outside_folded_containers()
+            && declaration_is_whole(backend, node, text)
+        {
+            recovered.push(node);
+        }
+        if !node.is_named() && node.child_count() == 0 {
+            braces.read_token(node, recovery.container_keywords);
+        }
+        let node_in_chain = error_chain.is_empty() || (beneath_chain && node.is_error());
+        if cursor.goto_first_child() {
+            error_chain.push(node_in_chain);
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return recovered;
+            }
+            error_chain.pop();
+        }
+    }
+}
+
+/// The braces an ERROR subtree has opened and closed so far, token by token.
+#[derive(Default)]
+struct BraceScan {
+    /// Each unclosed `{`, and whether a container keyword introduced it.
+    open: Vec<bool>,
+    /// The bracket depth at which a container keyword held directly by an ERROR was read, until a
+    /// `{`, `}` or `;` at that depth ends its header.
+    keyword_pending: Option<usize>,
+    /// Unclosed `(` and `[`. A `{` deeper than the pending keyword belongs to the header (a lambda
+    /// argument, a default value, `extends mix({})`), not the container's body. The depth is
+    /// compared with the keyword's rather than with zero because an ERROR can leave a `(` unclosed
+    /// before the container.
+    bracket_depth: usize,
+    /// A `}` closed a brace the ERROR did not open: the enclosing container ended inside it.
+    closed_enclosing: bool,
+    /// The ERROR sits in the file root, which a stray `}` cannot close.
+    at_file_root: bool,
+}
+
+impl BraceScan {
+    fn read_token(&mut self, token: Node<'_>, container_keywords: &[&str]) {
+        let kind = token.kind();
+        let at_keyword_depth = self.keyword_pending == Some(self.bracket_depth);
+        match kind {
+            // A string-interpolation opener (`${` in Kotlin and TypeScript) is closed by a plain
+            // `}`, so it opens a brace like any other.
+            _ if kind.ends_with('{') => {
+                self.open.push(kind == "{" && at_keyword_depth);
+                if at_keyword_depth {
+                    self.keyword_pending = None;
+                }
+            },
+            "}" => {
+                if self.open.pop().is_none() && !self.at_file_root {
+                    self.closed_enclosing = true;
+                }
+                if at_keyword_depth {
+                    self.keyword_pending = None;
+                }
+            },
+            ";" if at_keyword_depth => self.keyword_pending = None,
+            "(" | "[" => self.bracket_depth += 1,
+            ")" | "]" => self.bracket_depth = self.bracket_depth.saturating_sub(1),
+            // Only a keyword the ERROR itself holds heads a folded container. One inside a node the
+            // parser built belongs to that node: a bodiless specifier in a return type
+            // (`struct S *f(`) or a template parameter (`template <class T>`) heads no body, and
+            // the next `{` at its depth is a function's.
+            _ if container_keywords.contains(&kind)
+                && token.parent().is_some_and(|p| p.is_error()) =>
+                self.keyword_pending = Some(self.bracket_depth),
+            _ => {},
+        }
+    }
+
+    fn outside_folded_containers(&self) -> bool {
+        !self.closed_enclosing && !self.open.contains(&true)
+    }
+}
+
+/// A declaration found beneath an ERROR node is whole when no ERROR or MISSING node lies outside
+/// every `body` field in it — its name and header parsed as written — and nothing anywhere in it
+/// marks it as stitched from split text ([`ParserBackend::marks_split_declaration`]). Errors
+/// inside a body do not disqualify it: the walk judges those ERROR nodes where they sit. The body
+/// may be a descendant's rather than the declaration's own, so a wrapper is judged through what it
+/// wraps: an `export` through the exported class, a `const` through its arrow function, a
+/// `template_declaration` through its function. A grammar with no `body` field (kotlin-ng) keeps
+/// the whole span as the header.
+///
+/// Iterative over one cursor: the declaration can be arbitrarily deep.
+///
+/// [`ParserBackend::marks_split_declaration`]:
+///     crate::index::languages::ParserBackend::marks_split_declaration
+fn declaration_is_whole(
+    backend: &dyn crate::index::languages::ParserBackend,
+    declaration: Node<'_>,
+    text: &str,
+) -> bool {
+    let mut cursor = declaration.walk();
+    // The cursor's depth below `declaration`, and the depth of the body it is inside, if any.
+    let mut depth = 0_usize;
+    let mut body_depth: Option<usize> = None;
+    loop {
+        let node = cursor.node();
+        if body_depth.is_none() && cursor.field_name() == Some("body") {
+            body_depth = Some(depth);
+        }
+        if body_depth.is_none() && (node.is_error() || node.is_missing()) {
+            return false;
+        }
+        if backend.marks_split_declaration(node, text) {
+            return false;
+        }
+        if cursor.goto_first_child() {
+            depth += 1;
+            continue;
+        }
+        loop {
+            if body_depth == Some(depth) {
+                body_depth = None;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return true;
+            }
+            depth -= 1;
         }
     }
 }

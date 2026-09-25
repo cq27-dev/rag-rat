@@ -30,6 +30,32 @@ mod typescript;
 
 pub(super) type SymbolMatch<'tree> = (&'static str, Node<'tree>);
 
+/// A backend's policy for declarations found beneath a tree-sitter ERROR node. See
+/// [`ParserBackend::error_recovery`] and `parser::recovered_declarations`.
+pub(super) struct ErrorRecovery {
+    /// The file root's kind: the context of an ERROR that is itself the tree's root, which the
+    /// parser produces when the error starts at the file's first token.
+    pub(super) file_root: &'static str,
+    /// Where a declaration directly beneath an ERROR is legal. Any other kind, or any other
+    /// position, stays pruned with the rest of the subtree.
+    pub(super) contexts: &'static [RecoveryContext],
+    /// The keyword tokens that open a scope container with the next `{` (`class`, `namespace`).
+    /// A declaration after such a brace left open inside the ERROR belongs to a container whose
+    /// header the ERROR swallowed, so it is not recovered.
+    pub(super) container_keywords: &'static [&'static str],
+}
+
+/// One position [`ErrorRecovery`] trusts: the kind of the ERROR's nearest non-ERROR ancestor (the
+/// file root, or a container body), and the declaration kinds legal there.
+pub(super) struct RecoveryContext {
+    pub(super) kind: &'static str,
+    /// The kinds the context node's parent must have, when its kind alone does not make it a
+    /// container body (a TypeScript `statement_block` is a namespace body only beneath a
+    /// namespace). Empty: any parent.
+    pub(super) within: &'static [&'static str],
+    pub(super) legal: &'static [&'static str],
+}
+
 /// Multi-binding declarations need one symbol/chunk per name, so each name supplies its
 /// own span. A single binding retains the complete declaration span and signature.
 pub(super) fn emit_bindings<'tree>(
@@ -111,12 +137,39 @@ pub(super) trait ParserBackend: Sync {
         });
     }
 
+    /// Symbols an ERROR node itself declares, recognized from its text: for a construct the
+    /// grammar cannot parse at all, so no declaration node exists beneath the ERROR. Declaration
+    /// nodes the grammar DID parse beneath an ERROR are recovered by the shared walk instead, as
+    /// [`Self::error_recovery`] allows.
     fn for_each_recovered_symbol<'tree>(
         &self,
         _node: Node<'tree>,
         _text: &str,
         _emit: &mut dyn FnMut(Node<'tree>, SymbolMatch<'tree>),
     ) {
+    }
+
+    /// Which declarations the parser walk trusts beneath an ERROR node. `None` by default: the
+    /// walk prunes the whole ERROR subtree. A backend opts in by naming only positions where its
+    /// grammar's declaration nodes are unambiguous, since a node recovered beneath an ERROR skips
+    /// every scope guard the enclosing syntax would otherwise have applied.
+    fn error_recovery(&self) -> Option<&'static ErrorRecovery> {
+        None
+    }
+
+    /// `node`'s kind as [`Self::error_recovery`]'s legal kinds name it. A backend whose grammar
+    /// parses a declaration beneath an ERROR as some other node (a TypeScript class declaration
+    /// as a class expression) maps it back here, and only when that node really is one.
+    fn declaration_kind<'tree>(&self, node: Node<'tree>) -> &'tree str {
+        node.kind()
+    }
+
+    /// Whether `node`, anywhere inside a declaration found beneath an ERROR node, shows the
+    /// declaration was assembled from text the parser saw split apart (a C `#endif` left inside a
+    /// function body whose header came from one `#ifdef` branch). Such a declaration is not
+    /// recovered.
+    fn marks_split_declaration(&self, _node: Node<'_>, _text: &str) -> bool {
+        false
     }
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String>;

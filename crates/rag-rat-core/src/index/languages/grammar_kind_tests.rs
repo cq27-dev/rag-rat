@@ -456,7 +456,9 @@ fn every_kind_the_rust_backend_names_exists_in_the_grammar() {
 #[test]
 fn every_kind_the_typescript_backend_names_exists_in_the_grammar() {
     let names =
-        assert_kinds_exist(TYPESCRIPT_SOURCES, &[ParserKind::TypeScript, ParserKind::Tsx], &[]);
+        assert_kinds_exist(TYPESCRIPT_SOURCES, &[ParserKind::TypeScript, ParserKind::Tsx], &[
+            "export", "default", "abstract",
+        ]);
     assert_found_at_least(&names, 10);
 }
 

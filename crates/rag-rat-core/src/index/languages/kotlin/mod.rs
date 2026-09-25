@@ -2,7 +2,9 @@ use std::path::Path;
 
 use tree_sitter::Node;
 
-use super::{ParserBackend, ReceiverFallback, ResolutionPolicy, SymbolMatch};
+use super::{
+    ErrorRecovery, ParserBackend, ReceiverFallback, RecoveryContext, ResolutionPolicy, SymbolMatch,
+};
 use crate::index::edges::named_children;
 use crate::index::parser::{self, ParserKind};
 
@@ -17,6 +19,29 @@ const NAME_KINDS: &[&str] = &["identifier"];
 const IDENTIFIER_KINDS: &[&str] = NAME_KINDS;
 
 pub(super) static SUPPORT: Kotlin = Kotlin;
+
+const TOP_LEVEL_DECLARATIONS: &[&str] =
+    &["class_declaration", "object_declaration", "function_declaration", "property_declaration"];
+const MEMBER_DECLARATIONS: &[&str] = &[
+    "class_declaration",
+    "object_declaration",
+    "function_declaration",
+    "property_declaration",
+    "companion_object",
+];
+
+/// kotlin-ng cannot parse a member on the same line as its class's opening brace
+/// (`class A { fun f() {} }`): the member lands in an ERROR inside the class body, though the
+/// member itself parses whole.
+static ERROR_RECOVERY: ErrorRecovery = ErrorRecovery {
+    file_root: "source_file",
+    contexts: &[
+        RecoveryContext { kind: "source_file", within: &[], legal: TOP_LEVEL_DECLARATIONS },
+        RecoveryContext { kind: "class_body", within: &[], legal: MEMBER_DECLARATIONS },
+        RecoveryContext { kind: "enum_class_body", within: &[], legal: MEMBER_DECLARATIONS },
+    ],
+    container_keywords: &["class", "object", "interface"],
+};
 
 pub(super) struct Kotlin;
 
@@ -38,6 +63,10 @@ impl ParserBackend for Kotlin {
             "companion_object" => Some(("object", companion_name(node).unwrap_or(node))),
             _ => None,
         }
+    }
+
+    fn error_recovery(&self) -> Option<&'static ErrorRecovery> {
+        Some(&ERROR_RECOVERY)
     }
 
     fn scope_segment(&self, node: Node<'_>, text: &str) -> Option<String> {
