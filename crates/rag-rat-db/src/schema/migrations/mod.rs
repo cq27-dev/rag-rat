@@ -40,7 +40,8 @@ pub(crate) use steps::graph::{
 };
 pub use steps::graph::{
     apply_edge_string_interning, apply_edge_target_qname_index, apply_external_symbols,
-    apply_files_has_test_code, apply_oracle_tables, apply_scip_moniker_anchors,
+    apply_files_has_test_code, apply_local_bindings, apply_oracle_tables,
+    apply_scip_moniker_anchors,
 };
 pub(crate) use steps::index_enrichment::{
     apply_clone_refinements_lcs_sampled, apply_commit_addressable_worktrees,

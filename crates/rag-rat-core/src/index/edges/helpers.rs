@@ -637,6 +637,37 @@ pub(crate) fn all_symbols(conn: &Connection) -> anyhow::Result<Vec<IndexedSymbol
     let rows = stmt.query_map(rusqlite::params![active_repo_id, active_generation], symbol_row)?;
     collect_rows(rows)
 }
+/// Every local binding (`parser::LocalBinding`) in the active checkout, scoped exactly as
+/// [`all_symbols`] scopes the symbols it merges into.
+pub(crate) fn all_local_bindings(conn: &Connection) -> anyhow::Result<Vec<LocalBindingFields>> {
+    let active_repo_id = rag_rat_db::schema::active_repo_id(conn)?;
+    let active_generation = rag_rat_db::schema::active_generation(conn)?;
+    let mut stmt = conn.prepare(
+        "
+        SELECT local_bindings.file_id, files.language, files.path, local_bindings.name,
+               local_bindings.kind, local_bindings.scope_path, local_bindings.start_byte,
+               local_bindings.end_byte
+        FROM local_bindings
+        JOIN files ON files.id = local_bindings.file_id
+        WHERE local_bindings.file_id IN (
+                  SELECT id FROM main.files WHERE repo_id = ?1 AND generation = ?2
+              )
+        ",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![active_repo_id, active_generation], |row| {
+        Ok(LocalBindingFields {
+            file_id: row.get(0)?,
+            language: row.get(1)?,
+            path: row.get(2)?,
+            name: row.get(3)?,
+            kind: row.get(4)?,
+            scope_path: row.get(5)?,
+            start: usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+            end: usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+        })
+    })?;
+    collect_rows(rows)
+}
 pub(crate) fn symbol_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSymbol> {
     let start_byte = usize::try_from(row.get::<_, i64>(6)?).unwrap_or(0);
     let end_byte = usize::try_from(row.get::<_, i64>(7)?).unwrap_or(0);

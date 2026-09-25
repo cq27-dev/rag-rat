@@ -98,6 +98,9 @@ pub(crate) struct PreparedIndexContent {
     pub(crate) sha256: String,
     pub(crate) chunks: Vec<PreparedChunk>,
     pub(crate) symbols: Vec<Symbol>,
+    /// The local variables the parse found: not symbols, but edge-resolution candidates that are
+    /// never bound (`parser::LocalBinding`).
+    pub(crate) local_bindings: Vec<parser::LocalBinding>,
     // Graph edge candidates computed here in the parallel prepare phase (their `from_symbol_id`s
     // are local symbol indices, remapped to DB ids in insert_prepared_file). Empty for
     // generated / oversized / markdown files. Moving this off the serial insert loop kills the
@@ -618,11 +621,14 @@ pub(crate) fn prepare_index_content_from_text(
                 .unwrap_or_default()
         };
 
+    let (symbols, local_bindings) =
+        parsed.map(|p| (p.symbols, p.local_bindings)).unwrap_or_default();
     PreparedIndexContent {
         modified_at_ms,
         sha256,
         chunks,
-        symbols: parsed.map(|p| p.symbols).unwrap_or_default(),
+        symbols,
+        local_bindings,
         edge_candidates,
         symbol_fingerprints,
         parser_failure,

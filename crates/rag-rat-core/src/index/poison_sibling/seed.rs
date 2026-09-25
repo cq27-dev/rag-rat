@@ -20,6 +20,7 @@ pub(super) const SEEDED_TABLES: &[&str] = &[
     "git_change_couplings",
     "git_commits",
     "git_file_changes",
+    "local_bindings",
     "logical_symbol_members",
     "logical_symbol_monikers",
     "logical_symbols",
@@ -143,6 +144,11 @@ pub(crate) fn seed_sibling(conn: &Connection) -> anyhow::Result<()> {
         params![file_id, format!("{POISON_PREFIX}symbol")],
     )?;
     let symbol_id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO local_bindings(file_id, name, kind, scope_path, start_byte, end_byte)
+         VALUES (?1, ?2, 'variable', ?2, 0, 0)",
+        params![file_id, format!("{POISON_PREFIX}local")],
+    )?;
     conn.execute(
         "INSERT INTO chunks(file_id, chunk_kind, start_byte, end_byte, start_line, end_line, \
          text_hash, source_revision, anchor_version, normalized_hash, start_boundary_hash, \
@@ -672,6 +678,8 @@ fn clear_sibling(conn: &Connection) -> anyhow::Result<()> {
          DELETE FROM chunks WHERE file_id IN (SELECT id FROM main.files WHERE repo_id = \
          '{POISON_REPO_ID}');
          DELETE FROM symbols WHERE file_id IN (SELECT id FROM main.files WHERE repo_id = \
+         '{POISON_REPO_ID}');
+         DELETE FROM local_bindings WHERE file_id IN (SELECT id FROM main.files WHERE repo_id = \
          '{POISON_REPO_ID}');
          DELETE FROM parser_failures WHERE repo_id = '{POISON_REPO_ID}';
          DELETE FROM packages WHERE repo_id = '{POISON_REPO_ID}';

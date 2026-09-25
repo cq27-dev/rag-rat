@@ -23,6 +23,14 @@ pub(crate) struct LanguageFixture {
     pub(crate) broken_declaration: &'static str,
     /// Every symbol parsed from `broken_declaration`, as `(kind, scope path)` in source order.
     pub(crate) broken_declaration_symbols: &'static [(&'static str, &'static str)],
+    /// Value bindings, types and functions declared at file level, as members, and inside
+    /// function bodies and closures: the case the local-variable policy decides. In a language
+    /// with local variables, every `function_scopes` kind wraps one here with no other
+    /// function scope around it, so dropping any one kind changes the parse.
+    pub(crate) local_declarations: &'static str,
+    /// Every symbol parsed from `local_declarations`, as `(kind, scope path)` in source order. A
+    /// local variable is absent; any other declaration in a function body keeps its base path.
+    pub(crate) local_declarations_symbols: &'static [(&'static str, &'static str)],
     /// The text before and after a callee `g` wrapped in nested parentheses, forming a function
     /// named `deep_marker_fn`: see [`Self::deep_call`].
     deep_call: (&'static str, &'static str),
@@ -59,6 +67,39 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                 ("impl", "K"),
                 ("function", "K::m"),
             ],
+            local_declarations: "const TOP: i32 = 1;\nfn f() {\n    let x = 1;\n    const C: i32 \
+                                 = 2;\n    static S: i32 = 3;\n    struct Local;\n    impl Local \
+                                 { fn lm() {} }\n    impl K { fn km() {} }\n    fn nested() { \
+                                 impl Local { fn nm() {} } }\n    mod inner { pub struct Q; }\n    \
+                                 impl inner::Q { fn z() {} }\n    let c = || { const IN_CLOSURE: \
+                                 i32 = 4; struct InClosure; };\n}\nimpl K {\n    const ASSOC: i32 \
+                                 = 5;\n    fn m() { struct MethodLocal; }\n}\n",
+            // Rust indexes no `let`, and a `const` or `static` in a function body is an item, not a
+            // variable: nothing is dropped. Every local declaration keeps its base path (#1496).
+            local_declarations_symbols: &[
+                ("const", "TOP"),
+                ("function", "f"),
+                ("const", "C"),
+                ("static", "S"),
+                ("struct", "Local"),
+                ("impl", "Local"),
+                ("function", "Local::lm"),
+                ("impl", "K"),
+                ("function", "K::km"),
+                ("function", "nested"),
+                ("impl", "Local"),
+                ("function", "Local::nm"),
+                ("module", "inner"),
+                ("struct", "inner::Q"),
+                ("impl", "inner::Q"),
+                ("function", "inner::Q::z"),
+                ("const", "IN_CLOSURE"),
+                ("struct", "InClosure"),
+                ("impl", "K"),
+                ("const", "K::ASSOC"),
+                ("function", "K::m"),
+                ("struct", "K::MethodLocal"),
+            ],
             deep_call: ("fn deep_marker_fn() { ", "(); }\n"),
         },
         Language::TypeScript => LanguageFixture {
@@ -76,6 +117,34 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
             broken_declaration: "function ok(){}\nfunction broken( { target(); }\nfunction \
                                  after(){}\nclass K { m(){} }\n",
             broken_declaration_symbols: &[("function", "ok"), ("class", "K"), ("function", "K::m")],
+            local_declarations: "const TOP = 1;\nclass K {\n  field = 1;\n  m() { const x = 1; \
+                                 class MethodLocal {} }\n}\nfunction f() {\n  let x = 1;\n  class \
+                                 Local {}\n  function nested() {}\n  const g = () => { var \
+                                 inClosure = 1; };\n  abstract class D { abstract q: number; w = \
+                                 1 }\n  const E = class { z = 1 };\n}\nfunction* gen() { let \
+                                 inGen = 1; }\nconst fe = function () { let inFe = 1; };\nconst \
+                                 ge = function* () { let inGe = 1; };\nconst af = () => { let \
+                                 inArrow = 1; };\nclass S { static { let inStatic = 1; } }\n",
+            // Every local variable is dropped; a local class or function keeps its base path
+            // (#1496), and so does a member of a class body in a function, which is no local.
+            local_declarations_symbols: &[
+                ("const", "TOP"),
+                ("class", "K"),
+                ("const", "K::field"),
+                ("function", "K::m"),
+                ("class", "K::MethodLocal"),
+                ("function", "f"),
+                ("class", "Local"),
+                ("function", "nested"),
+                ("const", "q"),
+                ("const", "w"),
+                ("const", "z"),
+                ("function", "gen"),
+                ("const", "fe"),
+                ("const", "ge"),
+                ("const", "af"),
+                ("class", "S"),
+            ],
             deep_call: ("function deep_marker_fn() { ", "(); }\n"),
         },
         Language::Kotlin => LanguageFixture {
@@ -94,6 +163,32 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                 ("function", "A::f"),
                 ("function", "after"),
             ],
+            local_declarations: "val top = 1\nclass K {\n  val field = 1\n  fun m() {\n    val x \
+                                 = 1\n    class MethodLocal\n  }\n}\nfun f() {\n  val x = 1\n  \
+                                 class Local\n  fun nested() {}\n  val g = { val inLambda = 1 }\n  \
+                                 val o = object { val member = 1 }\n}\nval lam = { val inLambda = \
+                                 1 }\nval anon = fun() { val inAnon = 1 }\nclass C() {\n  \
+                                 constructor(a: Int) : this() { val inCtor = 1 }\n  init { val \
+                                 inInit = 1 }\n  val p: Int\n    get() { val inGetter = 1; return \
+                                 1 }\n  var q: Int = 0\n    set(v) { val inSetter = v }\n}\n",
+            // Every local variable is dropped; a local class or function keeps its base path
+            // (#1496), and so does a member of an object literal in a function, which is no local.
+            local_declarations_symbols: &[
+                ("property", "top"),
+                ("class", "K"),
+                ("property", "K::field"),
+                ("function", "K::m"),
+                ("class", "K::MethodLocal"),
+                ("function", "f"),
+                ("class", "Local"),
+                ("function", "nested"),
+                ("property", "member"),
+                ("property", "lam"),
+                ("property", "anon"),
+                ("class", "C"),
+                ("property", "C::p"),
+                ("property", "C::q"),
+            ],
             deep_call: ("fun deep_marker_fn() { ", "() }\n"),
         },
         Language::C => LanguageFixture {
@@ -111,6 +206,11 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                 "#ifdef X\nint f(int a) {\n#else\nint f(int a, int b) {\n#endif\n  return \
                  a;\n}\nint after(void){ return 0; }\n",
             broken_declaration_symbols: &[("function", "after")],
+            local_declarations: "int top = 1;\nstruct S { int a; };\nvoid f(void) {\n  int x = \
+                                 1;\n  struct Local { int a; };\n}\n",
+            // C declares no variable, at file level or local, as a symbol. A local type keeps its
+            // base path (#1496).
+            local_declarations_symbols: &[("struct", "S"), ("function", "f"), ("struct", "Local")],
             deep_call: ("void deep_marker_fn() { ", "(); }\n"),
         },
         Language::Cpp => LanguageFixture {
@@ -126,6 +226,18 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                 "#ifdef X\nint f(int a) {\n#else\nint f(int a, int b) {\n#endif\n  return \
                  a;\n}\nint after(void){ return 0; }\n",
             broken_declaration_symbols: &[("function", "after")],
+            local_declarations: "int top = 1;\nclass K {\n  int field;\n  void m() { struct \
+                                 MethodLocal {}; }\n};\nvoid f() {\n  int x = 1;\n  class Local \
+                                 {};\n  auto g = []() { struct InLambda {}; };\n}\n",
+            // As for C, no variable is a symbol, and a local type keeps its base path (#1496).
+            local_declarations_symbols: &[
+                ("class", "K"),
+                ("function", "K::m"),
+                ("struct", "K::MethodLocal"),
+                ("function", "f"),
+                ("class", "Local"),
+                ("struct", "InLambda"),
+            ],
             deep_call: ("void deep_marker_fn() { ", "(); }\n"),
         },
         Language::Python => LanguageFixture {
@@ -145,6 +257,21 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                 ("function", "after"),
                 ("class", "K"),
                 ("function", "K::m"),
+            ],
+            local_declarations: "TOP = 1\nclass K:\n    LIMIT = 2\n    def m(self):\n        \
+                                 class MethodLocal: pass\ndef f():\n    X = 1\n    class Local: \
+                                 pass\n    def nested(): pass\n    g = lambda: 1\n",
+            // Python already dropped local variables and scoped local definitions under their
+            // function.
+            local_declarations_symbols: &[
+                ("const", "TOP"),
+                ("class", "K"),
+                ("const", "K::LIMIT"),
+                ("function", "K::m"),
+                ("class", "K::m::MethodLocal"),
+                ("function", "f"),
+                ("class", "f::Local"),
+                ("function", "f::nested"),
             ],
             deep_call: ("def deep_marker_fn():\n    ", "()\n"),
         },
@@ -166,6 +293,41 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                 ("class", "K"),
                 ("function", "K::m"),
             ],
+            local_declarations: "let top = 1\nclass K {\n  var field = 1\n  func m() {\n    let x \
+                                 = 1\n    class MethodLocal {}\n  }\n}\nfunc f() {\n  let x = 1\n  \
+                                 class Local {}\n  func nested() {}\n  let g = { let inClosure = \
+                                 1 }\n}\nlet lam = { let inLambda = 1 }\nvar short: Int { let \
+                                 inShort = 1; return inShort }\nclass C {\n  init() { let inInit \
+                                 = 1 }\n  deinit { let inDeinit = 1 }\n  subscript(i: Int) -> Int \
+                                 { struct InSub {}; return i }\n  var sp: Int { let inShort = 1; \
+                                 return inShort }\n  var cp: Int {\n    get { let inGet = 1; \
+                                 return 1 }\n    set { let inSet = 1 }\n    _modify { let \
+                                 inModify = 1 }\n  }\n  var ob: Int = 0 {\n    willSet { let \
+                                 inWill = 1 }\n    didSet { let inDid = 1 }\n  }\n}\n",
+            // Every local variable is dropped; a local type or function keeps its base path, which
+            // Swift already scopes under its function (#1496).
+            local_declarations_symbols: &[
+                ("property", "top"),
+                ("class", "K"),
+                ("property", "K::field"),
+                ("function", "K::m"),
+                ("class", "K::m::MethodLocal"),
+                ("function", "f"),
+                ("class", "f::Local"),
+                ("function", "f::nested"),
+                // Each of these bodies is the only function scope around its local.
+                ("property", "lam"),
+                ("property", "short"),
+                ("class", "C"),
+                ("constructor", "C::init"),
+                ("function", "C::deinit"),
+                ("function", "C::subscript"),
+                // A subscript names its body, which is a computed property.
+                ("struct", "C::subscript::InSub"),
+                ("property", "C::sp"),
+                ("property", "C::cp"),
+                ("property", "C::ob"),
+            ],
             deep_call: ("func deep_marker_fn() { ", "() }\n"),
         },
         Language::Go => LanguageFixture {
@@ -185,6 +347,23 @@ pub(crate) fn fixture(language: Language) -> Option<LanguageFixture> {
                 ("function", "after"),
                 ("struct", "K"),
                 ("method", "K.m"),
+            ],
+            local_declarations: "package p\nvar Top = 1\nconst (\n\tA = 1\n)\nfunc f() {\n\tvar x \
+                                 = 1\n\tconst c = 2\n\ttype local struct{}\n\tg := func() { var \
+                                 inClosure = 3 }\n}\ntype K struct{ F int }\nfunc (k K) m() \
+                                 {\n\tvar inMethod = 1\n\ttype methodLocal int\n}\nvar fl = \
+                                 func() { var inLiteral = 1 }\n",
+            // Every local variable is dropped; a local type keeps its base path (#1496). Go has no
+            // named nested function, and a struct field is not a symbol.
+            local_declarations_symbols: &[
+                ("var", "Top"),
+                ("const", "A"),
+                ("function", "f"),
+                ("struct", "local"),
+                ("struct", "K"),
+                ("method", "K.m"),
+                ("type", "methodLocal"),
+                ("var", "fl"),
             ],
             deep_call: ("func deep_marker_fn() { ", "() }\n"),
         },

@@ -189,6 +189,25 @@ pub struct ParsedSymbol {
     pub facts: Vec<ParsedSymbolFact>,
 }
 
+/// A local variable ([`ParserBackend::local_variable_kinds`] declared in a function body): not a
+/// symbol, but still a declaration of its name. Edge resolution counts it as a candidate that can
+/// never be bound, so a reference to it, or to any name it shares, resolves exactly as it would if
+/// the local were a symbol, except that a reference it would win stays unresolved.
+///
+/// [`ParserBackend::local_variable_kinds`]: crate::index::languages::ParserBackend::local_variable_kinds
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBinding {
+    pub name: String,
+    pub kind: String,
+    /// The scope path the binding would carry as a symbol.
+    pub scope_path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    /// The signature the binding would carry as a symbol: with its path, name, scope path and
+    /// kind, the logical key that decides which symbols it would have grouped with.
+    pub signature: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedSymbolFact {
     pub kind: String,
@@ -242,6 +261,7 @@ pub(crate) fn grammar_for(kind: ParserKind) -> Option<tree_sitter::Language> {
 pub struct ParsedFile {
     tree: tree_sitter::Tree,
     pub symbols: Vec<ParsedSymbol>,
+    pub local_bindings: Vec<LocalBinding>,
     pub has_error: bool,
 }
 
@@ -261,12 +281,30 @@ impl ParsedFile {
 pub fn parse_file(path: &Path, language: Language, text: &str) -> Option<ParsedFile> {
     let grammar = grammar_for(parser_kind(path, language))?;
     let tree = parse_within_budget(grammar, text, PARSE_BUDGET)?;
-    let mut symbols = Vec::new();
-    collect_symbols(path, language, text, tree.root_node(), &mut symbols);
-    symbols.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
-    symbols.dedup_by_key(|symbol| (symbol.start_byte, symbol.end_byte, symbol.name.clone()));
+    let mut declarations = Vec::new();
+    collect_symbols(path, language, text, tree.root_node(), &mut declarations);
+    // Order and dedupe symbols and local bindings together, as one declaration list, so which
+    // symbols survive does not depend on the local bindings having left it.
+    declarations.sort_by_key(|(symbol, _)| (symbol.start_byte, symbol.end_byte));
+    declarations
+        .dedup_by_key(|(symbol, _)| (symbol.start_byte, symbol.end_byte, symbol.name.clone()));
+    let mut symbols = Vec::with_capacity(declarations.len());
+    let mut local_bindings = Vec::new();
+    for (symbol, role) in declarations {
+        match role {
+            DeclarationRole::Symbol => symbols.push(symbol),
+            DeclarationRole::LocalVariable => local_bindings.push(LocalBinding {
+                name: symbol.name,
+                kind: symbol.kind,
+                scope_path: symbol.scope_path,
+                start_byte: symbol.start_byte,
+                end_byte: symbol.end_byte,
+                signature: symbol.signature,
+            }),
+        }
+    }
     let has_error = tree.root_node().has_error();
-    Some(ParsedFile { tree, symbols, has_error })
+    Some(ParsedFile { tree, symbols, local_bindings, has_error })
 }
 
 pub fn parse_symbols(
@@ -298,7 +336,7 @@ fn collect_symbols(
     language: Language,
     text: &str,
     root: Node<'_>,
-    out: &mut Vec<ParsedSymbol>,
+    out: &mut Vec<(ParsedSymbol, DeclarationRole)>,
 ) {
     let backend = crate::index::languages::parser_backend(language);
     let context = SymbolBuildContext { path, backend, text };
@@ -583,12 +621,48 @@ fn scope_path(
     segments.join("::")
 }
 
+/// Whether `node`'s nearest enclosing scope is a function body
+/// ([`ParserBackend::function_scopes`]) rather than a type, a member body
+/// ([`ParserBackend::member_bodies`]), a module or the file.
+///
+/// [`ParserBackend::function_scopes`]: crate::index::languages::ParserBackend::function_scopes
+/// [`ParserBackend::member_bodies`]: crate::index::languages::ParserBackend::member_bodies
+fn in_function_body(
+    backend: &dyn crate::index::languages::ParserBackend,
+    node: Node<'_>,
+    text: &str,
+) -> bool {
+    let function_scopes = backend.function_scopes();
+    let member_bodies = backend.member_bodies();
+    std::iter::successors(node.parent(), Node::parent)
+        .find_map(|parent| {
+            let is_function = function_scopes.contains(&parent.kind());
+            (is_function
+                || member_bodies.contains(&parent.kind())
+                || backend.scope_segment(parent, text).is_some())
+            .then_some(is_function)
+        })
+        .unwrap_or(false)
+}
+
 struct SymbolBuildContext<'a> {
     path: &'a Path,
     backend: &'a dyn crate::index::languages::ParserBackend,
     text: &'a str,
 }
 
+/// Whether a declaration is a symbol or a local variable, which is not one.
+#[derive(Clone, Copy)]
+enum DeclarationRole {
+    Symbol,
+    /// A [`ParserBackend::local_variable_kinds`] kind declared in a function body.
+    ///
+    /// [`ParserBackend::local_variable_kinds`]: crate::index::languages::ParserBackend::local_variable_kinds
+    LocalVariable,
+}
+
+/// The declaration `node` makes, built as a symbol whatever its role, so a local binding carries
+/// exactly the scope path the symbol would.
 fn make_symbol(
     context: &SymbolBuildContext<'_>,
     node: Node<'_>,
@@ -598,7 +672,7 @@ fn make_symbol(
     signature_node: Node<'_>,
     kind: &str,
     name: String,
-) -> ParsedSymbol {
+) -> (ParsedSymbol, DeclarationRole) {
     let SymbolBuildContext { path, backend, text } = *context;
     // Every emitted kind must be one the backend DECLARED in `symbol_kinds()` — that declaration is
     // what downstream consumers (the `symbol_lookup` kind ranking) are completeness-tested against,
@@ -609,6 +683,13 @@ fn make_symbol(
         backend.symbol_kinds().contains(&kind),
         "{kind} is not declared in this backend's symbol_kinds(); add it there and rank it",
     );
+    let role = if backend.local_variable_kinds().contains(&kind)
+        && in_function_body(backend, node, text)
+    {
+        DeclarationRole::LocalVariable
+    } else {
+        DeclarationRole::Symbol
+    };
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
     // tree-sitter already computed each node's 1-based line span during the parse — read it off the
@@ -618,7 +699,7 @@ fn make_symbol(
     let scope_path = scope_path(backend, node, text, &name);
     let is_test = rag_rat_base::path_class::is_test_path(path)
         || backend.is_test_symbol(text, node, &scope_path, &name);
-    ParsedSymbol {
+    let symbol = ParsedSymbol {
         // `path::name` is the symbol's human-readable identity every graph and MCP surface
         // round-trips, so the path half must be spelled exactly as `files.path` spells it.
         qualified_name: format!("{}::{name}", rag_rat_base::paths::path_string(path)),
@@ -633,7 +714,8 @@ fn make_symbol(
         docs: docs_before(text, start_byte),
         is_test,
         facts: backend.symbol_facts(text, node),
-    }
+    };
+    (symbol, role)
 }
 
 pub(super) fn node_text(node: Node<'_>, text: &str) -> Option<String> {
