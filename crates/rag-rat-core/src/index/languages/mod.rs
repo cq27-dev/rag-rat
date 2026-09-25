@@ -89,6 +89,33 @@ pub(super) trait ParserBackend: Sync {
     /// declared here.
     fn symbol_kinds(&self) -> &'static [&'static str];
 
+    /// The node kinds whose body is a function-local scope: functions, methods and constructors,
+    /// and anonymous ones (closures, lambdas, accessors). A declaration of a
+    /// [`Self::local_variable_kinds`] kind whose nearest enclosing scope is one of these is a local
+    /// variable, not a symbol. Other declarations there keep their scope path (#1496).
+    ///
+    /// Read only for a declaration of a [`Self::local_variable_kinds`] kind, so it matters only
+    /// alongside a non-empty one; there, leaving it out would index the language's local
+    /// variables as symbols. Empty by default, for the languages with no local variable kinds.
+    fn function_scopes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// The symbol kinds that, declared directly in a function body, are local variables and not
+    /// symbols (`let`, `val`, `var`, a JavaScript `const`). A kind absent here stays a symbol in a
+    /// function body: a Rust `const` or `static` there is an item, named for the whole block and,
+    /// for a `static`, one value for the program's lifetime.
+    fn local_variable_kinds(&self) -> &'static [&'static str];
+
+    /// The node kinds whose body declares members, not locals, where no [`Self::scope_segment`]
+    /// already ends the search for a function body: the body of a class expression, of an
+    /// abstract class, or of an anonymous object. A value declared there is a member. Like
+    /// [`Self::function_scopes`], read only alongside a non-empty [`Self::local_variable_kinds`],
+    /// and empty by default.
+    fn member_bodies(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn symbol_node<'tree>(&self, node: Node<'tree>, text: &str) -> Option<SymbolMatch<'tree>>;
 
     fn symbol_name(&self, _node: Node<'_>, name_node: Node<'_>, text: &str) -> String {

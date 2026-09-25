@@ -233,6 +233,7 @@ impl IndexDatabase {
         // independent INSERTs into their own tables, so the order is free — nothing between the two
         // depends on chunks preceding symbols.
         let symbol_db_ids = self.insert_symbols(file_id, file.language, &prepared.symbols)?;
+        self.insert_local_bindings(file_id, &prepared.local_bindings)?;
         self.insert_chunks(
             ChunkInsertFile { file_id, source_revision: &prepared.sha256 },
             &prepared.chunks,
@@ -259,6 +260,9 @@ impl IndexDatabase {
             FileWrite::StagedRebuild(graph) => {
                 for (symbol, &id) in prepared.symbols.iter().zip(&symbol_db_ids) {
                     graph.push_symbol(id, file_id, file.language, symbol);
+                }
+                for binding in &prepared.local_bindings {
+                    graph.push_local_binding(file_id, file.language, &path, binding);
                 }
                 for candidate in &prepared.edge_candidates {
                     graph.push_edge(file_id, candidate, &symbol_db_ids);
@@ -533,6 +537,32 @@ impl IndexDatabase {
             }
         }
         Ok(symbol_ids)
+    }
+
+    /// Record the file's local variables (`parser::LocalBinding`) for edge resolution.
+    fn insert_local_bindings(
+        &self,
+        file_id: i64,
+        bindings: &[parser::LocalBinding],
+    ) -> anyhow::Result<()> {
+        let conn = self.storage.connection();
+        for binding in bindings {
+            conn.prepare_cached(
+                "INSERT INTO local_bindings(file_id, name, kind, scope_path, start_byte, end_byte,
+                                            signature)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(params![
+                file_id,
+                binding.name,
+                binding.kind,
+                binding.scope_path,
+                i64::try_from(binding.start_byte)?,
+                i64::try_from(binding.end_byte)?,
+                binding.signature,
+            ])?;
+        }
+        Ok(())
     }
 
     /// Label a logical group by what the members ACTUALLY show, not by a guess.

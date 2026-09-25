@@ -318,6 +318,82 @@ fn an_ambiguous_short_name_does_not_absorb_unrelated_unresolved_calls() {
     assert!(!summary.truncated, "nothing was withheld, so nothing may claim to be");
 }
 
+/// A function-local variable is not a symbol, but it declares its name, so an unbound call of that
+/// name may mean the local (#1466). It is a rival exactly as a second definition is: the short
+/// name is not unique, and the unbound calls are no candidates of the seed.
+#[test]
+fn a_local_variable_of_the_short_name_is_a_rival_too() {
+    let conn = scoped_conn();
+    let file = add_file(&conn, "a.rs", "sha-a");
+    let other_file = add_file(&conn, "b.ts", "sha-b");
+    let target = add_symbol(&conn, file, "target", "a.rs::target");
+    conn.execute(
+        "INSERT INTO local_bindings(file_id, name, kind, scope_path, start_byte, end_byte)
+         VALUES (?1, 'target', 'const', 'target', 0, 10)",
+        params![other_file],
+    )
+    .unwrap();
+    let caller = add_symbol(&conn, file, "caller", "a.rs::caller");
+    add_call(&conn, file, caller, Some(target), "target", "a.rs::target", 10);
+    for i in 0..3 {
+        add_call(&conn, file, caller, None, "target", "other::target", 100 + i * 10);
+    }
+    install_scope_view(&conn, SCOPE).unwrap();
+
+    assert!(!unique_symbol_name(&conn, "target").unwrap(), "the local shares the name");
+    let options = syntactic(target);
+    let hops = callers(&conn, "a.rs::target", &options);
+    let summary =
+        traversal_summary(&conn, "a.rs::target", Direction::Callers, 2, &options, hops.len())
+            .unwrap();
+    assert_eq!(summary.unresolved, 0, "the unbound calls may mean the local");
+}
+
+/// A local variable that sat inside the seed while it was indexed as a symbol is no rival (#1466):
+/// in the seed's own file it shares the seed's qualified name, and it was a member of the seed's
+/// logical symbol when its whole logical key matched. A same-named local of another kind was a
+/// logical symbol of its own, so it still is one.
+#[test]
+fn a_local_variable_that_was_inside_the_seed_is_no_rival() {
+    let conn = scoped_conn();
+    let file = add_file(&conn, "a.rs", "sha-a");
+    let target = add_symbol(&conn, file, "target", "a.rs::target");
+    let logical = add_logical_symbol(&conn, "a.rs::target", &[target]);
+    let add_local = |kind: &str| {
+        conn.execute(
+            "INSERT INTO local_bindings(file_id, name, kind, scope_path, start_byte, end_byte)
+             VALUES (?1, 'target', ?2, '', 20, 30)",
+            params![file, kind],
+        )
+        .unwrap();
+    };
+    add_local("function");
+    install_scope_view(&conn, SCOPE).unwrap();
+    let by_qualified_name = syntactic(target);
+    let by_logical_symbol = GraphTraversalOptions {
+        symbol_id: Some(target),
+        logical_symbol_id: Some(logical),
+        ..GraphTraversalOptions::default()
+    };
+
+    for options in [&by_qualified_name, &by_logical_symbol] {
+        assert!(
+            short_name_identifies_seed_alone(&conn, "a.rs::target", options).unwrap(),
+            "the local was inside the seed: {options:?}"
+        );
+    }
+
+    add_local("const");
+    assert!(
+        short_name_identifies_seed_alone(&conn, "a.rs::target", &by_qualified_name).unwrap(),
+        "every local of the seed's file shares its qualified name"
+    );
+    assert!(
+        !short_name_identifies_seed_alone(&conn, "a.rs::target", &by_logical_symbol).unwrap(),
+        "a local of another kind was never a member of the seed's logical symbol"
+    );
+}
+
 /// The seed's OWN definitions are not rivals for its short name: a `#[cfg]`-split pair (and every
 /// overload group) puts two `symbols` rows under one name while naming one callable.
 ///

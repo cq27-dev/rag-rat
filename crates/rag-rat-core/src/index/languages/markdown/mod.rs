@@ -15,6 +15,10 @@ impl ParserBackend for Markdown {
         &[]
     }
 
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Markdown
     }

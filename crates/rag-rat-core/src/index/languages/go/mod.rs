@@ -21,6 +21,18 @@ impl ParserBackend for Go {
         &["const", "function", "interface", "method", "struct", "type", "var"]
     }
 
+    fn function_scopes(&self) -> &'static [&'static str] {
+        &["function_declaration", "method_declaration", "func_literal"]
+    }
+
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &["const", "var"]
+    }
+
+    fn member_bodies(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Go
     }

@@ -475,7 +475,12 @@ const GENERATED_FLAGS_VERSION_KEY: &str = "generated_flags_version";
 // 5: #1465 — TypeScript, Kotlin, C and C++ recover whole declarations found beneath an ERROR node
 // (`parser::recovered_declarations`), so a malformed file declares symbols it used to drop; the
 // heal re-extracts those languages' file rows derived before it.
-const LOGICAL_KEY_VERSION: &str = "5";
+// 6: #1466 — a local variable (`ParserBackend::local_variable_kinds`) declared in a function body
+// is no longer a symbol in TypeScript, Kotlin, Swift and Go but a `local_bindings` row; the heal
+// re-extracts those languages' file rows derived before it. Every other symbol keeps its path, and
+// edge resolution still counts each local as a candidate it never binds, so only a reference the
+// local itself would win resolves differently: it stays unresolved.
+const LOGICAL_KEY_VERSION: &str = "6";
 const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
 
 /// The `LOGICAL_KEY_VERSION` at which `language`'s extractor last changed WHICH symbols a file
@@ -485,9 +490,11 @@ const LOGICAL_KEY_VERSION_KEY: &str = "logical_key_version";
 /// version is re-extracted whole instead.
 fn symbol_set_changed_at(language: Language) -> Option<i64> {
     match language {
-        // 4: the C/C++ function-declarator and name-field changes above; 5: ERROR recovery.
-        Language::C | Language::Cpp | Language::TypeScript | Language::Kotlin => Some(5),
-        _ => None,
+        // 4: the C/C++ function-declarator and name-field changes above; 5: ERROR recovery; 6:
+        // local variables dropped.
+        Language::C | Language::Cpp => Some(5),
+        Language::TypeScript | Language::Kotlin | Language::Swift | Language::Go => Some(6),
+        Language::Rust | Language::Python | Language::Markdown => None,
     }
 }
 
