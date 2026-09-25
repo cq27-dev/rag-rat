@@ -1155,13 +1155,15 @@ fn ingest_received_against(
         local_writer: local_writer.clone(),
     };
     let stream_id = StreamId::from_bytes(stream.stream_id);
-    let pending = coverage::pending_tip(&tx, stream_id, signer)?.is_some();
     let floor_before = retention::retained_floor(&tx, stream_id, signer)?;
-    // An unresolved target cannot be replaced by an unrelated higher floor. Receive contiguous
-    // entries from any source, but retain the original obligation until its exact tip arrives.
-    // A caller without the inventory tip may still offer ordinary contiguous entries,
-    // but cannot create a floor whose required suffix would be forgotten immediately.
-    let usable_floor = advertised_floor.filter(|_| !pending && advertised_tip.is_some());
+    // A newer floor re-roots a store that still owes an earlier root's suffix exactly as it
+    // re-roots one that never heard of that suffix: the floor carries its own contract (every
+    // current carrier on the chain is at or above it at the advertising store), and the obligation
+    // then follows the new root (#1489). Holding out for the old tip instead wedged the stream for
+    // good once every holder had compacted that tip away. A caller without the inventory tip may
+    // still offer ordinary contiguous entries, but cannot create a floor whose required suffix
+    // would be forgotten immediately.
+    let usable_floor = advertised_floor.filter(|_| advertised_tip.is_some());
     if let (Some(floor), Some(tip)) = (usable_floor, advertised_tip) {
         anyhow::ensure!(
             tip.lamport >= floor.lamport && tip.lamport < crate::entry::MAX_ENTRY_LAMPORT,

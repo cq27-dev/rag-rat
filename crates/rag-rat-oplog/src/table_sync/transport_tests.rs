@@ -1742,6 +1742,112 @@ fn restating_obeys_the_twice_the_cost_rule_per_batch() {
     assert_eq!(live_rows(&fresh), vec![("live".to_string(), "live".to_string())]);
 }
 
+/// An intermediary that adopted `source`'s floor and owes its promised tip: the connection ended
+/// after the floor arrived. Returns the route, the owed chain's device and the promised tip.
+fn owe_the_promised_suffix(
+    source: &Connection,
+    intermediary: &Connection,
+    account: AccountId,
+) -> (TableSyncStream, [u8; 32], TableSyncChainCursor) {
+    let route = supported_streams_against(source, account, &[REPO_SPEC]).unwrap().remove(0);
+    let offered = accepted_chain_page(source, route.stream_id, None, 16).unwrap().remove(0);
+    let floor = offered.floor.expect("the source compacted to a floor");
+    let tip = TableSyncChainCursor { lamport: offered.lamport, entry_hash: offered.entry_hash };
+    assert!(floor.lamport < tip.lamport, "a suffix is promised beyond the floor");
+    let first = accepted_chain_entries(
+        source,
+        route.stream_id,
+        offered.device_fingerprint,
+        TableSyncEntryStart::At(floor),
+        1,
+    )
+    .unwrap()
+    .remove(0);
+    ingest_received_against(
+        intermediary,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: offered.device_fingerprint,
+            signed_bytes: &first.signed_bytes,
+            advertised_floor: Some(floor),
+            advertised_tip: Some(tip),
+        },
+        1,
+        &Default::default(),
+    )
+    .unwrap();
+    let stream_id = StreamId::from_bytes(route.stream_id);
+    assert!(coverage::stream_pending(intermediary, stream_id).unwrap(), "the suffix is owed");
+    (route, offered.device_fingerprint, tip)
+}
+
+/// A source compacted to a floor with a suffix beyond it, and an intermediary owing that suffix.
+fn source_and_indebted_intermediary() -> (Connection, AccountId, Connection) {
+    let (source, account) = writer_store();
+    write(&source, "deleted", "old");
+    author(&source, account);
+    source.execute("DELETE FROM t_transport WHERE id = 'deleted'", []).unwrap();
+    author(&source, account);
+    rewrite(&source, account, "hot", 8);
+    assert!(compact(&source, account, 3) > 0);
+    let intermediary = peer_of(&source, account);
+    (source, account, intermediary)
+}
+
+/// The writer keeps working and compacts the promised tip away, so no store can ever deliver it.
+/// The source's next floor re-roots the intermediary as it would any peer behind it, and the
+/// obligation follows the new root instead of holding the stream pending forever (#1489).
+#[test]
+fn a_promised_tip_compacted_away_is_superseded_by_the_senders_next_floor() {
+    for purged in [false, true] {
+        let (source, account, intermediary) = source_and_indebted_intermediary();
+        let (route, _, tip) = owe_the_promised_suffix(&source, &intermediary, account);
+        rewrite(&source, account, "hot", 8);
+        compact(&source, account, 3);
+        let still_held: bool = source
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM table_sync_entries WHERE entry_hash = ?1)",
+                [tip.entry_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!still_held, "the promised tip is gone from the only store that held it");
+        if purged {
+            rag_rat_db::schema::purge_repo_rows(&intermediary, "repo-a").unwrap();
+        }
+
+        sync_chains(&source, &intermediary, account);
+        let stream_id = StreamId::from_bytes(route.stream_id);
+        assert!(
+            !coverage::stream_pending(&intermediary, stream_id).unwrap(),
+            "purged = {purged}: the newer root's suffix arrived and nothing is owed",
+        );
+        assert_eq!(live_rows(&intermediary), live_rows(&source), "purged = {purged}");
+    }
+}
+
+/// A suffix owed on a device that is then removed can never arrive: its entries are refused. The
+/// removal drops the obligation, so the stream is not blocked for good (#1489).
+#[test]
+fn removing_the_owed_chains_device_drops_the_obligation() {
+    let (source, account, intermediary) = source_and_indebted_intermediary();
+    let (route, device, _tip) = owe_the_promised_suffix(&source, &intermediary, account);
+    let stream_id = StreamId::from_bytes(route.stream_id);
+    let tx = Transaction::new_unchecked(&intermediary, TransactionBehavior::Immediate).unwrap();
+    store::enqueue_readoption_work(
+        &tx,
+        account,
+        crate::op::DeviceFingerprint::from_bytes(device),
+        stream_id,
+        [7; 32],
+        9,
+        10,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert!(!coverage::stream_pending(&intermediary, stream_id).unwrap());
+}
+
 #[test]
 fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_peer() {
     let (source, account) = writer_store();
@@ -1850,24 +1956,6 @@ fn interrupted_floor_delivery_needs_the_promised_suffix_before_serving_a_fresh_p
         )
         .is_err()
     );
-    let tip = suffix.last().unwrap();
-    // Another source offers the target itself as a new root. It must stay gapped: a higher
-    // floor cannot bypass the original, still-missing predecessor and erase the obligation.
-    ingest_received_against(
-        &intermediary,
-        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
-        &TableSyncReceived {
-            expected_device: offered.device_fingerprint,
-            signed_bytes: &tip.signed_bytes,
-            advertised_floor: Some(tip.cursor),
-            advertised_tip: Some(tip.cursor),
-        },
-        2,
-        &Default::default(),
-    )
-    .unwrap();
-    assert!(coverage::stream_pending(&intermediary, stream_id).unwrap());
-    assert_eq!(chain_lamports(&intermediary), [floor.lamport as i64]);
     let restart = tempfile::tempdir().unwrap();
     let database = restart.path().join("intermediary.db");
     intermediary.execute("VACUUM INTO ?1", [database.to_str().unwrap()]).unwrap();

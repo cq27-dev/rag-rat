@@ -1245,6 +1245,18 @@ pub(crate) fn enqueue_readoption_work(
             now_ms,
         ],
     )?;
+    // A suffix still owed on the removed device's chain can never arrive: its entries are refused
+    // from here on (#935). Keeping the obligation would block authoring, compaction and this very
+    // re-adoption on the stream for good (#1489). A placeholder removal reaches every stream.
+    tx.execute(
+        "DELETE FROM table_sync_suffix_coverage
+          WHERE device_fingerprint = ?1 AND (stream_id = ?2 OR ?2 = ?3)",
+        params![
+            device_fingerprint.to_bytes().as_slice(),
+            stream.to_bytes().as_slice(),
+            StreamId::PRECONTEXT.to_bytes().as_slice(),
+        ],
+    )?;
     Ok(())
 }
 
