@@ -62,6 +62,8 @@ pub(crate) struct TableMemStore {
     pub(crate) forbidden_snapshots: HashSet<Hash>,
     pub(crate) prepare_count: usize,
     pub(crate) owed_tips: HashMap<(Hash, Hash), (u64, Hash)>,
+    /// Serve entries with a plain store error (a failure that is not a diverged cursor).
+    pub(crate) fail_entries: bool,
 }
 
 impl TableMemStore {
@@ -73,6 +75,7 @@ impl TableMemStore {
             forbidden_snapshots: HashSet::new(),
             prepare_count: 0,
             owed_tips: HashMap::new(),
+            fail_entries: false,
         }
     }
 
@@ -177,6 +180,7 @@ impl TableSyncStore for TableMemStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        anyhow::ensure!(!self.fail_entries, "database is locked");
         let entries = self.entries.get(&item.stream_id);
         let (minimum, inclusive) = match start {
             ChainStart::Beginning => (None, false),
@@ -193,7 +197,7 @@ impl TableSyncStore for TableMemStore {
                     {
                         return Ok(Vec::new());
                     }
-                    anyhow::bail!("test cursor is not present")
+                    return Err(rag_rat_oplog::UnservableChainCursor::NotHeld.into());
                 }
                 (Some(lamport), false)
             },
@@ -203,7 +207,7 @@ impl TableSyncStore for TableMemStore {
                         .get(&entry_hash)
                         .is_some_and(|entry| entry.device == device && entry.lamport == lamport)
                 }) {
-                    anyhow::bail!("test restore cursor is not present")
+                    return Err(rag_rat_oplog::UnservableChainCursor::NoRestoreSuccessor.into());
                 }
                 (Some(lamport), true)
             },

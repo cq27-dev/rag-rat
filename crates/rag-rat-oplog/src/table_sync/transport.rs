@@ -896,7 +896,7 @@ fn accepted_chain_entries(
                 if below_rootless_holdings(conn, stream, device, cursor.lamport)? {
                     return Ok(Vec::new());
                 }
-                anyhow::bail!("table-sync accepted chain cursor is not present locally");
+                return Err(UnservableChainCursor::NotHeld.into());
             }
             (Some(cursor.lamport), false)
         },
@@ -913,9 +913,7 @@ fn accepted_chain_entries(
                     return Ok(Vec::new());
                 }
                 let Some(successor) = successor else {
-                    anyhow::bail!(
-                        "table-sync restore cursor has neither its tip nor a direct successor"
-                    )
+                    return Err(UnservableChainCursor::NoRestoreSuccessor.into());
                 };
                 (Some(successor), true)
             }
@@ -946,6 +944,21 @@ fn accepted_chain_entries(
         })
     })
     .collect::<anyhow::Result<_>>()
+}
+
+/// A chain cursor a peer named that this store cannot serve from, although it holds that chain:
+/// the peer's copy diverged from this one (a chain signed twice at one point, #1417), or it names
+/// a point below a chain this store holds from its first entry. Retrying never serves it, so a
+/// session skips that one chain rather than failing (#1480). A cursor below a purge-restored or
+/// compacted chain's holdings is not this error: it gets an empty page and a later re-plan.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UnservableChainCursor {
+    #[error("table-sync accepted chain cursor is not present locally")]
+    NotHeld,
+    #[error("table-sync chain cursor hash conflicts at lamport {0}")]
+    HashConflict(u64),
+    #[error("table-sync restore cursor has neither its tip nor a direct successor")]
+    NoRestoreSuccessor,
 }
 
 /// Whether `lamport` sits below everything this store holds of the chain, and the lowest held
@@ -1015,11 +1028,9 @@ fn cursor_matches(
         )
         .optional()?;
     let Some(stored) = stored else { return Ok(false) };
-    anyhow::ensure!(
-        EntryHash::try_from_sql(stored)? == cursor.entry_hash,
-        "table-sync chain cursor hash conflicts at lamport {}",
-        cursor.lamport
-    );
+    if EntryHash::try_from_sql(stored)? != cursor.entry_hash {
+        return Err(UnservableChainCursor::HashConflict(cursor.lamport).into());
+    }
     Ok(true)
 }
 

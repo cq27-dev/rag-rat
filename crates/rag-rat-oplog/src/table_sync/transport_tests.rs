@@ -675,6 +675,34 @@ fn a_purge_restored_chain_answers_a_lower_tip_with_nothing_and_advertises_no_flo
     );
 }
 
+/// The three cursors a sender cannot serve although it holds the chain are one typed error, so a
+/// session can skip that chain without catching unrelated store failures (#1480).
+#[test]
+fn unservable_cursors_on_a_held_chain_are_typed() {
+    let (source, account) = writer_store();
+    rewrite(&source, account, "r1", 3);
+    let route = supported_streams_against(&source, account, &[REPO_SPEC]).unwrap().remove(0);
+    let head = accepted_chain_page(&source, route.stream_id, None, 16).unwrap().remove(0);
+    let device = head.device_fingerprint;
+    let unservable = |start| {
+        accepted_chain_entries(&source, route.stream_id, device, start, 16)
+            .unwrap_err()
+            .downcast::<UnservableChainCursor>()
+            .expect("typed")
+    };
+    let conflicting = TableSyncChainCursor { lamport: head.lamport, entry_hash: [9; 32] };
+    assert_eq!(
+        unservable(TableSyncEntryStart::After(conflicting)),
+        UnservableChainCursor::HashConflict(head.lamport),
+    );
+    let missing = TableSyncChainCursor { lamport: head.lamport + 5, entry_hash: [9; 32] };
+    assert_eq!(unservable(TableSyncEntryStart::After(missing)), UnservableChainCursor::NotHeld);
+    assert_eq!(
+        unservable(TableSyncEntryStart::At(missing)),
+        UnservableChainCursor::NoRestoreSuccessor,
+    );
+}
+
 /// A purge-restored store that meets a sender compacted past its witness is re-rooted onto the
 /// sender's floor (#1481): the floor sits above the witness, so the store adopts it as a new root
 /// and continues from there.

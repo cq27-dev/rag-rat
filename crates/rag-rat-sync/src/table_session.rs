@@ -70,6 +70,8 @@ pub struct TableSessionReport {
     pub entries_received: usize,
     pub entries_newly_stored: usize,
     pub continuation_pending: bool,
+    /// Chains this side skipped as a sender because the peer's copy diverged from its own (#1480).
+    pub chains_skipped: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -178,9 +180,9 @@ where
         }
     }
     let streams = intersection.len();
-    let (entries_sent, entries_received, entries_newly_stored, continuation_pending) = match role {
+    let (sent, entries_received, entries_newly_stored, peer_pending) = match role {
         AuthRole::Dialer => {
-            let (entries_sent, local_pending) = send_direction(
+            let sent = send_direction(
                 store,
                 &intersection,
                 &mut send,
@@ -198,7 +200,7 @@ where
                 limits,
             )
             .await?;
-            (entries_sent, entries_received, entries_newly_stored, local_pending || peer_pending)
+            (sent, entries_received, entries_newly_stored, peer_pending)
         },
         AuthRole::Acceptor => {
             let (entries_received, entries_newly_stored, peer_pending) = receive_direction(
@@ -210,7 +212,7 @@ where
                 limits,
             )
             .await?;
-            let (entries_sent, local_pending) = send_direction(
+            let sent = send_direction(
                 store,
                 &intersection,
                 &mut send,
@@ -219,18 +221,27 @@ where
                 limits,
             )
             .await?;
-            (entries_sent, entries_received, entries_newly_stored, local_pending || peer_pending)
+            (sent, entries_received, entries_newly_stored, peer_pending)
         },
     };
     role.acknowledge_in_order(send_ack(&mut send, idle_timeout), read_ack(&mut recv, idle_timeout))
         .await?;
     Ok(TableSessionReport {
         streams,
-        entries_sent,
+        entries_sent: sent.entries,
         entries_received,
         entries_newly_stored,
-        continuation_pending,
+        continuation_pending: sent.pending || peer_pending,
+        chains_skipped: sent.chains_skipped,
     })
+}
+
+/// What one send direction moved.
+#[derive(Debug, PartialEq, Eq)]
+struct Sent {
+    entries: usize,
+    pending: bool,
+    chains_skipped: usize,
 }
 
 async fn send_direction<S, R, W>(
@@ -240,7 +251,7 @@ async fn send_direction<S, R, W>(
     recv: &mut R,
     local_capability: PeerCapability,
     limits: TableSessionLimits,
-) -> Result<(usize, bool), TableSessionError>
+) -> Result<Sent, TableSessionError>
 where
     S: TableSyncStore,
     R: AsyncRead + Unpin,
@@ -250,6 +261,7 @@ where
     let mut sent = 0;
     let mut offered_chains: usize = 0;
     let mut continuation_pending = false;
+    let mut chains_skipped = 0;
     for item in streams {
         let mut after_device = None;
         let mut stream_pending =
@@ -317,6 +329,17 @@ where
             }
 
             for (chain, frontier) in chains.iter().zip(frontiers) {
+                let skip = |chains_skipped: &mut usize| {
+                    // The peer's copy of this chain diverged from ours (a chain signed twice at
+                    // one point, #1417): retrying never serves it, and failing would abandon every
+                    // other chain and stream with this peer on every pass (#1480). Skip it alone.
+                    tracing::warn!(
+                        stream = %rag_rat_base::hash::hex_lower(&item.stream_id),
+                        device = %rag_rat_base::hash::hex_lower(&chain.device_fingerprint),
+                        "table-sync peer's copy of a chain diverged from ours; skipping that chain"
+                    );
+                    *chains_skipped += 1;
+                };
                 let mut start = match chain_plan(chain, frontier.state)? {
                     ChainPlan::Complete => continue,
                     ChainPlan::Send(start) => start,
@@ -324,14 +347,28 @@ where
                         stream_pending = true;
                         continue;
                     },
+                    ChainPlan::Diverged => {
+                        skip(&mut chains_skipped);
+                        continue;
+                    },
                 };
                 while sent < limits.entries_per_session {
                     let page_limit = limits
                         .entries_per_page
                         .min(limits.entries_per_session.saturating_sub(sent));
-                    let entries = store
-                        .entries(item, chain.device_fingerprint, start, page_limit)
-                        .map_err(TableSessionError::Store)?;
+                    let entries =
+                        match store.entries(item, chain.device_fingerprint, start, page_limit) {
+                            Ok(entries) => entries,
+                            Err(error)
+                                if error
+                                    .downcast_ref::<rag_rat_oplog::UnservableChainCursor>()
+                                    .is_some() =>
+                            {
+                                skip(&mut chains_skipped);
+                                break;
+                            },
+                            Err(error) => return Err(TableSessionError::Store(error)),
+                        };
                     if entries.is_empty() {
                         let delivered = match start {
                             ChainStart::After { lamport, entry_hash } =>
@@ -394,7 +431,7 @@ where
         continuation_pending |= stream_pending;
     }
     write_before(send, &TableFrame::Done, idle_timeout).await?;
-    Ok((sent, continuation_pending))
+    Ok(Sent { entries: sent, pending: continuation_pending, chains_skipped })
 }
 
 async fn receive_direction<S, R, W>(
@@ -522,6 +559,8 @@ enum ChainPlan {
     Complete,
     Send(ChainStart),
     Pending,
+    /// The peer's copy of the chain diverged from ours at its tip: nothing we hold continues it.
+    Diverged,
 }
 
 fn chain_plan(local: &ChainHead, frontier: FrontierState) -> Result<ChainPlan, TableSessionError> {
@@ -529,14 +568,12 @@ fn chain_plan(local: &ChainHead, frontier: FrontierState) -> Result<ChainPlan, T
         FrontierState::Empty => Ok(ChainPlan::Send(ChainStart::Beginning)),
         FrontierState::Accepted { lamport, .. } if lamport > local.lamport =>
             Ok(ChainPlan::Complete),
-        FrontierState::Accepted { lamport, entry_hash } if lamport == local.lamport => {
-            if entry_hash != local.entry_hash {
-                return Err(TableSessionError::Protocol(
-                    "peer chain frontier conflicts with the offered tip".into(),
-                ));
-            }
-            Ok(ChainPlan::Complete)
-        },
+        FrontierState::Accepted { lamport, entry_hash } if lamport == local.lamport =>
+            Ok(if entry_hash == local.entry_hash {
+                ChainPlan::Complete
+            } else {
+                ChainPlan::Diverged
+            }),
         FrontierState::Accepted { lamport, entry_hash } => {
             if let Some((floor_lamport, floor_hash)) = local.floor
                 && lamport < floor_lamport

@@ -146,6 +146,85 @@ async fn capped_sessions_advance_from_durable_frontiers_until_quiet() {
     assert_eq!(destination.entries[&shared.stream_id].len(), 5);
 }
 
+/// Two stores that hold different entries at one point of a chain (the chain was signed twice
+/// there, #1417): each is `device 5` at lamports 1..=2, sharing lamport 1.
+fn diverged_pair(stream: &ManifestItem) -> (MemStore, MemStore) {
+    let mut source = MemStore::new(vec![stream.clone()]);
+    let mut destination = MemStore::new(vec![stream.clone()]);
+    source.insert_chain(stream.stream_id, 5, 1, 10);
+    source.insert_chain(stream.stream_id, 5, 2, 11);
+    source.insert_chain(stream.stream_id, 5, 3, 12);
+    destination.insert_chain(stream.stream_id, 5, 1, 10);
+    destination.insert_chain(stream.stream_id, 5, 2, 20);
+    (source, destination)
+}
+
+/// One chain whose copies diverged must not cost the rest of the session: the sender skips it,
+/// every other chain and stream still converges, and the skip does not keep the stream pending
+/// (#1480).
+#[tokio::test]
+async fn a_diverged_chain_is_skipped_and_the_rest_of_the_session_converges() {
+    let shared = item("repo-a", 1);
+    let other = item("repo-b", 2);
+    let (mut source, mut destination) = diverged_pair(&shared);
+    for store in [&mut source, &mut destination] {
+        store.supported.push(other.clone());
+    }
+    source.insert_chain(shared.stream_id, 6, 4, 30);
+    source.insert_chain(other.stream_id, 7, 5, 40);
+
+    for (dialer_is_source, round) in [(true, 0), (false, 1)] {
+        let (source_report, destination_report) = if dialer_is_source {
+            pair(&mut source, &mut destination).await
+        } else {
+            let (d, s) = pair(&mut destination, &mut source).await;
+            (s, d)
+        };
+        assert_eq!(source_report.chains_skipped, 1, "round {round}: the diverged chain alone");
+        assert!(!source_report.continuation_pending && !destination_report.continuation_pending);
+        if round == 1 {
+            assert_eq!(source_report.entries_sent, 0, "the second round is quiet");
+        }
+    }
+    assert!(destination.entries[&shared.stream_id].contains_key(&[30; 32]), "healthy chain");
+    assert!(destination.entries[&other.stream_id].contains_key(&[40; 32]), "healthy stream");
+    assert!(
+        !destination.entries[&shared.stream_id].contains_key(&[12; 32]),
+        "nothing of the diverged chain is sent past the divergence",
+    );
+}
+
+/// Copies that diverged exactly at the tip (the same lamport, different entries) are recognised
+/// while planning, before any entry is read, and skipped the same way in both directions.
+#[tokio::test]
+async fn copies_diverged_at_the_tip_are_skipped_in_both_directions() {
+    let shared = item("repo-a", 1);
+    let mut left = MemStore::new(vec![shared.clone()]);
+    let mut right = MemStore::new(vec![shared.clone()]);
+    left.insert_chain(shared.stream_id, 5, 1, 10);
+    left.insert_chain(shared.stream_id, 5, 2, 11);
+    right.insert_chain(shared.stream_id, 5, 1, 10);
+    right.insert_chain(shared.stream_id, 5, 2, 20);
+    let (left_report, right_report) = pair(&mut left, &mut right).await;
+    assert_eq!((left_report.chains_skipped, right_report.chains_skipped), (1, 1));
+    assert_eq!(left_report.entries_sent + right_report.entries_sent, 0);
+    assert!(!left_report.continuation_pending && !right_report.continuation_pending);
+}
+
+/// Only a diverged cursor is skipped. Any other store failure — a busy database — still fails the
+/// session, so a transient error is retried as a whole rather than silently dropping a chain.
+#[tokio::test]
+async fn any_other_store_error_still_fails_the_session() {
+    let shared = item("repo-a", 1);
+    let mut source = MemStore::new(vec![shared.clone()]);
+    let mut destination = MemStore::new(vec![shared.clone()]);
+    source.insert_chain(shared.stream_id, 5, 1, 10);
+    source.fail_entries = true;
+    let (source_result, _) =
+        try_pair_with_limits(&mut source, &mut destination, TableSessionLimits::default()).await;
+    assert!(matches!(source_result, Err(TableSessionError::Store(_))), "{source_result:?}");
+}
+
 #[tokio::test]
 async fn lost_completion_ack_does_not_consume_or_repeat_progress() {
     let shared = item("repo-a", 1);
@@ -174,7 +253,7 @@ async fn lost_completion_ack_does_not_consume_or_repeat_progress() {
             limits,
         ),
     );
-    assert_eq!(sent.unwrap(), (1, false));
+    assert_eq!(sent.unwrap(), Sent { entries: 1, pending: false, chains_skipped: 0 });
     assert_eq!(received.unwrap(), (1, 1, false));
 
     let (source_report, destination_report) = pair(&mut source, &mut destination).await;
@@ -186,10 +265,11 @@ async fn lost_completion_ack_does_not_consume_or_repeat_progress() {
 fn peer_frontiers_must_be_provable_prefixes_and_restore_debt_stays_pending() {
     let local =
         ChainHead { device_fingerprint: [1; 32], lamport: 3, entry_hash: [3; 32], floor: None };
-    assert!(matches!(
-        chain_plan(&local, FrontierState::Accepted { lamport: 3, entry_hash: [4; 32] }),
-        Err(TableSessionError::Protocol(_))
-    ));
+    assert_eq!(
+        chain_plan(&local, FrontierState::Accepted { lamport: 3, entry_hash: [4; 32] }).unwrap(),
+        ChainPlan::Diverged,
+        "a different entry at our tip is a diverged chain, skipped rather than fatal",
+    );
     assert_eq!(
         chain_plan(&local, FrontierState::Accepted { lamport: 4, entry_hash: [4; 32] }).unwrap(),
         ChainPlan::Complete

@@ -5218,6 +5218,7 @@ dependencies = [
  "sha2",
  "strum",
  "tempfile",
+ "thiserror 2.0.20",
  "x25519-dalek",
  "zeroize",
 ]
