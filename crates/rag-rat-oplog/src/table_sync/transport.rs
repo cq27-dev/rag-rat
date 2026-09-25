@@ -868,16 +868,17 @@ fn chain_frontier(
         (None, None) => Ok(TableSyncFrontier::Empty),
         (Some(accepted), None) => Ok(TableSyncFrontier::Accepted(accepted)),
         (None, Some(witness)) => Ok(TableSyncFrontier::Restore(witness)),
-        (Some(accepted), Some(witness)) if accepted == witness =>
-            Ok(TableSyncFrontier::Accepted(accepted)),
         (Some(accepted), Some(witness)) if witness.lamport > accepted.lamport =>
             Ok(TableSyncFrontier::Restore(witness)),
-        // Rendered as `(lamport, hash)` tuples: the wording this error has always had.
-        (Some(accepted), Some(witness)) => anyhow::bail!(
-            "table-sync chain tip witness {:?} conflicts with accepted tail {:?}",
-            (witness.lamport, witness.entry_hash),
-            (accepted.lamport, accepted.entry_hash)
-        ),
+        // The witness at or below the accepted tail. Only the equal case is reachable: the witness
+        // is raised in the same transaction as every insert and never lowered, and nothing deletes
+        // a tail while entries below it survive. A witness below the tail, or a different
+        // entry at the tail's lamport, is damage from outside the engine. The accepted tail
+        // wins, as it does in `classify`, which reads the witness only when there is no
+        // tail: failing here instead would stop the whole session with every peer on every
+        // pass (#1491). The next accepted entry raises the witness past the tail and heals
+        // the chain.
+        (Some(accepted), Some(_)) => Ok(TableSyncFrontier::Accepted(accepted)),
     }
 }
 
