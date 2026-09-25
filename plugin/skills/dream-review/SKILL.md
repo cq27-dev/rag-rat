@@ -109,6 +109,19 @@ the rest are closely related but distinct rules.
 - **Dismiss** when both are needed (related but distinct rules): `dream_review` with
   `verdict: "dismiss"`. The dismissal holds until either note's title changes.
 
+### `dependent_of_dead_source` — `subject = <memory id>`
+A live memory derived (`derived_from`, directly or through other derived memories) from a memory
+that no longer stands: obsolete, rejected, or anchored only to code that is gone. The evidence
+names the dead source and, when one exists, the memory that supersedes it.
+- Read both (`memory_get`) and re-check the dependent against the dead source — and against its
+  successor, if named. Does the dependent still hold without it?
+- **Root fix:** `memory_update` the dependent to stand on its own or on the successor (and re-point
+  the edge: `memory_edge_remove` + `memory_edge_add`), or retire it with `status: "obsolete"`. The
+  finding resolves by itself once the source stands again, the edge is gone, or the dependent is
+  retired.
+- **Dismiss** when the dependent is still true without its source: `dream_review` with
+  `verdict: "dismiss"` (dropping the `derived_from` edge is usually the better fix).
+
 ## 4. Verdict semantics (quick reference)
 
 Each is a **`dream_review`** call, `{ "finding": "<id>", "verdict": … }`:
