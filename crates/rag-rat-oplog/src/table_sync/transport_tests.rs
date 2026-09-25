@@ -559,6 +559,177 @@ fn a_witness_without_an_accepted_tail_requests_the_tip_inclusively() {
     assert_eq!(successor[0].cursor.entry_hash, [10; 32]);
 }
 
+/// Restore `peer`'s chain after a purge: it receives only the source's current tip, the witness it
+/// kept. Returns the route and that witness.
+fn purge_and_restore_at_witness(
+    source: &Connection,
+    peer: &Connection,
+    account: AccountId,
+) -> (TableSyncStream, [u8; 32], TableSyncChainCursor) {
+    rag_rat_db::schema::purge_repo_rows(peer, "repo-a").unwrap();
+    assert!(chain_lamports(peer).is_empty(), "the purge dropped the log, keeping the witness");
+    let route = supported_streams_against(source, account, &[REPO_SPEC]).unwrap().remove(0);
+    let head = accepted_chain_page(source, route.stream_id, None, 16).unwrap().remove(0);
+    let witness = TableSyncChainCursor { lamport: head.lamport, entry_hash: head.entry_hash };
+    let restored = accepted_chain_entries(
+        source,
+        route.stream_id,
+        head.device_fingerprint,
+        TableSyncEntryStart::At(witness),
+        1,
+    )
+    .unwrap()
+    .remove(0);
+    ingest_received_against(
+        peer,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: head.device_fingerprint,
+            signed_bytes: &restored.signed_bytes,
+            advertised_floor: None,
+            advertised_tip: Some(witness),
+        },
+        2,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(chain_lamports(peer), [head.lamport as i64], "only the witness is back");
+    (route, head.device_fingerprint, witness)
+}
+
+/// A chain restored after a repository purge starts at its witness, with nothing held below it. A
+/// peer whose tip sits below the witness is honest: the restored store answers it with an empty
+/// page instead of failing the session, and the peer fills the prefix from a store that holds it.
+/// The witness is NOT advertised as a floor — it was never checked against the rows' carriers,
+/// and a floor would re-root peers past rows a full store could still give them (#1481).
+#[test]
+fn a_purge_restored_chain_answers_a_lower_tip_with_nothing_and_advertises_no_floor() {
+    let (source, account) = writer_store();
+    write(&source, "r1", "first");
+    author(&source, account);
+    let lagging = peer_of(&source, account);
+    sync_chains(&source, &lagging, account);
+    let lagging_tip = {
+        let route = supported_streams_against(&lagging, account, &[REPO_SPEC]).unwrap().remove(0);
+        let head = accepted_chain_page(&lagging, route.stream_id, None, 16).unwrap().remove(0);
+        TableSyncChainCursor { lamport: head.lamport, entry_hash: head.entry_hash }
+    };
+    rewrite(&source, account, "r2", 3);
+    let restored = peer_of(&source, account);
+    sync_chains(&source, &restored, account);
+    let (route, device, witness) = purge_and_restore_at_witness(&source, &restored, account);
+    assert!(lagging_tip.lamport < witness.lamport);
+
+    let head = accepted_chain_page(&restored, route.stream_id, None, 16).unwrap().remove(0);
+    assert_eq!(head.floor, None, "a witness is not a floor this store may advertise");
+    assert!(
+        accepted_chain_entries(
+            &restored,
+            route.stream_id,
+            device,
+            TableSyncEntryStart::After(lagging_tip),
+            16,
+        )
+        .unwrap()
+        .is_empty(),
+        "a tip below the restored holdings is answered with nothing, not an error",
+    );
+    assert!(
+        accepted_chain_entries(
+            &restored,
+            route.stream_id,
+            device,
+            TableSyncEntryStart::At(lagging_tip),
+            16,
+        )
+        .unwrap()
+        .is_empty(),
+        "so is a purge-restored peer's older witness",
+    );
+    sync_chains(&source, &lagging, account);
+    assert_eq!(live_rows(&lagging), live_rows(&source), "the lagging peer fills from the source");
+
+    // A chain held from its first entry holds everything below its tip: a cursor below that is no
+    // honest shape and still fails. (Its first entry sits above lamport 0 because the stream's
+    // Lamport clock is shared by every writer.)
+    let other = [2; 32];
+    source
+        .execute(
+            "INSERT INTO table_sync_entries(
+                     entry_hash, stream_id, device_fingerprint, lamport, signed_bytes,
+                     received_at_ms)
+                 VALUES (?1, ?2, ?3, 5, x'09', 0)",
+            params![[9u8; 32].as_slice(), route.stream_id.as_slice(), other.as_slice()],
+        )
+        .unwrap();
+    let below = TableSyncChainCursor { lamport: 3, entry_hash: [3; 32] };
+    assert!(
+        accepted_chain_entries(
+            &source,
+            route.stream_id,
+            other,
+            TableSyncEntryStart::After(below),
+            16
+        )
+        .is_err()
+    );
+}
+
+/// A purge-restored store that meets a sender compacted past its witness is re-rooted onto the
+/// sender's floor (#1481): the floor sits above the witness, so the store adopts it as a new root
+/// and continues from there.
+#[test]
+fn a_purged_store_adopts_a_sender_floor_above_its_witness() {
+    let (source, account) = writer_store();
+    rewrite(&source, account, "r1", 3);
+    let purged = peer_of(&source, account);
+    sync_chains(&source, &purged, account);
+    let route = supported_streams_against(&source, account, &[REPO_SPEC]).unwrap().remove(0);
+    let witness = {
+        let head = accepted_chain_page(&purged, route.stream_id, None, 16).unwrap().remove(0);
+        TableSyncChainCursor { lamport: head.lamport, entry_hash: head.entry_hash }
+    };
+    rag_rat_db::schema::purge_repo_rows(&purged, "repo-a").unwrap();
+    rewrite(&source, account, "r1", 3);
+    assert!(compact(&source, account, 1) > 0);
+    let head = accepted_chain_page(&source, route.stream_id, None, 16).unwrap().remove(0);
+    let floor = head.floor.expect("the source compacted to a floor");
+    assert!(floor.lamport > witness.lamport, "the sender compacted past the witness");
+
+    let floor_entry = accepted_chain_entries(
+        &source,
+        route.stream_id,
+        head.device_fingerprint,
+        TableSyncEntryStart::At(floor),
+        1,
+    )
+    .unwrap()
+    .remove(0);
+    ingest_received_against(
+        &purged,
+        &IngestRoute { account_id: account, stream: &route, registry: &[REPO_SPEC] },
+        &TableSyncReceived {
+            expected_device: head.device_fingerprint,
+            signed_bytes: &floor_entry.signed_bytes,
+            advertised_floor: Some(floor),
+            advertised_tip: Some(TableSyncChainCursor {
+                lamport: head.lamport,
+                entry_hash: head.entry_hash,
+            }),
+        },
+        3,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(chain_lamports(&purged), [floor.lamport as i64], "the floor is the new root");
+    assert_eq!(
+        chain_frontier(&purged, route.stream_id, head.device_fingerprint).unwrap(),
+        TableSyncFrontier::Accepted(floor),
+    );
+    sync_chains(&source, &purged, account);
+    assert_eq!(live_rows(&purged), live_rows(&source));
+}
+
 #[test]
 fn production_registry_advertises_every_scope_per_current_repo() {
     let conn = database();
