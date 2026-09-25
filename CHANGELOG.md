@@ -7,6 +7,367 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0](https://github.com/cq27-dev/rag-rat/compare/v0.23.2...v0.24.0) - 2026-09-25
+
+### Added
+
+- *(sync)* a removed device re-enrolls under a fresh identity ([#1477](https://github.com/cq27-dev/rag-rat/pull/1477))
+- *(sync)* list, remove and promote account devices ([#1471](https://github.com/cq27-dev/rag-rat/pull/1471))
+- *(mcp)* memory_get, and memory_update and find_clones absorb their near-duplicates ([#1451](https://github.com/cq27-dev/rag-rat/pull/1451))
+- *(mcp)* history_for and history_search replace eleven history tools ([#1449](https://github.com/cq27-dev/rag-rat/pull/1449))
+- *(plugin)* expose the plugin's rag-rat on PATH through a ~/.local/bin shim ([#1428](https://github.com/cq27-dev/rag-rat/pull/1428))
+- *(enrollment)* carry the checkpoint digest on the invite ticket ([#1413](https://github.com/cq27-dev/rag-rat/pull/1413))
+- *(checkpoint)* propose, inspect and report control checkpoints ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1411](https://github.com/cq27-dev/rag-rat/pull/1411))
+- *(sync)* persist and report unresolved table-row causes ([#1344](https://github.com/cq27-dev/rag-rat/pull/1344))
+- *(sync)* key memory summaries by memory so a regeneration syncs as one upsert ([#1320](https://github.com/cq27-dev/rag-rat/pull/1320))
+- *(dream)* memory_duplicate findings for near-duplicate memory pairs ([#1445](https://github.com/cq27-dev/rag-rat/pull/1445)) ([#1484](https://github.com/cq27-dev/rag-rat/pull/1484))
+- *(memory)* warn on near-duplicate memories at memory_create ([#1445](https://github.com/cq27-dev/rag-rat/pull/1445)) ([#1478](https://github.com/cq27-dev/rag-rat/pull/1478))
+- *(memory)* hybrid memory_search with a vector arm over cached memory embeddings ([#1443](https://github.com/cq27-dev/rag-rat/pull/1443)) ([#1472](https://github.com/cq27-dev/rag-rat/pull/1472))
+- *(mcp)* list the coding surface by default and move maintenance tools into opt-in toolsets ([#1442](https://github.com/cq27-dev/rag-rat/pull/1442))
+- *(enrollment)* refuse an invite the pin moved out from under ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1414](https://github.com/cq27-dev/rag-rat/pull/1414))
+- *(oplog)* persist permanent account pins and block unsupported authority ([#1352](https://github.com/cq27-dev/rag-rat/pull/1352))
+- *(sync)* restate a writer's own deletes so compaction can reclaim the entries that first stated them
+- *(enrollment)* let any owner enroll a device ([#1416](https://github.com/cq27-dev/rag-rat/pull/1416)) ([#1420](https://github.com/cq27-dev/rag-rat/pull/1420))
+- *(oplog)* let any owner author, not only the founder device ([#1416](https://github.com/cq27-dev/rag-rat/pull/1416)) ([#1418](https://github.com/cq27-dev/rag-rat/pull/1418))
+- *(checkpoint)* store a pin's evidence for this store's own account ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1412](https://github.com/cq27-dev/rag-rat/pull/1412))
+- *(oplog)* encode control-checkpoint bundles for transport ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1410](https://github.com/cq27-dev/rag-rat/pull/1410))
+- *(oplog)* author a control-v2 device removal with its view manifest ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1408](https://github.com/cq27-dev/rag-rat/pull/1408))
+- *(oplog)* sign a pinned account's control ops as control v2 ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1406](https://github.com/cq27-dev/rag-rat/pull/1406))
+- *(oplog)* project applied v2 operations through the v1 effect pass ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1405](https://github.com/cq27-dev/rag-rat/pull/1405))
+- *(oplog)* read folded authority under a pin this binary executes ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1398](https://github.com/cq27-dev/rag-rat/pull/1398))
+- *(oplog)* make a control v2 cut's pre-cut manifest durable ([#1364](https://github.com/cq27-dev/rag-rat/pull/1364))
+- *(oplog)* fold control v2 register effects into a pinned account's authority history ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1363](https://github.com/cq27-dev/rag-rat/pull/1363))
+- *(oplog)* fold a pinned account from its checkpoint instead of retracting it ([#1361](https://github.com/cq27-dev/rag-rat/pull/1361))
+- *(oplog)* execute owner-authorized control v2 cuts over a pinned checkpoint ([#1355](https://github.com/cq27-dev/rag-rat/pull/1355))
+- *(oplog)* add isolated control v2 grammar and replay planning ([#1351](https://github.com/cq27-dev/rag-rat/pull/1351))
+- *(oplog)* verify externally pinned legacy checkpoints for control v2 ([#1350](https://github.com/cq27-dev/rag-rat/pull/1350))
+- *(cli)* expose tool catalog as native subcommands ([#1273](https://github.com/cq27-dev/rag-rat/pull/1273))
+- *(sync)* sync devices through active MCP ([#1114](https://github.com/cq27-dev/rag-rat/pull/1114))
+- *(lens)* add authenticated VS Code repository lens ([#985](https://github.com/cq27-dev/rag-rat/pull/985))
+- *(distill)* default to the validated 30B ephemeral box, with distillation docs ([#876](https://github.com/cq27-dev/rag-rat/pull/876))
+- *(plugin)* opencode plugin bundle — @rag-rat/plugin-opencode (MCP + hooks) ([#785](https://github.com/cq27-dev/rag-rat/pull/785))
+- *(lang)* add Swift baseline support ([#639](https://github.com/cq27-dev/rag-rat/pull/639))
+- *(papertrail)* add native GitHub project mirror ([#638](https://github.com/cq27-dev/rag-rat/pull/638))
+- *(papertrail)* add provider-neutral schema ([#632](https://github.com/cq27-dev/rag-rat/pull/632))
+- *(plugin)* one-step plugin for Claude Code + Codex — MCP via npx, harness-neutral hooks ([#569](https://github.com/cq27-dev/rag-rat/pull/569))
+- *(dist)* ship an android/Termux binary + make npx @rag-rat/bin work there ([#616](https://github.com/cq27-dev/rag-rat/pull/616)) ([#621](https://github.com/cq27-dev/rag-rat/pull/621))
+- *(index)* global database by default, rag-rat consolidate importer ([#402](https://github.com/cq27-dev/rag-rat/pull/402)) ([#419](https://github.com/cq27-dev/rag-rat/pull/419))
+- *(embed)* remote Ollama embedding — connect + ephemeral cookbook, hardened (#317/#318) ([#330](https://github.com/cq27-dev/rag-rat/pull/330))
+- *(clones)* write-time clone check — warn agents when they're duplicating existing code ([#287](https://github.com/cq27-dev/rag-rat/pull/287)) ([#289](https://github.com/cq27-dev/rag-rat/pull/289))
+- *(clones)* precompute the clone-edge graph in the background so find_clones scales ([#286](https://github.com/cq27-dev/rag-rat/pull/286)) ([#288](https://github.com/cq27-dev/rag-rat/pull/288))
+- cross-platform support — macOS + Windows ([#244](https://github.com/cq27-dev/rag-rat/pull/244))
+- *(index)* clone-detection fingerprint substrate — SourcererCC inverted index ([#215](https://github.com/cq27-dev/rag-rat/pull/215)) ([#229](https://github.com/cq27-dev/rag-rat/pull/229))
+- *(impact)* compact repo-memory view by default; full bodies on request ([#37](https://github.com/cq27-dev/rag-rat/pull/37)) ([#194](https://github.com/cq27-dev/rag-rat/pull/194))
+- *(eval)* gate eval behind a non-default feature + add CI eval job ([#162](https://github.com/cq27-dev/rag-rat/pull/162))
+- confidence-aware + SCIP-aware symbol importance ranking ([#108](https://github.com/cq27-dev/rag-rat/pull/108)) ([#142](https://github.com/cq27-dev/rag-rat/pull/142))
+- default to TOON output for CLI + MCP, --json opt-out ([#104](https://github.com/cq27-dev/rag-rat/pull/104)) ([#123](https://github.com/cq27-dev/rag-rat/pull/123))
+- *(search)* always-present retrieval_mode on every hit ([#41](https://github.com/cq27-dev/rag-rat/pull/41))
+- Claude Code grep-augmentation PreToolUse hook ([#56](https://github.com/cq27-dev/rag-rat/pull/56))
+- *(embed)* selectable embedding backend (minilm | model2vec | none) + init nudge
+- background index file watcher (live freshness for uncommitted edits)
+- *(gc)* worktree-safe pruning of dead-commit index rows
+- *(hooks)* manage a post-commit reindex+reconcile hook
+- *(index)* support C and C++ projects
+- polish fastembed operational status
+- expand ranking eval harness
+- add real embedding backend abstraction
+- add search evaluation harness
+- parallelize indexing and embeddings
+- add local vector search
+- add discover incremental indexing
+- add explicit schema migrations
+- populate syntactic graph edges
+- reconcile local ai artifacts
+- cache github papertrail evidence
+- index git history and blame
+- broaden tree-sitter structural indexing
+
+### Fixed
+
+- *(cli)* close the dead ends and wrong turns in onboarding ([#1430](https://github.com/cq27-dev/rag-rat/pull/1430))
+- *(cli)* run git hooks through the pinned npx package and keep the pin current ([#1425](https://github.com/cq27-dev/rag-rat/pull/1425))
+- *(oplog)* refuse to extend a chain the device has forked ([#1417](https://github.com/cq27-dev/rag-rat/pull/1417)) ([#1424](https://github.com/cq27-dev/rag-rat/pull/1424))
+- *(enrollment)* never Debug-print an invite's one-time nonce ([#1419](https://github.com/cq27-dev/rag-rat/pull/1419)) ([#1422](https://github.com/cq27-dev/rag-rat/pull/1422))
+- *(oracle)* reject an unknown corpus tool or tier when the profiles load
+- *(index)* recover whole declarations beneath ERROR nodes ([#1487](https://github.com/cq27-dev/rag-rat/pull/1487))
+- *(index)* stop type references binding their own declaration or a non-type ([#1485](https://github.com/cq27-dev/rag-rat/pull/1485))
+- *(index)* read names from grammar fields, not whole-subtree identifier scans ([#1475](https://github.com/cq27-dev/rag-rat/pull/1475))
+- *(oplog)* grant the view-manifest reserve only to a manifest a stored cut cites ([#1367](https://github.com/cq27-dev/rag-rat/pull/1367)) ([#1394](https://github.com/cq27-dev/rag-rat/pull/1394))
+- *(oplog)* judge invite-reservation expiry by the wall clock ([#1365](https://github.com/cq27-dev/rag-rat/pull/1365))
+- *(oplog)* retract a pinned account's projections and park its table entries once ([#1360](https://github.com/cq27-dev/rag-rat/pull/1360))
+- *(sync)* pad discovery announcements to hide roster size ([#1349](https://github.com/cq27-dev/rag-rat/pull/1349))
+- *(core)* advance migration replay test pin to schema v129 ([#1347](https://github.com/cq27-dev/rag-rat/pull/1347))
+- *(sync)* retain outstanding suffix tips after floor adoption ([#1346](https://github.com/cq27-dev/rag-rat/pull/1346))
+- *(core)* reject malformed local distill source tokens during hydration
+- *(core)* raise rebind's durability guard after the backfill it runs
+- *(core)* omit full error details from watcher test diagnostics
+- *(core)* roll back failed overlay refresh commits
+- *(mcp)* trim the repeated worktree description and advertise docs_for_symbol's real arguments ([#1441](https://github.com/cq27-dev/rag-rat/pull/1441))
+- *(db)* discard derived verification rows during late repo merge ([#1335](https://github.com/cq27-dev/rag-rat/pull/1335))
+- *(papertrail)* read a drifted error-class token as an unknown failure
+- *(oracle)* gate indexed definition documents on index-vs-disk drift
+- *(query)* recognize graph seed extensions from the language registry
+- *(clones)* stop charging the template-lane cell budget for skipped members
+- *(sync)* re-adopt a removed writer's live rows at their original identity ([#1498](https://github.com/cq27-dev/rag-rat/pull/1498))
+- *(sync)* skip a diverged table chain instead of failing the whole session ([#1494](https://github.com/cq27-dev/rag-rat/pull/1494))
+- *(oplog)* let pre-V133 stores upgrade by reading an absent retired-identity table as empty ([#1483](https://github.com/cq27-dev/rag-rat/pull/1483)) ([#1493](https://github.com/cq27-dev/rag-rat/pull/1493))
+- *(sync)* serve a purge-restored table chain to peers behind its witness ([#1490](https://github.com/cq27-dev/rag-rat/pull/1490))
+- *(oplog)* keep a device removal authorable when the ordinary budget is full ([#1409](https://github.com/cq27-dev/rag-rat/pull/1409)) ([#1423](https://github.com/cq27-dev/rag-rat/pull/1423))
+- *(oplog)* bound one signer's share of the view-manifest reserve ([#1393](https://github.com/cq27-dev/rag-rat/pull/1393)) ([#1403](https://github.com/cq27-dev/rag-rat/pull/1403))
+- *(oplog)* read folded authority under a pin, and gate the authoring seams ([#1399](https://github.com/cq27-dev/rag-rat/pull/1399)) ([#1400](https://github.com/cq27-dev/rag-rat/pull/1400))
+- *(oplog)* filter the v2 execution pool instead of refusing inside a bundle (#1395, #1396) ([#1397](https://github.com/cq27-dev/rag-rat/pull/1397))
+- *(oplog)* keep a chain closed once a register join cannot decide it ([#1368](https://github.com/cq27-dev/rag-rat/pull/1368)) ([#1374](https://github.com/cq27-dev/rag-rat/pull/1374))
+- *(oplog)* correct stale control v2 composition docs and pin a forked revocation ([#1366](https://github.com/cq27-dev/rag-rat/pull/1366))
+- *(oplog)* park a control v2 cut whose cited mint was not supplied ([#1358](https://github.com/cq27-dev/rag-rat/pull/1358))
+- *(oplog)* identify malformed stored ids by their actual field
+- *(sync)* bound an entries page by bytes as well as entry count ([#1371](https://github.com/cq27-dev/rag-rat/pull/1371)) ([#1373](https://github.com/cq27-dev/rag-rat/pull/1373))
+- *(sync)* refuse a writer nonce presented to the pairing flow as unknown
+- *(sync)* report enrollment transport failures as transport, not storage
+- *(sync)* report a stalled session peer as a timeout, not a protocol violation
+- *(sync)* refuse an over-cap account-lane frame before writing it
+- *(mcp)* tool-output quality pass — correctness, verbosity, descriptions
+- validate drift anchors before returning context
+- enforce fts freshness invariant
+- switch rag-rat indexing back to sqlite
+
+### Other
+
+- *(setup)* move repo scan, the config draft and git hooks into a rag-rat-setup crate ([#1454](https://github.com/cq27-dev/rag-rat/pull/1454))
+- *(deps)* bump Rust 1.98, crates, cookbook images, npm locks and CI actions ([#1453](https://github.com/cq27-dev/rag-rat/pull/1453))
+- *(cli)* share command parsing, locking and maintenance reports ([#1336](https://github.com/cq27-dev/rag-rat/pull/1336))
+- *(oplog)* share account authority operations and type identifiers ([#1338](https://github.com/cq27-dev/rag-rat/pull/1338))
+- *(core)* type clone delta report status tokens
+- *(sync)* make SyncAlpn the crate's ALPN type for dialers and dispatchers
+- *(mcp)* correct test references that name things that no longer exist
+- *(base)* finish moving base's fixtures onto ScratchDir and test_git
+- *(base)* keep the embedding registry to one row per model
+- *(base)* route every hex encoding through base::hash
+- *(base)* name the global and per-worktree listener lock families
+- *(base)* settle the config enums on strum tokens and one config parser
+- *(base)* back Language tokens with strum and rename as_str to as_db_str
+- *(oracle)* pass the drift-gate snapshots as one ShaSnapshots bundle
+- *(sync)* pin live table rows through the chain that carries them ([#1495](https://github.com/cq27-dev/rag-rat/pull/1495))
+- *(index)* make per-language steps fail loudly, not silently ([#1474](https://github.com/cq27-dev/rag-rat/pull/1474))
+- *(index)* node-kind tripwires for every language backend and the clone engine ([#1473](https://github.com/cq27-dev/rag-rat/pull/1473))
+- *(core)* share index pipeline contracts and finalization ([#1341](https://github.com/cq27-dev/rag-rat/pull/1341))
+- *(core)* clarify query and embedding API boundaries ([#1340](https://github.com/cq27-dev/rag-rat/pull/1340))
+- *(core)* share graph extraction rules and clarify healing phases ([#1339](https://github.com/cq27-dev/rag-rat/pull/1339))
+- *(core)* avoid dumping sync effects in assertion failures
+- *(core)* move the remaining inline test tails into #[path] sibling files
+- *(core)* read sync_driver's kv timestamps through typed meta accessors
+- *(core)* split grep-augment's compose into its three lanes
+- *(core)* carry the discovery advertisement's identity as one AdvertisementIdentity
+- *(core)* reattach drain_synced_memory's doc and drop prompts.rs's module-wide dead_code allow
+- *(core)* give the stream seal-policy and access-mode intents a token surface
+- *(core)* route every lexical search entry point through LexicalQuery
+- *(core)* share eval's recall predicates and pass its search knobs as SearchTuning
+- *(core)* remove the unused search::hybrid and search::semantic modules
+- *(core)* merge eval expectation lanes through one accessor pair
+- *(core)* build signed node content and edge specs from the rows that carry them
+- *(core)* split sync_driver's reconcile and resident start into named phases
+- *(core)* share distill source tokens in the thread identity module
+- *(core)* run distill extract and drain through one transaction helper
+- *(core)* colocate watcher tests with their modules
+- *(core)* split consolidation by import responsibility
+- *(core)* name watcher pass inputs and lifecycle stages
+- *(core)* document overlay transaction failure policies
+- *(core)* share connection scope keys and view columns
+- *(core)* report watcher overlay failures through tracing
+- *(core)* pair on-open repairs with their read-only gates
+- *(core)* bump overlay revisions in their matching change arms
+- *(core)* name consolidation child slices and metadata sides
+- *(core)* carry checkout keys through overlay scopes
+- *(core)* enforce poison tripwire coverage from the schema registry
+- *(core)* describe poison coverage against the current schema
+- *(core)* align lifecycle documentation with its functions
+- *(db)* move EdgeConfidence below the read layer and hang its ladders off it
+- *(query)* type the persisted memory kind, status, confidence, source and relocation reason
+- *(db)* tighten the digest lane and chunk-text decoder primitives
+- *(dream)* type finding status and expose a typed kind on worklist and review rows
+- *(llm)* cover endpoint redaction in the crate that owns it
+- *(base)* name the workspace dir, legacy database, and imported marker
+- *(oracle)* type the persisted run status as RunStatus
+- *(papertrail)* isolate the reference-driven sync lane in ref_sync
+- *(papertrail)* type the report's pause reason and sync-error status
+- *(mcp)* drive tool schema checks from a complete per-tool table
+- *(mcp)* turn the hook listener's task body into an ordinary function
+- *(mcp)* export only the catalog's contract from the tools module
+- *(mcp)* declare the resurface window once for both dedup lanes
+- *(mcp)* route the clone file lens through file_lens
+- *(mcp)* share the lens discovery record and serve options between serve paths
+- *(mcp)* escalate graph completeness risk on the typed report
+- *(mcp)* build the graph tools' traversal options in one place
+- *(mcp)* declare the symbol selector and handle encoding once
+- *(mcp)* stop advertising search knobs the plain full-text tools discard
+- *(base)* share the config test fixtures instead of copying them
+- *(base)* honour the crate's own clock, version, and import seams
+- *(base)* resolve [index] root through one helper in Config::load
+- *(base)* derive the retention sweep's owned log names from Role
+- *(db)* split migrations into ladder infrastructure and per-era step modules
+- *(db)* move the migration ladder's interleaved test modules into their own files
+- *(db)* render PurgeIdSet's live subquery and temp capture from one descriptor
+- *(db)* name the registration outcomes in a Registration enum
+- *(db)* extract the adoption re-point phase into repoint_scoped_rows
+- *(db)* route sqlite_master existence probes through one helper
+- *(db)* pin the late-merge periphery list to its A5 prefix and fix stale coverage prose
+- *(db)* retire the stale migration-registration doc and tests that cannot fail
+- *(db)* carry each migration's ledger-atomic and refold flags in the roster
+- *(db)* build SchemaStatus through one constructor
+- *(db)* correct stale module headers and unresolvable cross-crate doc links
+- *(papertrail)* split the mirror runner's test tail by concern
+- *(papertrail)* route ref grammars on one reported MatchedShape
+- *(papertrail)* fold the configless legacy-grammar fallback into parse_tracker_refs
+- *(papertrail)* declare the transport's GitHub quota quirks as ProviderQuirks
+- *(papertrail)* bind delete_item's item identity once
+- *(papertrail)* bind the remaining enum tokens in SQL instead of spelling literals
+- *(papertrail)* state the ref-kind claim rank once on RefKind
+- *(papertrail)* type the mirror cursor's processed item kind as ItemKind
+- *(papertrail)* derive the error-class tokens and bind the pause class in SQL
+- *(papertrail)* name the persisted-health, symbol-span and issue-target shapes
+- *(papertrail)* key evidence coalescing on RecordKey
+- *(papertrail)* share the previous-civil-day rule between mirror and GitLab
+- *(papertrail)* reattach the commit-closer doc block to its function
+- *(papertrail)* route the tag and token fingerprints through hex_lower
+- *(llm)* make lib.rs an index of the crate's surface
+- *(llm)* correct provisioning visibility and stale module paths
+- *(llm)* name the sweep's failure-breaker budget once
+- *(llm)* build the tuner's and the benchmark's probe workload in one place
+- *(llm)* put the cookbook's platform process handling behind named shims
+- *(llm)* derive the embedding provision deadline from provision_deadline
+- *(llm)* type CookbookInput's backend and capability
+- *(llm)* fold the embedder's BuildParams into ProvisionedEmbedderParams
+- *(llm)* build every Authorization header in the shared http transport
+- *(oracle)* split backend tests by subject and narrow the lsp dead-code allow
+- *(oracle)* drop the stale phase-1 module headers and index every module
+- *(oracle)* collect store.rs row iterators instead of hand-rolled loops
+- *(oracle)* split the live pass's per-definition verdict write out of resolve_one_file
+- *(oracle)* give check_library_usage's cost-ordered phases their own functions
+- *(oracle)* spell the edge_oracle.kind SQL lists from OracleResolutionKind
+- *(oracle)* declare each live backend's moniker source on its registry entry
+- *(oracle)* share the edge-join-candidate SELECT and row mapper
+- *(oracle)* pin the corpus profile hash
+- *(oracle)* record an oracle run from a named OracleRunRecord
+- *(oracle)* express every drift gate through one pinning predicate
+- *(query)* share persisted memory test fixtures
+- *(query)* move memory tests into sibling modules
+- *(query)* curate graph and impact exports and remove row collectors
+- *(query)* make scoped_weighted_fan_in delegate to its batched sibling
+- *(query)* one short_name helper, and distinct names for the two qualified-symbol rules
+- *(query)* keep ImpactCategory typed through ImpactSurface
+- *(query)* read import/export dependents through one shared query
+- *(query)* share the traversal hop SELECT and summary counts between directions
+- *(query)* split important_symbols into its load, graph, seed and hydrate phases
+- *(query)* compose forward_visibility_filter from its three clauses
+- *(query)* name graph_meta's call-edge set and count/list predicates
+- *(query)* read binding resolution shadows through one named fragment
+- *(query)* name the live-memory status predicate once
+- *(dream)* match divergence evidence on the resolver's own resolution labels
+- *(dream)* keep the finding builders and imports in reading order
+- *(dream)* move the verdict grounding guards into their own module
+- *(dream)* write memory_reality through one UPSERT for both outcomes
+- *(dream)* build the pack content-line set once per grounding check
+- *(dream)* share each model pass's scope and failure-stamp preamble
+- *(dream)* name the unassigned repo sentinel through LEGACY_REPO_ID
+- *(clones)* share the RefineMember fixtures and import test names directly
+- *(clones)* pass the anti-unify class as one ClassView
+- *(clones)* drop the redundant per-group cancel poll in the maximality pass
+- *(clones)* split coherence_split_cancellable into named stages
+- *(clones)* gather member-run tokens and fold agreement in one place each
+- *(clones)* share one annotation-type scan
+- *(clones)* drive both LCS lanes through the budgeted path
+- *(clones)* type SigParam::type_source as an enum
+- *(clones)* name the v1 confidence thresholds and derive band steps
+- *(clones)* list str_escaped_char in the shared string-body kinds
+- *(clones)* restore the opening sentence of the MemberStatement doc
+- *(clones)* drop the crate-visible ClassAlignment and OccSpan re-export
+- *(clones)* write the star align's skip-and-sample arm once
+- *(clones)* make CellBudget own its spent/exhausted state
+- *(oplog)* pin that a rejected v2 removal is not final ([#1415](https://github.com/cq27-dev/rag-rat/pull/1415)) ([#1421](https://github.com/cq27-dev/rag-rat/pull/1421))
+- *(oplog)* pin that a citation records the payload, not the checkpoint it names ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1404](https://github.com/cq27-dev/rag-rat/pull/1404))
+- *(oplog)* pin that a v2 revocation's content cut reaches the projection ([#1311](https://github.com/cq27-dev/rag-rat/pull/1311)) ([#1402](https://github.com/cq27-dev/rag-rat/pull/1402))
+- *(oplog)* pin the last two rows — absent-verdict default and the reservation headroom refusal ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1392](https://github.com/cq27-dev/rag-rat/pull/1392))
+- *(oplog)* a condemned removal must not tombstone the device it names ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1390](https://github.com/cq27-dev/rag-rat/pull/1390))
+- *(oplog)* pin the mint gate a demote's peer-supplied owner_id reaches ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1388](https://github.com/cq27-dev/rag-rat/pull/1388))
+- *(oplog)* make every plan_replay bound and refusal attributable ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1386](https://github.com/cq27-dev/rag-rat/pull/1386))
+- *(oplog)* pin every conjunct of the v2 candidate admission check ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1385](https://github.com/cq27-dev/rag-rat/pull/1385))
+- *(oplog)* pin the two structural refusals in the replay planner ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1384](https://github.com/cq27-dev/rag-rat/pull/1384))
+- *(oplog)* compose two applied cuts so the ordering and epoch rows are reachable ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1383](https://github.com/cq27-dev/rag-rat/pull/1383))
+- *(oplog)* complete both sides of the v2 register preconditions ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1382](https://github.com/cq27-dev/rag-rat/pull/1382))
+- *(oplog)* let the determinism fixtures reach two of the fold's sort components ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1381](https://github.com/cq27-dev/rag-rat/pull/1381))
+- *(oplog)* route the executor's two verdict maps through pure functions ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1380](https://github.com/cq27-dev/rag-rat/pull/1380))
+- *(oplog)* pin the three preconditions a v2 revocation must satisfy ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1379](https://github.com/cq27-dev/rag-rat/pull/1379))
+- *(oplog)* pin the control v2 ancestry walk's step conditions ([#1369](https://github.com/cq27-dev/rag-rat/pull/1369)) ([#1376](https://github.com/cq27-dev/rag-rat/pull/1376))
+- *(oplog)* trim the checkpoint legacy trace to what execution reads ([#1359](https://github.com/cq27-dev/rag-rat/pull/1359))
+- *(sync)* pin v1 revocation credit and plan explicit account upgrades ([#1343](https://github.com/cq27-dev/rag-rat/pull/1343))
+- *(oplog)* move large test modules to sibling files
+- *(oplog)* retain typed pending reasons in ingest outcomes
+- *(oplog)* share the identity-keyed wire set rules
+- *(oplog)* carry row keys and clocks through merge bookkeeping
+- *(oplog)* name projection ordering and assembly phases
+- *(oplog)* name the persisted pre-context stream placeholder
+- *(oplog)* name the (lamport, entry hash) chain cursor
+- *(oplog)* add field-aware constructors for stored fixed-width ids
+- *(oplog)* type the /5 scope id as ScopeId
+- *(oplog)* derive the node-status and override-action wire tokens with strum
+- *(oplog)* write the signed and stream-identity preimages through VecEncoderExt
+- *(oplog)* retire the stale crate header, dead-code allows and mangled comments
+- *(sync)* pin the two peer-facing caps a session cannot do without ([#1372](https://github.com/cq27-dev/rag-rat/pull/1372)) ([#1378](https://github.com/cq27-dev/rag-rat/pull/1378))
+- *(sync)* move the large inline test tails into tests modules and share the in-memory stores
+- *(sync)* split endpoint.rs into a module directory by concern
+- *(sync)* type the sync_invites role column as a StoredInviteKind
+- *(sync)* share the redeem-under-writer-lock scaffold between both invite kinds
+- *(sync)* expose transport error sources and derive discovery errors
+- *(sync)* share one bounded dial between the two enrollment dialers
+- *(sync)* bound every lane's frame IO through one deadline helper
+- *(sync)* route every length-prefixed framing through one reader and writer
+- *(sync)* carry the table session's idle timeout in its limits and pass capabilities, not bools
+- *(sync)* generate the op-log stores' NodeAuth impls from one macro
+- *(sync)* name lanes without ALPN-like suffixes and map every module in the crate docs
+- *(sync)* pin framing bytes and refusal boundaries before consolidation
+- document Go language support ([#1061](https://github.com/cq27-dev/rag-rat/pull/1061))
+- *(deps)* upgrade Rust dependencies ([#933](https://github.com/cq27-dev/rag-rat/pull/933))
+- *(readme)* link the rag-rat.cq27.dev site ([#749](https://github.com/cq27-dev/rag-rat/pull/749))
+- split config.md into per-topic pages under docs/config/ ([#669](https://github.com/cq27-dev/rag-rat/pull/669))
+- explain Codex MCP approval for reviews ([#628](https://github.com/cq27-dev/rag-rat/pull/628))
+- *(benchmarks)* refresh kernel-index + SCIP-oracle numbers to v0.15.0 ([#563](https://github.com/cq27-dev/rag-rat/pull/563))
+- *(init)* print the MCP connect command instead of auto-registering ([#542](https://github.com/cq27-dev/rag-rat/pull/542))
+- complete the MCP tool catalog, trim the README, make the skills MCP-native ([#539](https://github.com/cq27-dev/rag-rat/pull/539))
+- *(readme)* reframe as an agent-workflow conversion path ([#359](https://github.com/cq27-dev/rag-rat/pull/359))
+- list Python in the README's code-graph languages ([#183](https://github.com/cq27-dev/rag-rat/pull/183))
+- rewrite README, add oracle/grep-augmentation docs, fix MCP setup footgun
+- integrate release-plz with lockstep workspace versioning ([#124](https://github.com/cq27-dev/rag-rat/pull/124))
+- Auto-migrate forward on open — no manual `rag-rat migrate` ([#102](https://github.com/cq27-dev/rag-rat/pull/102)) ([#103](https://github.com/cq27-dev/rag-rat/pull/103))
+- *(readme)* SCIP oracle capability, benchmarks section + Bencher badge
+- *(readme)* lead with positioning + surface the grep-augmentation proof
+- *(readme)* add crates.io badge, drop hardcoded release version
+- GitHub Actions for fmt, clippy, test, full build, and coverage
+- v0.3.2
+- add Opus 4.8 take to README
+- v0.3.1
+- v0.3.0
+- v0.2.0
+- move install guide near overview
+- prepare crates.io release
+- simplify command examples
+- use sequence diagram for evidence flow
+- add evidence flow diagram
+- describe rag-rat init workflow
+- Add interactive init command
+- Document generic installation flow
+- Add GPT-5.5 usage quote
+- Add MIT license
+- Document supported rag-rat features
+- simplify rag-rat config examples
+- Add bounded maintenance hooks
+- Configure default embedding runtime profile
+- Add commit-addressable worktree overlays
+- Add logical symbol groups for graph exactness
+- Optimize embedding reconciliation
+- Improve graph resolution trust modes
+- add MCP server install guide
+- cover sqlite baseline status
+- Initial rag-rat workspace
+
 ## [0.23.2](https://github.com/cq27-dev/rag-rat/compare/v0.23.1...v0.23.2) - 2026-09-13
 
 ### Added

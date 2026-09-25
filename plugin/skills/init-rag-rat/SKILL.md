@@ -34,7 +34,7 @@ hand-write a config blind, and let a real config load re-check it before indexin
      plugin/MCP version — a stale global install would build the index with the wrong binary. With
      the plugin, `~/.local/bin/rag-rat` is its version-matched binary (the MCP server links it when
      it starts), so try that path too if `rag-rat` alone is not found.
-   - Otherwise (or on a version mismatch) use `npx -y @rag-rat/bin@0.23.2 …` — the plugin pins
+   - Otherwise (or on a version mismatch) use `npx -y @rag-rat/bin@0.24.0 …` — the plugin pins
      `@rag-rat/bin` to its own version and caches the binary privately, so this is the
      version-matched CLI; `npx` runs it in the current directory.
 
