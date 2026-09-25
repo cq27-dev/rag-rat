@@ -1506,3 +1506,31 @@ fn selection_converges_across_ingest_orders() {
         "the recovered key is the tiebreak winner's",
     );
 }
+
+/// A store upgraded from before V133 has no `oplog_retired_identities` table while the earlier
+/// migrations (V064/V065/V099) run the authority backfill over its accounts, and that refold
+/// recovers stream keys. The absent table must read as "no identity retired yet", the store's true
+/// state then (#1483).
+#[test]
+fn the_migration_backfill_runs_before_the_retired_identity_table_exists() {
+    let conn = db();
+    let (account, founder, genesis_hash, stream_id) = account_with_owned_stream(&conn);
+    let device = local_device(&conn, NOW).unwrap();
+    let key = ContentKey::from_seed(&[0x31; 32]);
+    let wrap =
+        honest_wrap(account, stream_id, device.fingerprint(), &device.x25519_public(), &key, 0);
+    let (bytes, _) =
+        wrap_entry(account, &founder, 0, None, Some(OwnerId::from_bytes(genesis_hash)), &wrap);
+    ingest(&conn, &bytes);
+    conn.execute_batch("DROP TABLE oplog_retired_identities; DROP TABLE oplog_pending_identity;")
+        .unwrap();
+
+    let keyring = historical_content_keyring(&conn, account, stream_id, &device)
+        .expect("key recovery on a pre-V133 store");
+    assert!(keyring.get(key.key_id()).is_some(), "the live identity still recovers its key");
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    crate::backfill_authority_projection(&tx)
+        .expect("the V064/V065/V099 backfill on a pre-V133 store");
+    tx.commit().unwrap();
+}

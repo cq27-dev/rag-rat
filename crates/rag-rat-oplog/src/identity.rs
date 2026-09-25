@@ -126,7 +126,23 @@ impl RetiredIdentity {
 }
 
 /// Every identity this store retired, oldest first. Read-only: decryption paths call it.
+///
+/// A store being upgraded from before V133 has no `oplog_retired_identities` table while the
+/// earlier migrations (V064/V065/V099) refold its accounts through this read, so an absent table
+/// reads as "none retired" — the store's true state then (#1483).
 pub(super) fn retired_identities(conn: &Connection) -> anyhow::Result<Vec<RetiredIdentity>> {
+    let table_exists = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = \
+             'oplog_retired_identities'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !table_exists {
+        return Ok(Vec::new());
+    }
     let mut stmt = conn.prepare(
         "SELECT fingerprint, x25519_secret, x25519_public FROM oplog_retired_identities
           ORDER BY retired_at_ms, fingerprint",
