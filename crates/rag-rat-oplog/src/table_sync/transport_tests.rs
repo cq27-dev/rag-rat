@@ -758,6 +758,57 @@ fn a_purged_store_adopts_a_sender_floor_above_its_witness() {
     assert_eq!(live_rows(&purged), live_rows(&source));
 }
 
+/// A witness at or below the accepted tail that is not the tail is damage no engine path produces
+/// (the witness only ever rises, with every insert). The accepted tail wins, as it does in
+/// `classify`, rather than failing the whole session with every peer on every pass (#1491).
+#[test]
+fn a_witness_that_disagrees_with_the_accepted_tail_yields_to_it() {
+    let (source, account) = writer_store();
+    rewrite(&source, account, "r1", 2);
+    let peer = peer_of(&source, account);
+    sync_chains(&source, &peer, account);
+    let route = supported_streams_against(&peer, account, &[REPO_SPEC]).unwrap().remove(0);
+    let head = accepted_chain_page(&peer, route.stream_id, None, 16).unwrap().remove(0);
+    let tail = TableSyncChainCursor { lamport: head.lamport, entry_hash: head.entry_hash };
+    let witness = |conn: &Connection| -> (i64, Vec<u8>) {
+        conn.query_row(
+            "SELECT lamport, entry_hash FROM table_sync_chain_tips
+              WHERE stream_id = ?1 AND device_fingerprint = ?2",
+            params![route.stream_id.as_slice(), head.device_fingerprint.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    };
+    for (lamport, hash) in [(head.lamport - 1, [5u8; 32]), (head.lamport, [6u8; 32])] {
+        peer.execute(
+            "UPDATE table_sync_chain_tips SET lamport = ?1, entry_hash = ?2
+              WHERE stream_id = ?3 AND device_fingerprint = ?4",
+            params![
+                i64::try_from(lamport).unwrap(),
+                hash.as_slice(),
+                route.stream_id.as_slice(),
+                head.device_fingerprint.as_slice()
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            chain_frontier(&peer, route.stream_id, head.device_fingerprint).unwrap(),
+            TableSyncFrontier::Accepted(tail),
+            "witness at {lamport}",
+        );
+    }
+
+    // The next entry the peer accepts raises the witness past the tail: nothing needs a repair.
+    rewrite(&source, account, "r1", 1);
+    sync_chains(&source, &peer, account);
+    let newest = accepted_chain_page(&source, route.stream_id, None, 16).unwrap().remove(0);
+    assert_eq!(
+        witness(&peer),
+        (i64::try_from(newest.lamport).unwrap(), newest.entry_hash.to_vec())
+    );
+    assert_eq!(live_rows(&peer), live_rows(&source));
+}
+
 #[test]
 fn production_registry_advertises_every_scope_per_current_repo() {
     let conn = database();
