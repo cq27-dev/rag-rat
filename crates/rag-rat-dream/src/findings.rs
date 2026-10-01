@@ -36,6 +36,7 @@ pub enum FindingKind {
     MemoryUnverifiable,
     MemoryDivergence,
     MemoryDuplicate,
+    DependentOfDeadSource,
 }
 
 impl FindingKind {
@@ -60,6 +61,8 @@ impl FindingKind {
             Self::MemoryDivergence => 0.8,
             // Redundancy costs attention, not correctness: below the kinds that flag a wrong note.
             Self::MemoryDuplicate => 0.6,
+            // A stale dependent misleads like a stale path reference, so they rank together.
+            Self::DependentOfDeadSource => 0.5,
         }
     }
 
@@ -69,7 +72,7 @@ impl FindingKind {
     /// supplied near-duplicate pairs: a run that did not evaluate a kind must not resolve the
     /// findings an earlier run opened for it.
     pub(crate) fn computed_by(verify: bool, duplicates: bool) -> Vec<Self> {
-        let mut kinds = vec![Self::CoverageGap, Self::StaleReference];
+        let mut kinds = vec![Self::CoverageGap, Self::StaleReference, Self::DependentOfDeadSource];
         if verify {
             kinds.extend([Self::MemoryUnverifiable, Self::MemoryDivergence]);
         }
@@ -806,6 +809,7 @@ mod tests {
             (FindingKind::MemoryUnverifiable, "memory_unverifiable"),
             (FindingKind::MemoryDivergence, "memory_divergence"),
             (FindingKind::MemoryDuplicate, "memory_duplicate"),
+            (FindingKind::DependentOfDeadSource, "dependent_of_dead_source"),
         ];
         for (kind, token) in kinds {
             assert_eq!(kind.as_db_str(), token);
