@@ -679,3 +679,296 @@ fn a_cpp_path_ambiguous_among_classes_is_not_vetoed_by_their_constructor() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// A local variable is not a symbol, but it still takes part in edge resolution as the symbol it
+/// was (#1466): a reference it would have won stays unresolved instead of falling through to a
+/// same-named symbol in another file, and a name that is ambiguous only because of the local stays
+/// ambiguous instead of binding the one symbol left, here across languages. Checked on the full
+/// rebuild's in-memory resolver, the database re-resolve, and a scoped incremental pass.
+#[test]
+fn a_local_variable_blocks_the_bindings_it_blocked_as_a_symbol() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn run<F: Fn()>(f: F) {\n    f();\n}\n").unwrap();
+    fs::write(root.join("src/a.ts"), "export const f = () => 1;\n").unwrap();
+    fs::write(
+        root.join("src/b.ts"),
+        "export function g() {\n  const f = () => 2;\n  return f();\n}\n",
+    )
+    .unwrap();
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let mut config = source_config(root.clone(), Language::Rust);
+    let mut typescript = config.targets[0].clone();
+    typescript.name = Language::TypeScript.as_db_str().to_string();
+    typescript.language = Language::TypeScript;
+    config.targets.push(typescript);
+
+    // Every `f` call site as `(caller file, bound target file)`.
+    let f_calls = |db: &IndexDatabase| -> Vec<(String, Option<String>)> {
+        db.storage
+            .connection()
+            .prepare(
+                "SELECT f.path, IIF(e.to_symbol_id IS NULL, NULL, COALESCE(tf.path, 'dangling'))
+                 FROM edges e
+                 JOIN files f ON f.id = e.source_file_id
+                 LEFT JOIN symbols t ON t.id = e.to_symbol_id
+                 LEFT JOIN files tf ON tf.id = t.file_id
+                 WHERE e.edge_kind = 'calls_name' AND e.to_name = 'f'
+                 ORDER BY f.path",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let unresolved = vec![("src/b.ts".to_string(), None), ("src/lib.rs".to_string(), None)];
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    assert_eq!(f_calls(&db), unresolved, "full rebuild");
+    db.resolve_edges().unwrap();
+    assert_eq!(f_calls(&db), unresolved, "database re-resolve");
+    drop(db);
+
+    fs::write(root.join("src/lib.rs"), "// touched\npub fn run<F: Fn()>(f: F) {\n    f();\n}\n")
+        .unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(f_calls(&db), unresolved, "scoped incremental pass");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// A reference a local variable wins is stored unresolved, so no in-edge leads from the local's
+/// file to the caller. Renaming the local in a dirty edit must still rebind the caller on a scoped
+/// incremental pass exactly as a fresh index binds it, through a plain or an aliased import,
+/// whether the full rebuild or the database re-resolve last resolved the reference.
+#[test]
+fn renaming_a_winning_local_variable_rebinds_its_callers_incrementally() {
+    const SEEDED: &str =
+        "function g() { const f = () => 1; return 0; }\nexport const f = () => 2;\n";
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/before.ts"), SEEDED).unwrap();
+    fs::write(
+        root.join("src/use.ts"),
+        "import { f } from './before';\nexport function use() { f(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/alias.ts"),
+        "import { f as h } from './before';\nexport function alias() { h(); }\n",
+    )
+    .unwrap();
+    init_git_repo(&root);
+    run_git(&root, &["add", "."]);
+    run_git(&root, &["commit", "-q", "-m", "seed"]);
+    let config = source_config(root.clone(), Language::TypeScript);
+
+    // Every call site as `(caller file, bound target line)`.
+    let calls = |db: &IndexDatabase| -> Vec<(String, Option<i64>)> {
+        db.storage
+            .connection()
+            .prepare(
+                "SELECT f.path, t.start_line FROM edges e
+                 JOIN files f ON f.id = e.source_file_id
+                 LEFT JOIN symbols t ON t.id = e.to_symbol_id
+                 WHERE e.edge_kind = 'calls_name' AND f.path != 'src/before.ts'
+                 ORDER BY f.path",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
+    for last_resolved_by in ["full rebuild", "database re-resolve"] {
+        fs::write(root.join("src/before.ts"), SEEDED).unwrap();
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        if last_resolved_by == "database re-resolve" {
+            // Clear what the rebuild recorded, so only the re-resolve can record it again.
+            db.storage
+                .connection()
+                .execute("UPDATE edges_data SET local_binding_file_id = NULL", [])
+                .unwrap();
+            db.resolve_edges().unwrap();
+        }
+        assert_eq!(
+            calls(&db),
+            [("src/alias.ts".into(), None), ("src/use.ts".into(), None)],
+            "{last_resolved_by}"
+        );
+        drop(db);
+
+        fs::write(
+            root.join("src/before.ts"),
+            "function g() { const q = () => 1; return 0; }\nexport const f = () => 2;\n",
+        )
+        .unwrap();
+        let db = IndexDatabase::index_changed(&config).unwrap();
+        let incremental = calls(&db);
+        drop(db);
+        let fresh = calls(&IndexDatabase::rebuild(&config).unwrap());
+        assert_eq!(incremental, fresh, "scoped incremental pass after {last_resolved_by}");
+        assert!(fresh.contains(&("src/use.ts".into(), Some(2))), "{fresh:?}");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Same-named declarations of one file are variants of one logical symbol, and a reference that
+/// reaches only them binds the first in source order. A local variable keeps its place in that
+/// order (#1466): declared first, it is the one the reference wins, so the reference stays
+/// unresolved; declared after the file-level `const`, the reference binds the `const` as before.
+#[test]
+fn a_local_variable_keeps_its_place_among_same_named_declarations() {
+    let root = unique_temp_root();
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src/before.ts"),
+        "function g() { const f = () => 1; return 0; }\nexport const f = () => 2;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/after.ts"),
+        "export const h = () => 2;\nfunction k() { const h = () => 1; return 0; }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/use.ts"),
+        "import { f } from './before';\nimport { h } from './after';\nexport function use() { \
+         f(); h(); }\n",
+    )
+    .unwrap();
+    let config = source_config(root.clone(), Language::TypeScript);
+
+    let bound = |db: &IndexDatabase, callee: &str| -> Option<(String, i64)> {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT tf.path, t.start_line FROM edges e
+                 JOIN symbols t ON t.id = e.to_symbol_id
+                 JOIN files tf ON tf.id = t.file_id
+                 WHERE e.edge_kind = 'calls_name' AND e.to_name = ?1",
+                [callee],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    };
+
+    let db = IndexDatabase::rebuild(&config).unwrap();
+    for pass in ["full rebuild", "database re-resolve"] {
+        if pass == "database re-resolve" {
+            db.resolve_edges().unwrap();
+        }
+        assert_eq!(bound(&db, "f"), None, "{pass}");
+        assert_eq!(bound(&db, "h"), Some(("src/after.ts".to_string(), 1)), "{pass}");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Local bindings belong to their checkout's file row. A linked worktree that declares a local `f`
+/// where the base checkout has none must not make the base's `f()` ambiguous: the base resolves
+/// and counts rivals exactly as a fresh index of the base does. The scoped edit and removal passes
+/// touch `lib.rs` too, so its `f()` is re-resolved against the scoped pool rather than kept from
+/// the earlier rebuild. And the sibling's rows survive the base editing and then deleting the
+/// same path incrementally.
+#[test]
+fn a_sibling_worktrees_local_variable_stays_out_of_the_base_checkout() {
+    const WITHOUT_LOCAL: &str = "export function g() {\n  const q = () => 2;\n  return q();\n}\n";
+    const LIB: &str = "pub fn run<F: Fn()>(f: F) {\n    f();\n}\n";
+    let main = unique_temp_root();
+    let _ = fs::remove_dir_all(&main);
+    fs::create_dir_all(main.join("src")).unwrap();
+    fs::write(main.join("src/lib.rs"), LIB).unwrap();
+    fs::write(main.join("src/a.ts"), "export const f = () => 1;\n").unwrap();
+    fs::write(main.join("src/b.ts"), WITHOUT_LOCAL).unwrap();
+    init_git_repo(&main);
+    run_git(&main, &["add", "."]);
+    run_git(&main, &["commit", "-q", "-m", "base"]);
+    let mut config = source_config(main.clone(), Language::Rust);
+    let mut typescript = config.targets[0].clone();
+    typescript.name = Language::TypeScript.as_db_str().to_string();
+    typescript.language = Language::TypeScript;
+    config.targets.push(typescript);
+
+    // The file the base checkout's `lib.rs` call to `f` binds to, if any.
+    let base_f_target = |db: &IndexDatabase| -> Option<String> {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT tf.path FROM edges e
+                 JOIN files f ON f.id = e.source_file_id
+                 LEFT JOIN symbols t ON t.id = e.to_symbol_id
+                 LEFT JOIN files tf ON tf.id = t.file_id
+                 WHERE e.edge_kind = 'calls_name' AND e.to_name = 'f' AND f.path = 'src/lib.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    let sibling_bindings = |db: &IndexDatabase, worktree_id: &str| -> i64 {
+        db.storage
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM local_bindings lb
+                 JOIN main.files f ON f.id = lb.file_id
+                 WHERE f.path = 'src/b.ts' AND f.worktree_id = ?1 AND lb.name = 'f'",
+                [worktree_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    let mut db = IndexDatabase::rebuild(&config).unwrap();
+    let fresh = base_f_target(&db);
+    assert_eq!(fresh, Some("src/a.ts".to_string()), "a fresh base index binds the one `f`");
+
+    let linked = unique_temp_root();
+    let _ = fs::remove_dir_all(&linked);
+    run_git(&main, &["worktree", "add", "-q", "-b", "feat", linked.to_str().unwrap()]);
+    fs::write(
+        linked.join("src/b.ts"),
+        "export function g() {\n  const f = () => 2;\n  return f();\n}\n",
+    )
+    .unwrap();
+    run_git(&linked, &["add", "."]);
+    run_git(&linked, &["commit", "-q", "-m", "branch local"]);
+    let report = db.index_worktree_overlay(&config, &linked, &mut |_| {}).unwrap();
+    assert!(report.indexed >= 1, "b.ts indexed as an overlay row");
+    let sibling = worktree_id_of(&linked);
+    assert_eq!(sibling_bindings(&db, &sibling), 1, "the sibling recorded its local `f`");
+
+    set_base_scope(&mut db, &main);
+    db.resolve_edges().unwrap();
+    assert_eq!(base_f_target(&db), fresh, "the base re-resolve ignores the sibling's local");
+    assert!(
+        rag_rat_query::graph::unique_symbol_name(db.storage.connection(), "f").unwrap(),
+        "the sibling's local is no rival of the base's `f`"
+    );
+    drop(db);
+
+    fs::write(main.join("src/b.ts"), format!("// touched\n{WITHOUT_LOCAL}")).unwrap();
+    fs::write(main.join("src/lib.rs"), format!("// touched\n{LIB}")).unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(base_f_target(&db), fresh, "a scoped base edit ignores the sibling's local");
+    assert_eq!(sibling_bindings(&db, &sibling), 1, "a base edit keeps the sibling's rows");
+    drop(db);
+
+    fs::remove_file(main.join("src/b.ts")).unwrap();
+    fs::write(main.join("src/lib.rs"), format!("// touched again\n{LIB}")).unwrap();
+    let db = IndexDatabase::index_changed(&config).unwrap();
+    assert_eq!(base_f_target(&db), fresh, "a scoped base removal ignores the sibling's local");
+    assert_eq!(sibling_bindings(&db, &sibling), 1, "a base removal keeps the sibling's rows");
+    drop(db);
+
+    let _ = fs::remove_dir_all(&linked);
+    let _ = fs::remove_dir_all(&main);
+}

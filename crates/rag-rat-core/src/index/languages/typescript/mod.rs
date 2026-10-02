@@ -57,6 +57,26 @@ impl ParserBackend for TypeScript {
         &["class", "const", "function", "interface", "type"]
     }
 
+    fn function_scopes(&self) -> &'static [&'static str] {
+        &[
+            "function_declaration",
+            "generator_function_declaration",
+            "method_definition",
+            "function_expression",
+            "generator_function",
+            "arrow_function",
+            "class_static_block",
+        ]
+    }
+
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &["const"]
+    }
+
+    fn member_bodies(&self) -> &'static [&'static str] {
+        &["class_body"]
+    }
+
     fn parser_kind(&self, path: &Path) -> ParserKind {
         if path.extension().and_then(|ext| ext.to_str()) == Some("tsx") {
             ParserKind::Tsx

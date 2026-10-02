@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::hooks::MigrationHooks;
 
-pub const LATEST_SCHEMA_VERSION: u32 = 134;
+pub const LATEST_SCHEMA_VERSION: u32 = 135;
 
 /// The `files.kind` token of a deletion tombstone — the row `mark_file_deleted` /
 /// `write_tombstone_in_scope` leave for a path the checkout no longer serves. It is outside
@@ -101,6 +101,8 @@ pub const CASCADE_FK_ALLOWLIST: &[(&str, &str)] = &[
     ("edges_data", "files"),
     // `symbols` are rebuilt per-file (AUTOINCREMENT rowids re-mint on reindex).
     ("symbols", "files"),
+    // Local variable bindings are rewritten with the file's symbols.
+    ("local_bindings", "files"),
     // Logical-symbol grouping is rebuilt wholesale from the live symbols on every pass.
     ("logical_symbol_members", "symbols"),
     ("logical_symbol_members", "logical_symbols"),
@@ -1195,6 +1197,14 @@ additive_migrations! {
          its newest carrying entry, so retention pins the entry a chain holds rather than keying on \
          the clock's device (#1488); backfilled with one statement per clock at its own identity",
     ) => MigrationFn::Plain(migrations::apply_row_statements);
+    MIGRATION_135_ID, MIGRATION_135_CHECKSUM, MIGRATION_135_DESCRIPTION = (
+        "135_local_bindings",
+        "sha256:rag-rat-local-bindings-v135",
+        "Add local_bindings: the function-local variables a file declares, which are not symbols \
+         but which edge resolution counts as never-bound candidates for their names, and \
+         edges_data.local_binding_file_id: the file whose local variable won an unresolved \
+         reference (#1466)",
+    ) => MigrationFn::Plain(migrations::apply_local_bindings);
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

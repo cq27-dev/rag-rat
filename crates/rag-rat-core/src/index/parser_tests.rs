@@ -1209,6 +1209,7 @@ fn an_export_or_a_variable_declaration_beneath_the_error_is_recovered() {
         ("function".to_owned(), "E::m".to_owned()),
         ("const".to_owned(), "c".to_owned()),
     ]);
+    // `s` is a local variable of the arrow function, so no symbol.
     let src = "do\nexport function after(){ y(; }\nexport class E { m(){ y(; } }\nconst c = () => \
                { let s = ; };\n";
     assert_eq!(symbol_scopes("s.ts", Language::TypeScript, src), [
@@ -1216,8 +1217,51 @@ fn an_export_or_a_variable_declaration_beneath_the_error_is_recovered() {
         ("class".to_owned(), "E".to_owned()),
         ("function".to_owned(), "E::m".to_owned()),
         ("const".to_owned(), "c".to_owned()),
-        ("const".to_owned(), "s".to_owned()),
     ]);
     let src = "do\nconst a = () => {}, b = f(;\n";
     assert!(symbol_scopes("s.ts", Language::TypeScript, src).is_empty(), "{src}");
+}
+
+/// One local-variable policy in every language (#1466): a value binding declared in a function
+/// body or closure is a local variable and not a symbol. File-level and member value bindings stay
+/// symbols, and a type or function declared in a function body keeps its scope path (#1496).
+#[test]
+fn function_local_declarations_follow_one_policy_in_every_language() {
+    // Every language reports, so one run shows the whole domain a regression reaches.
+    let mismatches = crate::index::languages::test_support::fixtures()
+        .filter_map(|(language, fixture)| {
+            let symbols = parser::parse_symbols(
+                Path::new(fixture.path),
+                language,
+                fixture.local_declarations,
+            )
+            .expect("parse");
+            let symbols = symbols
+                .iter()
+                .map(|symbol| (symbol.kind.as_str(), symbol.scope_path.as_str()))
+                .collect::<Vec<_>>();
+            (symbols != fixture.local_declarations_symbols)
+                .then(|| format!("{language}: {symbols:?}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+}
+
+/// A `function_scopes` entry that names no node of its grammar, or a `local_variable_kinds` entry
+/// the backend never emits, matches nothing: the local variables it meant to cover silently stay
+/// symbols. A `member_bodies` entry that names no node lets the members it meant to keep drop as
+/// local variables.
+#[test]
+fn local_declaration_tables_name_real_kinds() {
+    for (language, fixture) in crate::index::languages::test_support::fixtures() {
+        let backend = crate::index::languages::parser_backend(language);
+        let grammar = parser::grammar_for(backend.parser_kind(Path::new(fixture.path)))
+            .expect("a structural grammar");
+        for kind in backend.function_scopes().iter().chain(backend.member_bodies()) {
+            assert_ne!(grammar.id_for_node_kind(kind, true), 0, "{language}: node `{kind}`");
+        }
+        for kind in backend.local_variable_kinds() {
+            assert!(backend.symbol_kinds().contains(kind), "{language}: symbol kind `{kind}`");
+        }
+    }
 }

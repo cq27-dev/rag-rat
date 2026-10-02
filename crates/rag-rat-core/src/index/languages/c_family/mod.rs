@@ -100,6 +100,10 @@ impl ParserBackend for C {
         &["enum", "function", "macro", "struct", "type", "union"]
     }
 
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::C
     }
@@ -144,6 +148,10 @@ impl ParserBackend for C {
 impl ParserBackend for Cpp {
     fn symbol_kinds(&self) -> &'static [&'static str] {
         &["class", "enum", "function", "macro", "namespace", "struct", "type", "union"]
+    }
+
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &[]
     }
 
     fn parser_kind(&self, _path: &Path) -> ParserKind {

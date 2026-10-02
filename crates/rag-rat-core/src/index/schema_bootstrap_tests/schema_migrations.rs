@@ -1811,7 +1811,7 @@ fn migration_101_file_graph_version_provenance() {
 /// V103 (#1109) makes memory bindings deterministic whole-row `anchors/1` state.
 #[test]
 fn migration_103_syncable_memory_bindings() {
-    assert_eq!(schema::LATEST_SCHEMA_VERSION, 134, "move this pin with the next schema migration");
+    assert_eq!(schema::LATEST_SCHEMA_VERSION, 135, "move this pin with the next schema migration");
 
     let conn = fresh_conn();
     conn.execute_batch(
@@ -2703,4 +2703,37 @@ fn migration_134_row_statements_backfill_one_per_clock() {
         [("a".into(), "aa".into(), 3), ("b".into(), "bb".into(), 9)],
         "one statement per clock at its identity; the replay kept the advanced one",
     );
+}
+
+/// V135 (#1466) records each file's local variables for edge resolution. The rows belong to their
+/// file and go with it, and the table is STRICT, so a span that is not an integer is refused.
+#[test]
+fn migration_135_local_bindings() {
+    let bare = rusqlite::Connection::open_in_memory().unwrap();
+    bare.execute_batch(
+        "PRAGMA foreign_keys = ON; CREATE TABLE files(id INTEGER PRIMARY KEY);
+         CREATE TABLE edges_data(id INTEGER PRIMARY KEY) STRICT;",
+    )
+    .unwrap();
+    schema::migrations::apply_local_bindings(&bare).unwrap();
+    schema::migrations::apply_local_bindings(&bare).expect("replay is a no-op");
+    bare.execute("INSERT INTO edges_data(id, local_binding_file_id) VALUES (1, 7), (2, NULL)", [])
+        .expect("an edge names the file of the local that won it, or none");
+
+    bare.execute("INSERT INTO files(id) VALUES (1)", []).unwrap();
+    let insert = |start: &str| {
+        bare.execute(
+            &format!(
+                "INSERT INTO local_bindings(file_id, name, kind, scope_path, start_byte, end_byte)
+                 VALUES (1, 'x', 'const', 'x', {start}, 20)"
+            ),
+            [],
+        )
+    };
+    insert("'ten'").expect_err("a span is an integer");
+    insert("10").expect("a well-formed binding");
+    bare.execute("DELETE FROM files WHERE id = 1", []).unwrap();
+    let left: i64 =
+        bare.query_row("SELECT COUNT(*) FROM local_bindings", [], |row| row.get(0)).unwrap();
+    assert_eq!(left, 0, "a file's local bindings go with it");
 }

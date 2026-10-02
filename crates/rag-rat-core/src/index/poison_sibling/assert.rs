@@ -32,6 +32,7 @@ pub(super) fn sibling_tripwires(conn: &Connection) -> anyhow::Result<Vec<(&'stat
         ("docs", format!("repo_id = '{POISON_REPO_ID}'")),
         ("logical_symbols", format!("id = {POISON_LOGICAL_ID} AND repo_id = '{POISON_REPO_ID}'")),
         ("symbols", file_scope.clone()),
+        ("local_bindings", file_scope.clone()),
         ("chunks", file_scope.clone()),
         (
             "edges_data",

@@ -548,10 +548,17 @@ pub fn unique_symbol_name(conn: &Connection, name: &str) -> anyhow::Result<bool>
     // branch and suppresses a genuine LIVE hop from the returned rows. Joining the scoped view
     // counts only the live generation's symbols, matching the row queries in `traverse` /
     // `traversal_summary`.
+    //
+    // A function-local variable is not a symbol, but it still declares the name (#1466), so an
+    // unresolved reference of that name may mean the local: it counts as a rival exactly as edge
+    // resolution counts it.
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) AS symbol_count FROM symbols
-         JOIN files ON files.id = symbols.file_id
-         WHERE symbols.name = ?1",
+        "SELECT (SELECT COUNT(*) FROM symbols
+                 JOIN files ON files.id = symbols.file_id
+                 WHERE symbols.name = ?1)
+              + (SELECT COUNT(*) FROM local_bindings
+                 JOIN files ON files.id = local_bindings.file_id
+                 WHERE local_bindings.name = ?1) AS symbol_count",
         [name],
         |row| row.get("symbol_count"),
     )?;
@@ -576,15 +583,40 @@ pub(crate) fn short_name_identifies_seed_alone(
     symbol: &str,
     options: &GraphTraversalOptions,
 ) -> anyhow::Result<bool> {
-    let outside_seed = if options.logical_symbol_id.is_some() {
-        "symbols.id NOT IN (
-            SELECT symbol_id FROM logical_symbol_members WHERE logical_symbol_id = ?2
-         )"
+    // A local variable is not a symbol, but it declares the name, so it is a rival too (see
+    // `unique_symbol_name`) unless it sits inside the seed exactly as it did while it was indexed
+    // as a symbol: its qualified name is always `path::name`, and it would have joined the
+    // seed's logical symbol when its whole logical key matches a member's.
+    let (outside_seed, local_outside_seed) = if options.logical_symbol_id.is_some() {
+        (
+            "symbols.id NOT IN (
+                SELECT symbol_id FROM logical_symbol_members WHERE logical_symbol_id = ?2
+             )",
+            "NOT EXISTS (
+                SELECT 1 FROM logical_symbol_members members
+                JOIN symbols member ON member.id = members.symbol_id
+                JOIN main.files member_file ON member_file.id = member.file_id
+                WHERE members.logical_symbol_id = ?2
+                  AND member_file.path = files.path
+                  AND member.language = files.language
+                  AND member.name = local_bindings.name
+                  AND member.kind = local_bindings.kind
+                  AND COALESCE(member.scope_path, '') = local_bindings.scope_path
+                  AND member.signature IS local_bindings.signature
+                  AND member.qualified_name_id IS (
+                      SELECT id FROM name_strings
+                      WHERE value = files.path || '::' || local_bindings.name
+                  )
+             )",
+        )
     } else {
         // `IS NOT` is SQLite's null-safe inequality: a symbol with no interned qualified name, or a
         // seed name absent from the pool, must still count as outside the seed rather than vanish.
-        "symbols.id != ?2
-         AND symbols.qualified_name_id IS NOT (SELECT id FROM name_strings WHERE value = ?3)"
+        (
+            "symbols.id != ?2
+             AND symbols.qualified_name_id IS NOT (SELECT id FROM name_strings WHERE value = ?3)",
+            "files.path || '::' || local_bindings.name IS NOT ?3",
+        )
     };
     // Bound per branch: the logical arm never mentions `?3`, and SQLite counts a statement's
     // parameters by the highest index it references, so passing the seed name there is rejected.
@@ -598,9 +630,13 @@ pub(crate) fn short_name_identifies_seed_alone(
     }
     let outside_seed_count: i64 = conn.query_row(
         &format!(
-            "SELECT COUNT(*) AS outside_seed_count FROM symbols
-             JOIN files ON files.id = symbols.file_id
-             WHERE symbols.name = ?1 AND ({outside_seed})"
+            "SELECT (SELECT COUNT(*) FROM symbols
+                     JOIN files ON files.id = symbols.file_id
+                     WHERE symbols.name = ?1 AND ({outside_seed}))
+                  + (SELECT COUNT(*) FROM local_bindings
+                     JOIN files ON files.id = local_bindings.file_id
+                     WHERE local_bindings.name = ?1 AND ({local_outside_seed}))
+                 AS outside_seed_count"
         ),
         params_from_iter(params),
         |row| row.get("outside_seed_count"),

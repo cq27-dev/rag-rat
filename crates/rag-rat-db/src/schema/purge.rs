@@ -237,6 +237,11 @@ const TRANSITIVE_SCOPED_TABLES: &[TransitiveTable] = &[
         parent_ids: PurgeIdSet::Files,
     },
     TransitiveTable { table: "symbols", id_column: "file_id", parent_ids: PurgeIdSet::Files },
+    TransitiveTable {
+        table: "local_bindings",
+        id_column: "file_id",
+        parent_ids: PurgeIdSet::Files,
+    },
     TransitiveTable { table: "chunks", id_column: "file_id", parent_ids: PurgeIdSet::Files },
     // memory children (repo_memories.id → memory_id)
     TransitiveTable {

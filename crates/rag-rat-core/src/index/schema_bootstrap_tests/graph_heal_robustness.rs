@@ -1029,7 +1029,7 @@ fn a_c_file_derived_before_the_symbol_change_is_re_extracted_on_upgrade() {
         )
         .unwrap();
     owe_both_heals(&db);
-    let previous_key_version = LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1;
+    let previous_key_version = symbol_set_changed_at(Language::C).unwrap() - 1;
     db.storage
         .connection()
         .execute("UPDATE main.files SET scope_version = ?1 WHERE id = ?2", [
@@ -1104,6 +1104,112 @@ fn a_file_derived_before_error_recovery_is_re_extracted_on_upgrade() {
     }
 }
 
+/// TypeScript, Kotlin, Swift and Go used to index a local variable declared in a function body as a
+/// symbol, and recorded no `local_bindings` for edge resolution. The span-matched scope refresh can
+/// rescope a row but never delete one, so each of those languages must be re-extracted. The other
+/// languages declare no local variable kinds; Python's extractor never emitted one.
+#[test]
+fn a_file_derived_before_local_variables_were_dropped_heals_on_upgrade() {
+    for (language, fixture) in crate::index::languages::test_support::fixtures() {
+        let backend = crate::index::languages::parser_backend(language);
+        let Some(local_kind) = backend.local_variable_kinds().first() else {
+            continue;
+        };
+        let path = format!("src/{}", fixture.path);
+        let root = unique_temp_root();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join(&path), fixture.local_declarations).unwrap();
+        let config = source_config(root.to_path_buf(), language);
+        let db = IndexDatabase::rebuild(&config).unwrap();
+        let fresh = file_symbol_scopes(&db, &path);
+        let fresh_bindings = file_local_binding_names(&db, &path);
+        assert!(!fresh_bindings.is_empty(), "{language}: the fixture declares local variables");
+
+        // What the previous extractor persisted: a local variable as a symbol.
+        let file_id = scoped_file_id(&db, &path, &db.active_worktree_id.clone());
+        let conn = db.storage.connection();
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('symbols') WHERE name != 'id'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let copied = columns
+            .iter()
+            .map(|column| match column.as_str() {
+                "name" | "scope_path" => "'x'",
+                "kind" => "?2",
+                other => other,
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
+            &format!(
+                "INSERT INTO main.symbols({}) SELECT {copied} FROM main.symbols
+                 WHERE file_id = ?1 AND scope_path = 'f'",
+                columns.join(", ")
+            ),
+            params![file_id, local_kind],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM main.local_bindings WHERE file_id = ?1", [file_id]).unwrap();
+        assert_ne!(file_symbol_scopes(&db, &path), fresh, "{language}: staging changed nothing");
+        owe_both_heals(&db);
+        let previous_key_version = LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1;
+        conn.execute("UPDATE main.files SET scope_version = ?1 WHERE id = ?2", [
+            previous_key_version,
+            file_id,
+        ])
+        .unwrap();
+        db.set_repo_meta(LOGICAL_KEY_VERSION_KEY, &previous_key_version.to_string()).unwrap();
+        drop(db);
+
+        let db = IndexDatabase::open_config(&config).unwrap();
+        assert_eq!(file_symbol_scopes(&db, &path), fresh, "{language}");
+        assert_eq!(file_local_binding_names(&db, &path), fresh_bindings, "{language}");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+/// Every symbol scope path in the file at `path`, sorted.
+fn file_symbol_scopes(db: &IndexDatabase, path: &str) -> Vec<String> {
+    let mut scopes = db
+        .storage
+        .connection()
+        .prepare(
+            "SELECT s.scope_path FROM main.symbols s JOIN main.files f ON f.id = s.file_id
+             WHERE f.path = ?1 AND f.repo_id = ?2 AND f.generation = ?3",
+        )
+        .unwrap()
+        .query_map(params![path, &db.active_repo_id, db.active_generation], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    scopes.sort();
+    scopes
+}
+
+/// Every local binding name recorded for the file at `path`, sorted.
+fn file_local_binding_names(db: &IndexDatabase, path: &str) -> Vec<String> {
+    let mut names = db
+        .storage
+        .connection()
+        .prepare(
+            "SELECT b.name FROM main.local_bindings b JOIN main.files f ON f.id = b.file_id
+             WHERE f.path = ?1 AND f.repo_id = ?2 AND f.generation = ?3",
+        )
+        .unwrap()
+        .query_map(params![path, &db.active_repo_id, db.active_generation], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<String>, _>>()
+        .unwrap();
+    names.sort();
+    names
+}
+
 fn scoped_symbol_names(db: &IndexDatabase, file_id: i64) -> Vec<String> {
     let mut names = db
         .storage
@@ -1128,7 +1234,7 @@ fn stage_previous_c_derivation(db: &IndexDatabase, file_id: i64, from: &str, to:
             file_id, from, to
         ])
         .unwrap();
-    let previous_key_version = LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1;
+    let previous_key_version = symbol_set_changed_at(Language::C).unwrap() - 1;
     db.storage
         .connection()
         .execute("UPDATE main.files SET scope_version = ?1 WHERE id = ?2", [
@@ -1177,7 +1283,7 @@ fn a_c_re_extract_heals_each_checkout_from_its_own_bytes() {
     assert_eq!(scoped_symbol_names(&db, overlay_id), vec!["sig"], "the sibling row is untouched");
     assert_eq!(
         file_scope_version(&db, overlay_id),
-        LOGICAL_KEY_VERSION.parse::<i64>().unwrap() - 1
+        symbol_set_changed_at(Language::C).unwrap() - 1
     );
 
     let mut linked_config = source_config(linked.to_path_buf(), Language::C);

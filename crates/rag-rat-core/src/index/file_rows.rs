@@ -146,6 +146,17 @@ impl IndexDatabase {
              )",
             params![path, repo_id, generation],
         )?;
+        // A reference a local variable of the path wins is stored unresolved, so no in-edge above
+        // leads to it; the edge names the local's file instead.
+        self.storage.connection().execute(
+            "INSERT OR IGNORE INTO temp.edge_rewrite_files(file_id)
+             SELECT DISTINCT edges_data.source_file_id FROM edges_data
+             WHERE edges_data.local_binding_file_id IN (
+                 SELECT id FROM main.files
+                 WHERE path = ?1 AND repo_id = ?2 AND generation = ?3
+             )",
+            params![path, repo_id, generation],
+        )?;
         Ok(())
     }
 
@@ -304,6 +315,15 @@ impl IndexDatabase {
         )?;
         self.storage.connection().execute(
             "DELETE FROM symbols
+             WHERE file_id IN (
+                SELECT id FROM main.files
+                WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4
+                  AND generation = ?5
+             )",
+            params![path, commit_sha, worktree_id, repo_id, generation],
+        )?;
+        self.storage.connection().execute(
+            "DELETE FROM local_bindings
              WHERE file_id IN (
                 SELECT id FROM main.files
                 WHERE path = ?1 AND commit_sha = ?2 AND worktree_id = ?3 AND repo_id = ?4

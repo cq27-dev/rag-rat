@@ -17,12 +17,13 @@ pub(crate) use extract::{
 #[cfg(test)]
 pub(crate) use extract::{edge_candidates, syntactic_edges};
 pub(crate) use helpers::{
-    EdgeStringInterner, IdentifierPath, SymbolLocator, all_symbols, call_target_name,
-    call_target_node, child_name_text, edge_evidence, final_segment_node, first_identifier_node,
-    first_identifier_text, identifiers_under, insert_candidates, intern_edge_string,
-    is_rust_path_keyword, last_identifier_node, last_identifier_text, looks_like_type_name,
-    named_children, node_text, scoped_receiver_name, short_name, span_for_node, symbols_for_file,
-    target_qualified_name, unwrap_generic_function, use_declaration_evidence,
+    EdgeStringInterner, IdentifierPath, SymbolLocator, all_local_bindings, all_symbols,
+    call_target_name, call_target_node, child_name_text, edge_evidence, final_segment_node,
+    first_identifier_node, first_identifier_text, identifiers_under, insert_candidates,
+    intern_edge_string, is_rust_path_keyword, last_identifier_node, last_identifier_text,
+    looks_like_type_name, named_children, node_text, scoped_receiver_name, short_name,
+    span_for_node, symbols_for_file, target_qualified_name, unwrap_generic_function,
+    use_declaration_evidence,
 };
 pub(crate) use imports::scan_packages;
 use intern::{OptSym, StrArena, Sym};
@@ -417,6 +418,79 @@ impl IndexedSymbol {
         out.sort_by_key(|symbol| (symbol.start_byte, symbol.end_byte));
         out
     }
+
+    /// The resolution candidate for local binding `ordinal` of the pass. It carries a negative id,
+    /// which no symbol has, and no line span, since it is never bound.
+    fn local_binding(ordinal: i64, fields: LocalBindingFields) -> Self {
+        let LocalBindingFields { file_id, language, path, name, kind, scope_path, start, end } =
+            fields;
+        IndexedSymbol {
+            id: -1 - ordinal,
+            file_id,
+            language,
+            qualified_name: format!("{path}::{name}"),
+            name,
+            scope_path,
+            kind,
+            start_byte: start,
+            end_byte: end,
+            start_line: 0,
+            end_line: 0,
+        }
+    }
+
+    /// Whether this candidate is a local variable (`parser::LocalBinding`) rather than a symbol:
+    /// it competes for its name like the symbol it once was, but a reference it wins stays
+    /// unresolved.
+    pub(in crate::index) fn is_local_binding(&self) -> bool {
+        self.id < 0
+    }
+}
+
+/// One local binding's fields as the resolution pass reads them.
+pub(crate) struct LocalBindingFields {
+    pub(crate) file_id: i64,
+    pub(crate) language: String,
+    /// `files.path`: the path half of the qualified name the binding would carry as a symbol.
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) scope_path: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+/// Merge `bindings` into `symbols`, which is in resolution order (by qualified name, a file's
+/// symbols in source order), as if each local binding had stayed a symbol: before the first
+/// same-named symbol of its file that it precedes in source. The symbols keep their relative order,
+/// so a resolution stage that takes the first of several candidates picks the same one it would
+/// with the local bindings indexed as symbols.
+pub(crate) fn merge_local_bindings(
+    symbols: Vec<IndexedSymbol>,
+    bindings: impl IntoIterator<Item = LocalBindingFields>,
+) -> Vec<IndexedSymbol> {
+    let mut bindings = bindings
+        .into_iter()
+        .zip(0..)
+        .map(|(fields, ordinal)| IndexedSymbol::local_binding(ordinal, fields))
+        .collect::<Vec<_>>();
+    if bindings.is_empty() {
+        return symbols;
+    }
+    fn order(symbol: &IndexedSymbol) -> (&str, usize, usize) {
+        (&symbol.qualified_name, symbol.start_byte, symbol.end_byte)
+    }
+    bindings.sort_by(|a, b| order(a).cmp(&order(b)));
+    let mut merged = Vec::with_capacity(symbols.len() + bindings.len());
+    let mut bindings = bindings.into_iter().peekable();
+    for symbol in symbols {
+        while let Some(binding) = bindings.next_if(|binding| order(binding) < order(&symbol)) {
+            merged.push(binding);
+        }
+        merged.push(symbol);
+    }
+    merged.extend(bindings);
+    merged
 }
 
 impl EdgeCandidate {
@@ -601,7 +675,35 @@ impl CompactEdge {
 pub(crate) struct FullRebuildGraph {
     arena: StrArena,
     symbols: Vec<CompactSymbol>,
+    local_bindings: Vec<CompactLocalBinding>,
     edges: Vec<(i64, CompactEdge)>,
+}
+
+/// An accumulated local binding in interned form; see [`CompactSymbol`].
+struct CompactLocalBinding {
+    file_id: i64,
+    language: Sym,
+    path: Sym,
+    name: Sym,
+    kind: Sym,
+    scope_path: Sym,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+impl CompactLocalBinding {
+    fn hydrate(&self, arena: &StrArena) -> LocalBindingFields {
+        LocalBindingFields {
+            file_id: self.file_id,
+            language: arena.get(self.language).to_string(),
+            path: arena.get(self.path).to_string(),
+            name: arena.get(self.name).to_string(),
+            kind: arena.get(self.kind).to_string(),
+            scope_path: arena.get(self.scope_path).to_string(),
+            start: self.start_byte,
+            end: self.end_byte,
+        }
+    }
 }
 
 impl FullRebuildGraph {
@@ -627,6 +729,27 @@ impl FullRebuildGraph {
             end_line: i64::try_from(symbol.end_line).unwrap_or(0),
         };
         self.symbols.push(compact);
+    }
+
+    /// Intern and accumulate one local binding of the file at `path` (`files.path`).
+    pub(crate) fn push_local_binding(
+        &mut self,
+        file_id: i64,
+        language: Language,
+        path: &str,
+        binding: &crate::index::parser::LocalBinding,
+    ) {
+        let compact = CompactLocalBinding {
+            file_id,
+            language: self.arena.intern(language.as_db_str()),
+            path: self.arena.intern(path),
+            name: self.arena.intern(&binding.name),
+            kind: self.arena.intern(&binding.kind),
+            scope_path: self.arena.intern(&binding.scope_path),
+            start_byte: binding.start_byte,
+            end_byte: binding.end_byte,
+        };
+        self.local_bindings.push(compact);
     }
 
     /// Intern and accumulate one edge candidate produced by the prepare phase, after its local
@@ -660,9 +783,25 @@ impl FullRebuildGraph {
         self.edges.push((file_id, compact));
     }
 
-    fn into_parts(self) -> (StrArena, Vec<CompactSymbol>, Vec<(i64, CompactEdge)>) {
-        (self.arena, self.symbols, self.edges)
+    /// Split the graph for resolution, hydrating the local bindings: the arena is frozen by now.
+    fn into_parts(self) -> FullRebuildParts {
+        let local_bindings =
+            self.local_bindings.iter().map(|binding| binding.hydrate(&self.arena)).collect();
+        FullRebuildParts {
+            arena: self.arena,
+            symbols: self.symbols,
+            local_bindings,
+            edges: self.edges,
+        }
     }
+}
+
+/// A [`FullRebuildGraph`] taken apart for the resolve-and-insert pass.
+struct FullRebuildParts {
+    arena: StrArena,
+    symbols: Vec<CompactSymbol>,
+    local_bindings: Vec<LocalBindingFields>,
+    edges: Vec<(i64, CompactEdge)>,
 }
 
 #[derive(Debug, Clone, Copy)]

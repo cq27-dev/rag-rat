@@ -50,6 +50,26 @@ impl ParserBackend for Kotlin {
         &["class", "function", "object", "property"]
     }
 
+    fn function_scopes(&self) -> &'static [&'static str] {
+        &[
+            "function_declaration",
+            "secondary_constructor",
+            "anonymous_initializer",
+            "anonymous_function",
+            "lambda_literal",
+            "getter",
+            "setter",
+        ]
+    }
+
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &["property"]
+    }
+
+    fn member_bodies(&self) -> &'static [&'static str] {
+        &["class_body", "enum_class_body"]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Kotlin
     }

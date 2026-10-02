@@ -235,11 +235,18 @@ fn unresolved_verdict(
     (confidence, resolution)
 }
 
+/// A reference's resolution: the symbol it binds, if any, and, when a local variable wins it, the
+/// file that declares the local (`edges_data.local_binding_file_id`).
+struct ReferenceResolution<'s> {
+    resolved: Option<Resolved<'s>>,
+    local_binding_file_id: Option<i64>,
+}
+
 fn resolve_reference<'s>(
     reference: ReferenceInputs<'_>,
     import_scope: &ImportScope,
     index: &SymbolIndex<'s>,
-) -> Option<Resolved<'s>> {
+) -> ReferenceResolution<'s> {
     let ReferenceInputs {
         file_id,
         source_language,
@@ -273,7 +280,7 @@ fn resolve_reference<'s>(
         let root = hint.trim().split_once("::").map_or(hint.trim(), |(root, _)| root);
         import_scope.has_import_alias(file_id, root, ref_byte)
     });
-    resolve_symbol(
+    let resolved = resolve_symbol(
         ResolveSymbolRequest {
             name: rebind.name.as_deref().unwrap_or(to_name),
             target_qualified_name: rebind
@@ -311,7 +318,14 @@ fn resolve_reference<'s>(
             file_package: import_scope.file_packages(),
         },
         index,
-    )
+    );
+    // A local variable is not a symbol, so a reference it wins stays unresolved. It must not fall
+    // through to a later stage either: with the local indexed, no later stage would have run.
+    match resolved {
+        Some((target, ..)) if target.is_local_binding() =>
+            ReferenceResolution { resolved: None, local_binding_file_id: Some(target.file_id) },
+        resolved => ReferenceResolution { resolved, local_binding_file_id: None },
+    }
 }
 
 /// Load the per-package local-crate sets and COMPUTE each active file's owning package into `scope`
@@ -547,7 +561,7 @@ pub(crate) fn resolve_overlay_edges(conn: &Connection, worktree_id: &str) -> any
 }
 
 fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> anyhow::Result<()> {
-    let symbols = all_symbols(conn)?;
+    let symbols = super::merge_local_bindings(all_symbols(conn)?, all_local_bindings(conn)?);
     let index = SymbolIndex::build(&symbols);
     // Per-package + module-aware import scope (#61): the active checkout's Imports edges → per-file
     // module-scoped bindings, plus the per-package local-crate sets, so resolution suppresses a
@@ -599,12 +613,12 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
     // rewritten; empty for the base/incremental/full-rebuild path.
     let mut stmt = conn.prepare(&format!(
         "SELECT d.id, d.source_file_id, tn.value, tqn.value, ek.value, conf.value, d.evidence, \
-         rh.value, rth.value, d.source_start_byte, files.language FROM edges_data d JOIN files ON \
-         files.id = d.source_file_id LEFT JOIN name_strings tn ON tn.id = d.to_name_id LEFT JOIN \
-         name_strings tqn ON tqn.id = d.target_qualified_name_id LEFT JOIN name_strings ek ON \
-         ek.id = d.edge_kind_id LEFT JOIN name_strings conf ON conf.id = d.confidence_id LEFT \
-         JOIN name_strings rh ON rh.id = d.receiver_hint_id LEFT JOIN name_strings rth ON rth.id \
-         = d.receiver_type_hint_id WHERE 1 = 1{} ORDER BY d.id",
+         rh.value, rth.value, d.source_start_byte, files.language, d.local_binding_file_id FROM \
+         edges_data d JOIN files ON files.id = d.source_file_id LEFT JOIN name_strings tn ON \
+         tn.id = d.to_name_id LEFT JOIN name_strings tqn ON tqn.id = d.target_qualified_name_id \
+         LEFT JOIN name_strings ek ON ek.id = d.edge_kind_id LEFT JOIN name_strings conf ON \
+         conf.id = d.confidence_id LEFT JOIN name_strings rh ON rh.id = d.receiver_hint_id LEFT \
+         JOIN name_strings rth ON rth.id = d.receiver_type_hint_id WHERE 1 = 1{} ORDER BY d.id",
         write.files_write_predicate(),
     ))?;
     let rows = stmt.query_map([], |row| {
@@ -620,6 +634,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             row.get::<_, Option<String>>(8)?,
             row.get::<_, i64>(9)?,
             row.get::<_, String>(10)?,
+            row.get::<_, Option<i64>>(11)?,
         ))
     })?;
     let rows = rows.collect::<Result<Vec<_>, _>>()?;
@@ -635,6 +650,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
         receiver_type_hint,
         source_start_byte,
         source_language,
+        stored_local_binding_file_id,
     ) in rows
     {
         let edge_kind = EdgeKind::from_db_str(&edge_kind)?;
@@ -656,7 +672,7 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             })?;
             continue;
         }
-        let resolution = resolve_reference(
+        let ReferenceResolution { resolved, local_binding_file_id } = resolve_reference(
             ReferenceInputs {
                 file_id: source_file_id,
                 source_language: Some(source_language.as_str()),
@@ -671,7 +687,13 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
             &import_scope,
             &index,
         );
-        let Some((to_symbol_id, confidence, reason)) = resolution else {
+        let Some((to_symbol_id, confidence, reason)) = resolved else {
+            if local_binding_file_id != stored_local_binding_file_id {
+                conn.prepare_cached(
+                    "UPDATE edges_data SET local_binding_file_id = ?2 WHERE id = ?1",
+                )?
+                .execute(params![edge_id, local_binding_file_id])?;
+            }
             let (confidence, resolution) = unresolved_verdict(
                 Some(&source_language),
                 edge_kind,
@@ -698,7 +720,8 @@ fn resolve_edges_with_scope(conn: &Connection, write: EdgeWriteScope<'_>) -> any
                  target_start_line = ?4,
                  target_end_line = ?5,
                  resolution_id = ?6,
-                 hidden = ?7
+                 hidden = ?7,
+                 local_binding_file_id = NULL
              WHERE id = ?1",
         )?
         .execute(params![
@@ -731,11 +754,13 @@ pub(crate) fn resolve_and_insert_edges(
     conn: &Connection,
     graph: FullRebuildGraph,
 ) -> anyhow::Result<()> {
-    let (arena, compact_symbols, edges) = graph.into_parts();
+    let super::FullRebuildParts { arena, symbols: compact_symbols, local_bindings, edges } =
+        graph.into_parts();
     let mut symbols: Vec<IndexedSymbol> =
         compact_symbols.iter().map(|symbol| symbol.hydrate(&arena)).collect();
     drop(compact_symbols);
     symbols.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name).then(a.id.cmp(&b.id)));
+    let symbols = super::merge_local_bindings(symbols, local_bindings);
     let index = SymbolIndex::build(&symbols);
     crate::index::mem_trace("edges: symbols hydrated + index built, before insert");
 
@@ -845,45 +870,46 @@ pub(crate) fn resolve_and_insert_edges(
         // real target — never resolve it (synthesis reads only its `from_symbol_id`). Mirrors the
         // incremental driver's skip; `dispatch_handle` DOES resolve (synthesis needs its handler
         // id).
-        let resolution = if candidate.edge_kind == EdgeKind::DispatchConstruct {
-            None
-        } else {
-            resolve_reference(
-                ReferenceInputs {
-                    file_id: *file_id,
-                    source_language: file_language.get(file_id).map(String::as_str),
-                    edge_kind: candidate.edge_kind,
-                    to_name,
-                    target_qualified_name,
-                    evidence,
-                    receiver_hint,
-                    receiver_type_hint,
-                    // The same position the DB driver reads from `source_start_byte`.
-                    ref_byte: candidate.source_span.start_byte as usize,
-                },
-                &import_scope,
-                &index,
-            )
-        };
-        let (to_symbol_id, confidence, target_start_line, target_end_line, reason) =
-            match resolution {
-                Some((symbol, confidence, reason)) => (
-                    Some(symbol.id),
-                    confidence,
-                    Some(symbol.start_line),
-                    Some(symbol.end_line),
-                    EdgeResolution::Reason(reason),
-                ),
-                None => {
-                    let (confidence, reason) = unresolved_verdict(
-                        file_language.get(file_id).map(String::as_str),
-                        candidate.edge_kind,
+        let ReferenceResolution { resolved, local_binding_file_id } =
+            if candidate.edge_kind == EdgeKind::DispatchConstruct {
+                ReferenceResolution { resolved: None, local_binding_file_id: None }
+            } else {
+                resolve_reference(
+                    ReferenceInputs {
+                        file_id: *file_id,
+                        source_language: file_language.get(file_id).map(String::as_str),
+                        edge_kind: candidate.edge_kind,
+                        to_name,
+                        target_qualified_name,
                         evidence,
-                        candidate.confidence,
-                    );
-                    (None, confidence, None, None, reason)
-                },
+                        receiver_hint,
+                        receiver_type_hint,
+                        // The same position the DB driver reads from `source_start_byte`.
+                        ref_byte: candidate.source_span.start_byte as usize,
+                    },
+                    &import_scope,
+                    &index,
+                )
             };
+        let (to_symbol_id, confidence, target_start_line, target_end_line, reason) = match resolved
+        {
+            Some((symbol, confidence, reason)) => (
+                Some(symbol.id),
+                confidence,
+                Some(symbol.start_line),
+                Some(symbol.end_line),
+                EdgeResolution::Reason(reason),
+            ),
+            None => {
+                let (confidence, reason) = unresolved_verdict(
+                    file_language.get(file_id).map(String::as_str),
+                    candidate.edge_kind,
+                    evidence,
+                    candidate.confidence,
+                );
+                (None, confidence, None, None, reason)
+            },
+        };
         // NULL when the sentinel marks an absent callee range; see
         // `CompactEdge::callee_byte_columns`.
         let (callee_start_byte, callee_end_byte) = candidate.callee_byte_columns();
@@ -909,10 +935,11 @@ pub(crate) fn resolve_and_insert_edges(
                 callee_start_byte, callee_end_byte,
                 import_scope_start_byte, import_scope_end_byte, import_mod_id,
                 edge_kind_id, confidence_id,
-                to_symbol_id, target_start_line, target_end_line, resolution_id, hidden
+                to_symbol_id, target_start_line, target_end_line, resolution_id, hidden,
+                local_binding_file_id
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
             ",
         )?
         .execute(params![
@@ -940,6 +967,7 @@ pub(crate) fn resolve_and_insert_edges(
             target_end_line,
             resolution_id,
             edge_hidden_flag(candidate.edge_kind, reason),
+            local_binding_file_id,
         ])?;
     }
     crate::index::mem_trace("edges: inserted, before index rebuild");

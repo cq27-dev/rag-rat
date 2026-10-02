@@ -39,6 +39,12 @@ impl ParserBackend for Rust {
         ]
     }
 
+    /// A `let` is not a symbol at all, and a `const` or `static` in a function body is an item,
+    /// not a variable, so it stays a symbol.
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Rust
     }

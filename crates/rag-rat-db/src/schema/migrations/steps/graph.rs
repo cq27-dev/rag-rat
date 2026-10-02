@@ -261,6 +261,43 @@ pub(crate) fn apply_symbol_facts(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// V135 (#1466): the local variables a file declares. A function-local variable binding is not a
+/// symbol, but edge resolution still counts each one as a candidate for its name that is never
+/// bound: a name that is ambiguous only because of a local stays unresolved instead of binding a
+/// same-named symbol elsewhere in the repository, and a reference the local would win stays
+/// unresolved instead of falling through to one. Rewritten with the file's symbols on every
+/// reindex. `scope_path` is the path the binding would carry as a symbol; the qualified name and
+/// language are the file's. Purely additive; the logical-key heal re-extracts the languages with
+/// local variables, which fills it for files indexed before it.
+///
+/// `edges_data.local_binding_file_id` records, on a reference a local variable wins, the file that
+/// declares that local. No in-edge leads from that file to the reference, so a scoped incremental
+/// pass that rewrites the file stages the reference's source file through this column instead. NULL
+/// on every other row; the partial index covers only the stamped rows.
+pub fn apply_local_bindings(conn: &Connection) -> rusqlite::Result<()> {
+    add_column_if_missing(conn, "edges_data", "local_binding_file_id", "INTEGER")?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS local_bindings(
+            file_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            scope_path TEXT NOT NULL,
+            start_byte INTEGER NOT NULL,
+            end_byte INTEGER NOT NULL,
+            signature TEXT,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_local_bindings_file ON local_bindings(file_id);
+        CREATE INDEX IF NOT EXISTS idx_local_bindings_name ON local_bindings(name);
+        CREATE INDEX IF NOT EXISTS idx_edges_data_local_binding_file
+            ON edges_data(local_binding_file_id) WHERE local_binding_file_id IS NOT NULL;
+        ",
+    )?;
+    Ok(())
+}
+
 pub(crate) fn apply_repo_memories(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "

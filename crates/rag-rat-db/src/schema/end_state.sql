@@ -140,7 +140,7 @@ CREATE TABLE edges_data(
             -- an internal dispatch FACT kind (#200) or a suppressed unresolved candidate (V068).
             -- The `edges` view filters on `hidden = 0` (one integer compare per row); every
             -- writer keeps the flag in lockstep with that predicate (see `edge_hidden_flag`).
-            hidden INTEGER NOT NULL DEFAULT 0,
+            hidden INTEGER NOT NULL DEFAULT 0, local_binding_file_id INTEGER,
             FOREIGN KEY(source_file_id) REFERENCES files(id) ON DELETE CASCADE,
             FOREIGN KEY(from_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL,
             FOREIGN KEY(to_symbol_id) REFERENCES symbols(id) ON DELETE SET NULL
@@ -2249,6 +2249,20 @@ CREATE TABLE sync_row_statements(
          ) STRICT;
 CREATE INDEX sync_row_statements_chain
              ON sync_row_statements(stream_id, device_fingerprint, lamport);
+CREATE TABLE local_bindings(
+            file_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            scope_path TEXT NOT NULL,
+            start_byte INTEGER NOT NULL,
+            end_byte INTEGER NOT NULL,
+            signature TEXT,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        ) STRICT;
+CREATE INDEX idx_local_bindings_file ON local_bindings(file_id);
+CREATE INDEX idx_local_bindings_name ON local_bindings(name);
+CREATE INDEX idx_edges_data_local_binding_file
+            ON edges_data(local_binding_file_id) WHERE local_binding_file_id IS NOT NULL;
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('001_sqlite_storage_baseline',1789841199646,'sha256:rag-rat-sqlite-baseline-v1','SQLite storage baseline with FTS, tree-sitter graph edges, git/GitHub, and local AI metadata');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('002_embedding_vector_metadata',1789841199646,'sha256:rag-rat-embedding-vector-metadata-v2','Add embedding model dimension metadata and per-vector dimensions for hybrid vector search');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('003_derived_artifact_reconcile_metadata',1789841199646,'sha256:rag-rat-derived-artifact-reconcile-metadata-v3','Add model version, retry metadata, summaries, and reconcile meta for diff-based derived artifact reconciliation');
@@ -2383,5 +2397,6 @@ INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALU
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('132_invite_checkpoint_digest',1789841199860,'sha256:rag-rat-invite-checkpoint-digest-v132','Record which control-log pin an invite was minted under, so a pin installed between mint and redemption is refused before the one-time nonce is consumed rather than after (#1311)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('133_oplog_retired_identities',1789841199861,'sha256:rag-rat-oplog-retired-identities-v133','Add oplog_retired_identities and oplog_pending_identity: a removed device re-enrolls under a fresh identity that is staged until adoption swaps it in, and the replaced identity''s fingerprint and X25519 key are kept so content sealed to it stays readable (#1417)');
 INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('134_row_statements',1789841199862,'sha256:rag-rat-row-statements-v134','Add sync_row_statements: per chain that carries a row''s current live clock, the lamport of its newest carrying entry, so retention pins the entry a chain holds rather than keying on the clock''s device (#1488); backfilled with one statement per clock at its own identity');
+INSERT INTO "schema_version"("id","applied_at_ms","checksum","description") VALUES('135_local_bindings',1790327808434,'sha256:rag-rat-local-bindings-v135','Add local_bindings: the function-local variables a file declares, which are not symbols but which edge resolution counts as never-bound candidates for their names, and edges_data.local_binding_file_id: the file whose local variable won an unresolved reference (#1466)');
 INSERT INTO "repos"("repo_id","display_name","registered_at_ms") VALUES('__unassigned__','',0);
 INSERT INTO "content_digest_state"("id","state","rows_folded") VALUES(1,'0000000000000000000000000000000000000000000000000000000000000000',0);

@@ -830,6 +830,8 @@ impl IndexDatabase {
             -- `no such table` on every reindex).
             DELETE FROM main.symbols
             WHERE file_id IN (SELECT id FROM temp.staged_file_ids);
+            DELETE FROM main.local_bindings
+            WHERE file_id IN (SELECT id FROM temp.staged_file_ids);
             DELETE FROM main.chunks
             WHERE file_id IN (SELECT id FROM temp.staged_file_ids);
             DELETE FROM main.files

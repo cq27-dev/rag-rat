@@ -48,6 +48,30 @@ impl ParserBackend for Swift {
         ]
     }
 
+    /// `computed_property` is an accessor body: a shorthand getter's statements, or the block
+    /// holding `get`, `set` and `_modify`, which the grammar produces nowhere else. A subscript's
+    /// body is always one too, and the subscript already names its scope (`scope_segment`), so
+    /// neither the accessors nor the subscript need an entry of their own.
+    fn function_scopes(&self) -> &'static [&'static str] {
+        &[
+            "function_declaration",
+            "init_declaration",
+            "deinit_declaration",
+            "lambda_literal",
+            "computed_property",
+            "willset_clause",
+            "didset_clause",
+        ]
+    }
+
+    fn local_variable_kinds(&self) -> &'static [&'static str] {
+        &["property"]
+    }
+
+    fn member_bodies(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     fn parser_kind(&self, _path: &Path) -> ParserKind {
         ParserKind::Swift
     }
