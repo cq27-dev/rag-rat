@@ -36,8 +36,13 @@ pub(super) fn stream_pending(conn: &Connection, stream: StreamId) -> anyhow::Res
     )?)
 }
 
-/// Only the transaction that adopts a floor may create an obligation. Keep the first target:
-/// a later peer's numerically higher tip proves no ancestry through the missing suffix.
+/// Only the transaction that adopts a floor may create an obligation, and it always describes the
+/// CURRENT root: adopting a newer floor replaces the suffix an earlier root still owed (#1489). The
+/// older tip may be gone from every store — compacted by its writer, or refused once its device
+/// was removed — and a newer floor proves as much about the chain as the first one did, so waiting
+/// for the old tip only wedged the stream. Keeping the obligation tied to the current root is what
+/// keeps [`clear_delivered`]'s argument intact: exact presence of the tip proves the contiguous
+/// suffix from that root arrived.
 pub(super) fn record(
     tx: &Transaction<'_>,
     stream: StreamId,
@@ -46,9 +51,13 @@ pub(super) fn record(
     tip: ChainCursor,
 ) -> anyhow::Result<()> {
     tx.execute(
-        "INSERT OR IGNORE INTO table_sync_suffix_coverage(
+        "INSERT INTO table_sync_suffix_coverage(
             stream_id, device_fingerprint, floor_lamport, tip_lamport, tip_hash
-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(stream_id, device_fingerprint) DO UPDATE SET
+             floor_lamport = excluded.floor_lamport,
+             tip_lamport = excluded.tip_lamport,
+             tip_hash = excluded.tip_hash",
         params![
             stream.to_bytes().as_slice(),
             device.to_bytes().as_slice(),
@@ -60,9 +69,10 @@ pub(super) fn record(
     Ok(())
 }
 
-/// Gapped, rejected and merely advertised entries cannot settle delivery. While an obligation
-/// exists, ingress prohibits another discontinuous root, so exact accepted presence proves the
-/// contiguous suffix arrived. This includes entries promoted behind a newly received predecessor.
+/// Gapped, rejected and merely advertised entries cannot settle delivery. Every re-root rewrites
+/// the obligation to the new root in the same transaction ([`record`]), so exact accepted presence
+/// of the tip proves the contiguous suffix from the current root arrived. This includes entries
+/// promoted behind a newly received predecessor.
 pub(super) fn clear_delivered(
     tx: &Transaction<'_>,
     stream: StreamId,
