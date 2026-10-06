@@ -368,11 +368,12 @@ pub fn description(name: &str) -> &'static str {
         "dream" =>
             "Return the deterministic memory-maintenance worklist: coverage gaps (load-bearing \
              symbols with no memory) + stale references (a memory citing a path that no longer \
-             resolves) + near-duplicate memory pairs (memory_duplicate), ranked, each with a \
-             stable `id` to review. This is the pull surface for a strong agent to burn down the \
-             worklist. Recomputes the deterministic findings on each call (like `rag-rat dream`); \
-             it does NOT run the opt-in model verdict/compaction passes — those stay on the \
-             CLI/cron `rag-rat dream --verify|--compact`, and the findings they persist (e.g. \
+             resolves) + memories derived from a dead source (dependent_of_dead_source) + \
+             near-duplicate memory pairs (memory_duplicate), ranked, each with a stable `id` to \
+             review. This is the pull surface for a strong agent to burn down the worklist. \
+             Recomputes the deterministic findings on each call (like `rag-rat dream`); it does \
+             NOT run the opt-in model verdict/compaction passes — those stay on the CLI/cron \
+             `rag-rat dream --verify|--compact`, and the findings they persist (e.g. \
              memory_divergence) still surface here. Review a finding with dream_review.",
         "dream_review" =>
             "Apply a human verdict to ONE dream finding by id (a full id or unambiguous prefix): \

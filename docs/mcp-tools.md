@@ -624,6 +624,9 @@ with a stable `id`:
 - **coverage gaps** — load-bearing symbols (by the same PageRank as `important_symbols`) that carry no
   memory, so the next agent editing them gets nothing.
 - **stale references** — a memory citing a path or anchor that no longer resolves.
+- **memories resting on a dead source** (`dependent_of_dead_source`) — a live memory derived, directly
+  or transitively, from one that is obsolete, rejected or anchored only to gone code; the finding names
+  the source and its successor, and clears itself once the source stands again.
 - **near-duplicate memories** (`memory_duplicate`) — two live memories close enough in meaning to be
   one note under other words: merge them, or dismiss the pair when both rules are needed. Needs an
   embedding model with a measured threshold, like `memory_create`'s `similar_memories`.

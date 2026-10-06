@@ -23,6 +23,7 @@
 //! preserves dream's "never mutates a `repo_memories` row" invariant even as verification lands.
 
 mod compact;
+mod dead_sources;
 mod duplicates;
 mod failure;
 mod findings;
@@ -155,6 +156,7 @@ pub fn dream_run_with_near_duplicates(
 ) -> anyhow::Result<DreamReport> {
     let mut findings = findings::coverage_gap(conn, opts.limit)?;
     findings.extend(findings::stale_reference(conn)?);
+    findings.extend(dead_sources::dependent_of_dead_source_findings(conn)?);
     // The verification finding kinds emit over ALL active memories / ALL stored verdict rows
     // (stable, rate-independent populations, exactly like the other two kinds), so folding them
     // into the identity-keyed sync gives correct resolve semantics — a memory that becomes
