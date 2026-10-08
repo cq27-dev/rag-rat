@@ -721,7 +721,8 @@ impl IndexDatabase {
                     })
                     // Fully-deterministic final tiebreak: compare the full sorted member-id vector
                     // (lexicographically, reversed so max_by keeps the lexicographically-smallest).
-                    // `max_by` returns the LAST equal element, so we reverse: "greater" vector loses.
+                    // `max_by` returns the LAST equal element, so we reverse: "greater" vector
+                    // loses.
                     .then_with(|| b.cmp(a))
             })
         };

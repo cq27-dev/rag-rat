@@ -72,9 +72,14 @@ impl ReadinessState {
     }
 
     fn mark_not_ready(&self) {
-        let _ = self.bits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |bits| {
-            Some(bits.wrapping_add(2) & !SERVER_READY_BIT)
-        });
+        let mut old = self.bits.load(Ordering::SeqCst);
+        loop {
+            let new = old.wrapping_add(2) & !SERVER_READY_BIT;
+            match self.bits.compare_exchange_weak(old, new, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(actual) => old = actual,
+            }
+        }
     }
 
     #[cfg(test)]

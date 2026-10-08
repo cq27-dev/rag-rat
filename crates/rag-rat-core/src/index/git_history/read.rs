@@ -57,7 +57,9 @@ fn read_history_inner(
     let walk = repo
         .rev_walk([head_id])
         // Newest-first, matching `git log`'s default reverse-chronological order.
-        .sorting(Sorting::ByCommitTime(gix::traverse::commit::simple::CommitTimeOrder::NewestFirst));
+        .sorting(Sorting::ByCommitTime(
+            gix::traverse::commit::simple::CommitTimeOrder::NewestFirst,
+        ));
     let walk = match hidden_head {
         Some(hidden_head) => {
             let hidden_id = gix::ObjectId::from_hex(hidden_head.as_bytes())?;
@@ -109,14 +111,21 @@ fn read_history_inner(
         let mut commit_changes = Vec::new();
         parent_tree
             .changes()?
-            // Full paths, AND rename detection ON (gix default is off; `git log --numstat` has it ON
-            // unless `--no-renames`): a `git mv` becomes a single Rewrite at the destination rather
-            // than a spurious delete+add that corrupts per-path churn (#213 review).
+            // Full paths, AND rename detection ON (gix default is off; `git log --numstat` has it
+            // ON unless `--no-renames`): a `git mv` becomes a single Rewrite at the
+            // destination rather than a spurious delete+add that corrupts per-path
+            // churn (#213 review).
             .options(|opts| {
                 opts.track_path().track_rewrites(Some(gix::diff::Rewrites::default()));
             })
             .for_each_to_obtain_tree(&new_tree, |change| {
-                push_file_change(&change, &hash, scope.as_deref(), &mut diff_cache, &mut commit_changes);
+                push_file_change(
+                    &change,
+                    &hash,
+                    scope.as_deref(),
+                    &mut diff_cache,
+                    &mut commit_changes,
+                );
                 Ok::<_, std::convert::Infallible>(Action::Continue(()))
             })?;
         // No in-scope changes vs the first parent → not part of this index's history: `git log --

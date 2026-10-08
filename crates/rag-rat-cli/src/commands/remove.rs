@@ -234,14 +234,14 @@ fn clean_on_disk_footprint(roots: &[String], removed_repo_id: &str) -> CleanupRe
     let dirs: Vec<PathBuf> = candidate_dirs
         .into_iter()
         .filter(|dir| seen_dirs.insert(dir.clone()))
-        // …then the OWNERSHIP GUARD: only touch a dir that STILL belongs to the repo being removed —
-        // a PRESENT git worktree whose content-derived identity equals `removed_repo_id`. This is
-        // what makes the config discovery safe:
+        // …then the OWNERSHIP GUARD: only touch a dir that STILL belongs to the repo being removed
+        // — a PRESENT git worktree whose content-derived identity equals `removed_repo_id`.
+        // This is what makes the config discovery safe:
         //  * a GONE tree (the recorded root was deleted — rm's own use case) is skipped, so
         //    `discover_config_path`'s upward walk can never climb out of the missing git boundary
         //    into an UNRELATED parent repo and delete ITS governing config;
-        //  * a recorded root now REUSED by a different repo derives a different id and is skipped, so
-        //    rm never deletes the new occupant's config/hooks.
+        //  * a recorded root now REUSED by a different repo derives a different id and is skipped,
+        //    so rm never deletes the new occupant's config/hooks.
         // Skipping only UNDER-deletes (a stray config/hook left behind), which is harmless: the
         // removal tombstone refuses re-registration regardless of a surviving config.
         .filter(|dir| dir_belongs_to_removed_repo(dir, removed_repo_id))
