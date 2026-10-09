@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1](https://github.com/cq27-dev/rag-rat/compare/v0.24.0...v0.24.1) - 2026-10-09
+
+### Other
+
+- release v0.24.0 ([#1354](https://github.com/cq27-dev/rag-rat/pull/1354))
+
 ## [0.24.0](https://github.com/cq27-dev/rag-rat/compare/v0.23.2...v0.24.0) - 2026-10-08
 
 ### Added
