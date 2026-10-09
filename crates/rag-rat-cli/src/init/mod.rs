@@ -2,6 +2,7 @@ mod run;
 mod wizard;
 #[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::io;
 use std::path::PathBuf;
 
