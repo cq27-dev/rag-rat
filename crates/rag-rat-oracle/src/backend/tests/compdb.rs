@@ -1,6 +1,7 @@
 //! Compilation-database parsing and governance: which databases are usable, which configure
 //! an indexed file, and when one is pinned.
 
+use super::super::layout;
 use super::*;
 
 /// The #1008 case is distinguishable from every other reason for not pinning, so the watcher can
@@ -783,12 +784,14 @@ fn an_entrys_shape_is_judged_the_way_clangd_judges_it() {
 
 #[test]
 fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
-    // Checking every entry makes the cost scale with the database, and this runs while the
-    // maintenance pass holds the repository write lock — so the size a large C++ project actually
-    // produces is pinned here rather than assumed small. Measured on the fixture below (39 MB,
-    // 120k entries): ~0.3s in a release build, ~3.3s in this unoptimized test build. The budget is
-    // an order of magnitude above that, so it documents the cost without failing on a loaded
-    // machine; only a change that made validation super-linear would trip it.
+    // Validation runs while the maintenance pass holds the repository write lock. Pin one
+    // streaming pass over a realistically large database: every record is visited once, every
+    // input byte is read once, and read-ahead between records stays within the 64 KiB buffer.
+    // Net live heap at record boundaries is measured from before layout validation, including
+    // storage allocated before the array visitor. Allow 64 KiB for the fixed reader plus 64 KiB
+    // for remaining parser, path, and layout storage; exclude only net memo-update growth.
+    // Linux thread I/O accounting is required within these explicit observation scopes.
+    // These observations do not impose an absolute runtime budget or bound the memo's size.
     let clangd = LiveBackend::for_tool(OracleTool::ClangdLsp).unwrap();
     let (_dir_guard, dir) = checkout("clangd-large-db");
     std::fs::create_dir_all(dir.join("src")).unwrap();
@@ -796,11 +799,14 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
 
     // Shaped like a real Ninja/CMake export: absolute paths, one entry per translation unit, and
     // a flag list long enough that the file's size comes from the commands rather than the count.
+    const READER_STORAGE: usize = 64 * 1024;
+    const SCRATCH_STORAGE: usize = 64 * 1024;
     const FLAGS: &str = "-DNDEBUG -DUSE_AURA=1 -DCOMPONENT_BUILD -I../.. -Igen \
                          -I../../third_party/abseil-cpp -I../../third_party/boringssl/src/include \
                          -O2 -std=c++20 -fno-exceptions -fno-rtti -Wall";
     let mut database = String::from("[");
-    for unit in 0..120_000 {
+    const ENTRIES: usize = 120_000;
+    for unit in 0..ENTRIES {
         if unit > 0 {
             database.push(',');
         }
@@ -814,34 +820,57 @@ fn a_realistically_large_compilation_database_is_validated_in_one_pass() {
     }
     database.push(']');
     assert!(database.len() > 32 * 1024 * 1024, "the fixture must be tens of megabytes");
+    let database_bytes = database.len();
     std::fs::write(dir.join("compile_commands.json"), &database).unwrap();
     drop(database);
 
-    let started = std::time::Instant::now();
-    let layout = clangd.resolve_layout(&scope(&dir));
-    let elapsed = started.elapsed();
+    let checkout = scope(&dir);
+    let (layout, work) = layout::observe_compilation_database(|| clangd.resolve_layout(&checkout));
     assert!(layout.sole_marker_dir().is_some(), "a large database is still a usable one");
+    assert_eq!(work.records, ENTRIES, "usable database must visit each record exactly once");
+    assert_eq!(work.bytes, database_bytes, "usable database must read the file exactly once");
+    assert!(work.max_read_ahead <= 64 * 1024, "usable database must stream records: {work:?}");
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        work.input_bytes, database_bytes as u64,
+        "usable database must not read independent input handles"
+    );
     assert!(
-        elapsed < Duration::from_secs(30),
-        "validating one large compilation database took {elapsed:?}",
+        work.max_retained_bytes <= READER_STORAGE + SCRATCH_STORAGE,
+        "usable database must not accumulate entries or payloads: {work:?}"
     );
 
     // The governance answer comes from the SAME pass — there is no second read of the file — and
-    // this is its worst case: a corpus that matches nothing means every entry is captured and
-    // tested, with no short-circuit. That is the direction the vendored case takes, so it is the
-    // one worth budgeting; the mainstream case qualifies on entry one and never gets here.
+    // this is its worst case: a corpus that matches nothing means every entry's paths are captured
+    // and tested, with no governance short-circuit. It must still visit each record and read each
+    // byte just once, with bounded read-ahead, rather than performing a separate governance scan.
     let nothing_indexed = crate::test_support::PrefixCorpus::new(&dir, &["src"]);
     let scope = crate::backend::CheckoutScope::resolve(&dir, &nothing_indexed);
-    let started = std::time::Instant::now();
-    let layout = clangd.resolve_layout(&scope);
-    let elapsed = started.elapsed();
+    let (layout, work) = layout::observe_compilation_database(|| clangd.resolve_layout(&scope));
     assert!(
         layout.sole_marker_dir().is_none(),
         "its entries name another machine's tree, so it governs nothing here",
     );
+    assert_eq!(
+        work.records, ENTRIES,
+        "governs-nothing database must visit each record exactly once"
+    );
+    assert_eq!(
+        work.bytes, database_bytes,
+        "governs-nothing database must read the file exactly once"
+    );
     assert!(
-        elapsed < Duration::from_secs(30),
-        "testing every entry against the corpus took {elapsed:?}",
+        work.max_read_ahead <= 64 * 1024,
+        "governs-nothing database must stream records: {work:?}"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        work.input_bytes, database_bytes as u64,
+        "governs-nothing database must not read independent input handles"
+    );
+    assert!(
+        work.max_retained_bytes <= READER_STORAGE + SCRATCH_STORAGE,
+        "governs-nothing database must not accumulate entries or payloads: {work:?}"
     );
 }
 
