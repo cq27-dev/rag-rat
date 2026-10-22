@@ -120,6 +120,8 @@ jobs:
         # Upload even when tests fail, so failures show up in Codecov Test Analytics.
         if: ${{ !cancelled() }}
         uses: codecov/test-results-action@v1
+        # Reporting only: an unreachable third-party service must not fail the job.
+        continue-on-error: true
         with:
           files: target/nextest/ci/junit.xml
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -184,6 +186,8 @@ jobs:
           cargo llvm-cov --workspace --no-default-features --locked --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
+        # Reporting only: an unreachable third-party service must not fail the job.
+        continue-on-error: true
         with:
           files: lcov.info
           # Tokenless upload works for public repos; CODECOV_TOKEN is used if the secret is set.
