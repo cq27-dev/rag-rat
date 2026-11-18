@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.2](https://github.com/cq27-dev/rag-rat/compare/v0.24.1...v0.24.2) - 2026-11-18
+
+### Other
+
+- *(oracle)* pin large-compdb one-pass validation without wall-clock budgets ([#1505](https://github.com/cq27-dev/rag-rat/pull/1505))
+
 ## [0.24.1](https://github.com/cq27-dev/rag-rat/compare/v0.24.0...v0.24.1) - 2026-10-09
 
 ### Other
