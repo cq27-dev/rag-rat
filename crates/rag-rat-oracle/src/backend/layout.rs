@@ -645,12 +645,11 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// all for one, so a checkout holding it can never report ready and the backend would retry its
 /// backlog forever while `oracle status` called it runnable.
 ///
-/// The whole file is STREAMED rather than buffered: entries deserialize into presence flags and
-/// discarded payloads, so the cost is one pass with no allocation proportional to the file. That
-/// cost is real — a 39 MB / 120k-entry database, the size a large C++ project exports, takes about
-/// 0.3s in a release build. The memo on [`ProjectLayout`] is what keeps it to once per marker file
-/// per layout rather than once per worklist path, which matters because this runs while the
-/// maintenance pass holds the repository write lock.
+/// The whole file is STREAMED rather than buffered: entries deserialize into presence flags,
+/// command payloads are discarded, and captured path buffers are reused. The canonical-parent
+/// memo can still grow with distinct parents. The memo on [`ProjectLayout`] keeps validation to
+/// once per marker file per layout rather than once per worklist path, which matters because
+/// this runs while the maintenance pass holds the repository write lock.
 ///
 /// SYNTAX is where this is knowingly narrower than the server. clangd reads the file with clang's
 /// YAML reader, and YAML is a superset of JSON, so it also loads databases carrying `#` comments,
@@ -660,6 +659,9 @@ pub const LAYOUT_MAX_AGE: Duration = Duration::from_secs(60);
 /// closing bracket is ignored, both of which clangd accepts and neither of which says anything
 /// about whether the entries describe a loadable project.
 fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading {
+    #[cfg(all(test, target_os = "linux"))]
+    let _input_reads = COMPILATION_DATABASE_HEAP_START
+        .with(|start| start.get().map(|_| CompilationDatabaseInputReads::new()));
     let unreadable = MarkerReading { verdict: MarkerVerdict::Unknown, governs: Governs::Unknown };
     // Both callers reach here having checked only that the path EXISTS, and a marker path that
     // exists is not necessarily something that can be read: opening a FIFO with no writer blocks
@@ -677,6 +679,8 @@ fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading 
     // `serde_json`'s reader deserializer pulls ONE BYTE at a time — measured unbuffered, a 2 MB
     // database costs two million `read` syscalls — so the buffer in front of it is what makes this
     // a sequential read.
+    #[cfg(test)]
+    let file = CompilationDatabaseReader(file);
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
     if !skip_utf8_bom(&mut reader) {
         return unreadable;
@@ -716,6 +720,200 @@ fn read_marker_file(path: &Path, checkout: &CheckoutScope<'_>) -> MarkerReading 
                 MarkerReading { verdict: MarkerVerdict::NotLoadable, governs: Governs::Unknown },
             _ => unreadable,
         },
+    }
+}
+
+// Thread-local because layout validation is synchronous and tests run in parallel.
+#[cfg(test)]
+std::thread_local! {
+    static COMPILATION_DATABASE_WORK: RefCell<CompilationDatabaseWork> = RefCell::default();
+    static COMPILATION_DATABASE_HEAP_START: std::cell::Cell<Option<isize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct CompilationDatabaseWork {
+    pub(super) records: usize,
+    pub(super) bytes: usize,
+    pub(super) max_read_ahead: usize,
+    #[cfg(target_os = "linux")]
+    pub(super) input_bytes: u64,
+    pub(super) max_retained_bytes: usize,
+    read_ahead: usize,
+    metadata_heap_bytes: isize,
+}
+
+/// Observe one synchronous validation call, before any of its reader or parser allocations.
+/// Kernel accounting is opt-in with this scope and is required on Linux, not silently skipped.
+#[cfg(test)]
+pub(super) fn observe_compilation_database<T>(
+    validate: impl FnOnce() -> T,
+) -> (T, CompilationDatabaseWork) {
+    COMPILATION_DATABASE_HEAP_START.with(|start| {
+        assert!(start.get().is_none(), "compilation database observations must not nest");
+    });
+    COMPILATION_DATABASE_WORK.with(RefCell::take);
+    let heap_start = compilation_database_allocations::live_bytes();
+    COMPILATION_DATABASE_HEAP_START.with(|start| start.set(Some(heap_start)));
+    let _observation = CompilationDatabaseObservation;
+    let result = validate();
+    let work = COMPILATION_DATABASE_WORK.with(RefCell::take);
+    (result, work)
+}
+
+#[cfg(test)]
+struct CompilationDatabaseObservation;
+
+#[cfg(test)]
+impl Drop for CompilationDatabaseObservation {
+    fn drop(&mut self) {
+        COMPILATION_DATABASE_HEAP_START.with(|start| start.set(None));
+    }
+}
+
+/// Observe actual file reads below the buffer, including reads before the first record visit.
+#[cfg(test)]
+struct CompilationDatabaseReader(std::fs::File);
+
+#[cfg(test)]
+impl std::io::Read for CompilationDatabaseReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let bytes = std::io::Read::read(&mut self.0, buffer)?;
+        COMPILATION_DATABASE_WORK.with_borrow_mut(|work| {
+            work.bytes += bytes;
+            work.read_ahead += bytes;
+            work.max_read_ahead = work.max_read_ahead.max(work.read_ahead);
+        });
+        Ok(bytes)
+    }
+}
+
+// Kernel accounting also sees reads through independently opened handles. Use the current
+// thread, not the process, so parallel validation cannot contribute to this observation.
+#[cfg(all(test, target_os = "linux"))]
+struct CompilationDatabaseInputReads(u64);
+
+#[cfg(all(test, target_os = "linux"))]
+impl CompilationDatabaseInputReads {
+    fn snapshot() -> (u64, u64) {
+        let text = std::fs::read_to_string("/proc/thread-self/io")
+            .expect("compilation database observation requires Linux thread I/O accounting");
+        let bytes = text
+            .lines()
+            .find_map(|line| line.strip_prefix("rchar: "))
+            .expect("rchar in thread I/O accounting")
+            .trim()
+            .parse()
+            .expect("numeric rchar");
+        (bytes, text.len() as u64)
+    }
+
+    fn new() -> Self {
+        let (bytes, snapshot_bytes) = Self::snapshot();
+        // The snapshot reports rchar BEFORE the read returning the snapshot itself.
+        Self(bytes + snapshot_bytes)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for CompilationDatabaseInputReads {
+    fn drop(&mut self) {
+        let (bytes, _) = Self::snapshot();
+        COMPILATION_DATABASE_WORK.with_borrow_mut(|work| work.input_bytes += bytes - self.0);
+    }
+}
+
+// Sample net live heap at record boundaries against the validation-call baseline, including
+// reader and preallocated storage. Only net growth during the canonical-parent memo update is
+// excluded; allocations retained elsewhere stay charged, including entry payloads.
+#[cfg(test)]
+struct CompilationEntryRetention;
+
+#[cfg(test)]
+impl Drop for CompilationEntryRetention {
+    fn drop(&mut self) {
+        let Some(heap_start) = COMPILATION_DATABASE_HEAP_START.with(std::cell::Cell::get) else {
+            return;
+        };
+        let heap = compilation_database_allocations::live_bytes() - heap_start;
+        COMPILATION_DATABASE_WORK.with_borrow_mut(|work| {
+            let retained = heap - work.metadata_heap_bytes;
+            work.max_retained_bytes = work.max_retained_bytes.max(retained.max(0) as usize);
+        });
+    }
+}
+
+#[cfg(test)]
+struct CompilationMetadataAllocations(isize);
+
+#[cfg(test)]
+impl Drop for CompilationMetadataAllocations {
+    fn drop(&mut self) {
+        let growth = compilation_database_allocations::live_bytes() - self.0;
+        COMPILATION_DATABASE_WORK.with_borrow_mut(|work| work.metadata_heap_bytes += growth);
+    }
+}
+
+#[cfg(test)]
+mod compilation_database_allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static LIVE_BYTES: Cell<isize> = const { Cell::new(0) };
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: ObservedSystem = ObservedSystem;
+
+    struct ObservedSystem;
+
+    fn adjust(bytes: isize) {
+        // Allocation hooks must not allocate, panic, or initialize destructible thread state.
+        let _ = LIVE_BYTES.try_with(|live| live.set(live.get().wrapping_add(bytes)));
+    }
+
+    pub(super) fn live_bytes() -> isize {
+        LIVE_BYTES.with(Cell::get)
+    }
+
+    // SAFETY: every operation delegates its unchanged pointer/layout contract to System.
+    // Accounting only touches a const-initialized Cell, including during thread teardown.
+    unsafe impl GlobalAlloc for ObservedSystem {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller supplies the GlobalAlloc layout contract.
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                adjust(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller supplies the GlobalAlloc layout contract.
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                adjust(layout.size() as isize);
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: allocations come from System with this same layout.
+            unsafe { System.dealloc(pointer, layout) };
+            adjust(-(layout.size() as isize));
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            // SAFETY: the caller supplies a live allocation and a valid new size.
+            let pointer = unsafe { System.realloc(pointer, layout, size) };
+            if !pointer.is_null() {
+                adjust((size as isize).wrapping_sub(layout.size() as isize));
+            }
+            pointer
+        }
     }
 }
 
@@ -869,10 +1067,16 @@ impl EntryPaths {
         let (Some(parent), Some(name)) = (lexical.parent(), lexical.file_name()) else {
             return false;
         };
-        let resolved = self
-            .canonical_parents
-            .entry(parent.to_path_buf())
-            .or_insert_with(|| rag_rat_base::paths::canonicalize(parent).ok());
+        let resolved = {
+            // Exclude only net heap growth from the memo update: its table, parent keys, and
+            // resolved-parent values. Lexical work and corpus calls remain outside this scope.
+            #[cfg(test)]
+            let _metadata =
+                CompilationMetadataAllocations(compilation_database_allocations::live_bytes());
+            self.canonical_parents
+                .entry(parent.to_path_buf())
+                .or_insert_with(|| rag_rat_base::paths::canonicalize(parent).ok())
+        };
         resolved.as_ref().is_some_and(|dir| corpus.indexes_file(&dir.join(name)))
     }
 }
@@ -1150,7 +1354,7 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor<'_> {
         let mut unmodelled_key = false;
         let mut governs_indexed = false;
         let mut governs_unknown = false;
-        // Reused across every entry, so the read allocates nothing in proportion to the file.
+        // Reuse the captured paths; the canonical-parent memo may grow with distinct parents.
         let mut paths = EntryPaths::default();
         // The first entry `CompilationEntry` rejects ends the read: clangd would refuse the
         // database at that point too, so nothing later in the file could redeem it. An entry with
@@ -1170,6 +1374,13 @@ impl<'de> Visitor<'de> for CompilationDatabaseVisitor<'_> {
             let Some(entry) = entry else {
                 break;
             };
+            #[cfg(test)]
+            let _retention = CompilationEntryRetention;
+            #[cfg(test)]
+            COMPILATION_DATABASE_WORK.with_borrow_mut(|work| {
+                work.records += 1;
+                work.read_ahead = 0;
+            });
             if entry.configures_a_file {
                 entries += 1;
             }
