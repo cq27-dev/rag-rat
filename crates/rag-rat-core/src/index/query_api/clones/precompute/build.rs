@@ -340,6 +340,8 @@ pub(in super::super) fn make_edge(
 /// via `INSERT OR IGNORE` on their content-key PKs) and checkpoint the generation's cursor + edge
 /// count — all in ONE transaction, so postings, edges, and the cursor advance atomically together
 /// (review R6: a symbol's postings are durable before its symbol id is checkpointed as done).
+/// Retries the whole transaction at most twice on SQLite BUSY, with 50 ms then 100 ms
+/// backoff in addition to the connection's busy timeout. Failed attempts roll back before waiting.
 /// Returns the EDGE rows actually inserted (dedup-ignored rows don't count).
 fn flush_batch(
     conn: &Connection,
@@ -349,27 +351,82 @@ fn flush_batch(
     cursor: i64,
     cumulative_edges: u64,
 ) -> anyhow::Result<u64> {
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-    let result = (|| -> anyhow::Result<u64> {
-        let inserted = insert_edge_rows(conn, generation, batch)?;
-        insert_posting_groups(conn, generation, postings)?;
-        conn.execute(
-            "UPDATE clone_graph_generations SET cursor_symbol_id = ?1, edges_written = ?2
-              WHERE generation = ?3",
-            params![cursor, (cumulative_edges + inserted) as i64, generation],
-        )?;
-        Ok(inserted)
-    })();
-    match result {
-        Ok(inserted) => {
-            conn.execute_batch("COMMIT")?;
-            batch.clear();
-            postings.clear();
-            Ok(inserted)
-        },
-        Err(err) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(err)
-        },
+    BatchFlush { conn, generation, batch, postings, cursor, cumulative_edges }
+        .flush(BatchRetry::default())
+}
+
+struct BatchRetry<S = fn(Duration)> {
+    backoff: [Duration; 2],
+    sleep: S,
+}
+
+impl Default for BatchRetry {
+    fn default() -> Self {
+        Self {
+            backoff: [Duration::from_millis(50), Duration::from_millis(100)],
+            sleep: std::thread::sleep,
+        }
     }
 }
+
+struct BatchFlush<'a> {
+    conn: &'a Connection,
+    generation: i64,
+    batch: &'a mut Vec<EdgeRow>,
+    postings: &'a mut Vec<PostingGroup>,
+    cursor: i64,
+    cumulative_edges: u64,
+}
+
+impl BatchFlush<'_> {
+    fn flush(self, mut retry: BatchRetry<impl FnMut(Duration)>) -> anyhow::Result<u64> {
+        let mut backoff = retry.backoff.into_iter();
+        loop {
+            match self.persist_batch_checkpoint() {
+                Ok(inserted) => {
+                    self.batch.clear();
+                    self.postings.clear();
+                    return Ok(inserted);
+                },
+                Err(err) if is_sqlite_busy(&err) => {
+                    let Some(delay) = backoff.next() else { return Err(err) };
+                    (retry.sleep)(delay);
+                },
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn persist_batch_checkpoint(&self) -> anyhow::Result<u64> {
+        // Drop rolls back every failed attempt, including a failed COMMIT, before retrying.
+        let tx = rusqlite::Transaction::new_unchecked(
+            self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let inserted = insert_edge_rows(&tx, self.generation, self.batch)?;
+        insert_posting_groups(&tx, self.generation, self.postings)?;
+        tx.execute(
+            "UPDATE clone_graph_generations SET cursor_symbol_id = ?1, edges_written = ?2
+              WHERE generation = ?3",
+            params![self.cursor, (self.cumulative_edges + inserted) as i64, self.generation],
+        )?;
+        tx.commit()?;
+        Ok(inserted)
+    }
+}
+
+/// Recognize SQLite BUSY (including extended codes) through error context wrappers.
+/// LOCKED signals a same-connection or shared-cache conflict, rather than the separate
+/// writer contention retried here. Repository connection opens do not request shared cache.
+fn is_sqlite_busy(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests;
